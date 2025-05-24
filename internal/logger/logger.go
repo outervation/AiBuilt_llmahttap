@@ -299,6 +299,19 @@ func getRealClientIP(remoteAddr string, headers http.Header, realIPHeaderName st
 	return determinedDirectPeerIP
 }
 
+// writeLogLine ensures the log line is written atomically using the logger's mutex.
+func (al *AccessLogger) writeLogLine(line string) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	// al.logger is a standard log.Logger, which guarantees that each call
+	// to Println (which calls Output, then Write) is atomic with respect
+	// to other calls to the same logger instance.
+	// Our explicit lock here provides an additional layer of safety,
+	// particularly if the underlying al.output writer itself wasn't inherently thread-safe
+	// or if we were performing multiple operations on al.logger that needed to be atomic as a group.
+	al.logger.Println(line)
+}
+
 // LogAccess constructs and writes an access log entry.
 // This is a placeholder for full implementation.
 
@@ -358,14 +371,13 @@ func (al *AccessLogger) LogAccess(
 	jsonData, err := json.Marshal(entry)
 	if err != nil {
 		// Fallback: Log a JSON-formatted error about the marshalling failure.
-		// Using el.logger directly to avoid complex dependencies or recursion.
 		// This internal error message will go to the access log's target.
 		errorMsg := fmt.Sprintf("{\"level\":\"ERROR\", \"ts\":\"%s\", \"msg\":\"Error marshalling access log entry to JSON\", \"error\":\"%s\"}",
 			getTimestamp(), strings.ReplaceAll(err.Error(), "\"", "'")) // Basic sanitization for error string in JSON
-		al.logger.Println(errorMsg)
+		al.writeLogLine(errorMsg)
 		return
 	}
-	al.logger.Println(string(jsonData)) // log.Logger adds its own newline, which is desired.
+	al.writeLogLine(string(jsonData))
 }
 
 // Helper to map config.LogLevel to an internal severity level if needed, or just use it directly.
