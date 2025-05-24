@@ -243,6 +243,123 @@ func generateHTMLResponseBody(title, heading, htmlSafeMessage string) []byte {
 	))
 }
 
+// WriteErrorResponse generates and sends a default HTTP error response on the given stream.
+// It performs content negotiation based on the Accept header found in requestHeaders.
+//
+// stream: The HTTP/2 stream to send the response on.
+// statusCode: The HTTP status code for the error.
+// requestHeaders: The received request headers, used to extract the Accept header.
+// detailMessage: An optional, more specific message to include in the error response.
+//
+//	For JSON, this populates the "detail" field.
+//	For HTML, this is HTML-escaped and used to provide more specific information
+//	either as the main message (for unknown status codes) or appended to the
+//	standard message (for known status codes).
+//
+// Returns an error if sending the response fails. If JSON marshalling fails,
+// it gracefully falls back to sending an HTML response.
+func WriteErrorResponse(stream http2.ResponseWriter, statusCode int, requestHeaders []hpack.HeaderField, detailMessage string) error {
+	statusText := http.StatusText(statusCode)
+	if statusText == "" {
+		statusText = "Error" // Fallback for unknown status codes
+	}
+
+	acceptHeaderValue := ""
+	for _, hf := range requestHeaders {
+		// HTTP/2 header names should be lowercase.
+		if hf.Name == "accept" { // More direct check as HPACK decodes to lowercase.
+			acceptHeaderValue = hf.Value
+			break
+		} else if strings.ToLower(hf.Name) == "accept" { // Fallback for robustness
+			acceptHeaderValue = hf.Value
+			break
+		}
+	}
+
+	var body []byte
+	var contentType string
+	jsonMarshalFailed := false
+
+	// Determine if JSON response is preferred
+	shouldSendJSON := prefersJSON(acceptHeaderValue)
+
+	if shouldSendJSON {
+		contentType = "application/json; charset=utf-8"
+		errorResp := ErrorResponseJSON{
+			Error: ErrorDetail{
+				StatusCode: statusCode,
+				Message:    statusText,
+				Detail:     detailMessage,
+			},
+		}
+		var marshalErr error
+		body, marshalErr = json.Marshal(errorResp)
+		if marshalErr != nil {
+			// JSON marshaling failed. Per spec, if "SHOULD" send JSON cannot be met,
+			// then "MUST" send HTML (the "Otherwise" condition).
+			jsonMarshalFailed = true
+			// Note: The marshalErr itself is not returned here, as the function's goal
+			// is to send *an* error response. The caller can log if this function returns an error
+			// during the actual send operation.
+		}
+	}
+
+	// Fallback to HTML if JSON was not preferred, or if JSON marshaling failed
+	if !shouldSendJSON || jsonMarshalFailed {
+		contentType = "text/html; charset=utf-8"
+
+		var finalTitle, finalHeading, baseMessage string
+		defaultMsgData, isKnownCode := defaultHTMLMessages[statusCode]
+
+		if isKnownCode {
+			finalTitle = defaultMsgData.title
+			finalHeading = defaultMsgData.heading
+			baseMessage = defaultMsgData.message
+		} else { // Generic error for unknown status codes
+			finalTitle = fmt.Sprintf("%d %s", statusCode, statusText)
+			finalHeading = statusText
+			baseMessage = "The server encountered an error." // Default simple message for unknown codes
+		}
+
+		// Construct the final HTML-safe message body string
+		htmlSafeMessageBody := baseMessage
+		if detailMessage != "" {
+			escapedDetail := html.EscapeString(detailMessage)
+			if !isKnownCode {
+				// For generic/unknown errors, if detail is present, it becomes the primary message.
+				htmlSafeMessageBody = escapedDetail
+			} else {
+				// For known errors, if detail is present, it's appended to the base message.
+				htmlSafeMessageBody = baseMessage + " " + escapedDetail
+			}
+		}
+
+		body = generateHTMLResponseBody(finalTitle, finalHeading, htmlSafeMessageBody)
+	}
+
+	responseHPACKHeaders := []hpack.HeaderField{
+		{Name: ":status", Value: strconv.Itoa(statusCode)},
+		{Name: "content-type", Value: contentType},
+		{Name: "content-length", Value: strconv.Itoa(len(body))},
+		{Name: "cache-control", Value: "no-cache, no-store, must-revalidate"},
+		{Name: "pragma", Value: "no-cache"}, // For HTTP/1.0 proxies/clients
+		{Name: "expires", Value: "0"},       // For proxies
+	}
+
+	err := stream.SendHeaders(responseHPACKHeaders, len(body) == 0)
+	if err != nil {
+		return fmt.Errorf("failed to send error response headers (status %d): %w", statusCode, err)
+	}
+
+	if len(body) > 0 {
+		_, err = stream.WriteData(body, true)
+		if err != nil {
+			return fmt.Errorf("failed to send error response body (status %d): %w", statusCode, err)
+		}
+	}
+	return nil
+}
+
 // statusCode: The HTTP status code for the error.
 // req: The original http.Request, used to inspect the Accept header.
 // optionalDetail: A more specific error message string, can be empty.
