@@ -313,7 +313,6 @@ func (al *AccessLogger) writeLogLine(line string) {
 }
 
 // LogAccess constructs and writes an access log entry.
-// This is a placeholder for full implementation.
 
 func (al *AccessLogger) LogAccess(
 	req *http.Request,
