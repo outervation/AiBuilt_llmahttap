@@ -334,8 +334,8 @@ func (s *Stream) WriteTrailers(trailers []hpack.HeaderField) error {
 	s.mu.Lock()
 	if !s.responseHeadersSent {
 		s.mu.Unlock()
-		s.conn.logger.Error("stream: WriteTrailers called before WriteHeaders", logger.LogFields{"stream_id": s.id})
-		return NewStreamError(s.id, ErrCodeInternalError, "WriteHeaders must be called before WriteTrailers")
+		s.conn.logger.Error("stream: WriteTrailers called before SendHeaders", logger.LogFields{"stream_id": s.id})
+		return NewStreamError(s.id, ErrCodeInternalError, "SendHeaders must be called before WriteTrailers")
 	}
 	if s.endStreamSentToClient {
 		s.mu.Unlock()
