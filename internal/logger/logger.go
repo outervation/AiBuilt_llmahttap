@@ -384,6 +384,37 @@ func getSeverity(level config.LogLevel) int {
 	}
 }
 
+// getLogLevelSeverity converts config.LogLevel to an internal integer representation for comparison.
+// Lower numbers are less severe.
+func getLogLevelSeverity(level config.LogLevel) int {
+	switch level {
+	case config.LogLevelDebug:
+		return 0
+	case config.LogLevelInfo:
+		return 1
+	case config.LogLevelWarning:
+		return 2
+	case config.LogLevelError:
+		return 3
+	default:
+		// This case should ideally not be reached if config validation is robust.
+		// Default to a known level (e.g., INFO) or a specific value indicating unknown.
+		return 1 // Default to INFO's severity
+	}
+}
+
+// isLoggable checks if the given messageLevel is severe enough to be logged
+// based on the ErrorLogger's configured globalLogLevel.
+func (el *ErrorLogger) isLoggable(messageLevel config.LogLevel) bool {
+	if el == nil { // Should not happen if logger is properly initialized
+		return false
+	}
+	// We log if messageLevel's severity is >= globalLogLevel's severity.
+	messageSeverity := getLogLevelSeverity(messageLevel)
+	configuredSeverity := getLogLevelSeverity(el.globalLogLevel)
+	return messageSeverity >= configuredSeverity
+}
+
 // LogError constructs and writes an error log entry.
 // This is a placeholder for full implementation.
 
@@ -396,7 +427,7 @@ func (el *ErrorLogger) LogError(level config.LogLevel, msg string, context LogFi
 		return // Error logging not configured
 	}
 
-	if getSeverity(level) < getSeverity(el.globalLogLevel) {
+	if !el.isLoggable(level) {
 		return // Message severity is below configured threshold
 	}
 
