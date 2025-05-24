@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath" // Added
+	"runtime"       // Added
 	"strconv"
 	"strings"
 	"sync"
@@ -426,8 +428,66 @@ func (el *ErrorLogger) isLoggable(messageLevel config.LogLevel) bool {
 	return messageSeverity >= configuredSeverity
 }
 
-// LogError constructs and writes an error log entry.
-// This is a placeholder for full implementation.
+// Debug logs a message at DEBUG level.
+func (el *ErrorLogger) Debug(msg string, context LogFields) {
+	level := config.LogLevelDebug
+	if context == nil {
+		context = make(LogFields)
+	}
+	if _, ok := context["source"]; !ok {
+		// runtime.Caller(1) will give the caller of this Debug method.
+		_, file, line, ok := runtime.Caller(1)
+		if ok {
+			context["source"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
+		}
+	}
+	el.LogError(level, msg, context)
+}
+
+// Info logs a message at INFO level.
+func (el *ErrorLogger) Info(msg string, context LogFields) {
+	level := config.LogLevelInfo
+	if context == nil {
+		context = make(LogFields)
+	}
+	if _, ok := context["source"]; !ok {
+		_, file, line, ok := runtime.Caller(1)
+		if ok {
+			context["source"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
+		}
+	}
+	el.LogError(level, msg, context)
+}
+
+// Warn logs a message at WARNING level.
+func (el *ErrorLogger) Warn(msg string, context LogFields) {
+	level := config.LogLevelWarning
+	if context == nil {
+		context = make(LogFields)
+	}
+	if _, ok := context["source"]; !ok {
+		_, file, line, ok := runtime.Caller(1)
+		if ok {
+			context["source"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
+		}
+	}
+	el.LogError(level, msg, context)
+}
+
+// Error logs a message at ERROR level.
+func (el *ErrorLogger) Error(msg string, context LogFields) {
+	level := config.LogLevelError
+	if context == nil {
+		context = make(LogFields)
+	}
+	if _, ok := context["source"]; !ok {
+		_, file, line, ok := runtime.Caller(1)
+		if ok {
+			context["source"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
+		}
+	}
+	el.LogError(level, msg, context)
+}
 
 // writeLogLine ensures the log line is written atomically using the logger's mutex.
 func (el *ErrorLogger) writeLogLine(line string) {
@@ -521,25 +581,25 @@ func (el *ErrorLogger) LogError(level config.LogLevel, msg string, context LogFi
 // Convenience methods on the main Logger
 func (l *Logger) Info(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelInfo, msg, context)
+		l.errorLog.Info(msg, context)
 	}
 }
 
 func (l *Logger) Error(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelError, msg, context)
+		l.errorLog.Error(msg, context)
 	}
 }
 
 func (l *Logger) Debug(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelDebug, msg, context)
+		l.errorLog.Debug(msg, context)
 	}
 }
 
 func (l *Logger) Warn(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelWarning, msg, context)
+		l.errorLog.Warn(msg, context)
 	}
 }
 
