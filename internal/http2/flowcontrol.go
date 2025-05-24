@@ -480,9 +480,19 @@ func NewStreamFlowControlManager(streamID uint32, ourInitialWindowSize, peerInit
 	return sfcm
 }
 
-// AcquireSendSpace attempts to reserve 'n' bytes from this stream's send window.
-// It blocks until space is available or the window is closed/errored.
-// Returns an error if 'n' is 0 or if the window operation fails.
+// AcquireSendSpace allows a data sender to request 'n' bytes of window capacity from this stream's send window.
+// It fulfills the requirements:
+//  1. Request window capacity: The 'n' parameter specifies the amount.
+//  2. Block if unavailable: This method blocks if 'n' bytes are not currently available in the send window,
+//     waiting until space is granted by the peer (via WINDOW_UPDATE for this stream) or an error occurs.
+//  3. Consume window space: Upon successful acquisition (i.e., when the method returns nil),
+//     the requested 'n' bytes are immediately deducted from the available stream send window.
+//     This consumption happens before the actual data transmission by the caller.
+//
+// If 'n' is 0, it returns nil immediately as zero-length DATA frames do not consume window space.
+// Otherwise, it delegates to the underlying FlowControlWindow's Acquire method.
+// An error is returned if the window is closed, an unrecoverable flow control error has occurred,
+// or if 'n' is invalid for the underlying Acquire method (though 'n == 0' is handled here).
 func (sfcm *StreamFlowControlManager) AcquireSendSpace(n uint32) error {
 	if n == 0 { // Sending zero-length DATA frame does not consume window space.
 		return nil
