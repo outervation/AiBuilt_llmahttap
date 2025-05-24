@@ -2,6 +2,7 @@ package http2
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -116,10 +117,13 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 	defer pt.mu.Unlock()
 
 	if streamID == 0 {
-		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "cannot add or modify priority for stream 0"}
+		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "cannot add or modify priority for stream 0 via AddStream"}
 	}
 
-	streamNode := pt.getOrCreateNodeNoLock(streamID)
+	// Ensure the stream node exists or is created with defaults.
+	// This is important because updatePriorityNoLock assumes nodes exist
+	// or creates them as needed, but here we want to apply prioInfo if present.
+	_ = pt.getOrCreateNodeNoLock(streamID) // Ensures streamNode exists.
 
 	var newParentID uint32
 	var newWeight uint8
@@ -130,61 +134,42 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 		newWeight = prioInfo.Weight
 		isExclusiveOperation = prioInfo.Exclusive
 	} else {
-		// Default priority if prioInfo is nil
+		// Default priority if prioInfo is nil.
+		// This is usually for new streams not from HEADERS with PRIORITY.
+		// updatePriorityNoLock will use the existing values on streamNode if they're not overridden.
+		// So, here we ensure the streamNode has default values if it's new.
+		// getOrCreateNodeNoLock already sets default parent (0) and weight (15).
+		// We can retrieve these if needed or just let updatePriorityNoLock handle it
+		// if prioInfo is nil, then the function might not even call updatePriorityNoLock
+		// if no actual change in priority info is specified.
+
+		// Let's clarify: If prioInfo is nil, this usually means a stream is being created
+		// with default priority. getOrCreateNodeNoLock handles this. No further
+		// call to updatePriorityNoLock is needed unless specific prioInfo is given.
+		// However, the original logic updated priority even for "default" cases.
+		// To match the spec section 5.3.1 "All streams are initially dependent on stream 0."
+		// "Newly created streams are assigned a default weight of 16."
+		// getOrCreateNodeNoLock sets this up.
+
+		// The previous implementation *always* re-parented, even if prioInfo was nil,
+		// using parent=0, weight=15.
+		// Let's stick to that behavior for now, by providing default values to updatePriorityNoLock.
 		newParentID = 0
 		newWeight = 15 // Default weight 16
 		isExclusiveOperation = false
 	}
 
-	if newParentID == streamID {
-		return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: "stream cannot depend on itself"}
-	}
-
-	// Remove stream from its old parent's children list, if it had one.
-	// streamNode.parentID is the ID of the current parent.
-	if oldParentNode, exists := pt.nodes[streamNode.parentID]; exists {
-		oldParentNode.childrenIDs = removeChild(oldParentNode.childrenIDs, streamID)
-	}
-
-	newParentNode := pt.getOrCreateNodeNoLock(newParentID)
-
-	// Update streamNode's properties
-	streamNode.parentID = newParentID
-	streamNode.weight = newWeight
-
-	if isExclusiveOperation {
-		// This stream becomes the sole child of newParentNode.
-		// Other children of newParentNode become children of this stream.
-		previousChildrenOfNewParent := make([]uint32, len(newParentNode.childrenIDs))
-		copy(previousChildrenOfNewParent, newParentNode.childrenIDs)
-
-		newParentNode.childrenIDs = []uint32{streamID} // streamNode is now the only child
-
-		// Preserve streamNode's existing children and append the adopted ones.
-		// (RFC 7540, Section 5.3.2: "If the exclusive stream already has dependents, they remain dependents...")
-		newlyAdoptedChildren := make([]uint32, 0)
-		for _, childID := range previousChildrenOfNewParent {
-			if childID == streamID { // Should not happen
-				continue
-			}
-			childNode := pt.getOrCreateNodeNoLock(childID)
-			childNode.parentID = streamID
-			newlyAdoptedChildren = append(newlyAdoptedChildren, childID)
+	// The original AddStream logic was essentially a priority update.
+	// We can directly call updatePriorityNoLock.
+	err := pt.updatePriorityNoLock(streamID, newParentID, newWeight, isExclusiveOperation)
+	if err != nil {
+		// updatePriorityNoLock might return fmt.Errorf for "cannot depend on itself".
+		// We should wrap this in a StreamError for AddStream, which is often
+		// called in the context of HEADERS processing.
+		if strings.Contains(err.Error(), "cannot depend on itself") {
+			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself: %v", streamID, err)}
 		}
-		streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
-
-	} else {
-		// Not exclusive, just add to new parent's children list if not already there.
-		isAlreadyChild := false
-		for _, childID := range newParentNode.childrenIDs {
-			if childID == streamID {
-				isAlreadyChild = true
-				break
-			}
-		}
-		if !isAlreadyChild {
-			newParentNode.childrenIDs = append(newParentNode.childrenIDs, streamID)
-		}
+		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error updating priority for stream %d: %v", streamID, err)}
 	}
 	return nil
 }
@@ -282,54 +267,17 @@ func (pt *PriorityTree) ProcessPriorityFrame(streamID uint32, frame *PriorityFra
 		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "PRIORITY frame received on stream 0"}
 	}
 
-	newParentID := frame.StreamDependency
-	newWeight := frame.Weight
-	isExclusiveOperation := frame.Exclusive
-
-	if newParentID == streamID {
-		// Stream cannot depend on itself.
-		return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: "stream cannot depend on itself in PRIORITY frame"}
-	}
-
-	streamNode := pt.getOrCreateNodeNoLock(streamID)
-
-	// Remove stream from its old parent's children list.
-	if oldParentNode, exists := pt.nodes[streamNode.parentID]; exists {
-		oldParentNode.childrenIDs = removeChild(oldParentNode.childrenIDs, streamID)
-	}
-
-	newParentNode := pt.getOrCreateNodeNoLock(newParentID)
-
-	// Update streamNode's properties
-	streamNode.parentID = newParentID
-	streamNode.weight = newWeight
-
-	if isExclusiveOperation {
-		previousChildrenOfNewParent := make([]uint32, len(newParentNode.childrenIDs))
-		copy(previousChildrenOfNewParent, newParentNode.childrenIDs)
-		newParentNode.childrenIDs = []uint32{streamID}
-
-		newlyAdoptedChildren := make([]uint32, 0)
-		for _, childID := range previousChildrenOfNewParent {
-			if childID == streamID {
-				continue
-			}
-			childNode := pt.getOrCreateNodeNoLock(childID)
-			childNode.parentID = streamID
-			newlyAdoptedChildren = append(newlyAdoptedChildren, childID)
+	// PRIORITY frame defines all necessary parameters for updatePriorityNoLock.
+	// The streamID for the PRIORITY frame itself is the stream being reprioritized.
+	err := pt.updatePriorityNoLock(streamID, frame.StreamDependency, frame.Weight, frame.Exclusive)
+	if err != nil {
+		// updatePriorityNoLock returns fmt.Errorf for "cannot depend on itself".
+		// For PRIORITY frames, this is a StreamError.
+		if strings.Contains(err.Error(), "cannot depend on itself") {
+			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself in PRIORITY frame: %v", streamID, err)}
 		}
-		streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
-	} else {
-		isAlreadyChild := false
-		for _, childID := range newParentNode.childrenIDs {
-			if childID == streamID {
-				isAlreadyChild = true
-				break
-			}
-		}
-		if !isAlreadyChild {
-			newParentNode.childrenIDs = append(newParentNode.childrenIDs, streamID)
-		}
+		// Other errors from updatePriorityNoLock might be internal or unexpected.
+		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error processing PRIORITY frame for stream %d: %v", streamID, err)}
 	}
 	return nil
 }
