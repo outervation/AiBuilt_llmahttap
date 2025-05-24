@@ -129,10 +129,12 @@ type ErrorLogConfig struct {
 // This is an example of how a specific handler config would be defined.
 // It will be unmarshalled from Route.HandlerConfig (json.RawMessage).
 type StaticFileServerConfig struct {
-	DocumentRoot          string      `json:"document_root" toml:"document_root"`
-	IndexFiles            []string    `json:"index_files,omitempty" toml:"index_files,omitempty"`
-	ServeDirectoryListing *bool       `json:"serve_directory_listing,omitempty" toml:"serve_directory_listing,omitempty"`
-	MimeTypes             interface{} `json:"mime_types,omitempty" toml:"mime_types,omitempty"` // Can be map[string]string or string (path to JSON file)
+	DocumentRoot          string            `json:"document_root" toml:"document_root"`
+	IndexFiles            []string          `json:"index_files,omitempty" toml:"index_files,omitempty"`
+	ServeDirectoryListing *bool             `json:"serve_directory_listing,omitempty" toml:"serve_directory_listing,omitempty"`
+	MimeTypesPath         *string           `json:"mime_types_path,omitempty" toml:"mime_types_path,omitempty"` // Path to JSON file for MIME types
+	MimeTypesMap          map[string]string `json:"mime_types_map,omitempty" toml:"mime_types_map,omitempty"`   // Inline MIME type map
+	ResolvedMimeTypes     map[string]string `json:"-" toml:"-"`                                                 // Not from config, resolved later by handler
 }
 
 // TODO: Implement loading, parsing (JSON, TOML with auto-detect), and validation functions.
@@ -395,28 +397,28 @@ func validateConfig(cfg *Config) error {
 				if !filepath.IsAbs(sfsCfg.DocumentRoot) {
 					return fmt.Errorf("routing.routes[%d].handler_config.document_root '%s' must be an absolute path for HandlerType 'StaticFileServer' (path_pattern '%s')", i, sfsCfg.DocumentRoot, route.PathPattern)
 				}
-				// Validate MimeTypes if it's a string (path to JSON file)
-				if mimePath, ok := sfsCfg.MimeTypes.(string); ok {
-					if mimePath == "" {
-						return fmt.Errorf("routing.routes[%d].handler_config.mime_types path cannot be empty if specified as a string (path_pattern '%s')", i, route.PathPattern)
+
+				// Validate MimeTypesPath and MimeTypesMap
+				if sfsCfg.MimeTypesPath != nil && len(sfsCfg.MimeTypesMap) > 0 {
+					return fmt.Errorf("routing.routes[%d].handler_config: MimeTypesPath ('%s') and MimeTypesMap cannot both be specified for path_pattern '%s'. Provide one or the other.", i, *sfsCfg.MimeTypesPath, route.PathPattern)
+				}
+
+				if sfsCfg.MimeTypesPath != nil {
+					if *sfsCfg.MimeTypesPath == "" {
+						return fmt.Errorf("routing.routes[%d].handler_config.mime_types_path cannot be empty if specified (path_pattern '%s')", i, route.PathPattern)
 					}
-					// We don't check for file existence here, that can be done by the handler at startup.
-					// Or, we could add a check:
-					// if _, err := os.Stat(mimePath); os.IsNotExist(err) {
-					//    return fmt.Errorf("routing.routes[%d].handler_config.mime_types path '%s' does not exist (path_pattern '%s')", i, mimePath, route.PathPattern)
-					// }
-				} else if _, ok := sfsCfg.MimeTypes.(map[string]interface{}); ok {
-					// It's an inline map, check if values are strings
-					for k, v := range sfsCfg.MimeTypes.(map[string]interface{}) {
-						if _, vok := v.(string); !vok {
-							return fmt.Errorf("routing.routes[%d].handler_config.mime_types inline map contains non-string value for key '%s' (path_pattern '%s')", i, k, route.PathPattern)
-						}
+					// Further validation (e.g., file existence, JSON format) can be done by the handler at initialization.
+				}
+
+				if len(sfsCfg.MimeTypesMap) > 0 {
+					for k, v := range sfsCfg.MimeTypesMap {
 						if !strings.HasPrefix(k, ".") {
-							return fmt.Errorf("routing.routes[%d].handler_config.mime_types inline map key '%s' must start with a '.' (path_pattern '%s')", i, k, route.PathPattern)
+							return fmt.Errorf("routing.routes[%d].handler_config.mime_types_map key '%s' must start with a '.' (path_pattern '%s')", i, k, route.PathPattern)
+						}
+						if v == "" { // MIME type value should not be empty
+							return fmt.Errorf("routing.routes[%d].handler_config.mime_types_map value for key '%s' cannot be empty (path_pattern '%s')", i, k, route.PathPattern)
 						}
 					}
-				} else if sfsCfg.MimeTypes != nil {
-					return fmt.Errorf("routing.routes[%d].handler_config.mime_types must be a string (path to JSON file) or an inline map (path_pattern '%s')", i, route.PathPattern)
 				}
 			}
 		}
