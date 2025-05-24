@@ -189,6 +189,88 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 	return nil
 }
 
+// UpdatePriority changes the priority of a stream.
+// streamID: The ID of the stream whose priority is being updated.
+// depStreamID: The ID of the stream that streamID will depend on.
+// weight: The new weight for streamID (0-255).
+// exclusive: If true, streamID becomes the sole child of depStreamID,
+//
+//	and previous children of depStreamID become children of streamID.
+//
+// This method is NOT called directly by external frame processing; it's a utility
+// called by AddStream and ProcessPriorityFrame.
+// The caller (AddStream/ProcessPriorityFrame) must hold the lock.
+func (pt *PriorityTree) updatePriorityNoLock(streamID uint32, depStreamID uint32, weight uint8, exclusive bool) error {
+	// Validation for streamID != 0 is typically done by callers (AddStream, ProcessPriorityFrame)
+	// as they have specific error types (ConnectionError for stream 0 PRIORITY, StreamError for HEADERS)
+
+	if depStreamID == streamID {
+		// This check is crucial and should be here.
+		// The specific error type might vary based on the caller's context (PRIORITY vs HEADERS)
+		// For now, return a generic error, callers can wrap it.
+		return fmt.Errorf("stream %d cannot depend on itself (new parent %d)", streamID, depStreamID)
+	}
+
+	streamNode := pt.getOrCreateNodeNoLock(streamID)
+
+	// 1. Detach streamNode from its old parent
+	if oldParentNode, exists := pt.nodes[streamNode.parentID]; exists {
+		oldParentNode.childrenIDs = removeChild(oldParentNode.childrenIDs, streamID)
+	}
+
+	// 2. Get the new parent node
+	newParentNode := pt.getOrCreateNodeNoLock(depStreamID)
+
+	// 3. Update streamNode's properties
+	streamNode.parentID = depStreamID
+	streamNode.weight = weight // weight is 0-255 as per frame spec
+
+	// 4. Handle exclusive flag and attachment to new parent
+	if exclusive {
+		// streamNode becomes the sole child of newParentNode.
+		// Other children of newParentNode become children of streamNode.
+
+		// Make a copy of newParentNode's children before modifying it
+		previousChildrenOfNewParent := make([]uint32, len(newParentNode.childrenIDs))
+		copy(previousChildrenOfNewParent, newParentNode.childrenIDs)
+
+		newParentNode.childrenIDs = []uint32{streamID} // streamNode is now the only child
+
+		// Adopt previous children of newParentNode.
+		// RFC 7540, Section 5.3.3: "The dependents of the new parent are then added as
+		// dependents of the exclusive stream."
+		// It's implied that the exclusive stream's *own* previous dependents are preserved.
+		newlyAdoptedChildren := make([]uint32, 0)
+		for _, childID := range previousChildrenOfNewParent {
+			if childID == streamID { // Should not happen if logic is correct, but defensive.
+				continue
+			}
+			childNode := pt.getOrCreateNodeNoLock(childID)
+			childNode.parentID = streamID // Re-parent to streamID
+			newlyAdoptedChildren = append(newlyAdoptedChildren, childID)
+		}
+		// Prepend newly adopted children to preserve order as per RFC 7540 example,
+		// though spec doesn't strictly mandate order of children.
+		// Or append: streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
+		// Let's follow the spirit of "added as dependents". Appending is simpler.
+		streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
+
+	} else {
+		// Not exclusive: just add streamNode to newParentNode's children list if not already there.
+		isAlreadyChild := false
+		for _, childID := range newParentNode.childrenIDs {
+			if childID == streamID {
+				isAlreadyChild = true
+				break
+			}
+		}
+		if !isAlreadyChild {
+			newParentNode.childrenIDs = append(newParentNode.childrenIDs, streamID)
+		}
+	}
+	return nil
+}
+
 // ProcessPriorityFrame updates stream priorities based on a PRIORITY frame.
 // streamID is the ID of the stream whose priority is being updated (from PRIORITY frame header).
 func (pt *PriorityTree) ProcessPriorityFrame(streamID uint32, frame *PriorityFrame) error {
