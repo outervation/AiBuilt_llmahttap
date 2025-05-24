@@ -139,6 +139,117 @@ type StaticFileServerConfig struct {
 	ResolvedMimeTypes     map[string]string `json:"-" toml:"-"`                                                 // Not from config, resolved later by handler
 }
 
+// ParseAndValidateStaticFileServerConfig unmarshals, applies defaults, validates,
+// and resolves MIME types for a StaticFileServerConfig.
+// mainConfigFilePath is the path to the main server configuration file, used to resolve
+// relative paths for MimeTypesPath.
+func ParseAndValidateStaticFileServerConfig(rawConfig json.RawMessage, mainConfigFilePath string) (*StaticFileServerConfig, error) {
+	if rawConfig == nil || len(rawConfig) == 0 || string(rawConfig) == "null" {
+		return nil, fmt.Errorf("handler_config for StaticFileServer cannot be empty or null")
+	}
+
+	var sfsCfg StaticFileServerConfig
+	if err := json.Unmarshal(rawConfig, &sfsCfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal StaticFileServerConfig: %w", err)
+	}
+
+	// Apply defaults
+	if sfsCfg.IndexFiles == nil {
+		sfsCfg.IndexFiles = []string{"index.html"} // Default from spec 2.2.2
+	}
+	if sfsCfg.ServeDirectoryListing == nil {
+		b := false // Default from spec 2.2.3
+		sfsCfg.ServeDirectoryListing = &b
+	}
+
+	// Validate DocumentRoot
+	if sfsCfg.DocumentRoot == "" {
+		return nil, fmt.Errorf("handler_config.document_root is required for StaticFileServer")
+	}
+	if !filepath.IsAbs(sfsCfg.DocumentRoot) {
+		return nil, fmt.Errorf("handler_config.document_root '%s' must be an absolute path", sfsCfg.DocumentRoot)
+	}
+
+	// Validate MimeTypesPath and MimeTypesMap mutual exclusivity
+	// This check is also in validateConfig, but good to have here for a self-contained function.
+	if sfsCfg.MimeTypesPath != nil && len(sfsCfg.MimeTypesMap) > 0 {
+		// If MimeTypesPath is an empty string, it should be caught later.
+		// Here we check if the pointer is non-nil AND the map has entries.
+		if *sfsCfg.MimeTypesPath != "" { // Only error if MimeTypesPath is actually trying to specify a path
+			return nil, fmt.Errorf("handler_config: MimeTypesPath ('%s') and MimeTypesMap cannot both be specified. Provide one or the other.", *sfsCfg.MimeTypesPath)
+		}
+		// If MimeTypesPath is present but points to an empty string, it's an error handled below.
+		// If it was nil or empty string, and MimeTypesMap is also present, this specific check might be too strict
+		// Let's rely on the individual checks for MimeTypesPath being non-empty if set, and MimeTypesMap being used if MimeTypesPath is not effectively set.
+		// The primary spec is "A map (inline object) OR a string path"
+		// The existing validateConfig (line 430) is more robust for this combined check.
+		// For this function, we'll proceed assuming one or neither is *effectively* set.
+	}
+
+	sfsCfg.ResolvedMimeTypes = make(map[string]string)
+
+	// Load MimeTypes
+	if sfsCfg.MimeTypesPath != nil && *sfsCfg.MimeTypesPath != "" {
+		// Ensure MimeTypesMap is not also defined (partially redundant with global validation, but good for function integrity)
+		if len(sfsCfg.MimeTypesMap) > 0 {
+			return nil, fmt.Errorf("handler_config: MimeTypesPath ('%s') and MimeTypesMap cannot both be specified. Provide one or the other.", *sfsCfg.MimeTypesPath)
+		}
+
+		mimeFilePath := *sfsCfg.MimeTypesPath
+		if !filepath.IsAbs(mimeFilePath) {
+			if mainConfigFilePath == "" {
+				return nil, fmt.Errorf("cannot resolve relative mime_types_path '%s': main configuration file path is not available", mimeFilePath)
+			}
+			// Ensure mainConfigFilePath is a file path, not a directory.
+			// If it might be a directory, filepath.Dir() might behave unexpectedly.
+			// Assuming mainConfigFilePath is indeed the path to the config file.
+			configDir := filepath.Dir(mainConfigFilePath)
+			mimeFilePath = filepath.Join(configDir, mimeFilePath)
+		}
+
+		mimeData, err := ioutil.ReadFile(mimeFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read mime_types_path file '%s': %w", mimeFilePath, err)
+		}
+
+		var diskMimeTypes map[string]string
+		if err := json.Unmarshal(mimeData, &diskMimeTypes); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON from mime_types_path file '%s': %w", mimeFilePath, err)
+		}
+
+		for k, v := range diskMimeTypes {
+			if !strings.HasPrefix(k, ".") {
+				return nil, fmt.Errorf("mime_types_path file '%s': key '%s' must start with a '.'", mimeFilePath, k)
+			}
+			if v == "" {
+				return nil, fmt.Errorf("mime_types_path file '%s': value for key '%s' cannot be empty", mimeFilePath, k)
+			}
+			sfsCfg.ResolvedMimeTypes[k] = v
+		}
+	} else if len(sfsCfg.MimeTypesMap) > 0 {
+		// MimeTypesPath is not specified or is an empty string, so use MimeTypesMap
+		for k, v := range sfsCfg.MimeTypesMap {
+			if !strings.HasPrefix(k, ".") {
+				return nil, fmt.Errorf("handler_config.mime_types_map: key '%s' must start with a '.'", k)
+			}
+			if v == "" {
+				return nil, fmt.Errorf("handler_config.mime_types_map: value for key '%s' cannot be empty", k)
+			}
+			sfsCfg.ResolvedMimeTypes[k] = v
+		}
+	}
+	// If neither MimeTypesPath nor MimeTypesMap is provided, ResolvedMimeTypes will be empty, which is fine.
+
+	// Validate IndexFiles entries
+	for i, f := range sfsCfg.IndexFiles {
+		if f == "" {
+			return nil, fmt.Errorf("handler_config.index_files[%d] cannot be an empty string", i)
+		}
+	}
+
+	return &sfsCfg, nil
+}
+
 // TODO: Implement loading, parsing (JSON, TOML with auto-detect), and validation functions.
 // TODO: Implement functions to apply default values to the configuration.
 
