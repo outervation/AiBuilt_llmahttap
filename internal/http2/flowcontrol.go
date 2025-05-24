@@ -514,8 +514,16 @@ func (sfcm *StreamFlowControlManager) AcquireSendSpace(n uint32) error {
 // for this specific stream. This increases our send window for this stream.
 // Returns an error if the increment is invalid (e.g., 0, or causes overflow).
 func (sfcm *StreamFlowControlManager) HandleWindowUpdateFromPeer(increment uint32) error {
-	// Validation (increment != 0, not causing overflow) is handled by sendWindow.Increase()
-	// as it's a non-connection window.
+	if sfcm.streamID == 0 {
+		// A StreamFlowControlManager instance should always be associated with a non-zero stream ID.
+		// Handling stream 0 here indicates a server-internal logic error or misconfiguration.
+		// Connection-level WINDOW_UPDATE should be handled by ConnectionFlowControlManager.
+		return NewConnectionError(ErrCodeInternalError, "internal error: StreamFlowControlManager.HandleWindowUpdateFromPeer called for stream ID 0")
+	}
+
+	// Validation (increment != 0 for streams, not causing overflow) is handled by sendWindow.Increase().
+	// sendWindow.Increase() is aware via its `isConnection` flag (which is false for stream windows)
+	// that an increment of 0 is a protocol error for streams.
 	return sfcm.sendWindow.Increase(increment)
 }
 
