@@ -383,41 +383,81 @@ func getSeverity(level config.LogLevel) int {
 
 // LogError constructs and writes an error log entry.
 // This is a placeholder for full implementation.
-func (el *ErrorLogger) LogError(level config.LogLevel, msg string, fields ...map[string]interface{}) {
+
+// LogError constructs and writes an error log entry.
+// The 'context' map can contain specific keys like "source", "method", "uri", "h2_stream_id"
+// which will be mapped to the corresponding fields in ErrorLogEntry.
+// Other keys in 'context' will be placed in the 'Details' field of ErrorLogEntry.
+func (el *ErrorLogger) LogError(level config.LogLevel, msg string, context LogFields) {
 	if el == nil || el.logger == nil {
 		return // Error logging not configured
 	}
 
-	// Check against global log level
 	if getSeverity(level) < getSeverity(el.globalLogLevel) {
 		return // Message severity is below configured threshold
 	}
 
-	// Placeholder for structured error log entry (spec 3.4.2)
-	logEntry := map[string]interface{}{
-
-		"ts":    getTimestamp(),
-		"level": string(level),
-		"msg":   msg,
+	entry := ErrorLogEntry{
+		Timestamp: getTimestamp(),
+		Level:     string(level),
+		Message:   msg,
 	}
 
-	// Merge additional fields
-	if len(fields) > 0 {
-		for k, v := range fields[0] {
-			logEntry[k] = v
+	// Populate specific fields from context and gather remaining for 'Details'
+	if len(context) > 0 {
+		detailsMap := make(LogFields)
+		for k, v := range context {
+			switch k {
+			case "source":
+				if val, ok := v.(string); ok {
+					entry.Source = val
+				} else {
+					detailsMap[k] = v // Keep in details if type mismatch or not string
+				}
+			case "method":
+				if val, ok := v.(string); ok {
+					entry.RequestMethod = val
+				} else {
+					detailsMap[k] = v
+				}
+			case "uri":
+				if val, ok := v.(string); ok {
+					entry.RequestURI = val
+				} else {
+					detailsMap[k] = v
+				}
+			case "h2_stream_id":
+				switch val := v.(type) {
+				case uint32:
+					entry.RequestH2StreamID = val
+				case int: // Common for simple integer literals
+					entry.RequestH2StreamID = uint32(val)
+				case int32:
+					entry.RequestH2StreamID = uint32(val)
+				case float64: // JSON numbers might unmarshal as float64
+					entry.RequestH2StreamID = uint32(val)
+				default:
+					detailsMap[k] = v // Type mismatch, keep in details
+				}
+			default:
+				detailsMap[k] = v
+			}
+		}
+		if len(detailsMap) > 0 {
+			entry.Details = detailsMap
 		}
 	}
 
-	// TODO: Add 'source' and 'associated request details' if available.
-	// TODO: Ensure atomic writes for file targets.
-
-	// For now, simple JSON output.
-	jsonData, err := json.Marshal(logEntry)
+	jsonData, err := json.Marshal(entry)
 	if err != nil {
-		el.logger.Printf("Error marshalling error log entry: %v. Original msg: %s", err, msg)
+		// Fallback: Log a JSON-formatted error about the marshalling failure.
+		// Using el.logger directly to avoid recursion.
+		errorMsg := fmt.Sprintf("{\"level\":\"ERROR\", \"ts\":\"%s\", \"msg\":\"Error marshalling error log entry to JSON\", \"original_level\":\"%s\", \"original_msg\":\"%s\", \"error\":\"%s\"}",
+			getTimestamp(), level, strings.ReplaceAll(msg, "\"", "'"), strings.ReplaceAll(err.Error(), "\"", "'")) // Basic sanitization
+		el.logger.Println(errorMsg)
 		return
 	}
-	el.logger.Println(string(jsonData))
+	el.logger.Println(string(jsonData)) // log.Logger adds its own newline
 }
 
 // Convenience methods on the main Logger
