@@ -99,6 +99,33 @@ func (h *HpackAdapter) FinishDecoding() ([]hpack.HeaderField, error) {
 	return fields, nil
 }
 
+// GetAndClearDecodedFields returns a copy of the currently accumulated decoded header
+// fields and then clears the internal buffer of decoded fields to prepare for
+// decoding the next header block.
+// This method is an alternative to FinishDecoding if the caller wants to manage
+// the "end of header block" signal (e.g., END_HEADERS flag) and potential errors
+// from decoder.Close() separately, or if they need to access intermediately
+// decoded headers before the block is fully complete (though the latter is less common
+// for standard HPACK usage).
+// It's important to note that not calling decoder.Close() (as FinishDecoding does)
+// means that any final validation or state updates performed by decoder.Close()
+// will not occur when using only this method.
+func (h *HpackAdapter) GetAndClearDecodedFields() []hpack.HeaderField {
+	if len(h.decodedFields) == 0 {
+		return nil
+	}
+	// Return a copy, not the slice itself, to prevent external modification
+	// of the returned slice affecting future appends if the slice capacity was reused.
+	fieldsCopy := make([]hpack.HeaderField, len(h.decodedFields))
+	copy(fieldsCopy, h.decodedFields)
+
+	// Clear the internal slice for the next block.
+	// Setting to nil is generally preferred as it allows the underlying array to be GC'd
+	// if there are no other references.
+	h.decodedFields = nil
+	return fieldsCopy
+}
+
 // ResetDecoderState clears any accumulated decoded header fields from the HpackAdapter.
 // This is useful if a header block decoding sequence needs to be aborted
 // or to ensure a clean state before starting a new header block if
