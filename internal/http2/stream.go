@@ -140,6 +140,9 @@ type Handler interface {
 	ServeHTTP2(s *Stream, req *http.Request) // Using http.Request for now, may need custom struct.
 }
 
+// Compile-time check to ensure *Stream implements ResponseWriter.
+var _ ResponseWriter = (*Stream)(nil)
+
 // Stream represents a single HTTP/2 stream.
 // It manages stream state, flow control, priority, and request/response processing.
 type Stream struct {
