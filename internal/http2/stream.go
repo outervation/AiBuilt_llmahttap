@@ -625,63 +625,112 @@ func (s *Stream) transitionStateOnReceiveEndStream() {
 // transitionStateOnSendEndStream updates stream state when END_STREAM is sent.
 func (s *Stream) transitionStateOnSendEndStream() {
 	// Assumes s.mu is held by caller.
-	switch s.state {
+	oldState := s.state
+	newState := oldState
+
+	switch oldState {
 	case StreamStateOpen:
-		s.state = StreamStateHalfClosedLocal
+		newState = StreamStateHalfClosedLocal
 	case StreamStateHalfClosedRemote:
-		s.state = StreamStateClosed
-		s.closeStreamResourcesProtected()
+		newState = StreamStateClosed
 	default:
-		s.conn.logger.Error("stream: END_STREAM sent in unexpected state", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		s.state = StreamStateClosed
+		s.conn.logger.Error("stream: END_STREAM sent in unexpected state", logger.LogFields{"stream_id": s.id, "state": oldState.String()})
+		newState = StreamStateClosed // Force closed on error
+	}
+	s._setState(newState)
+}
+
+// _setState transitions the stream to a new state.
+// THIS IS A LOW-LEVEL METHOD. Callers MUST ensure the transition is valid.
+// It handles resource cleanup if transitioning to Closed.
+// Assumes s.mu is held by the caller.
+func (s *Stream) _setState(newState StreamState) {
+	if s.state == newState && newState != StreamStateClosed {
+		// No change, unless re-closing to ensure cleanup (which this path doesn't explicitly handle,
+		// callers ensure closeStreamResourcesProtected is called once effectively).
+		return
+	}
+
+	if s.state == StreamStateClosed && newState != StreamStateClosed {
+		// Cannot transition out of closed state, except to re-affirm closed (e.g. multiple RSTs)
+		// This check prevents accidental re-opening.
+		s.conn.logger.Warn("stream: attempt to transition out of closed state ignored", logger.LogFields{
+			"stream_id": s.id,
+			"old_state": s.state.String(),
+			"new_state": newState.String(),
+		})
+		return
+	}
+
+	s.conn.logger.Debug("stream: state transition", logger.LogFields{
+		"stream_id": s.id,
+		"old_state": s.state.String(),
+		"new_state": newState.String(),
+	})
+	oldState := s.state
+	s.state = newState
+
+	if newState == StreamStateClosed && oldState != StreamStateClosed {
+		// Call cleanup only on the first transition to closed.
 		s.closeStreamResourcesProtected()
 	}
 }
 
 // closeStreamResourcesProtected performs cleanup when stream transitions to fully closed state.
 // This version assumes s.mu is ALREADY HELD by the caller.
+// It is responsible for ensuring cleanup happens once.
 func (s *Stream) closeStreamResourcesProtected() {
-	// No s.mu.Lock() here
-
-	pipeWriter := s.requestBodyWriter
-	pipeReader := s.requestBodyReader
+	// Capture values needed after unlock, or for non-blocking operations
 	cancelCtxFunc := s.cancelCtx
-	connRef := s.conn // Capture before potentially niling out s.conn if stream struct is pooled/reset
+	pipeWriter := s.requestBodyWriter
+	// pipeReader := s.requestBodyReader // Reader usually closes itself when writer closes or EOF
+	streamID := s.id
+	conn := s.conn
 
-	// Avoid holding lock while calling external/blocking functions
-	// by capturing what's needed and then unlocking if safe, or doing calls after unlock.
-	// For cancelCtx, it's usually quick. Pipe close might block if other end is slow.
+	var rstCode ErrorCode = ErrCodeNoError // Default for graceful closure
+	if s.pendingRSTCode != nil {
+		rstCode = *s.pendingRSTCode
+	}
 
-	// These are safe to call while holding lock as they are generally non-blocking state changes
+	// These are safe to call while holding lock
 	if cancelCtxFunc != nil {
+		s.cancelCtx = nil // Avoid double call
 		cancelCtxFunc()
 	}
 
-	// Defer pipe closing to after lock release if possible, or ensure they don't deadlock
-	// For now, call under lock, assuming Pipe.Close() is robust.
 	if pipeWriter != nil {
-		pipeWriter.Close()
+		s.requestBodyWriter = nil                                  // Avoid double call
+		if rstCode != ErrCodeNoError && rstCode != ErrCodeCancel { // CANCEL is also a somewhat graceful closure from app perspective
+			pipeWriter.CloseWithError(NewStreamError(streamID, rstCode, "stream closed due to RST"))
+		} else {
+			// For NO_ERROR or CANCEL, just close the pipe. The reader will see EOF.
+			pipeWriter.Close()
+		}
 	}
-	if pipeReader != nil {
-		pipeReader.Close()
-	}
+	// if pipeReader != nil {
+	// s.requestBodyReader = nil
+	// pipeReader.Close() // Reader generally closes when writer does.
+	// }
 
-	// Notify connection (must be done carefully to avoid deadlocks if conn tries to lock stream)
-	// This might be better done after releasing s.mu by the caller of closeStreamResourcesProtected.
-	// For now, keep it simple. Connection removeStream should also be robust.
-	if connRef != nil {
-		// connRef.removeStream(streamID, ErrCodeNoError) // Or appropriate error code
-		// The removeStream call is now handled by the RST processing or graceful shutdown paths
+	if conn != nil {
+		// This needs to be scheduled to run after the current critical section (s.mu lock)
+		// if conn.removeStream might re-acquire s.mu or perform blocking operations.
+		// For now, assume direct call is okay or conn.removeStream is designed to handle this.
+		// A common pattern is to send this to a channel processed by the connection's main loop.
+		go conn.removeStream(streamID, rstCode)
 	}
 }
 
 // Called by connection to update stream priority based on a PRIORITY frame.
 func (s *Stream) processPriorityUpdate(depStreamID uint32, weight uint8, exclusive bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.priorityParentID = depStreamID
 	s.priorityWeight = weight
 	s.priorityExclusive = exclusive
-	s.mu.Unlock()
+	// Note: This only updates the stream's record. The connection's PriorityTree
+	// is updated by the connection itself when it processes the PRIORITY frame or
+	// priority info from HEADERS.
 }
 
 // Context returns the stream's context.
@@ -711,6 +760,7 @@ func (s *Stream) RequestBody() io.Reader {
 func (s *Stream) RequestHeaders() []hpack.HeaderField {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Return a copy to prevent modification of internal slice by handler
 	headersCopy := make([]hpack.HeaderField, len(s.requestHeaders))
 	copy(headersCopy, s.requestHeaders)
 	return headersCopy
@@ -728,4 +778,115 @@ type ExclusiveStreamDependency struct {
 	StreamDependency uint32
 	Weight           uint8
 	Exclusive        bool
+}
+
+// CanSendFrame checks if a frame of the given type can be sent from the current stream state.
+// This does not check if the frame itself is valid (e.g., flags, payload).
+// Reference: RFC 7540, Section 5.1.
+func (s *Stream) CanSendFrame(ft FrameType) bool {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+
+	switch state {
+	case StreamStateIdle:
+		// Technically, a stream object shouldn't exist in "idle" state before first frame.
+		// This case is more for theoretical validation if one were to check before creating.
+		return ft == FrameHeaders || ft == FramePushPromise
+	case StreamStateReservedLocal:
+		return ft == FrameHeaders || ft == FrameRSTStream || ft == FramePriority || ft == FrameWindowUpdate
+	case StreamStateReservedRemote:
+		return ft == FrameRSTStream || ft == FramePriority || ft == FrameWindowUpdate
+	case StreamStateOpen:
+		return true // Any frame type
+	case StreamStateHalfClosedLocal: // We sent END_STREAM.
+		return ft == FrameWindowUpdate || ft == FramePriority || ft == FrameRSTStream
+	case StreamStateHalfClosedRemote: // Peer sent END_STREAM. We can still send.
+		return true // Any frame type (until we send END_STREAM)
+	case StreamStateClosed:
+		// Per RFC 7540, Section 5.1:
+		// "PRIORITY frames can be sent on a stream in the "closed" state."
+		// "An endpoint that receives any frame other than PRIORITY after receiving RST_STREAM
+		// MUST treat that as a stream error (Section 5.4.2) of type STREAM_CLOSED."
+		// "WINDOW_UPDATE or RST_STREAM frames can be received in this state [closed] for a short
+		// period after a DATA or HEADERS frame containing an END_STREAM flag is sent. Until the
+		// remote peer receives and processes RST_STREAM or the frame bearing the END_STREAM flag,
+		// it might send frames of these types. Endpoints MUST ignore WINDOW_UPDATE or RST_STREAM
+		// frames received in this state, though endpoints MAY choose to treat frames that arrive
+		// excessively late as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+		// So, sending PRIORITY is okay. Sending others is generally not.
+		return ft == FramePriority
+	default:
+		s.conn.logger.Error("stream: CanSendFrame called in unknown state", logger.LogFields{"stream_id": s.id, "state_val": uint8(state)})
+		return false
+	}
+}
+
+// CanReceiveFrame checks if a frame of the given type can be received in the current stream state
+// without it being an immediate protocol error that requires connection termination.
+// Note: Some frames might be ignored or lead to stream-level errors (like STREAM_CLOSED)
+// even if this function returns true (e.g. WINDOW_UPDATE on a closed stream is ignored).
+// Reference: RFC 7540, Section 5.1.
+func (s *Stream) CanReceiveFrame(ft FrameType) bool {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+
+	switch state {
+	case StreamStateIdle:
+		// From connection perspective: HEADERS or PUSH_PROMISE expected to open/reserve.
+		// Other frames on an idle stream ID -> connection error PROTOCOL_ERROR.
+		// This function is for an existing stream object, which shouldn't be IDLE if active.
+		return ft == FrameHeaders || ft == FramePushPromise
+	case StreamStateReservedLocal: // We sent PUSH_PROMISE.
+		// Client can send RST_STREAM. Other frames from client on this stream are protocol error.
+		// However, PRIORITY or WINDOW_UPDATE from client are typically for streams client opens.
+		// RFC 8441 (Bootstrapping WebSockets with HTTP/2) uses PUSH_PROMISE then client sends HEADERS on pushed stream.
+		// RFC 7540 5.1 states for Reserved (Local):
+		//   - send PUSH_PROMISE -> reserved (local)
+		//   - send HEADERS -> half-closed (remote) [if END_STREAM] or open
+		//   - recv RST_STREAM -> closed
+		// This implies the peer (client) can send RST_STREAM.
+		// For frames received *by server* on a stream it PUSH_PROMISEd:
+		// RFC 7540 Section 6.6: "The PUSH_PROMISE frame ... reserves the promised stream for later use."
+		// "...the server can send a HEADERS frame to begin sending the pushed resource."
+		// If client sends HEADERS on a stream *it did not initiate*, it's a protocol error.
+		// If client sends on a stream server promised but hasn't sent HEADERS for yet, it's tricky.
+		// Generally, client should not send on server-initiated streams until server sends HEADERS.
+		// Thus, only RST_STREAM is safe for client to send.
+		// However, the state table also allows receiving PRIORITY/WINDOW_UPDATE.
+		// These usually apply to streams the receiver has some concept of being active.
+		// Let's be conservative based on who initiates:
+		// if server PUSH_PROMISE (state=ReservedLocal for server), client should only send RST_STREAM.
+		// The state table in 5.1 is generic.
+		// "An endpoint MUST NOT send frames other than PUSH_PROMISE on a stream that is in the "idle" state."
+		// "reserved (local)": "An endpoint might receive PRIORITY or WINDOW_UPDATE frames in this state."
+		// So, RFC 7540 allows these.
+		return ft == FrameRSTStream || ft == FramePriority || ft == FrameWindowUpdate
+	case StreamStateReservedRemote: // Peer sent PUSH_PROMISE. We (client) expect HEADERS from peer.
+		// If we are server, and client sent PUSH_PROMISE (not allowed for client).
+		// Assuming this state means WE received PUSH_PROMISE.
+		//   - recv PUSH_PROMISE -> reserved (remote)
+		//   - recv HEADERS -> half-closed (local) [if END_STREAM] or open
+		//   - send RST_STREAM -> closed
+		// We can receive HEADERS, RST_STREAM, PRIORITY, WINDOW_UPDATE.
+		return ft == FrameHeaders || ft == FrameRSTStream || ft == FramePriority || ft == FrameWindowUpdate
+	case StreamStateOpen:
+		return true // Any frame type
+	case StreamStateHalfClosedLocal: // We sent END_STREAM. Peer can still send anything.
+		return true // Any frame type
+	case StreamStateHalfClosedRemote: // Peer sent END_STREAM.
+		// We can send: WINDOW_UPDATE, PRIORITY, RST_STREAM.
+		// We can receive: WINDOW_UPDATE, PRIORITY, RST_STREAM.
+		// Receiving DATA, HEADERS, CONTINUATION, PUSH_PROMISE would be STREAM_CLOSED error.
+		return ft == FrameWindowUpdate || ft == FramePriority || ft == FrameRSTStream
+	case StreamStateClosed:
+		// Can receive PRIORITY (processed).
+		// Can receive WINDOW_UPDATE, RST_STREAM (ignored if late, unless triggers PROTOCOL_ERROR for excessive lateness).
+		// Others: Stream error STREAM_CLOSED or Connection error PROTOCOL_ERROR.
+		return ft == FramePriority || ft == FrameWindowUpdate || ft == FrameRSTStream
+	default:
+		s.conn.logger.Error("stream: CanReceiveFrame called in unknown state", logger.LogFields{"stream_id": s.id, "state_val": uint8(state)})
+		return false
+	}
 }
