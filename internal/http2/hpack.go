@@ -178,15 +178,15 @@ func (h *HpackAdapter) SetMaxDecoderDynamicTableSize(size uint32) error {
 	return nil
 }
 
-// SetEncoderMaxTableSize updates the maximum dynamic table size for the HPACK encoder.
-// This reflects the maximum table size that the remote peer (our decoder) can handle,
-// learned via its SETTINGS_HEADER_TABLE_SIZE.
-func (h *HpackAdapter) SetEncoderMaxTableSize(size uint32) {
+// SetMaxEncoderDynamicTableSize updates the maximum dynamic table size the HPACK encoder
+// will use. This size should be set to the value of SETTINGS_HEADER_TABLE_SIZE
+// received from the peer (the decoder of the encoded headers). The encoder must not
+// use a dynamic table larger than this size.
+// If the internal encoder is not initialized, this method does nothing.
+func (h *HpackAdapter) SetMaxEncoderDynamicTableSize(size uint32) {
 	if h.encoder != nil {
 		h.encoder.SetMaxDynamicTableSize(size)
 	}
-	// If HpackAdapter.maxTableSize was intended to be specific to the encoder,
-	// this would update it. For now, assuming it's decoder-related or a general default.
 }
 
 // Encode encodes a list of header fields using HPACK.
