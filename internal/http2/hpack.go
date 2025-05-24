@@ -149,6 +149,30 @@ func (h *HpackAdapter) Encode(headers []hpack.HeaderField) []byte {
 	return encodedBytes
 }
 
+// EncodeHeaderFields encodes a list of header fields using HPACK.
+// It writes the encoded header block to an internal buffer and returns its bytes.
+// The returned byte slice is valid until the next call to a method that modifies
+// the HpackAdapter's internal encode buffer (e.g., another call to EncodeHeaderFields
+// or the existing Encode method). If the HpackAdapter's encoder is not initialized,
+// it returns an error. If an error occurs during the encoding of any header field,
+// it returns nil and the error.
+func (h *HpackAdapter) EncodeHeaderFields(fields []hpack.HeaderField) ([]byte, error) {
+	if h.encoder == nil {
+		return nil, errors.New("hpack: HpackAdapter.encoder not initialized")
+	}
+	h.encodeBuf.Reset() // Reset internal buffer for this encoding operation
+	for _, hf := range fields {
+		if err := h.encoder.WriteField(hf); err != nil {
+			// Return nil for bytes and the error if WriteField fails.
+			return nil, fmt.Errorf("hpack: HpackAdapter.encoder.WriteField failed for header field %q: %w", hf.Name, err)
+		}
+	}
+	// Return the bytes from the buffer. The caller should be aware that this slice
+	// references the internal buffer's memory and is valid until the buffer is next modified.
+	// A copy can be made by the caller if persistence beyond buffer modification is needed.
+	return h.encodeBuf.Bytes(), nil
+}
+
 // Encoder wraps an hpack.Encoder.
 type Encoder struct {
 	hpackEncoder *hpack.Encoder
