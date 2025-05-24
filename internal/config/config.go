@@ -79,9 +79,10 @@ const (
 
 // Config is the top-level configuration structure for the server.
 type Config struct {
-	Server  *ServerConfig  `json:"server,omitempty" toml:"server,omitempty"`
-	Routing *RoutingConfig `json:"routing,omitempty" toml:"routing,omitempty"`
-	Logging *LoggingConfig `json:"logging,omitempty" toml:"logging,omitempty"`
+	Server           *ServerConfig  `json:"server,omitempty" toml:"server,omitempty"`
+	Routing          *RoutingConfig `json:"routing,omitempty" toml:"routing,omitempty"`
+	Logging          *LoggingConfig `json:"logging,omitempty" toml:"logging,omitempty"`
+	originalFilePath string         // Internal: path to the loaded config file
 }
 
 // ServerConfig holds general server settings.
@@ -187,18 +188,17 @@ func LoadConfig(filePath string) (*Config, error) {
 	} else {
 		// Auto-detect content if extension is not .json or .toml
 		// Try JSON first
-		errJSON := json.Unmarshal(data, cfg)
+		errJSON := json.Unmarshal(data, cfg) // cfg is the main Config struct instance
 		if errJSON == nil {
 			parsed = true
 		} else {
-			// Create a new cfg instance because Unmarshal might leave it partially populated
-			cfgJSONAttempt := &Config{}
-			_ = json.Unmarshal(data, cfgJSONAttempt) // Try to unmarshal to see if it's partial
-
+			// JSON parsing failed, try TOML.
+			// Note: 'cfg' might be partially modified by the failed JSON unmarshal.
+			// We create a new Config instance for TOML and assign it to 'cfg' only on success.
 			cfgTOMLAttempt := &Config{}
 			errTOML := toml.Unmarshal(data, cfgTOMLAttempt)
 			if errTOML == nil {
-				cfg = cfgTOMLAttempt // Use the successfully parsed TOML config
+				cfg = cfgTOMLAttempt // Replace original 'cfg' with the successfully parsed TOML one
 				parsed = true
 			} else {
 				parseErr = fmt.Errorf("failed to auto-detect and parse config %s: JSON error: %v, TOML error: %v", filePath, errJSON, errTOML)
@@ -216,9 +216,18 @@ func LoadConfig(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
 	}
 
+	cfg.originalFilePath = filePath // Store the path
 	return cfg, nil
 }
 
+// OriginalFilePath returns the path from which the configuration was loaded.
+// This is used for reloading the configuration on SIGHUP.
+func (c *Config) OriginalFilePath() string {
+	if c == nil {
+		return ""
+	}
+	return c.originalFilePath
+}
 func applyDefaults(cfg *Config) {
 	if cfg.Server == nil {
 		cfg.Server = &ServerConfig{}
