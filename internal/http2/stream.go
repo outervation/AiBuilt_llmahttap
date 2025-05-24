@@ -489,22 +489,16 @@ func (s *Stream) sendRSTStream(errorCode ErrorCode) error {
 
 	err := s.conn.sendRSTStreamFrame(s.id, errorCode)
 
-	s.mu.Lock()
+	s.mu.Lock()         // Lock to update state
+	defer s.mu.Unlock() // Ensure unlock even if early return from error
+
 	if err == nil {
-		s.state = StreamStateClosed // Mark closed *after* successful send
+		// Successfully sent RST_STREAM frame
+		s.pendingRSTCode = &errorCode  // Ensure this is set before calling _setState
+		s._setState(StreamStateClosed) // This will call closeStreamResourcesProtected for cleanup
 
-		pipeWriter := s.requestBodyWriter
-		cancelCtxFunc := s.cancelCtx
-
-		s.mu.Unlock() // Unlock before potentially blocking external calls
-
-		if pipeWriter != nil {
-			pipeWriter.CloseWithError(NewStreamError(s.id, errorCode, "stream reset by server"))
-		}
-		cancelCtxFunc()
-		s.conn.removeStream(s.id, errorCode)
-
-		return nil // Return nil as send was successful for stream logic
+		// Cleanup (pipes, context, conn.removeStream) is handled by closeStreamResourcesProtected.
+		return nil
 	}
 
 	// Failed to send RST_STREAM.
