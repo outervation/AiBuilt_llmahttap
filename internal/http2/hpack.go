@@ -2,9 +2,12 @@ package http2
 
 import (
 	"bytes"
+	"io"
 
 	"golang.org/x/net/http2/hpack"
 )
+
+var _ io.Reader // Use io package to avoid "imported and not used" error
 
 // Encoder wraps an hpack.Encoder.
 type Encoder struct {
