@@ -250,14 +250,14 @@ func newStream(
 // Implement ResponseWriter for Stream
 // Note: These methods will need to interact with the connection to send frames.
 
-// WriteHeaders sends response headers.
-func (s *Stream) WriteHeaders(headers []hpack.HeaderField, endStream bool) error {
+// SendHeaders sends response headers.
+func (s *Stream) SendHeaders(headers []hpack.HeaderField, endStream bool) error {
 	s.mu.Lock()
 	// defer s.mu.Unlock() // Unlock must be carefully managed due to calls to conn
 
 	if s.responseHeadersSent {
 		s.mu.Unlock()
-		s.conn.logger.Error("stream: WriteHeaders called after headers already sent", logger.LogFields{"stream_id": s.id})
+		s.conn.logger.Error("stream: SendHeaders called after headers already sent", logger.LogFields{"stream_id": s.id})
 		return NewStreamError(s.id, ErrCodeInternalError, "headers already sent")
 	}
 	if s.state == StreamStateClosed || s.pendingRSTCode != nil {
