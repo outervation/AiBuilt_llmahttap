@@ -358,7 +358,7 @@ func (cfcm *ConnectionFlowControlManager) ApplicationConsumedData(n uint32) (uin
 	// The amount consumed, 'n', cannot itself exceed the maximum window size,
 	// as it might form the basis of a WINDOW_UPDATE increment.
 	if n > MaxWindowSize {
-		return 0, fmt.Errorf("application consumed %d bytes, which exceeds MaxWindowSize %d for a single increment step", n, MaxWindowSize)
+		return 0, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("application consumed %d bytes, which exceeds MaxWindowSize %d for a single increment step", n, MaxWindowSize))
 	}
 
 	cfcm.receiveWindowMu.Lock()
