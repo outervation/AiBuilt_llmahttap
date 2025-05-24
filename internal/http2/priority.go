@@ -297,8 +297,19 @@ func (pt *PriorityTree) ProcessPriorityFrame(frame *PriorityFrame) error {
 	return nil
 }
 
-// RemoveStream removes a stream from the priority tree.
-// Its children are re-parented to the removed stream's parent.
+// RemoveStream removes a stream from the priority tree, typically when the stream is closed.
+// Its children are re-parented to the removed stream's former parent.
+//
+// RFC 7540, Section 5.3.4 specifies this behavior: "When a stream is removed
+// from the dependency tree, its dependents are moved to become dependents of
+// the removed stream's parent. The weights of these streams are not adjusted."
+//
+// The concept of "distributing effective weights among new siblings" (which might
+// appear in some interpretations or specifications) is understood here as the
+// natural outcome of HTTP/2's priority mechanism: once re-parented, children
+// contribute their existing (unchanged) weights to the resource allocation
+// decisions made by their new parent, alongside any other siblings under that new parent.
+// This method itself does not alter the numerical weight values of the re-parented streams.
 func (pt *PriorityTree) RemoveStream(streamID uint32) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
