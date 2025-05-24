@@ -2,6 +2,14 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 // MatchType defines how a path pattern is interpreted.
@@ -84,3 +92,365 @@ type StaticFileServerConfig struct {
 
 // TODO: Implement loading, parsing (JSON, TOML with auto-detect), and validation functions.
 // TODO: Implement functions to apply default values to the configuration.
+
+const (
+	defaultChildReadinessTimeout   = "10s"
+	defaultGracefulShutdownTimeout = "30s"
+	defaultLogLevel                = LogLevelInfo
+	defaultAccessLogEnabled        = true
+	defaultAccessLogTarget         = "stdout"
+	defaultAccessLogFormat         = "json"
+	defaultAccessLogRealIPHeader   = "X-Forwarded-For"
+	defaultErrorLogTarget          = "stderr"
+)
+
+// LoadConfig reads the configuration file from the given path,
+// auto-detects its format (JSON or TOML), parses it, applies defaults,
+// and validates it.
+func LoadConfig(filePath string) (*Config, error) {
+	if filePath == "" {
+		return nil, fmt.Errorf("configuration file path cannot be empty")
+	}
+
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read configuration file %s: %w", filePath, err)
+	}
+
+	cfg := &Config{}
+	fileExt := strings.ToLower(filepath.Ext(filePath))
+
+	parsed := false
+	var parseErr error
+
+	if fileExt == ".json" {
+		err = json.Unmarshal(data, cfg)
+		if err == nil {
+			parsed = true
+		} else {
+			parseErr = fmt.Errorf("failed to parse JSON config %s: %w", filePath, err)
+		}
+	} else if fileExt == ".toml" {
+		err = toml.Unmarshal(data, cfg)
+		if err == nil {
+			parsed = true
+		} else {
+			parseErr = fmt.Errorf("failed to parse TOML config %s: %w", filePath, err)
+		}
+	} else {
+		// Auto-detect content if extension is not .json or .toml
+		// Try JSON first
+		errJSON := json.Unmarshal(data, cfg)
+		if errJSON == nil {
+			parsed = true
+		} else {
+			// Create a new cfg instance because Unmarshal might leave it partially populated
+			cfgJSONAttempt := &Config{}
+			_ = json.Unmarshal(data, cfgJSONAttempt) // Try to unmarshal to see if it's partial
+
+			cfgTOMLAttempt := &Config{}
+			errTOML := toml.Unmarshal(data, cfgTOMLAttempt)
+			if errTOML == nil {
+				cfg = cfgTOMLAttempt // Use the successfully parsed TOML config
+				parsed = true
+			} else {
+				parseErr = fmt.Errorf("failed to auto-detect and parse config %s: JSON error: %v, TOML error: %v", filePath, errJSON, errTOML)
+			}
+		}
+	}
+
+	if !parsed {
+		return nil, parseErr
+	}
+
+	applyDefaults(cfg)
+
+	if err := validateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
+	return cfg, nil
+}
+
+func applyDefaults(cfg *Config) {
+	if cfg.Server == nil {
+		cfg.Server = &ServerConfig{}
+	}
+	if cfg.Server.ChildReadinessTimeout == nil {
+		val := defaultChildReadinessTimeout
+		cfg.Server.ChildReadinessTimeout = &val
+	}
+	if cfg.Server.GracefulShutdownTimeout == nil {
+		val := defaultGracefulShutdownTimeout
+		cfg.Server.GracefulShutdownTimeout = &val
+	}
+
+	if cfg.Logging == nil {
+		cfg.Logging = &LoggingConfig{}
+	}
+	if cfg.Logging.LogLevel == "" {
+		cfg.Logging.LogLevel = defaultLogLevel
+	}
+
+	if cfg.Logging.AccessLog == nil {
+		cfg.Logging.AccessLog = &AccessLogConfig{}
+	}
+	if cfg.Logging.AccessLog.Enabled == nil {
+		val := defaultAccessLogEnabled
+		cfg.Logging.AccessLog.Enabled = &val
+	}
+	if cfg.Logging.AccessLog.Target == "" {
+		cfg.Logging.AccessLog.Target = defaultAccessLogTarget
+	}
+	if cfg.Logging.AccessLog.Format == "" {
+		cfg.Logging.AccessLog.Format = defaultAccessLogFormat
+	}
+	if cfg.Logging.AccessLog.RealIPHeader == nil {
+		val := defaultAccessLogRealIPHeader
+		cfg.Logging.AccessLog.RealIPHeader = &val
+	}
+	// Ensure TrustedProxies is not nil if not provided, for easier use later
+	if cfg.Logging.AccessLog.TrustedProxies == nil {
+		cfg.Logging.AccessLog.TrustedProxies = []string{}
+	}
+
+	if cfg.Logging.ErrorLog == nil {
+		cfg.Logging.ErrorLog = &ErrorLogConfig{}
+	}
+	if cfg.Logging.ErrorLog.Target == "" {
+		cfg.Logging.ErrorLog.Target = defaultErrorLogTarget
+	}
+
+	// Defaults for StaticFileServerConfig
+	if cfg.Routing != nil {
+		for i := range cfg.Routing.Routes {
+			if cfg.Routing.Routes[i].HandlerType == "StaticFileServer" {
+				// This is tricky because HandlerConfig is json.RawMessage.
+				// Actual unmarshalling and default application for specific handlers
+				// should ideally happen when the handler is instantiated.
+				// However, we can set defaults for commonly expected StaticFileServer fields
+				// if we unmarshal it temporarily here, or document that handlers must manage their own defaults.
+				// For now, let's assume handlers manage their own full default setup.
+				// Example for IndexFiles if we were to do it here:
+				/*
+				   var sfsCfg StaticFileServerConfig
+				   if cfg.Routing.Routes[i].HandlerConfig != nil {
+				       if err := json.Unmarshal(cfg.Routing.Routes[i].HandlerConfig, &sfsCfg); err == nil {
+				           if sfsCfg.IndexFiles == nil {
+				               sfsCfg.IndexFiles = []string{"index.html"}
+				           }
+				           if sfsCfg.ServeDirectoryListing == nil {
+				               b := false
+				               sfsCfg.ServeDirectoryListing = &b
+				           }
+				           // Re-marshal back to HandlerConfig if modified
+				           // updatedHandlerConfig, _ := json.Marshal(sfsCfg)
+				           // cfg.Routing.Routes[i].HandlerConfig = updatedHandlerConfig
+				       }
+				   } else {
+				       // If HandlerConfig is nil, create a default one
+				       // sfsCfg.IndexFiles = []string{"index.html"}
+				       // b := false
+				       // sfsCfg.ServeDirectoryListing = &b
+				       // defaultHandlerConfig, _ := json.Marshal(sfsCfg)
+				       // cfg.Routing.Routes[i].HandlerConfig = defaultHandlerConfig
+				   }
+				*/
+			}
+		}
+	}
+}
+
+func parseDuration(s *string, fieldName string, defaultValue string) (time.Duration, error) {
+	valStr := defaultValue
+	if s != nil && *s != "" { // only use s if it's non-nil and non-empty
+		valStr = *s
+	} else if s != nil && *s == "" { // if explicitly set to empty string, it's an error for durations
+		return 0, fmt.Errorf("%s cannot be an empty string if specified; omit or provide valid duration", fieldName)
+	}
+
+	if valStr == "" { // Should only happen if defaultValue is empty, which is not the case for our durations
+		return 0, fmt.Errorf("%s has no value or default value for parsing", fieldName)
+	}
+
+	d, err := time.ParseDuration(valStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid format for %s '%s': %w", fieldName, valStr, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration, got '%s'", fieldName, valStr)
+	}
+	return d, nil
+}
+
+func validateConfig(cfg *Config) error {
+	if cfg.Server == nil {
+		// Default is applied, so this shouldn't happen unless applyDefaults is bypassed.
+		return fmt.Errorf("server configuration section is effectively missing after defaults")
+	}
+	if cfg.Server.ExecutablePath != nil && *cfg.Server.ExecutablePath == "" {
+		return fmt.Errorf("server.executable_path, if provided, cannot be empty")
+	}
+	// Validate durations using the parseDuration helper which also applies defaults for validation
+	if _, err := parseDuration(cfg.Server.ChildReadinessTimeout, "server.child_readiness_timeout", defaultChildReadinessTimeout); err != nil {
+		return err
+	}
+	if _, err := parseDuration(cfg.Server.GracefulShutdownTimeout, "server.graceful_shutdown_timeout", defaultGracefulShutdownTimeout); err != nil {
+		return err
+	}
+
+	if cfg.Routing == nil {
+		// Default is applied, making it &RoutingConfig{Routes: []Route{}}
+		// This state is considered valid (no routes).
+	}
+
+	routeSignatures := make(map[string]struct{})
+	if cfg.Routing != nil {
+		for i, route := range cfg.Routing.Routes {
+			if route.PathPattern == "" {
+				return fmt.Errorf("routing.routes[%d].path_pattern cannot be empty", i)
+			}
+			if route.HandlerType == "" {
+				return fmt.Errorf("routing.routes[%d].handler_type cannot be empty for path_pattern '%s'", i, route.PathPattern)
+			}
+
+			switch route.MatchType {
+			case MatchTypeExact:
+				if strings.HasSuffix(route.PathPattern, "/") && route.PathPattern != "/" {
+					return fmt.Errorf("routing.routes[%d].path_pattern '%s' with MatchType 'Exact' must not end with '/' unless it is the root path '/'", i, route.PathPattern)
+				}
+			case MatchTypePrefix:
+				if !strings.HasSuffix(route.PathPattern, "/") {
+					return fmt.Errorf("routing.routes[%d].path_pattern '%s' with MatchType 'Prefix' must end with '/'", i, route.PathPattern)
+				}
+			case "": // MatchType not specified
+				return fmt.Errorf("routing.routes[%d].match_type is missing for path_pattern '%s'; must be 'Exact' or 'Prefix'", i, route.PathPattern)
+			default:
+				return fmt.Errorf("routing.routes[%d].match_type '%s' is invalid for path_pattern '%s'; must be 'Exact' or 'Prefix'", i, route.MatchType, route.PathPattern)
+			}
+
+			signature := route.PathPattern + string(route.MatchType)
+			if _, exists := routeSignatures[signature]; exists {
+				return fmt.Errorf("ambiguous route: duplicate PathPattern '%s' and MatchType '%s' found at routing.routes[%d]", route.PathPattern, route.MatchType, i)
+			}
+			routeSignatures[signature] = struct{}{}
+
+			// Validate StaticFileServerConfig if HandlerType matches
+			if route.HandlerType == "StaticFileServer" {
+				if route.HandlerConfig == nil || len(route.HandlerConfig) == 0 {
+					return fmt.Errorf("routing.routes[%d].handler_config is missing for HandlerType 'StaticFileServer' with path_pattern '%s'", i, route.PathPattern)
+				}
+				var sfsCfg StaticFileServerConfig
+				if err := json.Unmarshal(route.HandlerConfig, &sfsCfg); err != nil {
+					return fmt.Errorf("routing.routes[%d].handler_config for HandlerType 'StaticFileServer' (path_pattern '%s') is invalid: %w", i, route.PathPattern, err)
+				}
+				if sfsCfg.DocumentRoot == "" {
+					return fmt.Errorf("routing.routes[%d].handler_config.document_root is required for HandlerType 'StaticFileServer' (path_pattern '%s')", i, route.PathPattern)
+				}
+				if !filepath.IsAbs(sfsCfg.DocumentRoot) {
+					return fmt.Errorf("routing.routes[%d].handler_config.document_root '%s' must be an absolute path for HandlerType 'StaticFileServer' (path_pattern '%s')", i, sfsCfg.DocumentRoot, route.PathPattern)
+				}
+				// Validate MimeTypes if it's a string (path to JSON file)
+				if mimePath, ok := sfsCfg.MimeTypes.(string); ok {
+					if mimePath == "" {
+						return fmt.Errorf("routing.routes[%d].handler_config.mime_types path cannot be empty if specified as a string (path_pattern '%s')", i, route.PathPattern)
+					}
+					// We don't check for file existence here, that can be done by the handler at startup.
+					// Or, we could add a check:
+					// if _, err := os.Stat(mimePath); os.IsNotExist(err) {
+					//    return fmt.Errorf("routing.routes[%d].handler_config.mime_types path '%s' does not exist (path_pattern '%s')", i, mimePath, route.PathPattern)
+					// }
+				} else if _, ok := sfsCfg.MimeTypes.(map[string]interface{}); ok {
+					// It's an inline map, check if values are strings
+					for k, v := range sfsCfg.MimeTypes.(map[string]interface{}) {
+						if _, vok := v.(string); !vok {
+							return fmt.Errorf("routing.routes[%d].handler_config.mime_types inline map contains non-string value for key '%s' (path_pattern '%s')", i, k, route.PathPattern)
+						}
+						if !strings.HasPrefix(k, ".") {
+							return fmt.Errorf("routing.routes[%d].handler_config.mime_types inline map key '%s' must start with a '.' (path_pattern '%s')", i, k, route.PathPattern)
+						}
+					}
+				} else if sfsCfg.MimeTypes != nil {
+					return fmt.Errorf("routing.routes[%d].handler_config.mime_types must be a string (path to JSON file) or an inline map (path_pattern '%s')", i, route.PathPattern)
+				}
+			}
+		}
+	}
+
+	if cfg.Logging == nil {
+		// Default is applied.
+		return fmt.Errorf("logging configuration section is effectively missing after defaults")
+	}
+	switch cfg.Logging.LogLevel {
+	case LogLevelDebug, LogLevelInfo, LogLevelWarning, LogLevelError:
+		// valid
+	default:
+		return fmt.Errorf("logging.log_level '%s' is invalid; must be one of 'DEBUG', 'INFO', 'WARNING', 'ERROR'", cfg.Logging.LogLevel)
+	}
+
+	if cfg.Logging.AccessLog == nil {
+		// Default is applied.
+		return fmt.Errorf("logging.access_log section is effectively missing after defaults")
+	}
+	if cfg.Logging.AccessLog.Target == "" { // Should be caught by default
+		return fmt.Errorf("logging.access_log.target cannot be empty")
+	}
+	if isFilePath(cfg.Logging.AccessLog.Target) && !filepath.IsAbs(cfg.Logging.AccessLog.Target) {
+		return fmt.Errorf("logging.access_log.target path '%s' must be absolute", cfg.Logging.AccessLog.Target)
+	}
+	if cfg.Logging.AccessLog.Format != "json" { // Currently only "json" is supported
+		return fmt.Errorf("logging.access_log.format '%s' is invalid; currently only 'json' is supported", cfg.Logging.AccessLog.Format)
+	}
+	if cfg.Logging.AccessLog.RealIPHeader != nil && *cfg.Logging.AccessLog.RealIPHeader == "" {
+		return fmt.Errorf("logging.access_log.real_ip_header, if provided, cannot be empty")
+	}
+	for _, cidr := range cfg.Logging.AccessLog.TrustedProxies {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			if net.ParseIP(cidr) == nil {
+				return fmt.Errorf("logging.access_log.trusted_proxies entry '%s' is not a valid CIDR or IP address: %w", cidr, err)
+			}
+		}
+	}
+
+	if cfg.Logging.ErrorLog == nil {
+		// Default is applied.
+		return fmt.Errorf("logging.error_log section is effectively missing after defaults")
+	}
+	if cfg.Logging.ErrorLog.Target == "" { // Should be caught by default
+		return fmt.Errorf("logging.error_log.target cannot be empty")
+	}
+	if isFilePath(cfg.Logging.ErrorLog.Target) && !filepath.IsAbs(cfg.Logging.ErrorLog.Target) {
+		return fmt.Errorf("logging.error_log.target path '%s' must be absolute", cfg.Logging.ErrorLog.Target)
+	}
+
+	return nil
+}
+
+// isFilePath checks if a target string is likely a file path (not stdout/stderr).
+func isFilePath(target string) bool {
+	return target != "stdout" && target != "stderr"
+}
+
+// Helper function to unmarshal StaticFileServerConfig specifically for validation or default application
+// This isn't strictly necessary if handlers do all their own unmarshalling and validation
+// but can be useful for centralized validation logic.
+func unmarshalStaticFileServerConfig(rawConfig json.RawMessage) (*StaticFileServerConfig, error) {
+	if rawConfig == nil {
+		return nil, fmt.Errorf("handler config is nil")
+	}
+	var sfsCfg StaticFileServerConfig
+	if err := json.Unmarshal(rawConfig, &sfsCfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal StaticFileServerConfig: %w", err)
+	}
+
+	// Apply defaults specific to StaticFileServerConfig
+	if sfsCfg.IndexFiles == nil {
+		sfsCfg.IndexFiles = []string{"index.html"}
+	}
+	if sfsCfg.ServeDirectoryListing == nil {
+		b := false
+		sfsCfg.ServeDirectoryListing = &b
+	}
+
+	return &sfsCfg, nil
+}
