@@ -1056,6 +1056,77 @@ func (s *Stream) handlePriorityFrame(frame *PriorityFrame) error {
 	return nil
 }
 
+// handleWindowUpdateFrame is called by the connection when a WINDOW_UPDATE frame is received for this stream.
+// It updates the stream's send flow control window.
+func (s *Stream) handleWindowUpdateFrame(frame *WindowUpdateFrame) error {
+	s.conn.logger.Debug("stream: received WINDOW_UPDATE frame", logger.LogFields{
+		"stream_id":       s.id,
+		"frame_stream_id": frame.Header().StreamID, // Should match s.id
+		"increment":       frame.WindowSizeIncrement,
+	})
+
+	// Validate that the frame's StreamID matches the stream's ID.
+	// This should be guaranteed by the dispatcher in the connection layer.
+	if frame.Header().StreamID != s.id {
+		msg := fmt.Sprintf("WINDOW_UPDATE frame stream ID %d in frame header does not match stream object ID %d", frame.Header().StreamID, s.id)
+		s.conn.logger.Error("stream: WINDOW_UPDATE frame ID mismatch (server dispatch error)", logger.LogFields{
+			"stream_id":       s.id,
+			"frame_stream_id": frame.Header().StreamID,
+			"error_msg":       msg,
+		})
+		// This is an internal server error if dispatch was incorrect.
+		return NewConnectionError(ErrCodeInternalError, msg)
+	}
+
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+
+	// RFC 7540, Section 5.1.1: For "closed" state:
+	// "WINDOW_UPDATE or RST_STREAM frames can be received in this state for a short period after a DATA or HEADERS
+	// frame containing an END_STREAM flag is sent. ... Endpoints MUST ignore WINDOW_UPDATE ... frames received in this state..."
+	if state == StreamStateClosed {
+		s.conn.logger.Debug("stream: WINDOW_UPDATE received on closed stream, ignoring", logger.LogFields{"stream_id": s.id})
+		return nil // Ignore as per RFC
+	}
+
+	// Attempt to increase the send window.
+	// s.fcManager.HandleWindowUpdateFromPeer calls s.sendWindow.Increase().
+	// s.sendWindow.Increase() handles:
+	// - StreamError(PROTOCOL_ERROR) if increment is 0 for a stream.
+	// - StreamError(FLOW_CONTROL_ERROR) if stream window overflows.
+	err := s.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement)
+	if err != nil {
+		s.conn.logger.Error("stream: error processing WINDOW_UPDATE frame via StreamFlowControlManager", logger.LogFields{
+			"stream_id": s.id,
+			"increment": frame.WindowSizeIncrement,
+			"error":     err.Error(),
+		})
+
+		// If the error is a StreamError, RST the stream.
+		if streamErr, ok := err.(*StreamError); ok {
+			// Ensure the StreamError is indeed for *this* stream.
+			if streamErr.StreamID == s.id {
+				s.sendRSTStream(streamErr.Code)
+				// The original error (which is a StreamError) is returned for the connection
+				// to know, but the stream is already being reset.
+				return streamErr
+			}
+			// This would be an unexpected situation.
+			connErr := NewConnectionError(ErrCodeInternalError,
+				fmt.Sprintf("WINDOW_UPDATE on stream %d resulted in StreamError for different stream %d: %s",
+					s.id, streamErr.StreamID, streamErr.Msg))
+			return connErr
+		}
+
+		// If it's any other type of error (e.g., ConnectionError), propagate it.
+		return err
+	}
+
+	s.conn.logger.Debug("stream: WINDOW_UPDATE frame processed successfully", logger.LogFields{"stream_id": s.id, "increment": frame.WindowSizeIncrement})
+	return nil
+}
+
 // Context returns the stream's context.
 func (s *Stream) Context() context.Context {
 	return s.ctx
