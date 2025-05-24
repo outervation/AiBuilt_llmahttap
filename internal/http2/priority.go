@@ -161,7 +161,7 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 
 	// The original AddStream logic was essentially a priority update.
 	// We can directly call updatePriorityNoLock.
-	err := pt.updatePriorityNoLock(streamID, newParentID, newWeight, isExclusiveOperation)
+	err := pt.UpdatePriority(streamID, newParentID, newWeight, isExclusiveOperation)
 	if err != nil {
 		// updatePriorityNoLock might return fmt.Errorf for "cannot depend on itself".
 		// We should wrap this in a StreamError for AddStream, which is often
@@ -182,10 +182,17 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 //
 //	and previous children of depStreamID become children of streamID.
 //
-// This method is NOT called directly by external frame processing; it's a utility
-// called by AddStream and ProcessPriorityFrame.
-// The caller (AddStream/ProcessPriorityFrame) must hold the lock.
-func (pt *PriorityTree) updatePriorityNoLock(streamID uint32, depStreamID uint32, weight uint8, exclusive bool) error {
+// UpdatePriority changes the priority of a stream.
+// streamID: The ID of the stream whose priority is being updated.
+// depStreamID: The ID of the stream that streamID will depend on.
+// weight: The new weight for streamID (0-255).
+// exclusive: If true, streamID becomes the sole child of depStreamID,
+//
+//	and previous children of depStreamID become children of streamID.
+//
+// This method is the core logic for priority updates and is called by AddStream (for HEADERS)
+// and ProcessPriorityFrame. The caller MUST hold the lock on PriorityTree.pt.mu.
+func (pt *PriorityTree) UpdatePriority(streamID uint32, depStreamID uint32, weight uint8, exclusive bool) error {
 	// Validation for streamID != 0 is typically done by callers (AddStream, ProcessPriorityFrame)
 	// as they have specific error types (ConnectionError for stream 0 PRIORITY, StreamError for HEADERS)
 
@@ -269,7 +276,7 @@ func (pt *PriorityTree) ProcessPriorityFrame(streamID uint32, frame *PriorityFra
 
 	// PRIORITY frame defines all necessary parameters for updatePriorityNoLock.
 	// The streamID for the PRIORITY frame itself is the stream being reprioritized.
-	err := pt.updatePriorityNoLock(streamID, frame.StreamDependency, frame.Weight, frame.Exclusive)
+	err := pt.UpdatePriority(streamID, frame.StreamDependency, frame.Weight, frame.Exclusive)
 	if err != nil {
 		// updatePriorityNoLock returns fmt.Errorf for "cannot depend on itself".
 		// For PRIORITY frames, this is a StreamError.
