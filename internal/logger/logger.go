@@ -428,6 +428,48 @@ func (el *ErrorLogger) isLoggable(messageLevel config.LogLevel) bool {
 	return messageSeverity >= configuredSeverity
 }
 
+// Reopen closes and reopens the log file if the target is a file.
+// This is used for log rotation. It is thread-safe.
+func (el *ErrorLogger) Reopen() error {
+	if el == nil {
+		return nil // Not configured
+	}
+	el.mu.Lock()
+	defer el.mu.Unlock()
+
+	if !config.IsFilePath(el.config.Target) {
+		return nil // Not a file target
+	}
+
+	currentFile, ok := el.output.(*os.File)
+	if ok {
+		// Only try to close if it's a file we manage (not stdout/stderr)
+		if currentFile != os.Stdout && currentFile != os.Stderr {
+			filePath := currentFile.Name() // Get path from existing file for logging
+			if err := currentFile.Close(); err != nil {
+				log.Printf("Error closing error log file %s during reopen: %v", filePath, err)
+				// Continue to attempt reopening
+			}
+		}
+	}
+
+	// Use the configured target path for reopening
+	filePathToOpen := el.config.Target
+	newFile, errOpen := os.OpenFile(filePathToOpen, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if errOpen != nil {
+		log.Printf("Failed to reopen error log file %s: %v. Error logging may be impaired and will fall back to stderr.", filePathToOpen, errOpen)
+		// Fallback to stderr
+		el.logger.SetOutput(os.Stderr)
+		el.output = os.Stderr
+		return fmt.Errorf("failed to reopen error log file %s: %w", filePathToOpen, errOpen)
+	}
+
+	el.logger.SetOutput(newFile)
+	el.output = newFile
+	log.Printf("Successfully reopened error log file: %s", filePathToOpen)
+	return nil
+}
+
 // Debug logs a message at DEBUG level.
 func (el *ErrorLogger) Debug(msg string, context LogFields) {
 	level := config.LogLevelDebug
