@@ -271,6 +271,7 @@ type Frame interface {
 	Header() *FrameHeader
 	ParsePayload(r io.Reader, header FrameHeader) error
 	WritePayload(w io.Writer) (int64, error)
+	PayloadLen() uint32 // New method
 }
 
 // Concrete frame types
@@ -343,6 +344,16 @@ func (f *DataFrame) WritePayload(w io.Writer) (int64, error) {
 		totalN += int64(n)
 	}
 	return totalN, nil
+}
+
+func (f *DataFrame) PayloadLen() uint32 {
+	var length uint32
+	if f.Flags&FlagDataPadded != 0 {
+		length += 1                   // PadLength field
+		length += uint32(f.PadLength) // Padding bytes
+	}
+	length += uint32(len(f.Data))
+	return length
 }
 
 // HeadersFrame represents an HTTP/2 HEADERS frame.
@@ -461,6 +472,20 @@ func (f *HeadersFrame) WritePayload(w io.Writer) (int64, error) {
 }
 
 // PriorityFrame represents an HTTP/2 PRIORITY frame.
+
+func (f *HeadersFrame) PayloadLen() uint32 {
+	var length uint32
+	if f.Flags&FlagHeadersPadded != 0 {
+		length += 1                   // PadLength field
+		length += uint32(f.PadLength) // Padding bytes
+	}
+	if f.Flags&FlagHeadersPriority != 0 {
+		length += 5 // StreamDependency, Exclusive, Weight
+	}
+	length += uint32(len(f.HeaderBlockFragment))
+	return length
+}
+
 // RFC 7540, Section 6.3
 type PriorityFrame struct {
 	FrameHeader
@@ -499,6 +524,10 @@ func (f *PriorityFrame) WritePayload(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
+func (f *PriorityFrame) PayloadLen() uint32 {
+	return 5 // Exclusive, StreamDependency, Weight
+}
+
 // RSTStreamFrame represents an HTTP/2 RST_STREAM frame.
 // RFC 7540, Section 6.4
 type RSTStreamFrame struct {
@@ -526,6 +555,10 @@ func (f *RSTStreamFrame) WritePayload(w io.Writer) (int64, error) {
 	binary.BigEndian.PutUint32(errCodeBuf[:], uint32(f.ErrorCode))
 	n, err := w.Write(errCodeBuf[:])
 	return int64(n), err
+}
+
+func (f *RSTStreamFrame) PayloadLen() uint32 {
+	return 4 // ErrorCode
 }
 
 // Setting represents a single setting in a SETTINGS frame.
@@ -590,6 +623,13 @@ func (f *SettingsFrame) WritePayload(w io.Writer) (int64, error) {
 		totalN += int64(n)
 	}
 	return totalN, nil
+}
+
+func (f *SettingsFrame) PayloadLen() uint32 {
+	if f.Flags&FlagSettingsAck != 0 {
+		return 0
+	}
+	return uint32(len(f.Settings) * settingEntrySize)
 }
 
 // PushPromiseFrame represents an HTTP/2 PUSH_PROMISE frame.
@@ -692,6 +732,17 @@ func (f *PushPromiseFrame) WritePayload(w io.Writer) (int64, error) {
 	return totalN, nil
 }
 
+func (f *PushPromiseFrame) PayloadLen() uint32 {
+	var length uint32
+	if f.Flags&FlagPushPromisePadded != 0 {
+		length += 1                   // PadLength field
+		length += uint32(f.PadLength) // Padding bytes
+	}
+	length += 4 // PromisedStreamID
+	length += uint32(len(f.HeaderBlockFragment))
+	return length
+}
+
 // PingFrame represents an HTTP/2 PING frame.
 // RFC 7540, Section 6.7
 type PingFrame struct {
@@ -715,6 +766,10 @@ func (f *PingFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 func (f *PingFrame) WritePayload(w io.Writer) (int64, error) {
 	n, err := w.Write(f.OpaqueData[:])
 	return int64(n), err
+}
+
+func (f *PingFrame) PayloadLen() uint32 {
+	return 8 // OpaqueData
 }
 
 // GoAwayFrame represents an HTTP/2 GOAWAY frame.
@@ -772,6 +827,10 @@ func (f *GoAwayFrame) WritePayload(w io.Writer) (int64, error) {
 	return totalN, nil
 }
 
+func (f *GoAwayFrame) PayloadLen() uint32 {
+	return 8 + uint32(len(f.AdditionalDebugData)) // LastStreamID (4) + ErrorCode (4) + AdditionalDebugData
+}
+
 // WindowUpdateFrame represents an HTTP/2 WINDOW_UPDATE frame.
 // RFC 7540, Section 6.9
 type WindowUpdateFrame struct {
@@ -807,6 +866,10 @@ func (f *WindowUpdateFrame) WritePayload(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
+func (f *WindowUpdateFrame) PayloadLen() uint32 {
+	return 4 // WindowSizeIncrement
+}
+
 // ContinuationFrame represents an HTTP/2 CONTINUATION frame.
 // RFC 7540, Section 6.10
 type ContinuationFrame struct {
@@ -830,6 +893,10 @@ func (f *ContinuationFrame) WritePayload(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
+func (f *ContinuationFrame) PayloadLen() uint32 {
+	return uint32(len(f.HeaderBlockFragment))
+}
+
 // UnknownFrame is used for frames whose type is not recognized or supported.
 // The payload is kept opaque.
 type UnknownFrame struct {
@@ -851,6 +918,10 @@ func (f *UnknownFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 func (f *UnknownFrame) WritePayload(w io.Writer) (int64, error) {
 	n, err := w.Write(f.Payload)
 	return int64(n), err
+}
+
+func (f *UnknownFrame) PayloadLen() uint32 {
+	return uint32(len(f.Payload))
 }
 
 // ReadFrame reads a full HTTP/2 frame from the reader.
@@ -909,25 +980,33 @@ func ReadFrame(r io.Reader) (Frame, error) {
 // It first writes the header, then the specific frame's payload.
 func WriteFrame(w io.Writer, f Frame) error {
 	header := f.Header()
-	// Ensure length is set correctly based on payload.
-	// This requires payload to be fully defined before header is written.
-	// For frames like DataFrame, HeadersFrame, etc., where payload size can vary,
-	// the Length field in the header must be pre-calculated.
-	// For now, we assume FrameHeader.Length is correctly set by the caller constructing the frame.
 
-	// A better approach might be to have WritePayload return its length,
-	// then construct and write the header, then write the payload.
-	// However, current structure has WritePayload take io.Writer.
-	// Let's assume header.Length is already correctly set by the frame construction logic.
+	// Calculate payload length using the new PayloadLen method.
+	// This length is what the frame *should* have as its payload.
+	calculatedPayloadLen := f.PayloadLen()
+	header.Length = calculatedPayloadLen // Set this in the header to be written.
 
+	// Serialize and write the header.
+	// The FrameHeader.WriteTo method uses header.Length to fill the raw header bytes.
 	_, err := header.WriteTo(w)
 	if err != nil {
-		return fmt.Errorf("writing frame header for %s: %w", header.Type, err)
+		return fmt.Errorf("writing frame header for %s (length %d): %w", header.Type, header.Length, err)
 	}
 
-	_, err = f.WritePayload(w)
+	// Serialize and write the payload.
+	// The WritePayload method for each frame type is responsible for writing
+	// exactly 'calculatedPayloadLen' bytes.
+	writtenPayloadBytes, err := f.WritePayload(w)
 	if err != nil {
-		return fmt.Errorf("writing %s payload: %w", header.Type, err)
+		// If WritePayload itself returns an error during writing.
+		return fmt.Errorf("writing %s payload (declared length %d): %w", header.Type, calculatedPayloadLen, err)
 	}
+
+	// This check ensures internal consistency: the number of bytes WritePayload
+	// claims to have written must match what PayloadLen declared.
+	if uint32(writtenPayloadBytes) != calculatedPayloadLen {
+		return fmt.Errorf("internal: %s payload length mismatch: PayloadLen() declared %d, but WritePayload() wrote %d bytes", header.Type, calculatedPayloadLen, writtenPayloadBytes)
+	}
+
 	return nil
 }
