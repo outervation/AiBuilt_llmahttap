@@ -180,11 +180,14 @@ func (fcw *FlowControlWindow) UpdateInitialWindowSize(newInitialSize uint32) err
 
 	// newInitialSize itself should be validated against MaxWindowSize by SETTINGS processing.
 	// Assuming newInitialSize <= MaxWindowSize.
-	if newInitialSize > MaxWindowSize { // Defensive check based on RFC 6.5.2 for SETTINGS_INITIAL_WINDOW_SIZE max value
-		msg := fmt.Sprintf("new SETTINGS_INITIAL_WINDOW_SIZE %d exceeds MaxWindowSize %d", newInitialSize, MaxWindowSize)
-		// This is a connection error because the peer sent an invalid SETTINGS value.
-		err := NewConnectionError(ErrCodeProtocolError, msg)
-		// fcw.setErrorLocked(err) // The FCW is not directly at fault, the setting is. Let connection handler deal.
+	if newInitialSize > MaxWindowSize { // Values from SETTINGS_INITIAL_WINDOW_SIZE
+		// RFC 6.5.2: "Values above the maximum flow-control window size of 2^31-1 MUST be treated as a connection error
+		// (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+		// This check applies when newInitialSize comes from a peer's SETTINGS_INITIAL_WINDOW_SIZE.
+		// fcw.streamID is relevant here as this method is for stream windows.
+		msg := fmt.Sprintf("peer's SETTINGS_INITIAL_WINDOW_SIZE value %d (for stream %d context) exceeds MaxWindowSize %d", newInitialSize, fcw.streamID, MaxWindowSize)
+		err := NewConnectionError(ErrCodeFlowControlError, msg) // Aligned with RFC 6.5.2 for invalid setting value from peer
+		// The FCW itself isn't necessarily "broken" by this, but the connection is due to peer's invalid setting.
 		return err
 	}
 
