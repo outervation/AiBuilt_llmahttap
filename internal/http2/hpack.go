@@ -2,7 +2,6 @@ package http2
 
 import (
 	"bytes"
-	// "io" // Removed as it's unused
 
 	"golang.org/x/net/http2/hpack"
 )
