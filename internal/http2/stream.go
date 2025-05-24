@@ -193,6 +193,7 @@ type Stream struct {
 // handler: The handler for this stream.
 // handlerCfg: The configuration for the handler.
 // TODO: Priority information for new streams (either default or from HEADERS).
+
 func newStream(
 	conn *connection,
 	id uint32,
@@ -203,18 +204,18 @@ func newStream(
 	prioWeight uint8,
 	prioParentID uint32,
 	prioExclusive bool,
-) *Stream {
-	ctx, cancel := context.WithCancel(conn.ctx) // Assuming conn has a base context
+) (*Stream, error) {
+	ctx, cancel := context.WithCancel(conn.ctx)
 
 	pr, pw := io.Pipe()
 
 	s := &Stream{
 		id:                          id,
-		state:                       StreamStateIdle, // Will transition upon receiving/sending HEADERS
+		state:                       StreamStateIdle,
 		conn:                        conn,
 		fcManager:                   NewStreamFlowControlManager(id, initialOurWindowSize, initialPeerWindowSize),
-		priorityWeight:              prioWeight,   // Default might be 16 (frame value 15)
-		priorityParentID:            prioParentID, // Default might be 0
+		priorityWeight:              prioWeight,
+		priorityParentID:            prioParentID,
 		priorityExclusive:           prioExclusive,
 		requestBodyReader:           pr,
 		requestBodyWriter:           pw,
@@ -226,8 +227,22 @@ func newStream(
 		endStreamSentToClient:       false,
 		responseHeadersSent:         false,
 	}
-	// s.dataAvailable = sync.NewCond(&s.mu)
-	return s
+
+	priorityInfo := &streamDependencyInfo{
+		StreamDependency: prioParentID,
+		Weight:           prioWeight,
+		Exclusive:        prioExclusive,
+	}
+	if conn.priorityTree != nil { // Defensive check, stub connection might not have it
+		err := conn.priorityTree.AddStream(s.id, priorityInfo)
+		if err != nil {
+			cancel()
+			_ = pr.CloseWithError(err) // Best effort close
+			_ = pw.CloseWithError(err) // Best effort close
+			return nil, err
+		}
+	}
+	return s, nil
 }
 
 // Implement ResponseWriter for Stream
@@ -889,6 +904,15 @@ func (s *Stream) CanReceiveFrame(ft FrameType) bool {
 		return false
 	}
 }
+
+// streamDependencyInfo is defined in priority.go, but for clarity if it were needed
+// specifically for stream creation/initialization, it might look like this.
+// However, we use the one from priority.go.
+// type StreamPriorityInfo struct {
+//  StreamDependency uint32
+//  Weight           uint8
+//  Exclusive        bool
+// }
 
 // Close explicitly terminates the stream from the server's perspective.
 // If err is nil, ErrCodeCancel will be used to RST_STREAM, indicating a
