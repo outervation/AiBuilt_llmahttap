@@ -355,13 +355,14 @@ func parseDuration(s *string, fieldName string, defaultValue string) (time.Durat
 
 func validateConfig(cfg *Config) error {
 	if cfg.Server == nil {
-		// Default is applied, so this shouldn't happen unless applyDefaults is bypassed.
-		return fmt.Errorf("server configuration section is effectively missing after defaults")
+		// This should not happen if applyDefaults ran correctly and initialized cfg.Server.
+		// If it does, it implies a problem prior to validation or in applyDefaults.
+		return fmt.Errorf("server configuration section (cfg.Server) is nil; this should have been initialized by applyDefaults")
+	}
 
-		// cfg.Server.Address is guaranteed to be non-nil by applyDefaults
-		if *cfg.Server.Address == "" {
-			return fmt.Errorf("server.address cannot be an empty string")
-		}
+	// cfg.Server.Address is guaranteed to be non-nil by applyDefaults.
+	if *cfg.Server.Address == "" {
+		return fmt.Errorf("server.address cannot be an empty string")
 	}
 	if cfg.Server.ExecutablePath != nil && *cfg.Server.ExecutablePath == "" {
 		return fmt.Errorf("server.executable_path, if provided, cannot be empty")
