@@ -22,23 +22,24 @@ type connection struct {
 	logger *logger.Logger
 	ctx    context.Context
 	// Mock methods needed by Stream for now
-	sendHeadersFrame     func(s *Stream, headers []hpack.HeaderField, endStream bool) error
-	sendDataFrame        func(s *Stream, p []byte, endStream bool) (int, error)
-	sendTrailersFrame    func(s *Stream, trailers []hpack.HeaderField) error
-	sendRSTStreamFrame   func(streamID uint32, errorCode ErrorCode) error
-	updateStreamPriority func(streamID uint32, depStreamID uint32, weight uint8, exclusive bool)
-	removeStream         func(streamID uint32, errCode ErrorCode)
-	streamHandlerDone    func(s *Stream)
-	remoteAddrStr        func() string
-	isTLS                func() bool
-	initialSettings      InitialSettings               // Placeholder
-	hpackDecoder         *HpackAdapter                 // Placeholder for HPACK decoding for requests
-	peerSettings         map[SettingID]uint32          // Placeholder
-	ourSettings          map[SettingID]uint32          // Placeholder
-	maxFrameSize         uint32                        // Max frame size this connection can send
-	connFCManager        *ConnectionFlowControlManager // Connection-level flow control
-	activeStreams        map[uint32]*Stream            // Map of active streams
-	priorityTree         *PriorityTree
+	sendHeadersFrame      func(s *Stream, headers []hpack.HeaderField, endStream bool) error
+	sendDataFrame         func(s *Stream, p []byte, endStream bool) (int, error)
+	sendTrailersFrame     func(s *Stream, trailers []hpack.HeaderField) error
+	sendRSTStreamFrame    func(streamID uint32, errorCode ErrorCode) error
+	sendWindowUpdateFrame func(streamID uint32, increment uint32) error // Added
+	updateStreamPriority  func(streamID uint32, depStreamID uint32, weight uint8, exclusive bool)
+	removeStream          func(streamID uint32, errCode ErrorCode)
+	streamHandlerDone     func(s *Stream)
+	remoteAddrStr         func() string
+	isTLS                 func() bool
+	initialSettings       InitialSettings               // Placeholder
+	hpackDecoder          *HpackAdapter                 // Placeholder for HPACK decoding for requests
+	peerSettings          map[SettingID]uint32          // Placeholder
+	ourSettings           map[SettingID]uint32          // Placeholder
+	maxFrameSize          uint32                        // Max frame size this connection can send
+	connFCManager         *ConnectionFlowControlManager // Connection-level flow control
+	activeStreams         map[uint32]*Stream            // Map of active streams
+	priorityTree          *PriorityTree
 }
 type InitialSettings struct { // Placeholder
 	MaxFrameSize         uint32
@@ -480,6 +481,67 @@ func (s *Stream) WriteTrailers(trailers []hpack.HeaderField) error {
 	s.endStreamSentToClient = true
 	s.transitionStateOnSendEndStream() // Trailers always end the stream for the sender.
 
+	return nil
+}
+
+// SendWindowUpdate sends a WINDOW_UPDATE frame for this stream.
+// This is typically called by the StreamFlowControlManager when it determines
+// that the receive window for this stream should be increased by the application consuming data.
+func (s *Stream) SendWindowUpdate(increment uint32) error {
+	s.mu.RLock()
+	state := s.state
+	streamID := s.id
+	pendingRST := s.pendingRSTCode != nil
+	s.mu.RUnlock()
+
+	if increment == 0 {
+		// RFC 7540, Section 6.9.1: "A sender MUST NOT send a WINDOW_UPDATE frame with a flow control
+		// window increment of 0. If an endpoint receives a WINDOW_UPDATE frame with a window increment
+		// of 0, it MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
+		// This method is for sending, so we prevent sending a zero increment.
+		s.conn.logger.Error("stream: SendWindowUpdate called with zero increment, not sending",
+			logger.LogFields{"stream_id": streamID})
+		return NewStreamError(streamID, ErrCodeProtocolError, "WINDOW_UPDATE increment cannot be zero")
+	}
+
+	if pendingRST {
+		s.conn.logger.Info("stream: SendWindowUpdate called on stream pending RST, aborting send",
+			logger.LogFields{"stream_id": streamID, "increment": increment})
+		// If stream is already being reset, sending WINDOW_UPDATE is likely futile / racy.
+		return NewStreamError(streamID, ErrCodeStreamClosed, "stream is being reset, cannot send WINDOW_UPDATE")
+	}
+
+	// According to RFC 7540, Section 5.1 (Stream States table), WINDOW_UPDATE can be sent in:
+	// "reserved (local)", "reserved (remote)", "open", "half-closed (local)", "half-closed (remote)".
+	// It is generally not sent on "idle" or "closed" streams.
+	if state == StreamStateIdle || state == StreamStateClosed {
+		s.conn.logger.Warn("stream: SendWindowUpdate called on idle or closed stream; send might be ignored or invalid",
+			logger.LogFields{"stream_id": streamID, "state": state.String(), "increment": increment})
+		if state == StreamStateIdle {
+			return NewStreamError(streamID, ErrCodeInternalError, "cannot send WINDOW_UPDATE on idle stream")
+		}
+		// If closed, the peer might ignore it. The fcManager should ideally not call this.
+		// Returning nil to indicate "operation completed" in the sense that there's nothing more to do from this call.
+		return nil
+	}
+
+	// Call the connection method to send the frame.
+	// This function should be part of the actual connection implementation.
+	if s.conn.sendWindowUpdateFrame == nil {
+		s.conn.logger.Error("stream: sendWindowUpdateFrame not implemented on connection (stub method is nil)",
+			logger.LogFields{"stream_id": streamID})
+		return fmt.Errorf("internal error: sendWindowUpdateFrame not available on connection for stream %d", streamID)
+	}
+
+	err := s.conn.sendWindowUpdateFrame(streamID, increment)
+	if err != nil {
+		s.conn.logger.Error("stream: failed to send WINDOW_UPDATE frame via connection",
+			logger.LogFields{"stream_id": streamID, "increment": increment, "error": err.Error()})
+		return err // Propagate error (e.g., connection closed, I/O error)
+	}
+
+	s.conn.logger.Debug("stream: successfully sent WINDOW_UPDATE frame",
+		logger.LogFields{"stream_id": streamID, "increment": increment})
 	return nil
 }
 
