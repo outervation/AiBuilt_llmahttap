@@ -428,6 +428,10 @@ func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream b
 // processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
 // after flow control accounting has been done.
 // It writes data to the request body pipe and handles END_STREAM.
+
+// processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
+// after flow control accounting has been done.
+// It writes data to the request body pipe and handles END_STREAM.
 func (s *Stream) processIncomingDataBody(data []byte, endStream bool) error {
 	// This method is called after flow control windows have been debited by handleDataFrame.
 	// It's responsible for writing to the pipe and handling END_STREAM.
@@ -479,15 +483,17 @@ func (s *Stream) processIncomingDataBody(data []byte, endStream bool) error {
 			s.mu.Lock() // Re-lock after pipe write
 
 			if pipeErr != nil {
-				s.mu.Unlock()
+				// s.mu is already held here
 				s.conn.logger.Error("stream: error writing to request body pipe", logger.LogFields{"stream_id": s.id, "error": pipeErr.Error()})
+				// Unlock before sendRSTStream, as it might re-enter or call conn methods
+				s.mu.Unlock()
 				s.sendRSTStream(ErrCodeCancel) // Handler will see pipe error; CANCEL indicates graceful termination request.
 				return NewStreamError(s.id, ErrCodeInternalError, "error writing to request body pipe: "+pipeErr.Error())
 			}
 		}
 	}
-	// If len(data) == 0, s.mu is still held from the start of the function (or after re-lock if pipeWriter was nil).
-	// If len(data) > 0, s.mu is re-acquired and held.
+	// If len(data) == 0, s.mu is still held from the start of the function (or after re-lock if pipeWriter was nil and data > 0 path taken).
+	// If len(data) > 0 and pipe write was successful, s.mu is held.
 
 	if endStream {
 		s.endStreamReceivedFromClient = true
