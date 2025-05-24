@@ -261,6 +261,9 @@ type ConnectionFlowControlManager struct {
 	// bytesConsumedTotal tracks the cumulative number of bytes consumed by the application
 	// from data received on this connection. Used to calculate WINDOW_UPDATE increments.
 	bytesConsumedTotal uint64
+	// totalBytesReceived tracks the cumulative number of payload bytes received on this connection from DATA frames.
+	// This is distinct from bytesConsumedTotal which tracks application consumption.
+	totalBytesReceived uint64
 	// lastWindowUpdateSentAt stores the value of bytesConsumedTotal at the time the last
 	// connection-level WINDOW_UPDATE was sent.
 	lastWindowUpdateSentAt uint64
@@ -333,7 +336,7 @@ func (cfcm *ConnectionFlowControlManager) DataReceived(n uint32) error {
 
 	if int64(n) > cfcm.currentReceiveWindowSize {
 		// Peer sent more data than available in its send window (our receive window).
-		msg := fmt.Sprintf("connection flow control error: received %d bytes, but peer's window was only %d", n, cfcm.currentReceiveWindowSize)
+		msg := fmt.Sprintf("connection flow control error: received %d bytes, but peer's send allowance (our receive window) was only %d", n, cfcm.currentReceiveWindowSize)
 		// This is a connection error of type FLOW_CONTROL_ERROR.
 		// The connection manager should send GOAWAY and terminate.
 		// currentReceiveWindowSize is not modified here as the connection is expected to terminate.
@@ -341,6 +344,7 @@ func (cfcm *ConnectionFlowControlManager) DataReceived(n uint32) error {
 	}
 
 	cfcm.currentReceiveWindowSize -= int64(n)
+	cfcm.totalBytesReceived += uint64(n) // Track total bytes received. uint64 overflow is negligible.
 	return nil
 }
 
