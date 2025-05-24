@@ -21,6 +21,41 @@ type parsedProxiesContainer struct {
 	ips   []net.IP
 }
 
+// AccessLogEntry defines the structure for a JSON access log entry.
+// Fields are based on spec 3.3.2.
+type AccessLogEntry struct {
+	Timestamp     string `json:"ts"`
+	RemoteAddr    string `json:"remote_addr"`
+	RemotePort    int    `json:"remote_port"` // Parsed from client's direct peer port string. Spec: Number.
+	Protocol      string `json:"protocol"`
+	Method        string `json:"method"`
+	URI           string `json:"uri"`
+	Status        int    `json:"status"`
+	ResponseBytes int64  `json:"resp_bytes"`
+	DurationMs    int64  `json:"duration_ms"`
+	UserAgent     string `json:"user_agent,omitempty"`
+	Referer       string `json:"referer,omitempty"`
+	H2StreamID    uint32 `json:"h2_stream_id"`
+}
+
+// LogFields represents a map of additional key-value data for structured logging.
+// This is used for the 'details' field in ErrorLogEntry or for passing custom fields
+// to logger methods.
+type LogFields map[string]interface{}
+
+// ErrorLogEntry defines the structure for a JSON error log entry.
+// Fields are based on spec 3.4.2.
+type ErrorLogEntry struct {
+	Timestamp         string    `json:"ts"`
+	Level             string    `json:"level"` // e.g., "ERROR", "INFO"
+	Message           string    `json:"msg"`
+	Source            string    `json:"source,omitempty"`       // e.g., "filename.go:123"
+	RequestMethod     string    `json:"method,omitempty"`       // Associated request HTTP method
+	RequestURI        string    `json:"uri,omitempty"`          // Associated request URI
+	RequestH2StreamID uint32    `json:"h2_stream_id,omitempty"` // Associated request HTTP/2 stream ID
+	Details           LogFields `json:"details,omitempty"`      // Additional structured key-value context
+}
+
 // AccessLogger handles access logging.
 type AccessLogger struct {
 	logger        *log.Logger
