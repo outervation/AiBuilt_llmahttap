@@ -2,7 +2,8 @@ package http2
 
 import (
 	"bytes"
-	"io"
+	"errors"
+	"fmt"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -18,8 +19,6 @@ type HpackAdapter struct {
 	maxTableSize  uint32              // Stores the current max dynamic table size
 }
 
-var _ io.Reader // Use io package to avoid "imported and not used" error
-
 // emitHeaderField is the callback function for the hpack.Decoder.
 // It appends decoded header fields to the HpackAdapter's decodedFields slice.
 func (h *HpackAdapter) emitHeaderField(hf hpack.HeaderField) {
@@ -28,6 +27,126 @@ func (h *HpackAdapter) emitHeaderField(hf hpack.HeaderField) {
 	// so direct append is safe. If Name/Value were slices or pointers
 	// to mutable data, a deep copy would be needed.
 	h.decodedFields = append(h.decodedFields, hf)
+}
+
+// NewHpackAdapter creates a new HpackAdapter for HPACK encoding and decoding.
+// initialMaxTableSize is the initial maximum dynamic table size setting for both
+// the encoder and decoder's dynamic tables. See RFC 7541, Section 4.2.
+func NewHpackAdapter(initialMaxTableSize uint32) *HpackAdapter {
+	adapter := &HpackAdapter{
+		encodeBuf:     new(bytes.Buffer),
+		decodedFields: nil, // Starts empty, will be populated during decoding
+		maxTableSize:  initialMaxTableSize,
+	}
+
+	// Initialize HPACK encoder
+	adapter.encoder = hpack.NewEncoder(adapter.encodeBuf)
+	adapter.encoder.SetMaxDynamicTableSize(initialMaxTableSize)
+
+	// Initialize HPACK decoder
+	// The emit function is bound to this HpackAdapter instance.
+	adapter.decoder = hpack.NewDecoder(initialMaxTableSize, adapter.emitHeaderField)
+
+	return adapter
+}
+
+// DecodeFragment processes a fragment of an HPACK-encoded header block.
+// Decoded header fields are accumulated internally. Call FinishDecoding
+// after all fragments (e.g., from HEADERS and subsequent CONTINUATION frames)
+// have been processed to get the complete list of header fields and to
+// finalize the decoding state for the header block.
+//
+// Each call to DecodeFragment appends to an internal list of headers.
+// This list is cleared by FinishDecoding or can be manually reset by
+// calling ResetDecoderState before processing a new header block.
+func (h *HpackAdapter) DecodeFragment(fragment []byte) error {
+	if h.decoder == nil {
+		// This case should ideally not be reached if NewHpackAdapter is always used.
+		return errors.New("hpack: HpackAdapter.decoder not initialized")
+	}
+	// The h.decodedFields slice accumulates headers via h.emitHeaderField.
+	// It is implicitly ready for new fields. It's cleared by FinishDecoding
+	// or ResetDecoderState.
+	_, err := h.decoder.Write(fragment)
+	if err != nil {
+		return fmt.Errorf("hpack: HpackAdapter.decoder.Write failed: %w", err)
+	}
+	return nil
+}
+
+// FinishDecoding finalizes the decoding of the current header block,
+// returns all accumulated header fields, and resets the internal decoding state
+// for the next header block. It must be called after all fragments of a
+// header block have been passed to DecodeFragment. This method calls
+// the underlying HPACK decoder's Close method, which can also return errors
+// if the HPACK stream is malformed at its conclusion.
+func (h *HpackAdapter) FinishDecoding() ([]hpack.HeaderField, error) {
+	if h.decoder == nil {
+		return nil, errors.New("hpack: HpackAdapter.decoder not initialized")
+	}
+
+	// Finalize current HPACK block processing by calling Close on the underlying decoder.
+	// This is necessary to process any remaining state and validate the end of the block.
+	err := h.decoder.Close()
+
+	fields := h.decodedFields
+	h.decodedFields = nil // Reset for the next header block
+
+	if err != nil {
+		// Even if Close() errors, return any fields that were successfully decoded before the error.
+		return fields, fmt.Errorf("hpack: HpackAdapter.decoder.Close failed: %w", err)
+	}
+	return fields, nil
+}
+
+// ResetDecoderState clears any accumulated decoded header fields from the HpackAdapter.
+// This is useful if a header block decoding sequence needs to be aborted
+// or to ensure a clean state before starting a new header block if
+// FinishDecoding was not called on the previous one.
+// Note: This does not reset the HPACK decoder's dynamic table state itself,
+// only the adapter's list of collected fields from the current block.
+// The underlying hpack.Decoder is expected to be ready for a new block
+// after Close() is called (even if it errored) or if it's freshly initialized.
+func (h *HpackAdapter) ResetDecoderState() {
+	h.decodedFields = nil
+}
+
+// SetDecoderMaxTableSize updates the maximum dynamic table size for the HPACK decoder.
+// This should be called when the peer signals a change via a SETTINGS_HEADER_TABLE_SIZE update.
+func (h *HpackAdapter) SetDecoderMaxTableSize(size uint32) {
+	if h.decoder != nil {
+		h.decoder.SetMaxDynamicTableSize(size)
+	}
+	h.maxTableSize = size // Update stored size, assuming it's for the decoder or a shared default
+}
+
+// SetEncoderMaxTableSize updates the maximum dynamic table size for the HPACK encoder.
+// This reflects the maximum table size that the remote peer (our decoder) can handle,
+// learned via its SETTINGS_HEADER_TABLE_SIZE.
+func (h *HpackAdapter) SetEncoderMaxTableSize(size uint32) {
+	if h.encoder != nil {
+		h.encoder.SetMaxDynamicTableSize(size)
+	}
+	// If HpackAdapter.maxTableSize was intended to be specific to the encoder,
+	// this would update it. For now, assuming it's decoder-related or a general default.
+}
+
+// Encode encodes a list of header fields using HPACK.
+// The encoded bytes are returned as a new slice.
+func (h *HpackAdapter) Encode(headers []hpack.HeaderField) []byte {
+	if h.encoder == nil {
+		// This case should ideally not be reached if NewHpackAdapter is always used.
+		// Consider logging an error or returning an error if the API allowed.
+		return nil
+	}
+	h.encodeBuf.Reset() // Reset internal buffer for this encoding operation
+	for _, hf := range headers {
+		h.encoder.WriteField(hf)
+	}
+	// Return a copy of the encoded bytes, as the internal buffer will be reused.
+	encodedBytes := make([]byte, h.encodeBuf.Len())
+	copy(encodedBytes, h.encodeBuf.Bytes())
+	return encodedBytes
 }
 
 // Encoder wraps an hpack.Encoder.
