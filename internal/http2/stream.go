@@ -428,10 +428,6 @@ func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream b
 // processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
 // after flow control accounting has been done.
 // It writes data to the request body pipe and handles END_STREAM.
-
-// processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
-// after flow control accounting has been done.
-// It writes data to the request body pipe and handles END_STREAM.
 func (s *Stream) processIncomingDataBody(data []byte, endStream bool) error {
 	// This method is called after flow control windows have been debited by handleDataFrame.
 	// It's responsible for writing to the pipe and handling END_STREAM.
