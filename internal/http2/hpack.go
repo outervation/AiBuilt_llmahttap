@@ -30,8 +30,29 @@ func (h *HpackAdapter) emitHeaderField(hf hpack.HeaderField) {
 }
 
 // NewHpackAdapter creates a new HpackAdapter for HPACK encoding and decoding.
-// initialMaxTableSize is the initial maximum dynamic table size setting for both
-// the encoder and decoder's dynamic tables. See RFC 7541, Section 4.2.
+//
+// The initialMaxTableSize parameter specifies the initial capacity for the dynamic
+// header compression tables.
+//
+// It initializes:
+//   - An internal buffer (`encodeBuf`) for HPACK encoding operations.
+//   - An HPACK encoder (`hpack.Encoder`), configured to write to `encodeBuf`.
+//     Its maximum dynamic table size is set to initialMaxTableSize. This value dictates
+//     the maximum size of the dynamic table the encoder will use. It should generally
+//     be updated via SetEncoderMaxTableSize() once the peer's SETTINGS_HEADER_TABLE_SIZE
+//     is known, as the encoder must respect the peer's limit.
+//   - An HPACK decoder (`hpack.Decoder`). Its dynamic table size is set to
+//     initialMaxTableSize. This is the size of the dynamic table our server will allocate
+//     and use for decoding incoming headers from the peer. This value should align with
+//     the SETTINGS_HEADER_TABLE_SIZE our server advertises to the peer.
+//     The decoder is configured with an emit function (the adapter's emitHeaderField method)
+//     to collect decoded hpack.HeaderField values internally.
+//
+// The adapter's internal maxTableSize field (primarily reflecting the decoder's current
+// table size setting) is also initialized to initialMaxTableSize.
+//
+// See RFC 7541 (HPACK) Section 4.2 "Dynamic Table Management" and RFC 7540 (HTTP/2)
+// Section 6.5.2 "SETTINGS_HEADER_TABLE_SIZE" for more details on dynamic table sizing.
 func NewHpackAdapter(initialMaxTableSize uint32) *HpackAdapter {
 	adapter := &HpackAdapter{
 		encodeBuf:     new(bytes.Buffer),
