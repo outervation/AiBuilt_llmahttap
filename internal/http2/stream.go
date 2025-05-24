@@ -292,41 +292,157 @@ func (s *Stream) SendHeaders(headers []hpack.HeaderField, endStream bool) error 
 
 // WriteData sends a chunk of the response body.
 func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
-	s.mu.Lock()
+	s.mu.Lock() // Initial lock for checks
 	if !s.responseHeadersSent {
 		s.mu.Unlock()
 		s.conn.logger.Error("stream: WriteData called before SendHeaders", logger.LogFields{"stream_id": s.id})
 		return 0, NewStreamError(s.id, ErrCodeInternalError, "SendHeaders must be called before WriteData")
 	}
+	// Check if stream is in a state where sending DATA is allowed, or if it's already ended from server side.
 	if (s.state == StreamStateHalfClosedLocal && s.endStreamSentToClient) || s.state == StreamStateClosed || s.pendingRSTCode != nil {
-		s.mu.Unlock()
 		errCode := ErrCodeStreamClosed
-		if s.pendingRSTCode != nil {
+		if s.pendingRSTCode != nil && s.state == StreamStateClosed { // If closed due to RST, use that code.
 			errCode = *s.pendingRSTCode
 		}
-		return 0, NewStreamError(s.id, errCode, "cannot send data on closed, reset, or already ended stream")
+		s.mu.Unlock()
+		return 0, NewStreamError(s.id, errCode, "cannot send data on closed, reset, or already server-ended stream")
+	}
+	s.mu.Unlock() // Unlock before potential blocking operations or multiple send calls
+
+	totalBytesToWrite := len(p)
+	dataOffset := 0
+
+	// Handle case: empty body with endStream=true (zero-length DATA frame with END_STREAM)
+	if totalBytesToWrite == 0 {
+		if !endStream {
+			return 0, nil // Nothing to send, not ending stream.
+		}
+		// Here, len(p) == 0 AND endStream == true. Send empty DATA frame with END_STREAM.
+		// No flow control needed for zero-length DATA frames.
+
+		s.mu.Lock() // Lock for state check and update around sendDataFrame
+		// Check if stream was already ended by another WriteData call concurrently (e.g. WriteTrailers)
+		if s.endStreamSentToClient {
+			s.mu.Unlock()
+			s.conn.logger.Warn("stream: WriteData with endStream=true called, but stream already marked as ended by server", logger.LogFields{"stream_id": s.id})
+			return 0, NewStreamError(s.id, ErrCodeInternalError, "stream already ended by a previous write with endStream=true")
+		}
+		// s.state checks already done above, assuming it hasn't changed to closed by a concurrent RST *after* initial unlock.
+		// A truly robust check would re-verify s.state here, but that adds complexity for a very racy condition.
+		// If state changed, sendDataFrame might fail or be ignored.
+		s.mu.Unlock() // Unlock for the sendDataFrame call
+
+		// The stub sendDataFrame returns (int, error). We expect 0 bytes for an empty frame.
+		_, sendErr := s.conn.sendDataFrame(s, nil, true)
+
+		s.mu.Lock() // Re-lock for state update
+		if sendErr == nil {
+			s.endStreamSentToClient = true
+			s.transitionStateOnSendEndStream()
+		} else {
+			s.conn.logger.Error("stream: failed to send empty DATA frame with END_STREAM", logger.LogFields{"stream_id": s.id, "error": sendErr.Error()})
+		}
+		s.mu.Unlock()
+		return 0, sendErr
+	}
+
+	// Determine max frame payload size
+	// This should be the MIN(our internal max, peer's SETTINGS_MAX_FRAME_SIZE)
+	// For the stub, s.conn.maxFrameSize is assumed to be this effective value.
+	maxFramePayloadSize := s.conn.maxFrameSize
+	if maxFramePayloadSize == 0 {
+		maxFramePayloadSize = DefaultMaxFrameSize // 16384, default from RFC 7540, 4.2 & 6.5.2
+	}
+	if maxFramePayloadSize < MinAllowedFrameSize { // Ensure it's at least the protocol minimum
+		maxFramePayloadSize = MinAllowedFrameSize
+	}
+
+	for dataOffset < totalBytesToWrite {
+		chunkLen := totalBytesToWrite - dataOffset
+		if chunkLen > int(maxFramePayloadSize) {
+			chunkLen = int(maxFramePayloadSize)
+		}
+
+		// Acquire flow control for this chunk (chunkLen is always > 0 in this loop)
+		// Stream-level FC
+		if errFc := s.fcManager.AcquireSendSpace(uint32(chunkLen)); errFc != nil {
+			s.conn.logger.Error("stream: failed to acquire stream flow control",
+				logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "requested": chunkLen, "available": s.fcManager.GetStreamSendAvailable(), "error": errFc.Error()})
+			return dataOffset, errFc // Return bytes successfully sent so far
+		}
+
+		// Connection-level FC
+		if s.conn.connFCManager != nil { // Defensive, stub might not init
+			if errFc := s.conn.connFCManager.AcquireSendSpace(uint32(chunkLen)); errFc != nil {
+				s.conn.logger.Error("stream: failed to acquire connection flow control",
+					logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "requested": chunkLen, "conn_available": s.conn.connFCManager.GetConnectionSendAvailable(), "error": errFc.Error()})
+				// CRITICAL: Stream FC was acquired but conn FC failed.
+				// The current FlowControlWindow has no "release" or "rollback".
+				// The stream FC remains debited for this failed attempt.
+				// This is a limitation of the current FCW design and needs future improvement
+				// (e.g., try-acquire, or a mechanism to return acquired capacity).
+				// For now, the write fails, and stream FC is effectively "lost" for this operation.
+				return dataOffset, errFc
+			}
+		}
+
+		// Re-check stream state under lock before sending, as it could have changed (e.g., RST received)
+		s.mu.Lock()
+		if s.state == StreamStateClosed || s.pendingRSTCode != nil {
+			s.mu.Unlock()
+			s.conn.logger.Warn("stream: state changed to closed/reset after FC acquire, before sending data chunk",
+				logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "state": s.state.String()})
+			// Acquired FC is "lost" from this operation's view. Connection might be closing.
+			return dataOffset, NewStreamError(s.id, ErrCodeStreamClosed, "stream closed/reset before send data chunk")
+		}
+		if s.endStreamSentToClient { // If another operation (e.g. WriteTrailers) ended the stream.
+			s.mu.Unlock()
+			s.conn.logger.Warn("stream: stream ended by server after FC acquire, before sending data chunk",
+				logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen})
+			return dataOffset, NewStreamError(s.id, ErrCodeInternalError, "stream ended by server before send data chunk")
+		}
+		s.mu.Unlock() // Unlock for the sendDataFrame call
+
+		chunkData := p[dataOffset : dataOffset+chunkLen]
+		isLastChunk := (dataOffset + chunkLen) == totalBytesToWrite
+		frameEndStream := isLastChunk && endStream
+
+		bytesSentThisChunk, sendErr := s.conn.sendDataFrame(s, chunkData, frameEndStream)
+
+		if sendErr != nil {
+			s.conn.logger.Error("stream: sendDataFrame failed for data chunk",
+				logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "error": sendErr.Error()})
+			// dataOffset is not incremented for *this* chunk.
+			// Acquired FC for this chunk is "lost" if send truly failed.
+			return dataOffset, sendErr
+		}
+
+		if bytesSentThisChunk != chunkLen {
+			// This implies the underlying connection write was partial but didn't error.
+			// This is complex to handle gracefully; usually means connection issues.
+			// For simplicity, treat as an error condition if not all bytes were "accepted" by sendDataFrame.
+			s.conn.logger.Error("stream: sendDataFrame reported partial write without error",
+				logger.LogFields{"stream_id": s.id, "expected_len": chunkLen, "sent_len": bytesSentThisChunk})
+			dataOffset += bytesSentThisChunk // Still account for what was sent
+			return dataOffset, fmt.Errorf("sendDataFrame reported partial write (%d/%d) for stream %d without error", bytesSentThisChunk, chunkLen, s.id)
+		}
+
+		dataOffset += chunkLen
+	}
+
+	// After loop, all data is sent.
+	s.mu.Lock()
+	if endStream {
+		// This check ensures that if multiple WriteData calls occur,
+		// or if WriteTrailers is called, endStreamSentToClient is set only once.
+		if !s.endStreamSentToClient {
+			s.endStreamSentToClient = true
+			s.transitionStateOnSendEndStream()
+		}
 	}
 	s.mu.Unlock()
 
-	if len(p) == 0 && !endStream {
-		return 0, nil // Nothing to send, not ending stream.
-	}
-
-	bytesWritten, err := s.conn.sendDataFrame(s, p, endStream) // This method in conn must handle its own locking.
-
-	s.mu.Lock() // Re-lock to update stream state
-	defer s.mu.Unlock()
-
-	if err != nil {
-		// If sending data failed, don't update stream state based on send.
-		return bytesWritten, err
-	}
-
-	if endStream {
-		s.endStreamSentToClient = true
-		s.transitionStateOnSendEndStream() // Update state based on sending END_STREAM
-	}
-	return bytesWritten, nil
+	return totalBytesToWrite, nil
 }
 
 // WriteTrailers sends trailing headers.
