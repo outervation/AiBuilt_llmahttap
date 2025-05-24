@@ -423,6 +423,73 @@ func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream b
 	return nil
 }
 
+// handleDataFrame is called by the connection when a DATA frame is received for this stream.
+// It handles flow control, state checks, and then passes data to processIncomingDataBody.
+func (s *Stream) handleDataFrame(frame *DataFrame) error {
+	// Check stream state: DATA frames are only permitted in Open or HalfClosedLocal states.
+	// RFC 7540, Section 6.1: "DATA frames ... MUST be associated with a stream. If a DATA frame is
+	// received whose stream is not in "open" or "half-closed (local)" state, the recipient
+	// MUST respond with a stream error (Section 5.4.2) of type STREAM_CLOSED."
+
+	s.mu.Lock()
+	currentState := s.state
+	if currentState != StreamStateOpen && currentState != StreamStateHalfClosedLocal {
+		s.mu.Unlock()
+		s.conn.logger.Error("stream: DATA frame received in invalid state",
+			logger.LogFields{"stream_id": s.id, "state": currentState.String(), "frame_flags": frame.Header().Flags})
+		// The connection will likely send RST_STREAM or GOAWAY based on this error.
+		// If the stream is idle or reserved, it's a connection error (PROTOCOL_ERROR).
+		// If closed or half-closed(remote), it's a stream error (STREAM_CLOSED).
+		// For simplicity here, assume higher level handles precise error code for RST.
+		// We should not process the frame further.
+		s.sendRSTStream(ErrCodeStreamClosed) // Send RST_STREAM with STREAM_CLOSED
+		return NewStreamError(s.id, ErrCodeStreamClosed, "DATA frame in invalid state "+currentState.String())
+	}
+
+	// If END_STREAM was already received on a previous frame (e.g., HEADERS with END_STREAM, or prior DATA with END_STREAM)
+	if s.endStreamReceivedFromClient {
+		s.mu.Unlock()
+		s.conn.logger.Error("stream: DATA frame received after END_STREAM already processed for request",
+			logger.LogFields{"stream_id": s.id, "state": currentState.String(), "frame_flags": frame.Header().Flags})
+		s.sendRSTStream(ErrCodeStreamClosed) // Data after stream closure
+		return NewStreamError(s.id, ErrCodeStreamClosed, "DATA frame received after END_STREAM")
+	}
+	s.mu.Unlock() // Unlock before potentially blocking flow control calls.
+
+	// Account for received data in stream-level flow control.
+	// This may return a StreamError if peer violates flow control (sends too much).
+	dataLen := uint32(len(frame.Data))
+	if err := s.fcManager.DataReceived(dataLen); err != nil {
+		s.conn.logger.Error("stream: stream flow control error on data received",
+			logger.LogFields{"stream_id": s.id, "data_len": dataLen, "error": err.Error()})
+		s.sendRSTStream(ErrCodeFlowControlError) // Send RST_STREAM with FLOW_CONTROL_ERROR
+		return err                               // err is already a StreamError
+	}
+
+	// Notify connection-level flow control about received data.
+	// This may return a ConnectionError if peer violates connection flow control.
+	if s.conn.connFCManager != nil { // Defensive check, stub connection might not have it
+		if err := s.conn.connFCManager.DataReceived(dataLen); err != nil {
+			s.conn.logger.Error("stream: connection flow control error on data received",
+				logger.LogFields{"stream_id": s.id, "data_len": dataLen, "error": err.Error()})
+			// Connection error implies GOAWAY will be sent by connection manager.
+			// This stream will be implicitly closed as part of connection termination.
+			// No need to send RST_STREAM from here, as connection is failing.
+			return err // err is a ConnectionError
+		}
+	}
+
+	// Pass the actual data payload and END_STREAM flag to processIncomingDataBody.
+	// This method handles writing to the pipe for the handler and state transitions.
+	// processIncomingDataBody requires its own locking.
+	if err := s.processIncomingDataBody(frame.Data, frame.Header().Flags&FlagDataEndStream != 0); err != nil {
+		// processIncomingDataBody already logs and potentially sends RST_STREAM on error.
+		return err
+	}
+
+	return nil
+}
+
 // processIncomingData is called by the connection when a DATA frame is received.
 
 // processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
