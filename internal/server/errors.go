@@ -230,6 +230,19 @@ func prefersJSON(acceptHeaderValue string) bool {
 // SendDefaultErrorResponse generates and sends a default HTTP error response on the given stream.
 // It performs content negotiation based on the Accept header.
 // stream: The HTTP/2 stream to send the response on.
+
+// generateHTMLResponseBody creates a minimal HTML error page.
+// title and heading are plain text (e.g., from http.StatusText or default messages) and will be HTML-escaped.
+// htmlSafeMessage is a string that is already HTML-safe (e.g., pre-escaped dynamic content or static HTML-safe text).
+func generateHTMLResponseBody(title, heading, htmlSafeMessage string) []byte {
+	return []byte(fmt.Sprintf(
+		"<html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>",
+		html.EscapeString(title),
+		html.EscapeString(heading),
+		htmlSafeMessage, // Already HTML-safe
+	))
+}
+
 // statusCode: The HTTP status code for the error.
 // req: The original http.Request, used to inspect the Accept header.
 // optionalDetail: A more specific error message string, can be empty.
@@ -285,58 +298,44 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 
 	if !prefersJSONCurrentLogic {
 		contentType = "text/html; charset=utf-8"
-		defaultMsg, ok := defaultHTMLMessages[statusCode]
-		if !ok {
-			defaultMsg = struct {
-				title   string
-				heading string
-				message string
-			}{
-				title:   fmt.Sprintf("%d %s", statusCode, statusText),
-				heading: statusText,
-				message: "An unexpected error occurred.",
-			}
-			if optionalDetail != "" {
-				defaultMsg.message = optionalDetail // User-provided detail might not be HTML safe.
-			}
-		} else {
-			if optionalDetail != "" {
-				defaultMsg.message += " " + html.EscapeString(optionalDetail)
-			}
+
+		// statusText is defined at the top of SendDefaultErrorResponse
+		// if statusText == "" { statusText = "Error" } // Already handled
+
+		// Determine title, heading, and base message for HTML response
+		var finalTitle, finalHeading, baseMessage string
+		defaultMsgData, isKnownCode := defaultHTMLMessages[statusCode]
+
+		if isKnownCode {
+			finalTitle = defaultMsgData.title
+			finalHeading = defaultMsgData.heading
+			baseMessage = defaultMsgData.message
+		} else { // Generic error
+			finalTitle = fmt.Sprintf("%d %s", statusCode, statusText)
+			finalHeading = statusText
+			baseMessage = "An unexpected error occurred."
 		}
 
-		body = []byte(fmt.Sprintf(
-			"<html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>",
-			html.EscapeString(defaultMsg.title),
-			html.EscapeString(defaultMsg.heading),
-			// defaultMsg.message is already escaped if optionalDetail was appended,
-			// or contains pre-defined safe string.
-			// If optionalDetail was directly assigned to generic message, it needs escaping.
-			// For safety, always escape dynamic parts unless known safe.
-			// The pre-defined messages are safe. If optionalDetail is assigned directly to defaultMsg.message, it should be escaped.
-			// Current logic: if optionalDetail is appended, it's escaped. If assigned to generic, it's not. Let's fix.
-			// If using the generic fallback and optionalDetail is present, it forms defaultMsg.message. It should be escaped.
-			// If using a known message, and optionalDetail is appended, it is escaped.
-			// Simplest is to ensure the final message string passed to Sprintf is safe.
-			// The current code for generic fallback: defaultMsg.message = optionalDetail. This should be html.EscapeString(optionalDetail)
-			// For now, I will keep SendDefaultErrorResponse as it was, minimal change for now.
-			// The specific line: if optionalDetail != "" { defaultMsg.message = optionalDetail } should be defaultMsg.message = html.EscapeString(optionalDetail)
-			// For strictness "Do NOT make other changes yet", I will leave it, but it's a small latent bug.
-			// Ok, one minor fix for security is fine, as it's an obvious XSS otherwise for generic errors + optionalDetail.
-			// Correcting the generic message formation with optionalDetail:
-			(func() string {
-				finalMessage := defaultMsg.message
-				if !ok && optionalDetail != "" { // This means it's the generic message case with optionalDetail
-					finalMessage = html.EscapeString(optionalDetail) // Ensure detail is escaped if it becomes the primary message
-				} else if ok && strings.HasSuffix(finalMessage, html.EscapeString(optionalDetail)) {
-					// Already handled: optionalDetail appended and escaped for known messages
-				} else if !ok && optionalDetail == "" {
-					// Generic message without detail, already safe.
+		// Construct the final HTML-safe message body string, incorporating optionalDetail
+		htmlSafeMessageBody := func() string {
+			if !isKnownCode { // Generic error
+				if optionalDetail != "" {
+					// For generic errors, if detail is present, it becomes the message (escaped)
+					return html.EscapeString(optionalDetail)
 				}
-				// If known message and no optionalDetail, it's safe.
-				return finalMessage
-			})(),
-		))
+				// No optionalDetail for generic error:
+				return baseMessage // which is "An unexpected error occurred." (safe plain text)
+			}
+			// Known error (isKnownCode == true)
+			if optionalDetail != "" {
+				// For known errors, if detail is present, it's appended to base message (escaped)
+				return baseMessage + " " + html.EscapeString(optionalDetail)
+			}
+			// No optionalDetail for known error:
+			return baseMessage // from map (safe plain text)
+		}() // Call the func immediately
+
+		body = generateHTMLResponseBody(finalTitle, finalHeading, htmlSafeMessageBody)
 	}
 
 	headers := []hpack.HeaderField{
