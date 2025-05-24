@@ -160,7 +160,8 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 		body, err = json.Marshal(errorResp)
 		if err != nil {
 			// Fallback to HTML if JSON marshaling fails, though this should be rare.
-			log.Error("Failed to marshal JSON error response. Falling back to HTML.", logger.LogFields{"error": err})
+			fields := logger.LogFields{"error": err}
+			log.Error("Failed to marshal JSON error response. Falling back to HTML.", fields)
 			prefersJSON = false // Force HTML path
 		}
 	}
