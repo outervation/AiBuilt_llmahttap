@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -300,6 +301,7 @@ func getRealClientIP(remoteAddr string, headers http.Header, realIPHeaderName st
 
 // LogAccess constructs and writes an access log entry.
 // This is a placeholder for full implementation.
+
 func (al *AccessLogger) LogAccess(
 	req *http.Request,
 	streamID uint32,
@@ -313,56 +315,57 @@ func (al *AccessLogger) LogAccess(
 
 	// Determine remote_addr and remote_port
 	remoteAddrFull := req.RemoteAddr
-	_, clientPortStr, err := net.SplitHostPort(remoteAddrFull)
-	if err != nil {
-		// Could be just an IP, or malformed.
+	clientHost, clientPortStr, errSplit := net.SplitHostPort(remoteAddrFull)
+	if errSplit != nil {
+		// Could be just an IP, or malformed (e.g. Unix socket path).
 		// For logging, we'll try to use remoteAddrFull as IP if it's not splitable.
-		clientPortStr = "0" // Or some other indicator of unknown port
+		clientHost = remoteAddrFull // Use full address as host part if split fails
+		clientPortStr = "0"         // Default port if not parsable
 	}
 
 	realIPHeaderName := ""
 	if al.config.RealIPHeader != nil {
 		realIPHeaderName = *al.config.RealIPHeader
 	}
-	resolvedRemoteAddr := getRealClientIP(remoteAddrFull, req.Header, realIPHeaderName, al.parsedProxies)
+	// Note: getRealClientIP expects the host part of remoteAddr, not host:port.
+	resolvedRemoteAddr := getRealClientIP(clientHost, req.Header, realIPHeaderName, al.parsedProxies)
 
-	// Placeholder for JSON structure, adapt to spec 3.3.2
-	logEntry := map[string]interface{}{
-
-		"ts":           getTimestamp(), // ISO 8601 with millisecond
-		"remote_addr":  resolvedRemoteAddr,
-		"remote_port":  clientPortStr, // Note: This is direct peer's port.
-		"protocol":     req.Proto,
-		"method":       req.Method,
-		"uri":          req.RequestURI,
-		"status":       status,
-		"resp_bytes":   responseBytes,
-		"duration_ms":  duration.Milliseconds(),
-		"h2_stream_id": streamID,
-	}
-	if ua := req.UserAgent(); ua != "" {
-		logEntry["user_agent"] = ua
-	}
-	if ref := req.Referer(); ref != "" {
-		logEntry["referer"] = ref
+	clientPort := 0 // Default if parsing fails
+	parsedPort, errParsePort := strconv.Atoi(clientPortStr)
+	if errParsePort == nil {
+		clientPort = parsedPort
+	} else if clientPortStr != "0" && clientPortStr != "" {
+		// Silently use 0 if port parsing fails.
+		// This could be logged to an error log if it's considered important.
 	}
 
-	// TODO: Ensure atomic writes for file targets if al.mu is used.
-	// For now, log.Logger handles its own synchronization for a single writer.
-	// If format is "json"
-	if al.config.Format == "json" {
-		jsonData, err := json.Marshal(logEntry)
-		if err != nil {
-			// Log marshalling error to error logger?
-			al.logger.Printf("Error marshalling access log entry: %v", err) // Fallback
-			return
-		}
-		al.logger.Println(string(jsonData)) // log.Logger adds its own newline
-	} else {
-		// Fallback or CLF format (not specified for this stage)
-		al.logger.Printf("%s %s %s %s %d %d %dms (stream %d)",
-			logEntry["ts"], resolvedRemoteAddr, req.Method, req.RequestURI, status, responseBytes, duration.Milliseconds(), streamID)
+	entry := AccessLogEntry{
+		Timestamp:     getTimestamp(),
+		RemoteAddr:    resolvedRemoteAddr,
+		RemotePort:    clientPort,
+		Protocol:      req.Proto,
+		Method:        req.Method,
+		URI:           req.RequestURI, // Includes path and query
+		Status:        status,
+		ResponseBytes: responseBytes,
+		DurationMs:    duration.Milliseconds(),
+		H2StreamID:    streamID,
+		UserAgent:     req.UserAgent(), // omitempty handles if empty
+		Referer:       req.Referer(),   // omitempty handles if empty
 	}
+
+	// Config validation ensures al.config.Format is "json" if access log is enabled.
+	jsonData, err := json.Marshal(entry)
+	if err != nil {
+		// Fallback: Log a JSON-formatted error about the marshalling failure.
+		// Using el.logger directly to avoid complex dependencies or recursion.
+		// This internal error message will go to the access log's target.
+		errorMsg := fmt.Sprintf("{\"level\":\"ERROR\", \"ts\":\"%s\", \"msg\":\"Error marshalling access log entry to JSON\", \"error\":\"%s\"}",
+			getTimestamp(), strings.ReplaceAll(err.Error(), "\"", "'")) // Basic sanitization for error string in JSON
+		al.logger.Println(errorMsg)
+		return
+	}
+	al.logger.Println(string(jsonData)) // log.Logger adds its own newline, which is desired.
 }
 
 // Helper to map config.LogLevel to an internal severity level if needed, or just use it directly.
