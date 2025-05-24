@@ -159,13 +159,23 @@ func (h *HpackAdapter) ResetDecoderState() {
 	h.decodedFields = nil
 }
 
-// SetDecoderMaxTableSize updates the maximum dynamic table size for the HPACK decoder.
-// This should be called when the peer signals a change via a SETTINGS_HEADER_TABLE_SIZE update.
-func (h *HpackAdapter) SetDecoderMaxTableSize(size uint32) {
-	if h.decoder != nil {
-		h.decoder.SetMaxDynamicTableSize(size)
+// SetMaxDecoderDynamicTableSize updates the maximum dynamic table size that this
+// HpackAdapter's internal HPACK decoder will support. This value corresponds to
+// the SETTINGS_HEADER_TABLE_SIZE that our server advertises to the peer.
+//
+// It calls the underlying hpack.Decoder's SetMaxDynamicTableSize method.
+// The golang.org/x/net/http2/hpack.Decoder's SetMaxDynamicTableSize method
+// does not return an error. This adapter method returns an error only if the
+// internal decoder is not initialized.
+//
+// It also updates the adapter's internal record of this size (h.maxTableSize).
+func (h *HpackAdapter) SetMaxDecoderDynamicTableSize(size uint32) error {
+	if h.decoder == nil {
+		return errors.New("hpack: HpackAdapter.decoder not initialized")
 	}
-	h.maxTableSize = size // Update stored size, assuming it's for the decoder or a shared default
+	h.decoder.SetMaxDynamicTableSize(size) // Underlying call does not return an error
+	h.maxTableSize = size                  // Update stored size, reflecting the decoder's new capacity
+	return nil
 }
 
 // SetEncoderMaxTableSize updates the maximum dynamic table size for the HPACK encoder.
