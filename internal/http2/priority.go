@@ -264,26 +264,34 @@ func (pt *PriorityTree) UpdatePriority(streamID uint32, depStreamID uint32, weig
 }
 
 // ProcessPriorityFrame updates stream priorities based on a PRIORITY frame.
-// streamID is the ID of the stream whose priority is being updated (from PRIORITY frame header).
-func (pt *PriorityTree) ProcessPriorityFrame(streamID uint32, frame *PriorityFrame) error {
+// It is called when a PRIORITY frame is received for a connection.
+func (pt *PriorityTree) ProcessPriorityFrame(frame *PriorityFrame) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
+	// The PRIORITY frame is associated with the stream identified in its header.
+	streamID := frame.Header().StreamID
+
 	if streamID == 0 {
 		// PRIORITY frames MUST NOT be sent on stream 0.
+		// RFC 7540, Section 6.3: "The PRIORITY frame is associated with the stream identified in the frame header."
+		// RFC 7540, Section 5.1: "Stream identifiers cannot be reused. Long-lived connections can result in an endpoint exhausting the available range of stream identifiers.
+		// A client that is unable to establish a new stream identifier can establish a new connection for new streams.
+		// A server that is unable to establish a new stream identifier can send a GOAWAY frame (Section 6.8) so that the client is forced to open a new connection for new streams."
+		// Section 6.3 also states: "If a PRIORITY frame is received with a stream identifier of 0x0, the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
 		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "PRIORITY frame received on stream 0"}
 	}
 
-	// PRIORITY frame defines all necessary parameters for updatePriorityNoLock.
-	// The streamID for the PRIORITY frame itself is the stream being reprioritized.
+	// The PRIORITY frame's payload (frame.StreamDependency, frame.Weight, frame.Exclusive)
+	// defines the new priority settings for the 'streamID' identified in the frame header.
 	err := pt.UpdatePriority(streamID, frame.StreamDependency, frame.Weight, frame.Exclusive)
 	if err != nil {
-		// updatePriorityNoLock returns fmt.Errorf for "cannot depend on itself".
-		// For PRIORITY frames, this is a StreamError.
+		// UpdatePriority can return an error if streamID tries to depend on itself.
+		// RFC 7540, Section 5.3.3: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
 		if strings.Contains(err.Error(), "cannot depend on itself") {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself in PRIORITY frame: %v", streamID, err)}
 		}
-		// Other errors from updatePriorityNoLock might be internal or unexpected.
+		// Other errors from UpdatePriority might indicate internal issues or inconsistencies.
 		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error processing PRIORITY frame for stream %d: %v", streamID, err)}
 	}
 	return nil
