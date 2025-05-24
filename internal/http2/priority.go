@@ -1,10 +1,12 @@
 package http2
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // priorityNode stores individual stream priority information.
 // As per RFC 7540 Section 5.3.
-// This struct is not typically exported, as its fields are managed by PriorityTree.
 type priorityNode struct {
 	// streamID is the ID of the stream this node represents.
 	streamID uint32
@@ -21,21 +23,7 @@ type priorityNode struct {
 	parentID uint32
 
 	// childrenIDs is a list of stream IDs that are direct children of this node.
-	// The order might matter for some scheduling algorithms, but RFC 7540
-	// does not specify order significance beyond weight.
 	childrenIDs []uint32
-
-	// exclusive indicates if this stream was made an exclusive child of its parent
-	// when its dependency was last set. If true, it implies that when this
-	// dependency was established, this stream became the sole child of parentID,
-	// and any previous children of parentID became children of this stream.
-	// The ongoing state of exclusivity might be complex if the parent's children
-	// list is modified subsequently by other operations.
-	exclusive bool
-
-	// Note: Additional fields for scheduler optimization (e.g., pointers to parent/child nodes,
-	// total child weights, active child count) could be added but are omitted here
-	// to stick to the core structural definition based on the spec's primary requirements.
 }
 
 // PriorityTree manages all priorityNodes and stream dependencies for a connection.
@@ -43,34 +31,300 @@ type priorityNode struct {
 // Stream 0 is the implicit root of the tree, and all streams are initially
 // dependent on stream 0.
 type PriorityTree struct {
-	// mu protects access to the nodes map and the internal structure of priorityNodes
-	// if they were to be modified directly by multiple goroutines (though typically
-	// modifications would be serialized through PriorityTree methods).
-	mu sync.RWMutex
-
-	// nodes maps a stream ID to its priorityNode.
-	// This map includes a node for stream 0, which acts as the root.
+	mu    sync.RWMutex
 	nodes map[uint32]*priorityNode
+}
+
+// streamDependencyInfo holds priority information for a stream.
+// Used internally when adding streams.
+type streamDependencyInfo struct {
+	StreamDependency uint32 // Stream ID of the parent stream
+	Weight           uint8  // Weight (0-255, effective 1-256)
+	Exclusive        bool   // Exclusive flag for the operation
 }
 
 // NewPriorityTree creates and initializes a new PriorityTree.
 // It sets up stream 0 as the root of the priority tree.
 func NewPriorityTree() *PriorityTree {
-	// Stream 0 is the root of the tree. It has no parent and its weight is not relevant.
-	// PRIORITY frames cannot be sent *on* stream 0.
 	rootNode := &priorityNode{
 		streamID:    0,
 		weight:      0, // Weight is not applicable to stream 0 itself.
-		parentID:    0, // Conventionally, root's parent can be 0 or a special marker.
+		parentID:    0, // Root's parent is conventionally 0.
 		childrenIDs: make([]uint32, 0),
-		exclusive:   false, // Exclusivity is not applicable to stream 0 itself.
 	}
-
 	return &PriorityTree{
 		nodes: map[uint32]*priorityNode{
 			0: rootNode,
 		},
 	}
+}
+
+// getOrCreateNodeNoLock retrieves an existing priorityNode for streamID or creates a new one
+// with default dependencies if it doesn't exist.
+// It ensures that stream 0 always exists.
+// This method is NOT thread-safe and expects the caller to hold the lock.
+func (pt *PriorityTree) getOrCreateNodeNoLock(streamID uint32) *priorityNode {
+	if node, exists := pt.nodes[streamID]; exists {
+		return node
+	}
+
+	// New streams are initially dependent on stream 0 (RFC 7540, Section 5.3.1).
+	// Default weight is 16 (frame value 15) (RFC 7540, Section 5.3.2).
+	newNode := &priorityNode{
+		streamID:    streamID,
+		weight:      15, // Default weight 16 (value-1)
+		parentID:    0,  // Default parent is stream 0
+		childrenIDs: make([]uint32, 0),
+	}
+	pt.nodes[streamID] = newNode
+
+	// Add this new node as a child of its default parent (stream 0).
+	// Stream 0 (rootNode) must exist.
+	parentNode := pt.nodes[0]
+	// Check if already a child (defensive, shouldn't be for a new node being default-parented)
+	isAlreadyChild := false
+	for _, childID := range parentNode.childrenIDs {
+		if childID == streamID {
+			isAlreadyChild = true
+			break
+		}
+	}
+	if !isAlreadyChild {
+		parentNode.childrenIDs = append(parentNode.childrenIDs, streamID)
+	}
+	return newNode
+}
+
+// removeChild is a helper to remove a streamID from a slice of children.
+// It returns a new slice. It's a non-mutating helper.
+func removeChild(children []uint32, streamIDToRemove uint32) []uint32 {
+	newChildren := make([]uint32, 0, len(children))
+	for _, childID := range children {
+		if childID != streamIDToRemove {
+			newChildren = append(newChildren, childID)
+		}
+	}
+	return newChildren
+}
+
+// AddStream adds a new stream to the priority tree or updates its priority
+// if it already exists (e.g., due to being referenced as a parent earlier).
+// prioInfo contains the dependency details. If nil, default priority is used.
+// This function is analogous to processing priority info from a HEADERS frame.
+func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInfo) error {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if streamID == 0 {
+		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "cannot add or modify priority for stream 0"}
+	}
+
+	streamNode := pt.getOrCreateNodeNoLock(streamID)
+
+	var newParentID uint32
+	var newWeight uint8
+	var isExclusiveOperation bool
+
+	if prioInfo != nil {
+		newParentID = prioInfo.StreamDependency
+		newWeight = prioInfo.Weight
+		isExclusiveOperation = prioInfo.Exclusive
+	} else {
+		// Default priority if prioInfo is nil
+		newParentID = 0
+		newWeight = 15 // Default weight 16
+		isExclusiveOperation = false
+	}
+
+	if newParentID == streamID {
+		return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: "stream cannot depend on itself"}
+	}
+
+	// Remove stream from its old parent's children list, if it had one.
+	// streamNode.parentID is the ID of the current parent.
+	if oldParentNode, exists := pt.nodes[streamNode.parentID]; exists {
+		oldParentNode.childrenIDs = removeChild(oldParentNode.childrenIDs, streamID)
+	}
+
+	newParentNode := pt.getOrCreateNodeNoLock(newParentID)
+
+	// Update streamNode's properties
+	streamNode.parentID = newParentID
+	streamNode.weight = newWeight
+
+	if isExclusiveOperation {
+		// This stream becomes the sole child of newParentNode.
+		// Other children of newParentNode become children of this stream.
+		previousChildrenOfNewParent := make([]uint32, len(newParentNode.childrenIDs))
+		copy(previousChildrenOfNewParent, newParentNode.childrenIDs)
+
+		newParentNode.childrenIDs = []uint32{streamID} // streamNode is now the only child
+
+		// Preserve streamNode's existing children and append the adopted ones.
+		// (RFC 7540, Section 5.3.2: "If the exclusive stream already has dependents, they remain dependents...")
+		newlyAdoptedChildren := make([]uint32, 0)
+		for _, childID := range previousChildrenOfNewParent {
+			if childID == streamID { // Should not happen
+				continue
+			}
+			childNode := pt.getOrCreateNodeNoLock(childID)
+			childNode.parentID = streamID
+			newlyAdoptedChildren = append(newlyAdoptedChildren, childID)
+		}
+		streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
+
+	} else {
+		// Not exclusive, just add to new parent's children list if not already there.
+		isAlreadyChild := false
+		for _, childID := range newParentNode.childrenIDs {
+			if childID == streamID {
+				isAlreadyChild = true
+				break
+			}
+		}
+		if !isAlreadyChild {
+			newParentNode.childrenIDs = append(newParentNode.childrenIDs, streamID)
+		}
+	}
+	return nil
+}
+
+// ProcessPriorityFrame updates stream priorities based on a PRIORITY frame.
+// streamID is the ID of the stream whose priority is being updated (from PRIORITY frame header).
+func (pt *PriorityTree) ProcessPriorityFrame(streamID uint32, frame *PriorityFrame) error {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if streamID == 0 {
+		// PRIORITY frames MUST NOT be sent on stream 0.
+		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "PRIORITY frame received on stream 0"}
+	}
+
+	newParentID := frame.StreamDependency
+	newWeight := frame.Weight
+	isExclusiveOperation := frame.Exclusive
+
+	if newParentID == streamID {
+		// Stream cannot depend on itself.
+		return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: "stream cannot depend on itself in PRIORITY frame"}
+	}
+
+	streamNode := pt.getOrCreateNodeNoLock(streamID)
+
+	// Remove stream from its old parent's children list.
+	if oldParentNode, exists := pt.nodes[streamNode.parentID]; exists {
+		oldParentNode.childrenIDs = removeChild(oldParentNode.childrenIDs, streamID)
+	}
+
+	newParentNode := pt.getOrCreateNodeNoLock(newParentID)
+
+	// Update streamNode's properties
+	streamNode.parentID = newParentID
+	streamNode.weight = newWeight
+
+	if isExclusiveOperation {
+		previousChildrenOfNewParent := make([]uint32, len(newParentNode.childrenIDs))
+		copy(previousChildrenOfNewParent, newParentNode.childrenIDs)
+		newParentNode.childrenIDs = []uint32{streamID}
+
+		newlyAdoptedChildren := make([]uint32, 0)
+		for _, childID := range previousChildrenOfNewParent {
+			if childID == streamID {
+				continue
+			}
+			childNode := pt.getOrCreateNodeNoLock(childID)
+			childNode.parentID = streamID
+			newlyAdoptedChildren = append(newlyAdoptedChildren, childID)
+		}
+		streamNode.childrenIDs = append(streamNode.childrenIDs, newlyAdoptedChildren...)
+	} else {
+		isAlreadyChild := false
+		for _, childID := range newParentNode.childrenIDs {
+			if childID == streamID {
+				isAlreadyChild = true
+				break
+			}
+		}
+		if !isAlreadyChild {
+			newParentNode.childrenIDs = append(newParentNode.childrenIDs, streamID)
+		}
+	}
+	return nil
+}
+
+// RemoveStream removes a stream from the priority tree.
+// Its children are re-parented to the removed stream's parent.
+func (pt *PriorityTree) RemoveStream(streamID uint32) error {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	if streamID == 0 {
+		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "cannot remove stream 0 from priority tree"}
+	}
+
+	streamToRemoveNode, exists := pt.nodes[streamID]
+	if !exists {
+		return nil // Stream not in tree, nothing to remove.
+	}
+
+	// Determine the new parent for the children of the removed stream.
+	// This is the parent of the stream being removed.
+	newParentForChildrenNode, parentExists := pt.nodes[streamToRemoveNode.parentID]
+	if !parentExists {
+		// This indicates an inconsistent tree. Fallback to root (stream 0).
+		newParentForChildrenNode = pt.nodes[0]
+	}
+
+	// Remove streamID from its (original) parent's children list.
+	if originalParentNode, ok := pt.nodes[streamToRemoveNode.parentID]; ok {
+		originalParentNode.childrenIDs = removeChild(originalParentNode.childrenIDs, streamID)
+	}
+
+	// Re-parent children of the removed stream.
+	for _, childID := range streamToRemoveNode.childrenIDs {
+		childNode, childExists := pt.nodes[childID]
+		if !childExists {
+			continue // Child already removed or tree inconsistent.
+		}
+		childNode.parentID = newParentForChildrenNode.streamID
+
+		// Add childID to newParentForChildrenNode's children list if not already there.
+		isAlreadyChild := false
+		for _, c := range newParentForChildrenNode.childrenIDs {
+			if c == childID {
+				isAlreadyChild = true
+				break
+			}
+		}
+		if !isAlreadyChild {
+			newParentForChildrenNode.childrenIDs = append(newParentForChildrenNode.childrenIDs, childID)
+		}
+	}
+
+	delete(pt.nodes, streamID)
+	return nil
+}
+
+// GetDependencies returns the parent ID, children IDs, and weight for a given stream.
+// Returns an error if the stream is not found (except for stream 0).
+func (pt *PriorityTree) GetDependencies(streamID uint32) (parentID uint32, childrenIDs []uint32, weight uint8, err error) {
+	pt.mu.RLock()
+	defer pt.mu.RUnlock()
+
+	node, exists := pt.nodes[streamID]
+	if !exists {
+		// Stream 0 should always exist due to NewPriorityTree.
+		// If it's requested and missing, it's an internal error.
+		if streamID == 0 {
+			return 0, nil, 0, &ConnectionError{Code: ErrCodeInternalError, Msg: "internal error: stream 0 node unexpectedly missing"}
+		}
+		return 0, nil, 0, fmt.Errorf("stream %d not found in priority tree", streamID)
+	}
+
+	childrenCopy := make([]uint32, len(node.childrenIDs))
+	copy(childrenCopy, node.childrenIDs)
+
+	return node.parentID, childrenCopy, node.weight, nil
 }
 
 // TODO: Implement methods for PriorityTree:
