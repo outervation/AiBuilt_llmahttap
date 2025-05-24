@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http" // For http.Header, if we decide to use it directly in Request struct
-	"net/url"  // For url.URL
-	"strings"  // For pseudo-header check
+
+	"fmt"     // For error formatting, Sprintf
+	"net/url" // For url.URL
+	"strings" // For pseudo-header check
 	"sync"
 
 	"example.com/llmahttap/v2/internal/logger" // For logging within stream operations
@@ -943,6 +945,70 @@ func (s *Stream) processPriorityUpdate(depStreamID uint32, weight uint8, exclusi
 	// Note: This only updates the stream's record. The connection's PriorityTree
 	// is updated by the connection itself when it processes the PRIORITY frame or
 	// priority info from HEADERS.
+}
+
+// handlePriorityFrame is called by the connection when a PRIORITY frame is received for this stream.
+// It validates the frame in the context of this stream and then delegates the priority
+// update logic to the connection's PriorityTree.
+func (s *Stream) handlePriorityFrame(frame *PriorityFrame) error {
+	s.conn.logger.Debug("stream: received PRIORITY frame", logger.LogFields{
+		"stream_id":        s.id,
+		"frame_stream_id":  frame.Header().StreamID, // Should match s.id if dispatched correctly
+		"frame_dependency": frame.StreamDependency,
+		"frame_weight":     frame.Weight,
+		"frame_exclusive":  frame.Exclusive,
+	})
+
+	// The PRIORITY frame's StreamID in its header MUST be non-zero.
+	// This is checked by PriorityTree.ProcessPriorityFrame, which returns ConnectionError(PROTOCOL_ERROR).
+	// If frame.Header().StreamID != s.id, it's a dispatch error by the connection layer.
+	if frame.Header().StreamID != s.id {
+		msg := fmt.Sprintf("PRIORITY frame stream ID %d in frame header does not match stream object ID %d", frame.Header().StreamID, s.id)
+		s.conn.logger.Error("stream: PRIORITY frame ID mismatch (server dispatch error)", logger.LogFields{
+			"stream_id":       s.id,
+			"frame_stream_id": frame.Header().StreamID,
+			"error_msg":       msg,
+		})
+		// This is an internal server error, not a client protocol violation directly related to this stream's PRIORITY rules.
+		return NewConnectionError(ErrCodeInternalError, msg)
+	}
+
+	// RFC 7540, Section 6.3: "A PRIORITY frame can be sent on a stream in any state..."
+	// No explicit state check needed here for CanReceiveFrame(FramePriority) as it's always allowed.
+
+	if s.conn.priorityTree == nil {
+		s.conn.logger.Warn("stream: priority tree not available on connection, PRIORITY frame ignored",
+			logger.LogFields{"stream_id": s.id})
+		return nil // Effectively ignored if no priority system is in place.
+	}
+
+	// Delegate to the connection's priority tree to handle the update.
+	// PriorityTree.ProcessPriorityFrame handles:
+	// - ConnectionError(PROTOCOL_ERROR) if frame.Header().StreamID == 0 (though dispatcher should prevent).
+	// - StreamError(PROTOCOL_ERROR) if frame.Header().StreamID attempts to depend on itself.
+	err := s.conn.priorityTree.ProcessPriorityFrame(frame)
+	if err != nil {
+		s.conn.logger.Error("stream: error processing PRIORITY frame via PriorityTree", logger.LogFields{
+			"stream_id": s.id,
+			"error":     err.Error(),
+		})
+
+		// If it's a StreamError specific to *this* stream (e.g., self-dependency from frame content),
+		// the stream should be reset.
+		if streamErr, ok := err.(*StreamError); ok && streamErr.StreamID == s.id {
+			s.sendRSTStream(streamErr.Code) // This will handle state transition and cleanup.
+		}
+		// The original error (StreamError or ConnectionError) is returned to the connection
+		// so it can decide on further actions (e.g., GOAWAY for ConnectionError).
+		return err
+	}
+
+	// If the priority tree update was successful, update the stream's local cache of its priority.
+	// This stream object might store priority info for local reference, but PriorityTree is authoritative.
+	s.processPriorityUpdate(frame.StreamDependency, frame.Weight, frame.Exclusive)
+
+	s.conn.logger.Debug("stream: PRIORITY frame processed successfully", logger.LogFields{"stream_id": s.id})
+	return nil
 }
 
 // Context returns the stream's context.
