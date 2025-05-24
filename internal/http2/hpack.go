@@ -7,6 +7,17 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
+// HpackAdapter provides a unified interface for HPACK encoding and decoding.
+// It wraps golang.org/x/net/http2/hpack.Encoder and hpack.Decoder,
+// managing their state and associated buffers.
+type HpackAdapter struct {
+	encoder       *hpack.Encoder
+	decoder       *hpack.Decoder
+	encodeBuf     *bytes.Buffer
+	decodedFields []hpack.HeaderField // Buffer for storing decoded fields, reset per decoding operation
+	maxTableSize  uint32              // Stores the current max dynamic table size
+}
+
 var _ io.Reader // Use io package to avoid "imported and not used" error
 
 // Encoder wraps an hpack.Encoder.
