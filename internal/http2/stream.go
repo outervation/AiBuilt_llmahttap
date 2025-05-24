@@ -888,7 +888,7 @@ func (s *Stream) sendRSTStream(errorCode ErrorCode) error {
 	// Failed to send RST_STREAM.
 	s.pendingRSTCode = nil
 	s.conn.logger.Error("stream: failed to send RST_STREAM", logger.LogFields{"stream_id": s.id, "error_code": errorCode.String(), "send_error": err.Error()})
-	s.mu.Unlock()
+	// s.mu.Unlock() // This was line 890; the defer s.mu.Unlock() handles this.
 	return err // Return the send error
 }
 
