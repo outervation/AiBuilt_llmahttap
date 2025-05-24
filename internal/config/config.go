@@ -289,38 +289,39 @@ func applyDefaults(cfg *Config) {
 	// Defaults for StaticFileServerConfig
 	if cfg.Routing != nil {
 		for i := range cfg.Routing.Routes {
-			if cfg.Routing.Routes[i].HandlerType == "StaticFileServer" {
-				// This is tricky because HandlerConfig is json.RawMessage.
-				// Actual unmarshalling and default application for specific handlers
-				// should ideally happen when the handler is instantiated.
-				// However, we can set defaults for commonly expected StaticFileServer fields
-				// if we unmarshal it temporarily here, or document that handlers must manage their own defaults.
-				// For now, let's assume handlers manage their own full default setup.
-				// Example for IndexFiles if we were to do it here:
-				/*
-				   var sfsCfg StaticFileServerConfig
-				   if cfg.Routing.Routes[i].HandlerConfig != nil {
-				       if err := json.Unmarshal(cfg.Routing.Routes[i].HandlerConfig, &sfsCfg); err == nil {
-				           if sfsCfg.IndexFiles == nil {
-				               sfsCfg.IndexFiles = []string{"index.html"}
-				           }
-				           if sfsCfg.ServeDirectoryListing == nil {
-				               b := false
-				               sfsCfg.ServeDirectoryListing = &b
-				           }
-				           // Re-marshal back to HandlerConfig if modified
-				           // updatedHandlerConfig, _ := json.Marshal(sfsCfg)
-				           // cfg.Routing.Routes[i].HandlerConfig = updatedHandlerConfig
-				       }
-				   } else {
-				       // If HandlerConfig is nil, create a default one
-				       // sfsCfg.IndexFiles = []string{"index.html"}
-				       // b := false
-				       // sfsCfg.ServeDirectoryListing = &b
-				       // defaultHandlerConfig, _ := json.Marshal(sfsCfg)
-				       // cfg.Routing.Routes[i].HandlerConfig = defaultHandlerConfig
-				   }
-				*/
+			if route := &cfg.Routing.Routes[i]; route.HandlerType == "StaticFileServer" {
+				// Apply defaults for StaticFileServerConfig if HandlerConfig is present and parsable.
+				// Validation will later ensure HandlerConfig is present and DocumentRoot is set.
+				handlerConfigProvided := route.HandlerConfig != nil && len(route.HandlerConfig) > 0 && string(route.HandlerConfig) != "null"
+
+				if handlerConfigProvided {
+					var sfsCfg StaticFileServerConfig
+					// Save original HandlerConfig in case marshalling the defaulted version fails.
+					originalHandlerConfig := route.HandlerConfig
+
+					if err := json.Unmarshal(route.HandlerConfig, &sfsCfg); err == nil {
+						// Unmarshal succeeded, now apply defaults to sfsCfg's optional fields.
+						if sfsCfg.IndexFiles == nil {
+							sfsCfg.IndexFiles = []string{"index.html"} // Default from spec 2.2.2
+						}
+						if sfsCfg.ServeDirectoryListing == nil {
+							b := false // Default from spec 2.2.3
+							sfsCfg.ServeDirectoryListing = &b
+						}
+
+						// Marshal the (potentially modified) sfsCfg back to HandlerConfig.
+						updatedHandlerConfig, errMarshal := json.Marshal(sfsCfg)
+						if errMarshal == nil {
+							route.HandlerConfig = updatedHandlerConfig
+						} else {
+							// If marshalling fails (should be rare), revert to original to avoid corruption.
+							// A log message here would be good in a real scenario.
+							route.HandlerConfig = originalHandlerConfig
+						}
+					}
+					// If unmarshalling route.HandlerConfig failed, it's likely malformed.
+					// We leave it as is; validateConfig should catch structural issues.
+				}
 			}
 		}
 	}
