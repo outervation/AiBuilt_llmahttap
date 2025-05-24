@@ -20,6 +20,16 @@ type HpackAdapter struct {
 
 var _ io.Reader // Use io package to avoid "imported and not used" error
 
+// emitHeaderField is the callback function for the hpack.Decoder.
+// It appends decoded header fields to the HpackAdapter's decodedFields slice.
+func (h *HpackAdapter) emitHeaderField(hf hpack.HeaderField) {
+	// According to golang.org/x/net/http2/hpack documentation,
+	// HeaderField is a struct with string fields. Strings are immutable,
+	// so direct append is safe. If Name/Value were slices or pointers
+	// to mutable data, a deep copy would be needed.
+	h.decodedFields = append(h.decodedFields, hf)
+}
+
 // Encoder wraps an hpack.Encoder.
 type Encoder struct {
 	hpackEncoder *hpack.Encoder
