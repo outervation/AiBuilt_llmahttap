@@ -425,3 +425,53 @@ func (cfcm *ConnectionFlowControlManager) GetConnectionReceiveAvailable() int64 
 	defer cfcm.receiveWindowMu.Unlock()
 	return cfcm.currentReceiveWindowSize
 }
+
+// StreamFlowControlManager manages send and receive flow control for a single HTTP/2 stream.
+type StreamFlowControlManager struct {
+	streamID uint32
+
+	// sendWindow governs how much data this endpoint can send on this stream.
+	// This window is initialized with the peer's SETTINGS_INITIAL_WINDOW_SIZE
+	// and replenished by WINDOW_UPDATE frames from the peer for this stream.
+	sendWindow *FlowControlWindow
+
+	// Receive-side flow control for this stream:
+	receiveWindowMu          sync.Mutex
+	currentReceiveWindowSize int64 // How much more data the peer can send us on this stream.
+	// Initialized with our SETTINGS_INITIAL_WINDOW_SIZE.
+	bytesConsumedTotal     uint64 // Cumulative bytes consumed by our app from this stream.
+	lastWindowUpdateSentAt uint64 // bytesConsumedTotal when last stream WINDOW_UPDATE was sent.
+	windowUpdateThreshold  uint32 // Threshold to send WINDOW_UPDATE for this stream.
+
+	// logger *logger.Logger // Optional: for detailed logging
+
+	// TODO: Add fields for closed state of the stream affecting flow control operations.
+}
+
+// NewStreamFlowControlManager creates a new manager for stream-level flow control.
+// - streamID: The ID of the stream this manager is for.
+// - ourInitialWindowSize: This server's SETTINGS_INITIAL_WINDOW_SIZE. Used for our receive window for this stream.
+// - peerInitialWindowSize: The peer's SETTINGS_INITIAL_WINDOW_SIZE. Used for our send window for this stream.
+func NewStreamFlowControlManager(streamID uint32, ourInitialWindowSize, peerInitialWindowSize uint32) *StreamFlowControlManager {
+	if ourInitialWindowSize > MaxWindowSize {
+		ourInitialWindowSize = MaxWindowSize // Defensive, should be validated by settings handler
+	}
+	if peerInitialWindowSize > MaxWindowSize {
+		peerInitialWindowSize = MaxWindowSize // Defensive
+	}
+
+	sfcm := &StreamFlowControlManager{
+		streamID:                 streamID,
+		sendWindow:               NewFlowControlWindow(peerInitialWindowSize, false, streamID),
+		currentReceiveWindowSize: int64(ourInitialWindowSize),
+		windowUpdateThreshold:    ourInitialWindowSize / 2,
+		// bytesConsumedTotal and lastWindowUpdateSentAt start at 0.
+	}
+
+	// Ensure threshold is at least 1 if initialSize is positive, to allow updates.
+	if sfcm.windowUpdateThreshold == 0 && ourInitialWindowSize > 0 {
+		sfcm.windowUpdateThreshold = 1
+	}
+
+	return sfcm
+}
