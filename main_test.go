@@ -2,9 +2,9 @@ package main
 
 import "testing"
 
-// TestMainExists is a dummy test to ensure 'go test ./...' passes.
-// It can be expanded or removed once real tests are in place.
-func TestMainExists(t *testing.T) {
-	// This test doesn't need to do much, just exist.
-	// It confirms that the main package is testable.
+// TestPlaceholder is a basic test.
+// Its existence helps ensure the 'main' package is recognized as testable.
+func TestPlaceholder(t *testing.T) {
+	// This test performs no actions and always passes.
+	// It's here to satisfy the test runner.
 }
