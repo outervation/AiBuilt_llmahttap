@@ -26,10 +26,10 @@ func NewHandlerRegistry() *HandlerRegistry {
 	}
 }
 
-// RegisterFactory associates a HandlerType string with a factory function.
+// Register associates a HandlerType string with a factory function.
 // This method is thread-safe.
 // It returns an error if a HandlerType is registered more than once.
-func (r *HandlerRegistry) RegisterFactory(handlerType string, factory HandlerFactory) error {
+func (r *HandlerRegistry) Register(handlerType string, factory HandlerFactory) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
