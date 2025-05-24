@@ -421,27 +421,29 @@ func (el *ErrorLogger) LogError(level config.LogLevel, msg string, fields ...map
 }
 
 // Convenience methods on the main Logger
-func (l *Logger) Info(msg string, fields ...map[string]interface{}) {
+
+// Convenience methods on the main Logger
+func (l *Logger) Info(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelInfo, msg, fields...)
+		l.errorLog.LogError(config.LogLevelInfo, msg, context)
 	}
 }
 
-func (l *Logger) Error(msg string, fields ...map[string]interface{}) {
+func (l *Logger) Error(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelError, msg, fields...)
+		l.errorLog.LogError(config.LogLevelError, msg, context)
 	}
 }
 
-func (l *Logger) Debug(msg string, fields ...map[string]interface{}) {
+func (l *Logger) Debug(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelDebug, msg, fields...)
+		l.errorLog.LogError(config.LogLevelDebug, msg, context)
 	}
 }
 
-func (l *Logger) Warn(msg string, fields ...map[string]interface{}) {
+func (l *Logger) Warn(msg string, context LogFields) {
 	if l.errorLog != nil {
-		l.errorLog.LogError(config.LogLevelWarning, msg, fields...)
+		l.errorLog.LogError(config.LogLevelWarning, msg, context)
 	}
 }
 
