@@ -664,6 +664,51 @@ func (s *Stream) processIncomingDataBody(data []byte, endStream bool) error {
 	return nil
 }
 
+// handleRSTStreamFrame is called by the connection when an RST_STREAM frame is received for this stream.
+// It processes the RST_STREAM frame, leading to the stream's closure.
+// This method itself generally doesn't return an error because receiving RST_STREAM is a terminal
+// action for the stream, and errors related to the frame's validity (e.g., on stream 0)
+// are typically connection-level issues handled before dispatching to the stream.
+func (s *Stream) handleRSTStreamFrame(frame *RSTStreamFrame) error {
+	// Log that we are handling an RST_STREAM frame at this entry point.
+	// More detailed logging occurs within processIncomingRSTStream.
+	s.conn.logger.Debug("stream: received RST_STREAM frame, dispatching for processing", logger.LogFields{
+		"stream_id":       s.id,
+		"frame_stream_id": frame.Header().StreamID, // Should match s.id
+		"error_code":      frame.ErrorCode.String(),
+	})
+
+	// Validate that the frame's StreamID matches the stream's ID.
+	// This should ideally be guaranteed by the dispatcher in the connection layer.
+	if frame.Header().StreamID != s.id {
+		msg := fmt.Sprintf("RST_STREAM frame stream ID %d in frame header does not match stream object ID %d", frame.Header().StreamID, s.id)
+		s.conn.logger.Error("stream: RST_STREAM frame ID mismatch (server dispatch error)", logger.LogFields{
+			"stream_id":       s.id,
+			"frame_stream_id": frame.Header().StreamID,
+			"error_msg":       msg,
+		})
+		// This is an internal server error if dispatch was incorrect.
+		return NewConnectionError(ErrCodeInternalError, msg)
+	}
+
+	// RFC 7540, Section 6.4: "RST_STREAM frames MUST be associated with a stream. If a RST_STREAM frame
+	// is received on a stream that is not in the "open", "reserved (local)", "reserved (remote)", or "half-closed"
+	// state, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+	// This check is tricky here because a stream object might be created just before this call
+	// or might be in 'idle' if looked up by ID.
+	// The `processIncomingRSTStream` method already handles the `StreamStateClosed` case gracefully.
+	// If the connection layer dispatched this to an 'idle' stream (by ID), it would be a connection error.
+	// For an existing stream object, any RST_STREAM leads to closure.
+	// We rely on `processIncomingRSTStream` to correctly manage the state transition.
+
+	s.processIncomingRSTStream(frame.ErrorCode)
+
+	// Processing RST_STREAM is a terminal action for the stream and typically doesn't "fail"
+	// in a way that requires an error return to the connection layer (unless the frame itself
+	// triggered a connection error, which would be handled before this stream-specific method).
+	return nil
+}
+
 // processIncomingRSTStream is called by the connection when an RST_STREAM frame is received.
 func (s *Stream) processIncomingRSTStream(errorCode ErrorCode) {
 	s.mu.Lock()
