@@ -1,0 +1,169 @@
+6. Frame Definitions
+
+This specification defines a number of frame types, each identified by a unique 8-bit type code. Each frame type serves a distinct purpose in the establishment and management of either the connection as a whole or individual streams.
+The transmission of specific frame types can alter the state of a connection. If endpoints fail to maintain a synchronized view of the connection state, successful communication within the connection will no longer be possible. Therefore, it is important that endpoints have a shared comprehension of how the state is affected by the use of any given frame.
+6.1. DATA
+
+DATA frames (type=0x00) convey arbitrary, variable-length sequences of octets associated with a stream. One or more DATA frames are used, for instance, to carry HTTP request or response message contents.
+DATA frames MAY also contain padding. Padding can be added to DATA frames to obscure the size of messages. Padding is a security feature; see Section 10.7.
+
+DATA Frame {
+  Length (24),
+  Type (8) = 0x00,
+
+  Unused Flags (4),
+  PADDED Flag (1),
+  Unused Flags (2),
+  END_STREAM Flag (1),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  [Pad Length (8)],
+  Data (..),
+  Padding (..2040),
+}
+
+Figure 3: DATA Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. The DATA frame contains the following additional fields:
+
+Pad Length:
+    An 8-bit field containing the length of the frame padding in units of octets. This field is conditional and is only present if the PADDED flag is set.
+
+Data:
+    Application data. The amount of data is the remainder of the frame payload after subtracting the length of the other fields that are present.
+Padding:
+    Padding octets that contain no application semantic value. Padding octets MUST be set to zero when sending. A receiver is not obligated to verify padding but MAY treat non-zero padding as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+The DATA frame defines the following flags:
+
+PADDED (0x08):
+    When set, the PADDED flag indicates that the Pad Length field and any padding that it describes are present.
+
+END_STREAM (0x01):
+    When set, the END_STREAM flag indicates that this frame is the last that the endpoint will send for the identified stream. Setting this flag causes the stream to enter one of the "half-closed" states or the "closed" state (Section 5.1).
+
+Note: An endpoint that learns of stream closure after sending all data can close a stream by sending a STREAM frame with a zero-length Data field and the END_STREAM flag set. This is only possible if the endpoint does not send trailers, as the END_STREAM flag appears on a HEADERS frame in that case; see Section 8.1.
+DATA frames MUST be associated with a stream. If a DATA frame is received whose Stream Identifier field is 0x00, the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.DATA frames are subject to flow control and can only be sent when a stream is in the "open" or "half-closed (remote)" state. The entire DATA frame payload is included in flow control, including the Pad Length and Padding fields if present. If a DATA frame is received whose stream is not in the "open" or "half-closed (local)" state, the recipient MUST respond with a stream error (Section 5.4.2) of type STREAM_CLOSED.The total number of padding octets is determined by the value of the Pad Length field. If the length of the padding is the length of the frame payload or greater, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+Note: A frame can be increased in size by one octet by including a Pad Length field with a value of zero.
+6.2. HEADERS
+
+The HEADERS frame (type=0x01) is used to open a stream (Section 5.1), and additionally carries a field block fragment. Despite the name, a HEADERS frame can carry a header section or a trailer section. HEADERS frames can be sent on a stream in the "idle", "reserved (local)", "open", or "half-closed (remote)" state.
+
+HEADERS Frame {
+  Length (24),
+  Type (8) = 0x01,
+
+  Unused Flags (2),
+  PRIORITY Flag (1),
+  Unused Flag (1),
+  PADDED Flag (1),
+  END_HEADERS Flag (1),
+  Unused Flag (1),
+  END_STREAM Flag (1),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  [Pad Length (8)],
+  [Exclusive (1)],
+  [Stream Dependency (31)],
+  [Weight (8)],
+  Field Block Fragment (..),
+  Padding (..2040),
+}
+
+Figure 4: HEADERS Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. The HEADERS frame payload has the following additional fields:
+
+Pad Length:
+    An 8-bit field containing the length of the frame padding in units of octets. This field is only present if the PADDED flag is set.
+
+Exclusive:
+    A single-bit flag. This field is only present if the PRIORITY flag is set. Priority signals in HEADERS frames are deprecated; see Section 5.3.2.
+Stream Dependency:
+    A 31-bit stream identifier. This field is only present if the PRIORITY flag is set.
+Weight:
+    An unsigned 8-bit integer. This field is only present if the PRIORITY flag is set.
+Field Block Fragment:
+    A field block fragment (Section 4.3).
+Padding:
+    Padding octets that contain no application semantic value. Padding octets MUST be set to zero when sending. A receiver is not obligated to verify padding but MAY treat non-zero padding as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+The HEADERS frame defines the following flags:
+
+PRIORITY (0x20):
+
+    When set, the PRIORITY flag indicates that the Exclusive, Stream Dependency, and Weight fields are present.
+
+PADDED (0x08):
+
+    When set, the PADDED flag indicates that the Pad Length field and any padding that it describes are present.
+END_HEADERS (0x04):
+
+    When set, the END_HEADERS flag indicates that this frame contains an entire field block (Section 4.3) and is not followed by any CONTINUATION frames.
+A HEADERS frame without the END_HEADERS flag set MUST be followed by a CONTINUATION frame for the same stream. A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+END_STREAM (0x01):
+
+    When set, the END_STREAM flag indicates that the field block (Section 4.3) is the last that the endpoint will send for the identified stream.
+A HEADERS frame with the END_STREAM flag set signals the end of a stream. However, a HEADERS frame with the END_STREAM flag set can be followed by CONTINUATION frames on the same stream. Logically, the CONTINUATION frames are part of the HEADERS frame.
+
+The frame payload of a HEADERS frame contains a field block fragment (Section 4.3). A field block that does not fit within a HEADERS frame is continued in a CONTINUATION frame (Section 6.10).
+HEADERS frames MUST be associated with a stream. If a HEADERS frame is received whose Stream Identifier field is 0x00, the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.The HEADERS frame changes the connection state as described in Section 4.3.The total number of padding octets is determined by the value of the Pad Length field. If the length of the padding is the length of the frame payload or greater, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+Note: A frame can be increased in size by one octet by including a Pad Length field with a value of zero.
+6.3. PRIORITY
+
+The PRIORITY frame (type=0x02) is deprecated; see Section 5.3.2. A PRIORITY frame can be sent in any stream state, including idle or closed streams.
+
+PRIORITY Frame {
+  Length (24) = 0x05,
+  Type (8) = 0x02,
+
+  Unused Flags (8),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  Exclusive (1),
+  Stream Dependency (31),
+  Weight (8),
+}
+
+Figure 5: PRIORITY Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. The frame payload of a PRIORITY frame contains the following additional fields:
+
+Exclusive:
+    A single-bit flag.
+
+Stream Dependency:
+    A 31-bit stream identifier.
+Weight:
+    An unsigned 8-bit integer.
+
+The PRIORITY frame does not define any flags.
+The PRIORITY frame always identifies a stream. If a PRIORITY frame is received with a stream identifier of 0x00, the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.Sending or receiving a PRIORITY frame does not affect the state of any stream (Section 5.1). The PRIORITY frame can be sent on a stream in any state, including "idle" or "closed". A PRIORITY frame cannot be sent between consecutive frames that comprise a single field block (Section 4.3).A PRIORITY frame with a length other than 5 octets MUST be treated as a stream error (Section 5.4.2) of type FRAME_SIZE_ERROR.
+6.4. RST_STREAM
+
+The RST_STREAM frame (type=0x03) allows for immediate termination of a stream. RST_STREAM is sent to request cancellation of a stream or to indicate that an error condition has occurred.
+
+RST_STREAM Frame {
+  Length (24) = 0x04,
+  Type (8) = 0x03,
+
+  Unused Flags (8),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  Error Code (32),
+}
+
+Figure 6: RST_STREAM Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. Additionally, the RST_STREAM frame contains a single unsigned, 32-bit integer identifying the error code (Section 7). The error code indicates why the stream is being terminated.
+The RST_STREAM frame does not define any flags.The RST_STREAM frame fully terminates the referenced stream and causes it to enter the "closed" state. After receiving a RST_STREAM on a stream, the receiver MUST NOT send additional frames for that stream, except for PRIORITY. However, after sending the RST_STREAM, the sending endpoint MUST be prepared to receive and process additional frames sent on the stream that might have been sent by the peer prior to the arrival of the RST_STREAM.RST_STREAM frames MUST be associated with a stream. If a RST_STREAM frame is received with a stream identifier of 0x00, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.RST_STREAM frames MUST NOT be sent for a stream in the "idle" state. If a RST_STREAM frame identifying an idle stream is received, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.A RST_STREAM frame with a length other than 4 octets MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.

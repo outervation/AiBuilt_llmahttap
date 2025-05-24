@@ -1,0 +1,155 @@
+6.5. SETTINGS
+
+The SETTINGS frame (type=0x04) conveys configuration parameters that affect how endpoints communicate, such as preferences and constraints on peer behavior. The SETTINGS frame is also used to acknowledge the receipt of those settings. Individually, a configuration parameter from a SETTINGS frame is referred to as a "setting".
+Settings are not negotiated; they describe characteristics of the sending peer, which are used by the receiving peer. Different values for the same setting can be advertised by each peer. For example, a client might set a high initial flow-control window, whereas a server might set a lower value to conserve resources.A SETTINGS frame MUST be sent by both endpoints at the start of a connection and MAY be sent at any other time by either endpoint over the lifetime of the connection. Implementations MUST support all of the settings defined by this specification.Each parameter in a SETTINGS frame replaces any existing value for that parameter. Settings are processed in the order in which they appear, and a receiver of a SETTINGS frame does not need to maintain any state other than the current value of each setting. Therefore, the value of a SETTINGS parameter is the last value that is seen by a receiver.SETTINGS frames are acknowledged by the receiving peer. To enable this, the SETTINGS frame defines the ACK flag:
+
+ACK (0x01):
+    When set, the ACK flag indicates that this frame acknowledges receipt and application of the peer's SETTINGS frame. When this bit is set, the frame payload of the SETTINGS frame MUST be empty. Receipt of a SETTINGS frame with the ACK flag set and a length field value other than 0 MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR. For more information, see Section 6.5.3 ("Settings Synchronization").
+
+SETTINGS frames always apply to a connection, never a single stream. The stream identifier for a SETTINGS frame MUST be zero (0x00). If an endpoint receives a SETTINGS frame whose Stream Identifier field is anything other than 0x00, the endpoint MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+The SETTINGS frame affects connection state. A badly formed or incomplete SETTINGS frame MUST be treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.A SETTINGS frame with a length other than a multiple of 6 octets MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.
+6.5.1. SETTINGS Format
+
+The frame payload of a SETTINGS frame consists of zero or more settings, each consisting of an unsigned 16-bit setting identifier and an unsigned 32-bit value.
+
+SETTINGS Frame {
+  Length (24),
+  Type (8) = 0x04,
+
+  Unused Flags (7),
+  ACK Flag (1),
+
+  Reserved (1),
+  Stream Identifier (31) = 0,
+
+  Setting (48) ...,
+}
+
+Setting {
+  Identifier (16),
+  Value (32),
+}
+
+Figure 7: SETTINGS Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. The frame payload of a SETTINGS frame contains any number of Setting fields, each of which consists of:
+
+Identifier:
+    A 16-bit setting identifier; see Section 6.5.2.
+
+Value:
+    A 32-bit value for the setting.
+
+6.5.2. Defined Settings
+
+The following settings are defined:
+
+SETTINGS_HEADER_TABLE_SIZE (0x01):
+
+    This setting allows the sender to inform the remote endpoint of the maximum size of the compression table used to decode field blocks, in units of octets. The encoder can select any size equal to or less than this value by using signaling specific to the compression format inside a field block (see [COMPRESSION]). The initial value is 4,096 octets.
+
+SETTINGS_ENABLE_PUSH (0x02):
+
+    This setting can be used to enable or disable server push. A server MUST NOT send a PUSH_PROMISE frame if it receives this parameter set to a value of 0; see Section 8.4. A client that has both set this parameter to 0 and had it acknowledged MUST treat the receipt of a PUSH_PROMISE frame as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+The initial value of SETTINGS_ENABLE_PUSH is 1. For a client, this value indicates that it is willing to receive PUSH_PROMISE frames. For a server, this initial value has no effect, and is equivalent to the value 0. Any value other than 0 or 1 MUST be treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.A server MUST NOT explicitly set this value to 1. A server MAY choose to omit this setting when it sends a SETTINGS frame, but if a server does include a value, it MUST be 0. A client MUST treat receipt of a SETTINGS frame with SETTINGS_ENABLE_PUSH set to 1 as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+SETTINGS_MAX_CONCURRENT_STREAMS (0x03):
+
+    This setting indicates the maximum number of concurrent streams that the sender will allow. This limit is directional: it applies to the number of streams that the sender permits the receiver to create. Initially, there is no limit to this value. It is recommended that this value be no smaller than 100, so as to not unnecessarily limit parallelism.
+A value of 0 for SETTINGS_MAX_CONCURRENT_STREAMS SHOULD NOT be treated as special by endpoints. A zero value does prevent the creation of new streams; however, this can also happen for any limit that is exhausted with active streams. Servers SHOULD only set a zero value for short durations; if a server does not wish to accept requests, closing the connection is more appropriate.
+SETTINGS_INITIAL_WINDOW_SIZE (0x04):
+
+    This setting indicates the sender's initial window size (in units of octets) for stream-level flow control. The initial value is 216-1 (65,535) octets.
+This setting affects the window size of all streams (see Section 6.9.2).Values above the maximum flow-control window size of 231-1 MUST be treated as a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR.
+SETTINGS_MAX_FRAME_SIZE (0x05):
+
+    This setting indicates the size of the largest frame payload that the sender is willing to receive, in units of octets.
+The initial value is 214 (16,384) octets. The value advertised by an endpoint MUST be between this initial value and the maximum allowed frame size (224-1 or 16,777,215 octets), inclusive. Values outside this range MUST be treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+SETTINGS_MAX_HEADER_LIST_SIZE (0x06):
+
+    This advisory setting informs a peer of the maximum field section size that the sender is prepared to accept, in units of octets. The value is based on the uncompressed size of field lines, including the length of the name and value in units of octets plus an overhead of 32 octets for each field line.
+For any given request, a lower limit than what is advertised MAY be enforced. The initial value of this setting is unlimited.
+
+An endpoint that receives a SETTINGS frame with any unknown or unsupported identifier MUST ignore that setting.
+6.5.3. Settings Synchronization
+
+Most values in SETTINGS benefit from or require an understanding of when the peer has received and applied the changed parameter values. In order to provide such synchronization timepoints, the recipient of a SETTINGS frame in which the ACK flag is not set MUST apply the updated settings as soon as possible upon receipt. SETTINGS frames are acknowledged in the order in which they are received.
+The values in the SETTINGS frame MUST be processed in the order they appear, with no other frame processing between values. Unsupported settings MUST be ignored. Once all values have been processed, the recipient MUST immediately emit a SETTINGS frame with the ACK flag set. Upon receiving a SETTINGS frame with the ACK flag set, the sender of the altered settings can rely on the values from the oldest unacknowledged SETTINGS frame having been applied.If the sender of a SETTINGS frame does not receive an acknowledgment within a reasonable amount of time, it MAY issue a connection error (Section 5.4.1) of type SETTINGS_TIMEOUT. In setting a timeout, some allowance needs to be made for processing delays at the peer; a timeout that is solely based on the round-trip time between endpoints might result in spurious errors.
+6.6. PUSH_PROMISE
+
+The PUSH_PROMISE frame (type=0x05) is used to notify the peer endpoint in advance of streams the sender intends to initiate. The PUSH_PROMISE frame includes the unsigned 31-bit identifier of the stream the endpoint plans to create along with a field section that provides additional context for the stream. Section 8.4 contains a thorough description of the use of PUSH_PROMISE frames.
+
+PUSH_PROMISE Frame {
+  Length (24),
+  Type (8) = 0x05,
+
+  Unused Flags (4),
+  PADDED Flag (1),
+  END_HEADERS Flag (1),
+  Unused Flags (2),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  [Pad Length (8)],
+  Reserved (1),
+  Promised Stream ID (31),
+  Field Block Fragment (..),
+  Padding (..2040),
+}
+
+Figure 8: PUSH_PROMISE Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4. The PUSH_PROMISE frame payload has the following additional fields:
+
+Pad Length:
+    An 8-bit field containing the length of the frame padding in units of octets. This field is only present if the PADDED flag is set.
+
+Promised Stream ID:
+    An unsigned 31-bit integer that identifies the stream that is reserved by the PUSH_PROMISE. The promised stream identifier MUST be a valid choice for the next stream sent by the sender (see "new stream identifier" in Section 5.1.1).
+Field Block Fragment:
+    A field block fragment (Section 4.3) containing the request control data and a header section.
+Padding:
+    Padding octets that contain no application semantic value. Padding octets MUST be set to zero when sending. A receiver is not obligated to verify padding but MAY treat non-zero padding as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+The PUSH_PROMISE frame defines the following flags:
+
+PADDED (0x08):
+
+    When set, the PADDED flag indicates that the Pad Length field and any padding that it describes are present.
+
+END_HEADERS (0x04):
+
+    When set, the END_HEADERS flag indicates that this frame contains an entire field block (Section 4.3) and is not followed by any CONTINUATION frames.
+A PUSH_PROMISE frame without the END_HEADERS flag set MUST be followed by a CONTINUATION frame for the same stream. A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+PUSH_PROMISE frames MUST only be sent on a peer-initiated stream that is in either the "open" or "half-closed (remote)" state. The stream identifier of a PUSH_PROMISE frame indicates the stream it is associated with. If the Stream Identifier field specifies the value 0x00, a recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+Promised streams are not required to be used in the order they are promised. The PUSH_PROMISE only reserves stream identifiers for later use.PUSH_PROMISE MUST NOT be sent if the SETTINGS_ENABLE_PUSH setting of the peer endpoint is set to 0. An endpoint that has set this setting and has received acknowledgment MUST treat the receipt of a PUSH_PROMISE frame as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.Recipients of PUSH_PROMISE frames can choose to reject promised streams by returning a RST_STREAM referencing the promised stream identifier back to the sender of the PUSH_PROMISE.A PUSH_PROMISE frame modifies the connection state in two ways. First, the inclusion of a field block (Section 4.3) potentially modifies the state maintained for field section compression. Second, PUSH_PROMISE also reserves a stream for later use, causing the promised stream to enter the "reserved (local)" or "reserved (remote)" state. A sender MUST NOT send a PUSH_PROMISE on a stream unless that stream is either "open" or "half-closed (remote)"; the sender MUST ensure that the promised stream is a valid choice for a new stream identifier (Section 5.1.1) (that is, the promised stream MUST be in the "idle" state).Since PUSH_PROMISE reserves a stream, ignoring a PUSH_PROMISE frame causes the stream state to become indeterminate. A receiver MUST treat the receipt of a PUSH_PROMISE on a stream that is neither "open" nor "half-closed (local)" as a connection error (Section 5.4.1) of type PROTOCOL_ERROR. However, an endpoint that has sent RST_STREAM on the associated stream MUST handle PUSH_PROMISE frames that might have been created before the RST_STREAM frame is received and processed.A receiver MUST treat the receipt of a PUSH_PROMISE that promises an illegal stream identifier (Section 5.1.1) as a connection error (Section 5.4.1) of type PROTOCOL_ERROR. Note that an illegal stream identifier is an identifier for a stream that is not currently in the "idle" state.The total number of padding octets is determined by the value of the Pad Length field. If the length of the padding is the length of the frame payload or greater, the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+
+Note: A frame can be increased in size by one octet by including a Pad Length field with a value of zero.
+6.7. PING
+
+The PING frame (type=0x06) is a mechanism for measuring a minimal round-trip time from the sender, as well as determining whether an idle connection is still functional. PING frames can be sent from any endpoint.
+
+PING Frame {
+  Length (24) = 0x08,
+  Type (8) = 0x06,
+
+  Unused Flags (7),
+  ACK Flag (1),
+
+  Reserved (1),
+  Stream Identifier (31) = 0,
+
+  Opaque Data (64),
+}
+
+Figure 9: PING Frame Format
+
+The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are described in Section 4.
+In addition to the frame header, PING frames MUST contain 8 octets of opaque data in the frame payload. A sender can include any value it chooses and use those octets in any fashion.Receivers of a PING frame that does not include an ACK flag MUST send a PING frame with the ACK flag set in response, with an identical frame payload. PING responses SHOULD be given higher priority than any other frame.The PING frame defines the following flags:
+
+ACK (0x01):
+    When set, the ACK flag indicates that this PING frame is a PING response. An endpoint MUST set this flag in PING responses. An endpoint MUST NOT respond to PING frames containing this flag.
+
+PING frames are not associated with any individual stream. If a PING frame is received with a Stream Identifier field value other than 0x00, the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+Receipt of a PING frame with a length field value other than 8 MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.

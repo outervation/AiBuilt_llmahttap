@@ -1,0 +1,140 @@
+ 1. Introduction
+
+The performance of applications using the Hypertext Transfer Protocol (HTTP, [HTTP]) is linked to how each version of HTTP uses the underlying transport, and the conditions under which the transport operates.
+Making multiple concurrent requests can reduce latency and improve application performance. HTTP/1.0 allowed only one request to be outstanding at a time on a given TCP [TCP] connection. HTTP/1.1 [HTTP/1.1] added request pipelining, but this only partially addressed request concurrency and still suffers from application-layer head-of-line blocking. Therefore, HTTP/1.0 and HTTP/1.1 clients use multiple connections to a server to make concurrent requests.Furthermore, HTTP fields are often repetitive and verbose, causing unnecessary network traffic as well as causing the initial TCP congestion window to quickly fill. This can result in excessive latency when multiple requests are made on a new TCP connection.HTTP/2 addresses these issues by defining an optimized mapping of HTTP's semantics to an underlying connection. Specifically, it allows interleaving of messages on the same connection and uses an efficient coding for HTTP fields. It also allows prioritization of requests, letting more important requests complete more quickly, further improving performance.The resulting protocol is more friendly to the network because fewer TCP connections can be used in comparison to HTTP/1.x. This means less competition with other flows and longer-lived connections, which in turn lead to better utilization of available network capacity. Note, however, that TCP head-of-line blocking is not addressed by this protocol.Finally, HTTP/2 also enables more efficient processing of messages through use of binary message framing.This document obsoletes RFCs 7540 and 8740. Appendix B lists notable changes.
+2. HTTP/2 Protocol Overview
+
+HTTP/2 provides an optimized transport for HTTP semantics. HTTP/2 supports all of the core features of HTTP but aims to be more efficient than HTTP/1.1.
+HTTP/2 is a connection-oriented application-layer protocol that runs over a TCP connection ([TCP]). The client is the TCP connection initiator.The basic protocol unit in HTTP/2 is a frame (Section 4.1). Each frame type serves a different purpose. For example, HEADERS and DATA frames form the basis of HTTP requests and responses (Section 8.1); other frame types like SETTINGS, WINDOW_UPDATE, and PUSH_PROMISE are used in support of other HTTP/2 features.Multiplexing of requests is achieved by having each HTTP request/response exchange associated with its own stream (Section 5). Streams are largely independent of each other, so a blocked or stalled request or response does not prevent progress on other streams.Effective use of multiplexing depends on flow control and prioritization. Flow control (Section 5.2) ensures that it is possible to efficiently use multiplexed streams by restricting data that is transmitted to what the receiver is able to handle. Prioritization (Section 5.3) ensures that limited resources are used most effectively. This revision of HTTP/2 deprecates the priority signaling scheme from [RFC7540].Because HTTP fields used in a connection can contain large amounts of redundant data, frames that contain them are compressed (Section 4.3). This has especially advantageous impact upon request sizes in the common case, allowing many requests to be compressed into one packet.Finally, HTTP/2 adds a new, optional interaction mode whereby a server can push responses to a client (Section 8.4). This is intended to allow a server to speculatively send data to a client that the server anticipates the client will need, trading off some network usage against a potential latency gain. The server does this by synthesizing a request, which it sends as a PUSH_PROMISE frame. The server is then able to send a response to the synthetic request on a separate stream.
+2.1. Document Organization
+
+The HTTP/2 specification is split into four parts:
+Starting HTTP/2 (Section 3) covers how an HTTP/2 connection is initiated.
+The frame (Section 4) and stream (Section 5) layers describe the way HTTP/2 frames are structured and formed into multiplexed streams. Frame (Section 6) and error (Section 7) definitions include details of the frame and error types used in HTTP/2. HTTP mappings (Section 8) and additional requirements (Section 9) describe how HTTP semantics are expressed using frames and streams.While some of the frame- and stream-layer concepts are isolated from HTTP, this specification does not define a completely generic frame layer. The frame and stream layers are tailored to the needs of HTTP.
+2.2. Conventions and Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all capitals, as shown here.
+All numeric values are in network byte order. Values are unsigned unless otherwise indicated. Literal values are provided in decimal or hexadecimal as appropriate. Hexadecimal literals are prefixed with "0x" to distinguish them from decimal literals.This specification describes binary formats using the conventions described in Section 1.3 of RFC 9000 [QUIC]. Note that this format uses network byte order and that high-valued bits are listed before low-valued bits.The following terms are used:
+
+client:
+    The endpoint that initiates an HTTP/2 connection. Clients send HTTP requests and receive HTTP responses.
+
+connection:
+    A transport-layer connection between two endpoints.
+connection error:
+    An error that affects the entire HTTP/2 connection.
+endpoint:
+    Either the client or server of the connection.
+frame:
+    The smallest unit of communication within an HTTP/2 connection, consisting of a header and a variable-length sequence of octets structured according to the frame type.
+peer:
+    An endpoint. When discussing a particular endpoint, "peer" refers to the endpoint that is remote to the primary subject of discussion.
+receiver:
+    An endpoint that is receiving frames.
+sender:
+    An endpoint that is transmitting frames.
+server:
+    The endpoint that accepts an HTTP/2 connection. Servers receive HTTP requests and send HTTP responses.
+stream:
+    A bidirectional flow of frames within the HTTP/2 connection.
+stream error:
+    An error on the individual HTTP/2 stream.
+
+Finally, the terms "gateway", "intermediary", "proxy", and "tunnel" are defined in Section 3.7 of [HTTP]. Intermediaries act as both client and server at different times.
+The term "content" as it applies to message bodies is defined in Section 6.4 of [HTTP].
+3. Starting HTTP/2
+
+Implementations that generate HTTP requests need to discover whether a server supports HTTP/2.
+HTTP/2 uses the "http" and "https" URI schemes defined in Section 4.2 of [HTTP], with the same default port numbers as HTTP/1.1 [HTTP/1.1]. These URIs do not include any indication about what HTTP versions an upstream server (the immediate peer to which the client wishes to establish a connection) supports.The means by which support for HTTP/2 is determined is different for "http" and "https" URIs. Discovery for "https" URIs is described in Section 3.2. HTTP/2 support for "http" URIs can only be discovered by out-of-band means and requires prior knowledge of the support as described in Section 3.3.
+3.1. HTTP/2 Version Identification
+
+The protocol defined in this document has two identifiers. Creating a connection based on either implies the use of the transport, framing, and message semantics described in this document.
+
+The string "h2" identifies the protocol where HTTP/2 uses Transport Layer Security (TLS); see Section 9.2. This identifier is used in the TLS Application-Layer Protocol Negotiation (ALPN) extension [TLS-ALPN] field and in any place where HTTP/2 over TLS is identified.
+The "h2" string is serialized into an ALPN protocol identifier as the two-octet sequence: 0x68, 0x32.
+
+The "h2c" string was previously used as a token for use in the HTTP Upgrade mechanism's Upgrade header field (Section 7.8 of [HTTP]). This usage was never widely deployed and is deprecated by this document. The same applies to the HTTP2-Settings header field, which was used with the upgrade to "h2c".
+3.2. Starting HTTP/2 for "https" URIs
+
+A client that makes a request to an "https" URI uses TLS [TLS13] with the ALPN extension [TLS-ALPN].
+HTTP/2 over TLS uses the "h2" protocol identifier. The "h2c" protocol identifier MUST NOT be sent by a client or selected by a server; the "h2c" protocol identifier describes a protocol that does not use TLS.Once TLS negotiation is complete, both the client and the server MUST send a connection preface (Section 3.4).
+3.3. Starting HTTP/2 with Prior Knowledge
+
+A client can learn that a particular server supports HTTP/2 by other means. For example, a client could be configured with knowledge that a server supports HTTP/2.
+A client that knows that a server supports HTTP/2 can establish a TCP connection and send the connection preface (Section 3.4) followed by HTTP/2 frames. Servers can identify these connections by the presence of the connection preface. This only affects the establishment of HTTP/2 connections over cleartext TCP; HTTP/2 connections over TLS MUST use protocol negotiation in TLS [TLS-ALPN].Likewise, the server MUST send a connection preface (Section 3.4).Without additional information, prior support for HTTP/2 is not a strong signal that a given server will support HTTP/2 for future connections. For example, it is possible for server configurations to change, for configurations to differ between instances in clustered servers, or for network conditions to change.
+3.4. HTTP/2 Connection Preface
+
+In HTTP/2, each endpoint is required to send a connection preface as a final confirmation of the protocol in use and to establish the initial settings for the HTTP/2 connection. The client and server each send a different connection preface.
+The client connection preface starts with a sequence of 24 octets, which in hex notation is:
+
+  0x505249202a20485454502f322e300d0a0d0a534d0d0a0d0a
+
+That is, the connection preface starts with the string "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n". This sequence MUST be followed by a SETTINGS frame (Section 6.5), which MAY be empty. The client sends the client connection preface as the first application data octets of a connection.
+
+Note: The client connection preface is selected so that a large proportion of HTTP/1.1 or HTTP/1.0 servers and intermediaries do not attempt to process further frames. Note that this does not address the concerns raised in [TALKING].
+The server connection preface consists of a potentially empty SETTINGS frame (Section 6.5) that MUST be the first frame the server sends in the HTTP/2 connection.The SETTINGS frames received from a peer as part of the connection preface MUST be acknowledged (see Section 6.5.3) after sending the connection preface.To avoid unnecessary latency, clients are permitted to send additional frames to the server immediately after sending the client connection preface, without waiting to receive the server connection preface. It is important to note, however, that the server connection preface SETTINGS frame might include settings that necessarily alter how a client is expected to communicate with the server. Upon receiving the SETTINGS frame, the client is expected to honor any settings established. In some configurations, it is possible for the server to transmit SETTINGS before the client sends additional frames, providing an opportunity to avoid this issue.Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR. A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.
+4. HTTP Frames
+
+Once the HTTP/2 connection is established, endpoints can begin exchanging frames.
+4.1. Frame Format
+
+All frames begin with a fixed 9-octet header followed by a variable-length frame payload.
+
+HTTP Frame {
+  Length (24),
+  Type (8),
+
+  Flags (8),
+
+  Reserved (1),
+  Stream Identifier (31),
+
+  Frame Payload (..),
+}
+
+Figure 1: Frame Layout
+
+The fields of the frame header are defined as:
+
+Length:
+
+    The length of the frame payload expressed as an unsigned 24-bit integer in units of octets. Values greater than 214 (16,384) MUST NOT be sent unless the receiver has set a larger value for SETTINGS_MAX_FRAME_SIZE.
+
+The 9 octets of the frame header are not included in this value.
+Type:
+
+    The 8-bit type of the frame. The frame type determines the format and semantics of the frame. Frames defined in this document are listed in Section 6. Implementations MUST ignore and discard frames of unknown types.
+Flags:
+
+    An 8-bit field reserved for boolean flags specific to the frame type.
+Flags are assigned semantics specific to the indicated frame type. Unused flags are those that have no defined semantics for a particular frame type. Unused flags MUST be ignored on receipt and MUST be left unset (0x00) when sending.
+Reserved:
+
+    A reserved 1-bit field. The semantics of this bit are undefined, and the bit MUST remain unset (0x00) when sending and MUST be ignored when receiving.
+Stream Identifier:
+
+    A stream identifier (see Section 5.1.1) expressed as an unsigned 31-bit integer. The value 0x00 is reserved for frames that are associated with the connection as a whole as opposed to an individual stream.
+
+The structure and content of the frame payload are dependent entirely on the frame type.
+4.2. Frame Size
+
+The size of a frame payload is limited by the maximum size that a receiver advertises in the SETTINGS_MAX_FRAME_SIZE setting. This setting can have any value between 214 (16,384) and 224-1 (16,777,215) octets, inclusive.
+All implementations MUST be capable of receiving and minimally processing frames up to 214 octets in length, plus the 9-octet frame header (Section 4.1). The size of the frame header is not included when describing frame sizes.
+
+Note: Certain frame types, such as PING (Section 6.7), impose additional limits on the amount of frame payload data allowed.
+An endpoint MUST send an error code of FRAME_SIZE_ERROR if a frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE, exceeds any limit defined for the frame type, or is too small to contain mandatory frame data. A frame size error in a frame that could alter the state of the entire connection MUST be treated as a connection error (Section 5.4.1); this includes any frame carrying a field block (Section 4.3) (that is, HEADERS, PUSH_PROMISE, and CONTINUATION), a SETTINGS frame, and any frame with a stream identifier of 0.Endpoints are not obligated to use all available space in a frame. Responsiveness can be improved by using frames that are smaller than the permitted maximum size. Sending large frames can result in delays in sending time-sensitive frames (such as RST_STREAM, WINDOW_UPDATE, or PRIORITY), which, if blocked by the transmission of a large frame, could affect performance.
+4.3. Field Section Compression and Decompression
+
+Field section compression is the process of compressing a set of field lines (Section 5.2 of [HTTP]) to form a field block. Field section decompression is the process of decoding a field block into a set of field lines. Details of HTTP/2 field section compression and decompression are defined in [COMPRESSION], which, for historical reasons, refers to these processes as header compression and decompression.
+Each field block carries all of the compressed field lines of a single field section. Header sections also include control data associated with the message in the form of pseudo-header fields (Section 8.3) that use the same format as a field line.
+
+Note: RFC 7540 [RFC7540] used the term "header block" in place of the more generic "field block".
+Field blocks carry control data and header sections for requests, responses, promised requests, and pushed responses (see Section 8.4). All these messages, except for interim responses and requests contained in PUSH_PROMISE (Section 6.6) frames, can optionally include a field block that carries a trailer section.A field section is a collection of field lines. Each of the field lines in a field block carries a single value. The serialized field block is then divided into one or more octet sequences, called field block fragments. The first field block fragment is transmitted within the frame payload of HEADERS (Section 6.2) or PUSH_PROMISE (Section 6.6), each of which could be followed by CONTINUATION (Section 6.10) frames to carry subsequent field block fragments.The Cookie header field [COOKIE] is treated specially by the HTTP mapping (see Section 8.2.3).A receiving endpoint reassembles the field block by concatenating its fragments and then decompresses the block to reconstruct the field section.A complete field section consists of either:
+a single HEADERS or PUSH_PROMISE frame, with the END_HEADERS flag set, or
+a HEADERS or PUSH_PROMISE frame with the END_HEADERS flag unset and one or more CONTINUATION frames, where the last CONTINUATION frame has the END_HEADERS flag set.Each field block is processed as a discrete unit. Field blocks MUST be transmitted as a contiguous sequence of frames, with no interleaved frames of any other type or from any other stream. The last frame in a sequence of HEADERS or CONTINUATION frames has the END_HEADERS flag set. The last frame in a sequence of PUSH_PROMISE or CONTINUATION frames has the END_HEADERS flag set. This allows a field block to be logically equivalent to a single frame.Field block fragments can only be sent as the frame payload of HEADERS, PUSH_PROMISE, or CONTINUATION frames because these frames carry data that can modify the compression context maintained by a receiver. An endpoint receiving HEADERS, PUSH_PROMISE, or CONTINUATION frames needs to reassemble field blocks and perform decompression even if the frames are to be discarded. A receiver MUST terminate the connection with a connection error (Section 5.4.1) of type COMPRESSION_ERROR if it does not decompress a field block.A decoding error in a field block MUST be treated as a connection error (Section 5.4.1) of type COMPRESSION_ERROR.
+4.3.1. Compression State
+
+Field compression is stateful. Each endpoint has an HPACK encoder context and an HPACK decoder context that are used for encoding and decoding all field blocks on a connection. Section 4 of [COMPRESSION] defines the dynamic table, which is the primary state for each context.
+The dynamic table has a maximum size that is set by an HPACK decoder. An endpoint communicates the size chosen by its HPACK decoder context using the SETTINGS_HEADER_TABLE_SIZE setting; see Section 6.5.2. When a connection is established, the dynamic table size for the HPACK decoder and encoder at both endpoints starts at 4,096 bytes, the initial value of the SETTINGS_HEADER_TABLE_SIZE setting.Any change to the maximum value set using SETTINGS_HEADER_TABLE_SIZE takes effect when the endpoint acknowledges settings (Section 6.5.3). The HPACK encoder at that endpoint can set the dynamic table to any size up to the maximum value set by the decoder. An HPACK encoder declares the size of the dynamic table with a Dynamic Table Size Update instruction (Section 6.3 of [COMPRESSION]).Once an endpoint acknowledges a change to SETTINGS_HEADER_TABLE_SIZE that reduces the maximum below the current size of the dynamic table, its HPACK encoder MUST start the next field block with a Dynamic Table Size Update instruction that sets the dynamic table to a size that is less than or equal to the reduced maximum; see Section 4.2 of [COMPRESSION]. An endpoint MUST treat a field block that follows an acknowledgment of the reduction to the maximum dynamic table size as a connection error (Section 5.4.1) of type COMPRESSION_ERROR if it does not start with a conformant Dynamic Table Size Update instruction.
+
+Implementers are advised that reducing the value of SETTINGS_HEADER_TABLE_SIZE is not widely interoperable. Use of the connection preface to reduce the value below the initial value of 4,096 is somewhat better supported, but this might fail with some implementations.

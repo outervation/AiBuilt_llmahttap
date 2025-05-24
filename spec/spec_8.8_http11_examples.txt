@@ -1,0 +1,93 @@
+8.8. Examples
+
+This section shows HTTP/1.1 requests and responses, with illustrations of equivalent HTTP/2 requests and responses.
+8.8.1. Simple Request
+
+An HTTP GET request includes control data and a request header with no message content and is therefore transmitted as a single HEADERS frame, followed by zero or more CONTINUATION frames containing the serialized block of request header fields. The HEADERS frame in the following has both the END_HEADERS and END_STREAM flags set; no CONTINUATION frames are sent.
+
+  GET /resource HTTP/1.1           HEADERS
+  Host: example.org          ==>     + END_STREAM
+  Accept: image/jpeg                 + END_HEADERS
+                                       :method = GET
+                                       :scheme = https
+                                       :authority = example.org
+                                       :path = /resource
+                                       host = example.org
+                                       accept = image/jpeg
+
+8.8.2. Simple Response
+
+Similarly, a response that includes only control data and a response header is transmitted as a HEADERS frame (again, followed by zero or more CONTINUATION frames) containing the serialized block of response header fields.
+
+  HTTP/1.1 304 Not Modified        HEADERS
+  ETag: "xyzzy"              ==>     + END_STREAM
+  Expires: Thu, 23 Jan ...           + END_HEADERS
+                                       :status = 304
+                                       etag = "xyzzy"
+                                       expires = Thu, 23 Jan ...
+
+8.8.3. Complex Request
+
+An HTTP POST request that includes control data and a request header with message content is transmitted as one HEADERS frame, followed by zero or more CONTINUATION frames containing the request header, followed by one or more DATA frames, with the last CONTINUATION (or HEADERS) frame having the END_HEADERS flag set and the final DATA frame having the END_STREAM flag set:
+
+  POST /resource HTTP/1.1          HEADERS
+  Host: example.org          ==>     - END_STREAM
+  Content-Type: image/jpeg           - END_HEADERS
+  Content-Length: 123                  :method = POST
+                                       :authority = example.org
+                                       :path = /resource
+  {binary data}                        :scheme = https
+
+                                   CONTINUATION
+                                     + END_HEADERS
+                                       content-type = image/jpeg
+                                       host = example.org
+                                       content-length = 123
+
+                                   DATA
+                                     + END_STREAM
+                                   {binary data}
+
+Note that data contributing to any given field line could be spread between field block fragments. The allocation of field lines to frames in this example is illustrative only.
+8.8.4. Response with Body
+
+A response that includes control data and a response header with message content is transmitted as a HEADERS frame, followed by zero or more CONTINUATION frames, followed by one or more DATA frames, with the last DATA frame in the sequence having the END_STREAM flag set:
+
+  HTTP/1.1 200 OK                  HEADERS
+  Content-Type: image/jpeg   ==>     - END_STREAM
+  Content-Length: 123                + END_HEADERS
+                                       :status = 200
+  {binary data}                        content-type = image/jpeg
+                                       content-length = 123
+
+                                   DATA
+                                     + END_STREAM
+                                   {binary data}
+
+8.8.5. Informational Responses
+
+An informational response using a 1xx status code other than 101 is transmitted as a HEADERS frame, followed by zero or more CONTINUATION frames.
+A trailer section is sent as a field block after both the request or response field block and all the DATA frames have been sent. The HEADERS frame starting the field block that comprises the trailer section has the END_STREAM flag set.The following example includes both a 100 (Continue) status code, which is sent in response to a request containing a "100-continue" token in the Expect header field, and a trailer section:
+
+  HTTP/1.1 100 Continue            HEADERS
+  Extension-Field: bar       ==>     - END_STREAM
+                                     + END_HEADERS
+                                       :status = 100
+                                       extension-field = bar
+
+  HTTP/1.1 200 OK                  HEADERS
+  Content-Type: image/jpeg   ==>     - END_STREAM
+  Transfer-Encoding: chunked         + END_HEADERS
+  Trailer: Foo                         :status = 200
+                                       content-type = image/jpeg
+  123                                  trailer = Foo
+  {binary data}
+  0                                DATA
+  Foo: bar                           - END_STREAM
+                                   {binary data}
+
+                                   HEADERS
+                                     + END_STREAM
+                                     + END_HEADERS
+                                       foo = bar
+
