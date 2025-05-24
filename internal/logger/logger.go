@@ -418,10 +418,22 @@ func (el *ErrorLogger) isLoggable(messageLevel config.LogLevel) bool {
 // LogError constructs and writes an error log entry.
 // This is a placeholder for full implementation.
 
+// writeLogLine ensures the log line is written atomically using the logger's mutex.
+func (el *ErrorLogger) writeLogLine(line string) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	// el.logger is a standard log.Logger, which guarantees that each call
+	// to Println (which calls Output, then Write) is atomic with respect
+	// to other calls to the same logger instance.
+	// Our explicit lock here provides an additional layer of safety.
+	el.logger.Println(line)
+}
+
 // LogError constructs and writes an error log entry.
 // The 'context' map can contain specific keys like "source", "method", "uri", "h2_stream_id"
 // which will be mapped to the corresponding fields in ErrorLogEntry.
 // Other keys in 'context' will be placed in the 'Details' field of ErrorLogEntry.
+
 func (el *ErrorLogger) LogError(level config.LogLevel, msg string, context LogFields) {
 	if el == nil || el.logger == nil {
 		return // Error logging not configured
@@ -485,13 +497,12 @@ func (el *ErrorLogger) LogError(level config.LogLevel, msg string, context LogFi
 	jsonData, err := json.Marshal(entry)
 	if err != nil {
 		// Fallback: Log a JSON-formatted error about the marshalling failure.
-		// Using el.logger directly to avoid recursion.
 		errorMsg := fmt.Sprintf("{\"level\":\"ERROR\", \"ts\":\"%s\", \"msg\":\"Error marshalling error log entry to JSON\", \"original_level\":\"%s\", \"original_msg\":\"%s\", \"error\":\"%s\"}",
 			getTimestamp(), level, strings.ReplaceAll(msg, "\"", "'"), strings.ReplaceAll(err.Error(), "\"", "'")) // Basic sanitization
-		el.logger.Println(errorMsg)
+		el.writeLogLine(errorMsg)
 		return
 	}
-	el.logger.Println(string(jsonData)) // log.Logger adds its own newline
+	el.writeLogLine(string(jsonData))
 }
 
 // Convenience methods on the main Logger
