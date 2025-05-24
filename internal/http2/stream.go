@@ -889,3 +889,53 @@ func (s *Stream) CanReceiveFrame(ft FrameType) bool {
 		return false
 	}
 }
+
+// Close explicitly terminates the stream from the server's perspective.
+// If err is nil, ErrCodeCancel will be used to RST_STREAM, indicating a
+// server-initiated cancellation. If err is a StreamError or ConnectionError,
+// its code will be used. Otherwise, ErrCodeInternalError is used.
+// This method ensures the stream transitions to Closed and resources are cleaned up.
+// It returns any error encountered while trying to send the RST_STREAM frame.
+func (s *Stream) Close(err error) error {
+	s.mu.Lock() // Lock to check state and prevent races on pendingRSTCode
+	// If already definitively closed and RST_STREAM processing initiated, no-op.
+	if s.state == StreamStateClosed && s.pendingRSTCode != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	// If it's closed but not due to our RST action, and we now want to RST, proceed.
+	// If it's merely half-closed, we can still RST it.
+	s.mu.Unlock() // Unlock before calling sendRSTStream which has its own locking.
+
+	var rstCode ErrorCode
+	if err == nil {
+		rstCode = ErrCodeCancel
+	} else {
+		// Try to extract ErrorCode from the provided error
+		switch e := err.(type) {
+		case *StreamError:
+			rstCode = e.Code
+		case *ConnectionError: // Less common for a stream-specific Close, but possible
+			rstCode = e.Code
+		default:
+			// For generic errors, use a generic code.
+			// ErrCodeInternalError suggests an issue on our side.
+			rstCode = ErrCodeInternalError
+		}
+	}
+
+	// sendRSTStream will handle state transition to Closed and resource cleanup
+	// via _setState -> closeStreamResourcesProtected.
+	// closeStreamResourcesProtected calls conn.removeStream, which is assumed to handle
+	// removal from the priority tree as well.
+	return s.sendRSTStream(rstCode)
+}
+
+// streamDependencyInfo is defined in priority.go, but for clarity if it were needed
+// specifically for stream creation/initialization, it might look like this.
+// However, we use the one from priority.go.
+// type StreamPriorityInfo struct {
+//  StreamDependency uint32
+//  Weight           uint8
+//  Exclusive        bool
+// }
