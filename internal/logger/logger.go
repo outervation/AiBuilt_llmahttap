@@ -381,6 +381,48 @@ func (al *AccessLogger) LogAccess(
 	al.writeLogLine(string(jsonData))
 }
 
+// Reopen closes and reopens the log file if the target is a file.
+// This is used for log rotation. It is thread-safe.
+func (al *AccessLogger) Reopen() error {
+	if al == nil {
+		return nil // Not configured
+	}
+	al.mu.Lock()
+	defer al.mu.Unlock()
+
+	if !config.IsFilePath(al.config.Target) {
+		return nil // Not a file target
+	}
+
+	currentFile, ok := al.output.(*os.File)
+	if ok {
+		// Only try to close if it's a file we manage (not stdout/stderr)
+		if currentFile != os.Stdout && currentFile != os.Stderr {
+			filePath := currentFile.Name() // Get path from existing file for logging
+			if err := currentFile.Close(); err != nil {
+				log.Printf("Error closing access log file %s during reopen: %v", filePath, err)
+				// Continue to attempt reopening
+			}
+		}
+	}
+
+	// Use the configured target path for reopening
+	filePathToOpen := al.config.Target
+	newFile, errOpen := os.OpenFile(filePathToOpen, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if errOpen != nil {
+		log.Printf("Failed to reopen access log file %s: %v. Access logging may be impaired and will fall back to stdout.", filePathToOpen, errOpen)
+		// Fallback to stdout
+		al.logger.SetOutput(os.Stdout)
+		al.output = os.Stdout
+		return fmt.Errorf("failed to reopen access log file %s: %w", filePathToOpen, errOpen)
+	}
+
+	al.logger.SetOutput(newFile)
+	al.output = newFile
+	log.Printf("Successfully reopened access log file: %s", filePathToOpen)
+	return nil
+}
+
 // Helper to map config.LogLevel to an internal severity level if needed, or just use it directly.
 func getSeverity(level config.LogLevel) int {
 	switch level {
