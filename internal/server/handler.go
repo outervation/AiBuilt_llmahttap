@@ -14,6 +14,22 @@ import (
 // and a logger instance. The logger instance is specifically an ErrorLogger
 // as handlers typically log errors or significant operational messages,
 // not access logs (which are handled centrally).
+
+// HandlerRegistry manages the registration and retrieval of HandlerFactory instances.
+// It provides a centralized and thread-safe way to map HandlerType strings
+// (from configuration) to their corresponding factory functions.
+type HandlerRegistry struct {
+	mu        sync.RWMutex
+	factories map[string]HandlerFactory
+}
+
+// NewHandlerRegistry creates and returns a new HandlerRegistry instance.
+func NewHandlerRegistry() *HandlerRegistry {
+	return &HandlerRegistry{
+		factories: make(map[string]HandlerFactory),
+	}
+}
+
 type HandlerFactory func(handlerConfig json.RawMessage, errorLogger *logger.ErrorLogger) (http2.Handler, error)
 
 var (
