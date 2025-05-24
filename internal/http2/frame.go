@@ -556,6 +556,10 @@ func (f *SettingsFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 
 	numSettings := f.Length / settingEntrySize
 	f.Settings = make([]Setting, 0, numSettings)
+
+	// If f.Length is 0 (e.g., for an ACK frame or a non-ACK frame with no settings),
+	// buf will be empty, and io.ReadFull will correctly do nothing and return nil error.
+	// The subsequent loop for parsing settings will not run as numSettings will be 0.
 	buf := make([]byte, f.Length)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return fmt.Errorf("reading SETTINGS payload: %w", err)
