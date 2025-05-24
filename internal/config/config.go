@@ -142,6 +142,7 @@ type StaticFileServerConfig struct {
 // TODO: Implement functions to apply default values to the configuration.
 
 const (
+	defaultServerAddress           = ":443"
 	defaultChildReadinessTimeout   = "10s"
 	defaultGracefulShutdownTimeout = "30s"
 	defaultLogLevel                = LogLevelInfo
