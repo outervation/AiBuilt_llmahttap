@@ -241,3 +241,187 @@ func (fcw *FlowControlWindow) Close(err error) {
 		fcw.cond.Broadcast() // Wake up any waiters
 	}
 }
+
+// ConnectionFlowControlManager manages the send and receive flow control windows
+// for the entire HTTP/2 connection.
+type ConnectionFlowControlManager struct {
+	// sendWindow governs how much data this endpoint can send on the connection.
+	// This window is replenished by WINDOW_UPDATE frames from the peer.
+	sendWindow *FlowControlWindow
+
+	// Receive-side flow control:
+	receiveWindowMu sync.Mutex
+	// currentReceiveWindowSize tracks how much more data the peer is currently allowed to send us.
+	// It starts at DefaultInitialWindowSize, decreases when we receive DATA frames,
+	// and effectively increases when our application consumes data (allowing us to send WINDOW_UPDATE).
+	currentReceiveWindowSize int64
+	// bytesConsumedTotal tracks the cumulative number of bytes consumed by the application
+	// from data received on this connection. Used to calculate WINDOW_UPDATE increments.
+	bytesConsumedTotal uint64
+	// lastWindowUpdateSentAt stores the value of bytesConsumedTotal at the time the last
+	// connection-level WINDOW_UPDATE was sent.
+	lastWindowUpdateSentAt uint64
+	// windowUpdateThreshold is the amount of consumed data that should accumulate before
+	// a new WINDOW_UPDATE frame is sent. E.g., DefaultInitialWindowSize / 2.
+	windowUpdateThreshold uint32
+
+	// logger *logger.Logger // Optional: for detailed logging
+}
+
+// NewConnectionFlowControlManager creates a new manager for connection-level flow control.
+// HTTP/2 connections start with a flow control window of 65,535 octets for both sending and receiving.
+func NewConnectionFlowControlManager() *ConnectionFlowControlManager {
+	initialSize := DefaultInitialWindowSize // As per RFC 7540, Section 6.9.1
+
+	cfcm := &ConnectionFlowControlManager{
+		sendWindow:               NewFlowControlWindow(initialSize, true, 0), // Our send window (streamID 0 for connection)
+		currentReceiveWindowSize: int64(initialSize),                         // Peer's send window (our receive capacity)
+		windowUpdateThreshold:    initialSize / 2,                            // Send update when half the window is consumed
+		// bytesConsumedTotal and lastWindowUpdateSentAt start at 0.
+	}
+
+	// Ensure threshold is at least 1 if initialSize is positive, to allow updates.
+	if cfcm.windowUpdateThreshold == 0 && initialSize > 0 {
+		cfcm.windowUpdateThreshold = 1
+	}
+	return cfcm
+}
+
+// AcquireSendSpace attempts to reserve 'n' bytes from our connection send window.
+// It blocks until space is available or the window is closed/errored.
+// Returns an error if 'n' is 0 or if the window operation fails.
+func (cfcm *ConnectionFlowControlManager) AcquireSendSpace(n uint32) error {
+	if n == 0 { // Sending zero-length DATA frame does not consume window space.
+		return nil
+	}
+	return cfcm.sendWindow.Acquire(n)
+}
+
+// HandleWindowUpdateFromPeer processes a WINDOW_UPDATE frame received from the peer
+// for the connection (StreamID 0). This increases our send window.
+// Returns an error if the increment is invalid (e.g., causes overflow).
+func (cfcm *ConnectionFlowControlManager) HandleWindowUpdateFromPeer(increment uint32) error {
+	// Validation of increment (not 0 for connection, not causing overflow)
+	// is handled by sendWindow.Increase().
+	return cfcm.sendWindow.Increase(increment)
+}
+
+// DataReceived is called when 'n' bytes of a DATA frame payload are received on the connection.
+// It consumes 'n' bytes from the peer's send window (our receive window).
+// Returns a ConnectionError of type FLOW_CONTROL_ERROR if the peer violates flow control
+// (i.e., sends more data than currently allowed).
+func (cfcm *ConnectionFlowControlManager) DataReceived(n uint32) error {
+	if n == 0 { // Receiving a DATA frame with no payload does not affect flow control.
+		return nil
+	}
+
+	cfcm.receiveWindowMu.Lock()
+	defer cfcm.receiveWindowMu.Unlock()
+
+	if int64(n) > cfcm.currentReceiveWindowSize {
+		// Peer sent more data than available in its send window (our receive window).
+		msg := fmt.Sprintf("connection flow control error: received %d bytes, but peer's window was only %d", n, cfcm.currentReceiveWindowSize)
+		// This is a connection error of type FLOW_CONTROL_ERROR.
+		// The connection manager should send GOAWAY and terminate.
+		// currentReceiveWindowSize is not modified here as the connection is expected to terminate.
+		return NewConnectionError(ErrCodeFlowControlError, msg)
+	}
+
+	cfcm.currentReceiveWindowSize -= int64(n)
+	return nil
+}
+
+// ApplicationConsumedData is called when the application has processed 'n' bytes of data
+// that were previously accounted for in DataReceived. This makes space available in our
+// receive window, potentially triggering a WINDOW_UPDATE to the peer.
+// It returns the size of the increment for the WINDOW_UPDATE frame if one should be sent,
+// otherwise 0.
+// Returns an error if 'n' is invalid or if an internal accounting error occurs.
+func (cfcm *ConnectionFlowControlManager) ApplicationConsumedData(n uint32) (uint32, error) {
+	if n == 0 {
+		return 0, nil
+	}
+
+	// The amount consumed, 'n', cannot itself exceed the maximum window size,
+	// as it might form the basis of a WINDOW_UPDATE increment.
+	if n > MaxWindowSize {
+		return 0, fmt.Errorf("application consumed %d bytes, which exceeds MaxWindowSize %d for a single increment step", n, MaxWindowSize)
+	}
+
+	cfcm.receiveWindowMu.Lock()
+	defer cfcm.receiveWindowMu.Unlock()
+
+	// Safely add to bytesConsumedTotal
+	newBytesConsumedTotal := cfcm.bytesConsumedTotal + uint64(n)
+	if newBytesConsumedTotal < cfcm.bytesConsumedTotal { // Check for uint64 overflow
+		return 0, NewConnectionError(ErrCodeInternalError, "connection bytesConsumedTotal overflow during application consumption")
+	}
+
+	// Calculate the total amount of data consumed since the last WINDOW_UPDATE was sent for the connection.
+	// This will be the increment for the new WINDOW_UPDATE frame.
+	pendingIncrement := uint32(newBytesConsumedTotal - cfcm.lastWindowUpdateSentAt)
+
+	// A WINDOW_UPDATE frame's increment MUST be greater than 0. (RFC 7540, 6.9)
+	// If n > 0, pendingIncrement should be > 0 unless newBytesConsumedTotal == lastWindowUpdateSentAt,
+	// which implies an issue or that n was effectively 0 after previous updates.
+	if pendingIncrement == 0 && n > 0 {
+		// This state could occur if, for example, lastWindowUpdateSentAt was already newBytesConsumedTotal
+		// due to some prior logic. If n>0, this implies something is amiss or it's a no-op for now.
+		// For safety, and strict adherence, if n > 0, we expect pendingIncrement to be potentially > 0.
+		// However, if threshold is not met, we return 0 anyway.
+		// The critical check is before returning a non-zero increment.
+	}
+
+	// The increment value for WINDOW_UPDATE must not exceed MaxWindowSize.
+	if pendingIncrement > MaxWindowSize {
+		// This indicates that the accumulated consumption is too large for a single WINDOW_UPDATE.
+		// This situation implies an internal logic error or that the update threshold is too large
+		// or not being effective.
+		return 0, NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("calculated connection WINDOW_UPDATE increment %d exceeds MaxWindowSize %d", pendingIncrement, MaxWindowSize))
+	}
+
+	// Update our internal view of the receive window size.
+	// currentReceiveWindowSize logically increases because we can now accept 'n' more bytes.
+	newCurrentReceiveWindowSize := cfcm.currentReceiveWindowSize + int64(n)
+	if newCurrentReceiveWindowSize > MaxWindowSize {
+		// Our logical view of the total space we are offering the peer has exceeded the max.
+		// This is an internal error; our accounting is flawed.
+		return 0, NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("internal: connection receive window effective size %d would exceed MaxWindowSize %d after consumption", newCurrentReceiveWindowSize, MaxWindowSize))
+	}
+
+	cfcm.bytesConsumedTotal = newBytesConsumedTotal
+	cfcm.currentReceiveWindowSize = newCurrentReceiveWindowSize
+
+	// Determine if a WINDOW_UPDATE frame should be sent.
+	// Send if the accumulated consumed data (pendingIncrement) meets the threshold.
+	// Also ensure the increment is > 0, as WINDOW_UPDATE with 0 increment is a protocol error for streams
+	// and a no-op (but wasteful) for connections if we were to send it.
+	if pendingIncrement >= cfcm.windowUpdateThreshold && pendingIncrement > 0 {
+		cfcm.lastWindowUpdateSentAt = cfcm.bytesConsumedTotal // Record that an update for this amount is being issued.
+		return pendingIncrement, nil
+	}
+
+	return 0, nil // No WINDOW_UPDATE to send yet.
+}
+
+// Close signals that the connection is closing. It closes the underlying send flow control window,
+// which will unblock any goroutines waiting to acquire send space.
+func (cfcm *ConnectionFlowControlManager) Close(err error) {
+	cfcm.sendWindow.Close(err)
+	// The receive side counters don't need explicit closing beyond their mutex.
+}
+
+// GetConnectionSendAvailable returns the current available space in our connection send window.
+func (cfcm *ConnectionFlowControlManager) GetConnectionSendAvailable() int64 {
+	return cfcm.sendWindow.Available()
+}
+
+// GetConnectionReceiveAvailable returns the current available space in our connection receive window
+// (i.e., how much more data the peer can send us before we need to send a WINDOW_UPDATE).
+func (cfcm *ConnectionFlowControlManager) GetConnectionReceiveAvailable() int64 {
+	cfcm.receiveWindowMu.Lock()
+	defer cfcm.receiveWindowMu.Unlock()
+	return cfcm.currentReceiveWindowSize
+}
