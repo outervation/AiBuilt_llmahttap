@@ -156,10 +156,11 @@ type Stream struct {
 
 	// Request handling
 	requestHeaders    []hpack.HeaderField
-	requestBodyReader *io.PipeReader  // For handler to read incoming DATA frames
-	requestBodyWriter *io.PipeWriter  // For stream to write incoming DATA frames into
-	handler           Handler         // Handler responsible for this stream
-	handlerConfig     json.RawMessage // Configuration for the handler
+	requestTrailers   []hpack.HeaderField // For storing received trailer headers
+	requestBodyReader *io.PipeReader      // For handler to read incoming DATA frames
+	requestBodyWriter *io.PipeWriter      // For stream to write incoming DATA frames into
+	handler           Handler             // Handler responsible for this stream
+	handlerConfig     json.RawMessage     // Configuration for the handler
 
 	// Response handling (Stream implements ResponseWriter or provides one)
 	responseHeadersSent bool                // True if response HEADERS frame has been sent
@@ -182,7 +183,6 @@ type Stream struct {
 	// _requestDataBuffer *bytes.Buffer
 
 	// TODO: Add fields for server push if implementing PUSH_PROMISE
-	// TODO: Add fields for received trailers from client, if supported/needed.
 }
 
 // NewStream creates a new stream.
@@ -364,59 +364,150 @@ func (s *Stream) WriteTrailers(trailers []hpack.HeaderField) error {
 
 // Methods for stream processing (to be expanded)
 
-// processIncomingHeaders is called by the connection when HEADERS (+ CONTINUATION) are received for this stream.
-func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream bool, hasPriority bool, prio ExclusiveStreamDependency) error {
+// handleHeadersFrame is called by the connection when a HEADERS frame (potentially after merging with CONTINUATIONs)
+// is received for this stream. It decodes headers, updates stream priority, transitions stream state,
+// stores decoded headers, and if applicable, invokes the handler.
+func (s *Stream) handleHeadersFrame(frame *HeadersFrame, hpackDecoder *HpackAdapter) error {
 	s.mu.Lock()
 
-	initialState := s.state
-	isTrailer := false
+	isInitialHeaders := false
+	isTrailerHeaders := false
+	currentState := s.state
 
-	if initialState == StreamStateOpen || initialState == StreamStateHalfClosedLocal {
-		if s.endStreamReceivedFromClient {
+	logFieldsBase := logger.LogFields{"stream_id": s.id, "state": currentState.String(), "frame_flags": frame.Header().Flags}
+
+	switch currentState {
+	case StreamStateIdle: // Client is opening a new stream
+		isInitialHeaders = true
+	case StreamStateOpen, StreamStateHalfClosedLocal: // Client is sending Trailing HEADERS
+		if s.endStreamReceivedFromClient && len(frame.HeaderBlockFragment) > 0 { // Trailers expected only if body not fully closed
+			// If END_STREAM was already on HEADERS/DATA, trailers might still arrive if they were "in flight".
+			// However, if client sent END_STREAM and *then* sends more HEADERS (trailers), it's an issue.
+			// For simplicity, if data part truly ended, no more HEADERS/trailers.
+			// RFC 7540, Section 8.1: "A request or response containing a body that is zero octets in length
+			// is PUT to a server with a final DATA frame ... trailers are ... sent as a HEADERS frame
+			// following the final DATA frame"
+			// If END_STREAM already received (e.g. on initial HEADERS or DATA), then receiving more HEADERS is an error.
 			s.mu.Unlock()
-			s.conn.logger.Error("stream: received headers after END_STREAM already processed for request", logger.LogFields{"stream_id": s.id})
+			s.conn.logger.Error("stream: received trailer HEADERS after END_STREAM already processed", logFieldsBase)
 			s.sendRSTStream(ErrCodeStreamClosed)
-			return NewStreamError(s.id, ErrCodeStreamClosed, "received headers after request end stream")
+			return NewStreamError(s.id, ErrCodeStreamClosed, "trailer HEADERS after END_STREAM processed")
 		}
-		isTrailer = true // These are trailers
-		s.conn.logger.Info("stream: received trailer headers", logger.LogFields{"stream_id": s.id, "num_trailers": len(headers)})
-		// TODO: Handle trailers: store them, validate, etc. s.requestTrailers = headers
-	} else if initialState != StreamStateIdle && initialState != StreamStateReservedRemote {
+		isTrailerHeaders = true
+	default:
+		// Invalid state to receive HEADERS (e.g., Closed, HalfClosedRemote by client, ReservedLocal by server means client shouldn't send HEADERS)
 		s.mu.Unlock()
-		s.conn.logger.Error("stream: received headers in invalid state", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		s.sendRSTStream(ErrCodeStreamClosed)
-		return NewStreamError(s.id, ErrCodeStreamClosed, "received headers in invalid state "+s.state.String())
+		logFieldsBase["error_msg"] = "HEADERS frame received in invalid state"
+		s.conn.logger.Error("stream: HEADERS frame received in invalid state", logFieldsBase)
+		// RFC 7540, 6.2: "HEADERS frames MUST be associated with a stream. If a HEADERS frame is received on a stream that is not in
+		// the "idle", "reserved (remote)", "open", or "half-closed (local)" state, the endpoint MUST respond with
+		// a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+		// ReservedLocal is not in that list for *receiving* client HEADERS.
+		return NewConnectionError(ErrCodeProtocolError, "HEADERS frame in invalid state "+currentState.String())
 	}
 
-	if !isTrailer {
-		s.requestHeaders = headers
-	} // Else, store in a separate field for trailers if needed.
+	// Decode Headers
+	// The hpackDecoder is specific to this connection. The connection layer is responsible for
+	// ensuring hpackDecoder.ResetDecoderState() or similar is called before a new header block
+	// (from potentially different stream) is decoded, or relying on FinishDecoding.
+	if err := hpackDecoder.DecodeFragment(frame.HeaderBlockFragment); err != nil {
+		s.mu.Unlock()
+		logFieldsBase["hpack_error"] = err.Error()
+		s.conn.logger.Error("stream: HPACK decode fragment error", logFieldsBase)
+		return NewConnectionError(ErrCodeCompressionError, "HPACK decode fragment error: "+err.Error())
+	}
+	decodedHeaders, err := hpackDecoder.FinishDecoding() // Finishes block, resets decoder state for next block
+	if err != nil {
+		s.mu.Unlock()
+		logFieldsBase["hpack_error"] = err.Error()
+		s.conn.logger.Error("stream: HPACK finish decoding error", logFieldsBase)
+		return NewConnectionError(ErrCodeCompressionError, "HPACK finish decoding error: "+err.Error())
+	}
 
-	if initialState == StreamStateIdle || initialState == StreamStateReservedRemote {
-		// Transition to open. This path is for initial HEADERS.
-		// Trailers path (initialState == Open or HalfClosedLocal) doesn't change to Open.
-		if !isTrailer {
+	// Process Priority (if applicable and initial HEADERS)
+	if isInitialHeaders && (frame.Header().Flags&FlagHeadersPriority != 0) {
+		s.priorityParentID = frame.StreamDependency
+		s.priorityWeight = frame.Weight
+		s.priorityExclusive = frame.Exclusive
+		if s.conn.priorityTree != nil {
+			// This updates the authoritative priority tree on the connection.
+			if errPrio := s.conn.priorityTree.UpdatePriority(s.id, frame.StreamDependency, frame.Weight, frame.Exclusive); errPrio != nil {
+				// If self-dependency in priority update from HEADERS.
+				// RFC 7540, 5.3.1 "A stream cannot depend on itself. An endpoint MUST treat this as a stream error ... of type PROTOCOL_ERROR."
+				s.mu.Unlock()
+				logFieldsBase["priority_error"] = errPrio.Error()
+				s.conn.logger.Error("stream: priority update from HEADERS failed (e.g. self-dependency)", logFieldsBase)
+				s.sendRSTStream(ErrCodeProtocolError)
+				return NewStreamError(s.id, ErrCodeProtocolError, "priority update failed: "+errPrio.Error())
+			}
+		}
+	}
+
+	// Validate and Store Headers
+	if isInitialHeaders {
+		// TODO: Implement robust pseudo-header validation (RFC 7540 Section 8.1.2.1, 8.1.2.2, 8.1.2.3)
+		// E.g., presence, order, single value for :method, :path, :scheme.
+		// For now, basic storage.
+		hasMethod := false
+		hasPath := false
+		hasScheme := false
+		for _, hf := range decodedHeaders {
+			if hf.Name == ":method" {
+				hasMethod = true
+			}
+			if hf.Name == ":path" {
+				hasPath = true
+			}
+			if hf.Name == ":scheme" {
+				hasScheme = true
+			}
+		}
+		if !hasMethod || !hasPath || !hasScheme {
+			s.mu.Unlock()
+			s.conn.logger.Error("stream: missing required pseudo-headers", logFieldsBase)
+			s.sendRSTStream(ErrCodeProtocolError)
+			return NewStreamError(s.id, ErrCodeProtocolError, "missing required pseudo-headers")
+		}
+
+		s.requestHeaders = decodedHeaders
+		if currentState == StreamStateIdle {
 			s._setState(StreamStateOpen)
 		}
+		// Note: StreamStateReservedRemote implies client sent PUSH_PROMISE, which is not allowed.
+		// The connection state check above should ideally catch this as a connection error before stream processing.
+		// If we do reach here from ReservedRemote (e.g., client-side code perspective receiving server headers after PUSH_PROMISE),
+		// then ReservedRemote -> Open is a valid transition. Server-side, this state implies error.
+		// For server, `idle -> open` is the main path for initial HEADERS from client.
+	} else if isTrailerHeaders {
+		// TODO: Implement trailer validation (RFC 7540 Section 8.1.2.2 - no pseudo-headers in trailers)
+		for _, hf := range decodedHeaders {
+			if strings.HasPrefix(hf.Name, ":") {
+				s.mu.Unlock()
+				s.conn.logger.Error("stream: pseudo-header found in trailers", logFieldsBase)
+				s.sendRSTStream(ErrCodeProtocolError)
+				return NewStreamError(s.id, ErrCodeProtocolError, "pseudo-header in trailers")
+			}
+		}
+		s.requestTrailers = decodedHeaders
+		s.conn.logger.Debug("stream: received trailer headers", logger.LogFields{"stream_id": s.id, "num_trailers": len(decodedHeaders)})
 	}
 
-	if hasPriority && !isTrailer { // Priority info only on initial HEADERS
-		s.priorityParentID = prio.StreamDependency
-		s.priorityWeight = prio.Weight
-		s.priorityExclusive = prio.Exclusive
-		s.conn.updateStreamPriority(s.id, prio.StreamDependency, prio.Weight, prio.Exclusive)
-	}
-
+	// Handle END_STREAM
+	endStream := frame.Header().Flags&FlagHeadersEndStream != 0
 	if endStream {
 		s.endStreamReceivedFromClient = true
 		if s.requestBodyWriter != nil {
-			s.requestBodyWriter.Close()
+			s.requestBodyWriter.Close() // Signal EOF to handler
 		}
-		s.transitionStateOnReceiveEndStream()
+		s.transitionStateOnReceiveEndStream() // Updates state: Open->HalfClosedRemote, HalfClosedLocal->Closed
 	}
+
+	// Unlock stream before potentially long-running handler
 	s.mu.Unlock()
 
-	if !isTrailer && len(s.requestHeaders) > 0 {
+	// Invoke Handler (if initial HEADERS)
+	// The END_HEADERS flag on the frame ensures this is the complete logical header block.
+	if isInitialHeaders {
 		go s.runHandler()
 	}
 
