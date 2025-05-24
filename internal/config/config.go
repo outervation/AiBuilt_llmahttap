@@ -234,6 +234,10 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server == nil {
 		cfg.Server = &ServerConfig{}
 	}
+	if cfg.Server.Address == nil {
+		val := defaultServerAddress
+		cfg.Server.Address = &val
+	}
 	if cfg.Server.ChildReadinessTimeout == nil {
 		val := defaultChildReadinessTimeout
 		cfg.Server.ChildReadinessTimeout = &val
