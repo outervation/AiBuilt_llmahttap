@@ -424,39 +424,77 @@ func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream b
 }
 
 // processIncomingData is called by the connection when a DATA frame is received.
-func (s *Stream) processIncomingData(data []byte, endStream bool) error {
-	s.mu.Lock()
-	if s.endStreamReceivedFromClient {
-		s.mu.Unlock()
-		s.conn.logger.Error("stream: received DATA frame after END_STREAM", logger.LogFields{"stream_id": s.id})
-		s.sendRSTStream(ErrCodeStreamClosed)
-		return NewStreamError(s.id, ErrCodeStreamClosed, "received DATA frame after END_STREAM")
+
+// processIncomingDataBody is called by the connection when a DATA frame's payload needs to be processed,
+// after flow control accounting has been done.
+// It writes data to the request body pipe and handles END_STREAM.
+func (s *Stream) processIncomingDataBody(data []byte, endStream bool) error {
+	// This method is called after flow control windows have been debited by handleDataFrame.
+	// It's responsible for writing to the pipe and handling END_STREAM.
+
+	// No data to write and not ending stream? No-op for the body processing part.
+	if len(data) == 0 && !endStream {
+		return nil
 	}
 
+	s.mu.Lock() // Lock for the whole operation except pipe write
+
+	// Critical state check before attempting to use pipeWriter or modify endStream state.
+	// handleDataFrame should have already performed similar checks. This is an additional safeguard.
 	if s.state != StreamStateOpen && s.state != StreamStateHalfClosedLocal {
 		s.mu.Unlock()
-		s.conn.logger.Error("stream: received DATA frame in invalid state", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		s.sendRSTStream(ErrCodeStreamClosed)
-		return NewStreamError(s.id, ErrCodeStreamClosed, "received DATA frame in invalid state "+s.state.String())
+		s.conn.logger.Error("stream: processIncomingDataBody called in invalid state", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+		// RST likely already sent by handleDataFrame. If not, this indicates a deeper issue.
+		return NewStreamError(s.id, ErrCodeInternalError, "processIncomingDataBody in invalid state "+s.state.String())
 	}
 
-	pipeWriter := s.requestBodyWriter
-	s.mu.Unlock() // Unlock before writing to pipe
+	// Check if END_STREAM was already received. handleDataFrame should also catch this.
+	if s.endStreamReceivedFromClient {
+		s.mu.Unlock()
+		s.conn.logger.Error("stream: processIncomingDataBody called after END_STREAM already processed for request", logger.LogFields{"stream_id": s.id})
+		// RST was likely already sent by handleDataFrame.
+		return NewStreamError(s.id, ErrCodeStreamClosed, "processIncomingDataBody called after END_STREAM")
+	}
 
-	if pipeWriter != nil {
-		_, err := pipeWriter.Write(data)
-		if err != nil {
-			s.conn.logger.Error("stream: error writing to request body pipe", logger.LogFields{"stream_id": s.id, "error": err.Error()})
-			s.sendRSTStream(ErrCodeCancel)
-			return NewStreamError(s.id, ErrCodeInternalError, "error writing to request body pipe: "+err.Error())
+	currentPipeWriter := s.requestBodyWriter // Get under lock
+
+	if len(data) > 0 {
+		if currentPipeWriter == nil {
+			// This means the stream is likely being closed/reset concurrently, or END_STREAM on HEADERS closed the pipe.
+			s.mu.Unlock()
+			s.conn.logger.Warn("stream: requestBodyWriter is nil in processIncomingDataBody; data lost",
+				logger.LogFields{"stream_id": s.id, "data_len": len(data), "end_stream": endStream})
+
+			// If data is present and this isn't the frame that's supposed to end the stream and close the pipe,
+			// it's an unexpected situation (data loss).
+			if !endStream {
+				s.sendRSTStream(ErrCodeInternalError)
+				return NewStreamError(s.id, ErrCodeInternalError, "requestBodyWriter is nil while data is pending")
+			}
+			// If endStream is true, the pipe being nil might be due to prior END_STREAM on HEADERS.
+			// Proceed to endStream logic below. Data, if any, is lost.
+		} else {
+			s.mu.Unlock() // Unlock for pipe write
+			_, pipeErr := currentPipeWriter.Write(data)
+			s.mu.Lock() // Re-lock after pipe write
+
+			if pipeErr != nil {
+				s.mu.Unlock()
+				s.conn.logger.Error("stream: error writing to request body pipe", logger.LogFields{"stream_id": s.id, "error": pipeErr.Error()})
+				s.sendRSTStream(ErrCodeCancel) // Handler will see pipe error; CANCEL indicates graceful termination request.
+				return NewStreamError(s.id, ErrCodeInternalError, "error writing to request body pipe: "+pipeErr.Error())
+			}
 		}
 	}
+	// If len(data) == 0, s.mu is still held from the start of the function (or after re-lock if pipeWriter was nil).
+	// If len(data) > 0, s.mu is re-acquired and held.
 
-	s.mu.Lock() // Re-acquire lock for state update
 	if endStream {
 		s.endStreamReceivedFromClient = true
-		if pipeWriter != nil { // Should be s.requestBodyWriter
-			pipeWriter.Close()
+		if currentPipeWriter != nil {
+			// Close the writer to signal EOF to the reader (handler).
+			// This is safe even if it was already closed.
+			currentPipeWriter.Close()
 		}
 		s.transitionStateOnReceiveEndStream()
 	}
