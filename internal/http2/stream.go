@@ -112,9 +112,9 @@ func (s StreamState) String() string {
 // ResponseWriter defines the interface for handlers to write HTTP/2 responses.
 // The Stream itself will likely implement this.
 type ResponseWriter interface {
-	// WriteHeaders sends response headers.
+	// SendHeaders sends response headers.
 	// If endStream is true, this also signals the end of the response body (e.g., for HEAD requests or empty bodies).
-	WriteHeaders(headers []hpack.HeaderField, endStream bool) error
+	SendHeaders(headers []hpack.HeaderField, endStream bool) error
 
 	// WriteData sends a chunk of the response body.
 	// If endStream is true, this is the final chunk of the response body.
