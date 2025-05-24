@@ -378,7 +378,11 @@ func (s *Stream) processIncomingHeaders(headers []hpack.HeaderField, endStream b
 	} // Else, store in a separate field for trailers if needed.
 
 	if initialState == StreamStateIdle || initialState == StreamStateReservedRemote {
-		s.state = StreamStateOpen
+		// Transition to open. This path is for initial HEADERS.
+		// Trailers path (initialState == Open or HalfClosedLocal) doesn't change to Open.
+		if !isTrailer {
+			s._setState(StreamStateOpen)
+		}
 	}
 
 	if hasPriority && !isTrailer { // Priority info only on initial HEADERS
@@ -456,19 +460,20 @@ func (s *Stream) processIncomingRSTStream(errorCode ErrorCode) {
 
 	s.conn.logger.Info("stream: received RST_STREAM", logger.LogFields{"stream_id": s.id, "error_code": errorCode.String()})
 
-	pipeWriter := s.requestBodyWriter
-	cancelCtxFunc := s.cancelCtx
+	// pipeWriter := s.requestBodyWriter // This variable is unused as cleanup is handled by closeStreamResourcesProtected
 
-	s.state = StreamStateClosed
-	s.pendingRSTCode = &errorCode
+	// Keep a reference to call after unlock, if needed, but closeStreamResourcesProtected handles it.
+	// cancelCtxFunc := s.cancelCtx
+	// pipeWriter := s.requestBodyWriter
 
-	s.mu.Unlock() // Unlock before calling external methods
+	s.pendingRSTCode = &errorCode  // Record why it's closing
+	s._setState(StreamStateClosed) // This will call closeStreamResourcesProtected
 
-	if pipeWriter != nil {
-		pipeWriter.CloseWithError(NewStreamError(s.id, errorCode, "stream reset by peer"))
-	}
-	cancelCtxFunc()
-	s.conn.removeStream(s.id, errorCode)
+	s.mu.Unlock() // Unlock before calling external methods that might block or re-enter
+
+	// Resource cleanup (pipes, context) is handled by closeStreamResourcesProtected,
+	// which is called by _setState(StreamStateClosed).
+	// conn.removeStream is also called by closeStreamResourcesProtected.
 }
 
 // sendRSTStream initiates sending an RST_STREAM frame from this endpoint.
