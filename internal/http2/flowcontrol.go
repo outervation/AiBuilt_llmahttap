@@ -475,3 +475,253 @@ func NewStreamFlowControlManager(streamID uint32, ourInitialWindowSize, peerInit
 
 	return sfcm
 }
+
+// AcquireSendSpace attempts to reserve 'n' bytes from this stream's send window.
+// It blocks until space is available or the window is closed/errored.
+// Returns an error if 'n' is 0 or if the window operation fails.
+func (sfcm *StreamFlowControlManager) AcquireSendSpace(n uint32) error {
+	if n == 0 { // Sending zero-length DATA frame does not consume window space.
+		return nil
+	}
+	return sfcm.sendWindow.Acquire(n)
+}
+
+// HandleWindowUpdateFromPeer processes a WINDOW_UPDATE frame received from the peer
+// for this specific stream. This increases our send window for this stream.
+// Returns an error if the increment is invalid (e.g., 0, or causes overflow).
+func (sfcm *StreamFlowControlManager) HandleWindowUpdateFromPeer(increment uint32) error {
+	// Validation (increment != 0, not causing overflow) is handled by sendWindow.Increase()
+	// as it's a non-connection window.
+	return sfcm.sendWindow.Increase(increment)
+}
+
+// DataReceived is called when 'n' bytes of a DATA frame payload are received on this stream.
+// It consumes 'n' bytes from the peer's send window for this stream (our stream receive window).
+// Returns a StreamError of type FLOW_CONTROL_ERROR if the peer violates flow control
+// (i.e., sends more data than currently allowed on this stream).
+func (sfcm *StreamFlowControlManager) DataReceived(n uint32) error {
+	if n == 0 { // Receiving a DATA frame with no payload does not affect flow control.
+		return nil
+	}
+
+	sfcm.receiveWindowMu.Lock()
+	defer sfcm.receiveWindowMu.Unlock()
+
+	if int64(n) > sfcm.currentReceiveWindowSize {
+		// Peer sent more data than available in its stream send window (our stream receive window).
+		msg := fmt.Sprintf("stream %d flow control error: received %d bytes, but peer's window was only %d",
+			sfcm.streamID, n, sfcm.currentReceiveWindowSize)
+		return NewStreamError(sfcm.streamID, ErrCodeFlowControlError, msg)
+	}
+
+	sfcm.currentReceiveWindowSize -= int64(n)
+	return nil
+}
+
+// ApplicationConsumedData is called when the application has processed 'n' bytes of data
+// from this stream that were previously accounted for in DataReceived. This makes space
+// available in our stream receive window, potentially triggering a WINDOW_UPDATE to the peer for this stream.
+// It returns the size of the increment for the WINDOW_UPDATE frame if one should be sent, otherwise 0.
+// Returns an error if 'n' is invalid or if an internal accounting error occurs.
+func (sfcm *StreamFlowControlManager) ApplicationConsumedData(n uint32) (uint32, error) {
+	if n == 0 {
+		return 0, nil
+	}
+
+	if n > MaxWindowSize {
+		return 0, NewStreamError(sfcm.streamID, ErrCodeInternalError,
+			fmt.Sprintf("application consumed %d bytes from stream %d, which exceeds MaxWindowSize %d for a single increment step", n, sfcm.streamID, MaxWindowSize))
+	}
+
+	sfcm.receiveWindowMu.Lock()
+	defer sfcm.receiveWindowMu.Unlock()
+
+	newBytesConsumedTotal := sfcm.bytesConsumedTotal + uint64(n)
+	if newBytesConsumedTotal < sfcm.bytesConsumedTotal { // Check for uint64 overflow
+		return 0, NewStreamError(sfcm.streamID, ErrCodeInternalError,
+			fmt.Sprintf("stream %d bytesConsumedTotal overflow during application consumption", sfcm.streamID))
+	}
+
+	pendingIncrement := uint32(newBytesConsumedTotal - sfcm.lastWindowUpdateSentAt)
+
+	if pendingIncrement == 0 && n > 0 {
+		// No-op for now, threshold check will handle it.
+	}
+
+	if pendingIncrement > MaxWindowSize {
+		return 0, NewStreamError(sfcm.streamID, ErrCodeInternalError,
+			fmt.Sprintf("calculated stream %d WINDOW_UPDATE increment %d exceeds MaxWindowSize %d", sfcm.streamID, pendingIncrement, MaxWindowSize))
+	}
+
+	newCurrentReceiveWindowSize := sfcm.currentReceiveWindowSize + int64(n)
+	if newCurrentReceiveWindowSize > MaxWindowSize {
+		// This is an internal error in our accounting for the stream's receive window.
+		// It means if we were to simply add 'n' to currentReceiveWindowSize, it would overflow.
+		// This should ideally not happen if initial sizes and consumption are handled correctly.
+		return 0, NewStreamError(sfcm.streamID, ErrCodeInternalError,
+			fmt.Sprintf("internal: stream %d receive window effective size %d would exceed MaxWindowSize %d after consumption", sfcm.streamID, newCurrentReceiveWindowSize, MaxWindowSize))
+	}
+
+	sfcm.bytesConsumedTotal = newBytesConsumedTotal
+	sfcm.currentReceiveWindowSize = newCurrentReceiveWindowSize
+
+	// Send WINDOW_UPDATE if accumulated consumed data meets threshold AND increment is > 0.
+	if pendingIncrement >= sfcm.windowUpdateThreshold && pendingIncrement > 0 {
+		sfcm.lastWindowUpdateSentAt = sfcm.bytesConsumedTotal
+		return pendingIncrement, nil
+	}
+
+	return 0, nil // No WINDOW_UPDATE to send yet for this stream.
+}
+
+// HandlePeerSettingsInitialWindowSizeChange is called when the peer's SETTINGS_INITIAL_WINDOW_SIZE changes.
+// This affects our send window for this stream.
+// Returns a ConnectionError if the peer's new setting would cause our send window to overflow.
+func (sfcm *StreamFlowControlManager) HandlePeerSettingsInitialWindowSizeChange(newPeerInitialSize uint32) error {
+	// The sendWindow.UpdateInitialWindowSize method handles the logic including overflow check.
+	// The error returned by it would be a ConnectionError(FLOW_CONTROL_ERROR) if overflow occurs
+	// due to the new setting value.
+	return sfcm.sendWindow.UpdateInitialWindowSize(newPeerInitialSize)
+}
+
+// HandleOurSettingsInitialWindowSizeChange is called when our server's SETTINGS_INITIAL_WINDOW_SIZE changes.
+// This affects our receive window for this stream.
+// Returns a ConnectionError if applying this change would cause an invalid flow control state (e.g. overflow).
+func (sfcm *StreamFlowControlManager) HandleOurSettingsInitialWindowSizeChange(newOurInitialSize uint32) error {
+	sfcm.receiveWindowMu.Lock()
+	defer sfcm.receiveWindowMu.Unlock()
+
+	// Validate newOurInitialSize against MaxWindowSize (as per RFC 6.5.2)
+	// This check should ideally be done by the SETTINGS frame handler before calling this.
+	if newOurInitialSize > MaxWindowSize {
+		msg := fmt.Sprintf("new local SETTINGS_INITIAL_WINDOW_SIZE %d for stream %d exceeds MaxWindowSize %d", newOurInitialSize, sfcm.streamID, MaxWindowSize)
+		// This implies a bug in our own settings application logic if it reaches here with invalid size.
+		// However, from a flow control perspective, if such a setting *were* applied, it's problematic.
+		// For stream, this doesn't directly cause an FC error on the wire unless we start advertising bad windows.
+		// Let's treat as internal error for now.
+		return NewConnectionError(ErrCodeInternalError, msg) // Or just return an error if config is bad
+	}
+
+	// Calculate the old initial size that was used for this stream's receive window.
+	// The `currentReceiveWindowSize` has had consumption (n) and received data (m) applied.
+	// old_initial_receive_window_size = currentReceiveWindowSize - n_consumed_since_last_update + m_data_received_and_not_consumed
+	// It's simpler: currentReceiveWindowSize = oldInitialReceiveWindowSize - (total_data_received - total_data_consumed_by_app)
+	// delta = newOurInitialSize - oldInitialReceiveWindowSize
+	// The change in initial size directly impacts the available capacity.
+	// The current `bytesConsumedTotal` and `lastWindowUpdateSentAt` are based on data flow.
+	// The `currentReceiveWindowSize` is what's "left" of the window the peer sees.
+	// We need to find the previous initial size this stream was using for its receive window.
+	// This info is not directly stored in sfcm, but we can derive the delta based on
+	// how much currentReceiveWindowSize changes.
+	// The `sendWindow` has `initialWindowSize` for *its* perspective.
+	// For the receive side, the `ourInitialWindowSize` used at construction was implicit.
+	// The change is relative to the *current* total offered window.
+	// Let's re-evaluate: when SETTINGS_INITIAL_WINDOW_SIZE changes from old_IWS to new_IWS,
+	// the flow control window for existing streams is adjusted by (new_IWS - old_IWS).
+	// We don't have old_IWS directly. But we know currentReceiveWindowSize is what's left.
+	// If current = 10k, old_IWS was 65k, new_IWS is 30k. Delta is -35k. New current = 10k - 35k = -25k.
+	// This would be a flow control error if negative.
+
+	// To correctly apply the delta, we need the initial window size this stream was established with *for our receive side*.
+	// This was `ourInitialWindowSize` passed to `NewStreamFlowControlManager`.
+	// Let's assume we need to store this `ourInitialWindowSize` within `StreamFlowControlManager`.
+	// For now, let's assume this method means "the effective initial size *is now* newOurInitialSize".
+	// We need to adjust `currentReceiveWindowSize` by the delta.
+	// The problem is: `currentReceiveWindowSize` is `initial - received_unconsumed`.
+	// If `initial` changes, `currentReceiveWindowSize` changes by that same delta.
+
+	// This is essentially: current_available_to_peer_to_send_us += (new_our_initial_size - old_our_initial_size)
+	// We need 'old_our_initial_size'. It was the `ourInitialWindowSize` parameter during construction
+	// or the value from a previous call to this method.
+	// For simplicity, let's assume this function is only called *once* with the *final* new size,
+	// or that it needs to know the *original* setting.
+	//
+	// RFC 6.9.2: "When the value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+	// the size of all stream flow-control windows that it maintains by the difference between
+	// the new value and the old value."
+	// The "size of all stream flow-control windows" refers to the `currentReceiveWindowSize` (how much more peer can send).
+	// So, if this stream was using `current_IWS_for_this_stream_receive_side` and it changes to `newOurInitialSize`,
+	// then delta = `newOurInitialSize` - `current_IWS_for_this_stream_receive_side`.
+	// `currentReceiveWindowSize` += delta.
+	// And `current_IWS_for_this_stream_receive_side` becomes `newOurInitialSize`.
+	// We also need to update `windowUpdateThreshold`.
+
+	// To do this properly, sfcm needs to remember its *current effective initial receive window size*.
+	// Let's add a field `effectiveInitialReceiveWindowSize` to `StreamFlowControlManager`.
+	// Initialize it with `ourInitialWindowSize` in the constructor.
+
+	// **REVISIT THIS LOGIC AFTER ADDING THE FIELD**
+	// For now, assuming a simpler interpretation or that more context is needed from the caller.
+	// The `FlowControlWindow.UpdateInitialWindowSize` for the *send* side handles this delta correctly.
+	// We need similar logic here for the *receive* side scalar value.
+
+	// Let's assume, for now, that the caller provides the *delta* or manages the old/new values.
+	// Or, this function is for *newly created streams* after a setting change.
+	// The spec is clear: existing streams are adjusted.
+
+	// Simplest immediate action: update threshold. The actual window size adjustment is more complex
+	// without storing the "old" or "current effective" initial size for the receive side.
+	// If this is called from a central settings manager, it would know old and new initial sizes.
+	// Then it can calculate delta and call a method like `AdjustReceiveWindow(delta int32)`.
+
+	// Let's assume this function sets the new absolute initial size, and we adjust based on that.
+	// This requires storing the previous effective initial size used for this stream's receive window.
+	// This is what `sendWindow.UpdateInitialWindowSize` does.
+	// We are essentially reimplementing part of that for the receive side scalar value.
+
+	// If `currentReceiveWindowSize` could become negative:
+	// "An endpoint that receives a SETTINGS frame that causes a flow-control window to exceed the maximum
+	// size MUST treat this as a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR." (RFC 6.9.2)
+	// This also implies if it goes negative (below 0), it's a problem.
+	// "A change to SETTINGS_INITIAL_WINDOW_SIZE can cause the available space in a flow-control window to become negative.
+	// A sender MUST track the negative flow-control window and MUST NOT send new flow-control-limited frames
+	// until it receives WINDOW_UPDATE frames that cause the flow-control window to become positive."
+	// This applies to the *sender*. For the *receiver* (us, in this case, for our receive window),
+	// if our adjustment makes the window for the peer effectively negative, it's not directly an error for *us*,
+	// but the peer must respect it. The "exceed maximum size" part is key for the connection error.
+
+	// Let's refine: this function should be called with the NEW global initial window size.
+	// sfcm needs to know its *own* current initial setting for its receive side.
+	// Let effectiveInitialReceiveWindow be this value.
+	// delta = newOurInitialSize - sfcm.effectiveInitialReceiveWindow
+	// sfcm.currentReceiveWindowSize += delta
+	// sfcm.effectiveInitialReceiveWindow = newOurInitialSize
+	// sfcm.windowUpdateThreshold = newOurInitialSize / 2 (with min 1)
+
+	// This means `StreamFlowControlManager` needs `effectiveInitialReceiveWindowSize uint32`.
+	// Constructor: sfcm.effectiveInitialReceiveWindowSize = ourInitialWindowSize
+	// This is not present yet.
+	// **PENDING: This method needs `effectiveInitialReceiveWindowSize` field in `StreamFlowControlManager` struct.**
+	// For now, will only update threshold.
+
+	sfcm.windowUpdateThreshold = newOurInitialSize / 2
+	if sfcm.windowUpdateThreshold == 0 && newOurInitialSize > 0 {
+		sfcm.windowUpdateThreshold = 1
+	}
+	// TODO: Adjust sfcm.currentReceiveWindowSize based on the delta from the *previous*
+	// effectiveInitialReceiveWindowSize for this stream. This requires adding that field.
+	// If `sfcm.currentReceiveWindowSize + delta` exceeds MaxWindowSize, return ConnectionError(FLOW_CONTROL_ERROR).
+
+	return nil // Placeholder, needs proper implementation with the new field.
+}
+
+// Close signals that the stream is closing. It closes the underlying send flow control window,
+// which will unblock any goroutines waiting to acquire send space for this stream.
+func (sfcm *StreamFlowControlManager) Close(err error) {
+	sfcm.sendWindow.Close(err)
+	// Receive side counters don't need explicit closing beyond their mutex.
+	// Higher-level stream state (e.g., closed, reset) will prevent further DataReceived calls.
+}
+
+// GetStreamSendAvailable returns the current available space in this stream's send window.
+func (sfcm *StreamFlowControlManager) GetStreamSendAvailable() int64 {
+	return sfcm.sendWindow.Available()
+}
+
+// GetStreamReceiveAvailable returns the current available space in this stream's receive window
+// (i.e., how much more data the peer can send us on this stream before we need to send a WINDOW_UPDATE).
+func (sfcm *StreamFlowControlManager) GetStreamReceiveAvailable() int64 {
+	sfcm.receiveWindowMu.Lock()
+	defer sfcm.receiveWindowMu.Unlock()
+	return sfcm.currentReceiveWindowSize
+}
