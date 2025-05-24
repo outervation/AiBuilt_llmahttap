@@ -357,6 +357,11 @@ func validateConfig(cfg *Config) error {
 	if cfg.Server == nil {
 		// Default is applied, so this shouldn't happen unless applyDefaults is bypassed.
 		return fmt.Errorf("server configuration section is effectively missing after defaults")
+
+		// cfg.Server.Address is guaranteed to be non-nil by applyDefaults
+		if *cfg.Server.Address == "" {
+			return fmt.Errorf("server.address cannot be an empty string")
+		}
 	}
 	if cfg.Server.ExecutablePath != nil && *cfg.Server.ExecutablePath == "" {
 		return fmt.Errorf("server.executable_path, if provided, cannot be empty")
