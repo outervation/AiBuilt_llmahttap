@@ -30,6 +30,16 @@ func NewHandlerRegistry() *HandlerRegistry {
 	}
 }
 
+// GetFactory retrieves a registered HandlerFactory for the given handlerType.
+// It returns the factory and a boolean indicating if the factory was found.
+// This method is thread-safe.
+func (r *HandlerRegistry) GetFactory(handlerType string) (HandlerFactory, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	factory, ok := r.factories[handlerType]
+	return factory, ok
+}
+
 type HandlerFactory func(handlerConfig json.RawMessage, errorLogger *logger.ErrorLogger) (http2.Handler, error)
 
 var (
