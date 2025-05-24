@@ -453,6 +453,7 @@ type StreamFlowControlManager struct {
 	currentReceiveWindowSize          int64  // How much more data the peer can send us on this stream.
 	effectiveInitialReceiveWindowSize uint32 // The current SETTINGS_INITIAL_WINDOW_SIZE value applied to this stream's receive side.
 	bytesConsumedTotal                uint64 // Cumulative bytes consumed by our app from this stream.
+	totalBytesReceived                uint64 // Cumulative payload bytes received on this stream from DATA frames.
 	lastWindowUpdateSentAt            uint64 // bytesConsumedTotal when last stream WINDOW_UPDATE was sent.
 	windowUpdateThreshold             uint32 // Threshold to send WINDOW_UPDATE for this stream.
 
@@ -541,12 +542,13 @@ func (sfcm *StreamFlowControlManager) DataReceived(n uint32) error {
 
 	if int64(n) > sfcm.currentReceiveWindowSize {
 		// Peer sent more data than available in its stream send window (our stream receive window).
-		msg := fmt.Sprintf("stream %d flow control error: received %d bytes, but peer's window was only %d",
+		msg := fmt.Sprintf("stream %d flow control error: received %d bytes, but peer's send allowance (our receive window) was only %d",
 			sfcm.streamID, n, sfcm.currentReceiveWindowSize)
 		return NewStreamError(sfcm.streamID, ErrCodeFlowControlError, msg)
 	}
 
 	sfcm.currentReceiveWindowSize -= int64(n)
+	sfcm.totalBytesReceived += uint64(n) // Track total bytes received on this stream. uint64 overflow is negligible.
 	return nil
 }
 
