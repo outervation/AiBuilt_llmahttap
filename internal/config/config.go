@@ -279,6 +279,13 @@ func applyDefaults(cfg *Config) {
 		cfg.Logging.ErrorLog.Target = defaultErrorLogTarget
 	}
 
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	// Ensure Routes slice is not nil, for easier iteration and to guard against "routes: null" in JSON.
+	if cfg.Routing.Routes == nil {
+		cfg.Routing.Routes = []Route{}
+	}
 	// Defaults for StaticFileServerConfig
 	if cfg.Routing != nil {
 		for i := range cfg.Routing.Routes {
