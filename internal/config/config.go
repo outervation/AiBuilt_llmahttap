@@ -12,6 +12,51 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// Duration is a wrapper around time.Duration to allow for custom
+// unmarshalling from string values in configuration files.
+type Duration time.Duration
+
+// UnmarshalText implements the encoding.TextUnmarshaler interface.
+// This is used by TOML and potentially other text-based formats.
+func (d *Duration) UnmarshalText(text []byte) error {
+	if len(text) == 0 {
+		// Handle empty string case, perhaps by setting a default or returning an error
+		// For now, let's assume empty string means "not set" or "use default"
+		// which should be handled by the calling code or applyDefaults.
+		// Or, treat as an error:
+		return fmt.Errorf("duration string cannot be empty")
+	}
+	dur, err := time.ParseDuration(string(text))
+	if err != nil {
+		return fmt.Errorf("invalid duration string %q: %w", string(text), err)
+	}
+	if dur <= 0 {
+		return fmt.Errorf("duration must be positive, got %q", string(text))
+	}
+	*d = Duration(dur)
+	return nil
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("duration should be a string, got %s: %w", string(data), err)
+	}
+	// Reuse UnmarshalText logic after converting string from JSON quotes
+	return d.UnmarshalText([]byte(s))
+}
+
+// String returns the string representation of the Duration.
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
+
+// Value returns the underlying time.Duration.
+func (d Duration) Value() time.Duration {
+	return time.Duration(d)
+}
+
 // MatchType defines how a path pattern is interpreted.
 type MatchType string
 
