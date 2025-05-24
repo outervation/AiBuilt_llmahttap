@@ -39,6 +39,12 @@ type ErrorLogger struct {
 	output         io.WriteCloser
 }
 
+// getTimestamp generates a timestamp string in ISO 8601 UTC format
+// with millisecond precision (e.g., "2023-03-15T12:00:00.123Z").
+func getTimestamp() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
 // Logger is a general logger that contains specific loggers for access and errors.
 type Logger struct {
 	accessLog      *AccessLogger
@@ -287,7 +293,8 @@ func (al *AccessLogger) LogAccess(
 
 	// Placeholder for JSON structure, adapt to spec 3.3.2
 	logEntry := map[string]interface{}{
-		"ts":           time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), // ISO 8601 with millisecond
+
+		"ts":           getTimestamp(), // ISO 8601 with millisecond
 		"remote_addr":  resolvedRemoteAddr,
 		"remote_port":  clientPortStr, // Note: This is direct peer's port.
 		"protocol":     req.Proto,
@@ -353,7 +360,8 @@ func (el *ErrorLogger) LogError(level config.LogLevel, msg string, fields ...map
 
 	// Placeholder for structured error log entry (spec 3.4.2)
 	logEntry := map[string]interface{}{
-		"ts":    time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+
+		"ts":    getTimestamp(),
 		"level": string(level),
 		"msg":   msg,
 	}
