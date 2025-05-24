@@ -884,19 +884,18 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	case FrameContinuation:
 		frame = &ContinuationFrame{}
 	default:
-		// If we don't recognize the frame type, we can treat it as an UnknownFrame
-		// to at least consume its payload per its length, if desired by the caller.
-		// However, RFC 7540, Section 4.1 states:
-		// "Implementations MUST ignore and discard any frame that has a type that is unknown."
-		// So, proper handling might be to return an error or a specific signal.
-		// For now, let's create an UnknownFrame, and the caller can decide.
-		// If we want to strictly discard, we should read fh.Length bytes and return an error or nil.
-		// This behavior might need to be configurable or more strictly defined based on server policy.
+		// RFC 7540, Section 4.1: "Implementations MUST ignore and discard any frame that has a type that is unknown."
+		// Further, "Unknown frame types are not errors."
+		// This implementation handles this by parsing the frame into an UnknownFrame instance.
+		// The UnknownFrame.ParsePayload method will read and effectively "discard" the payload
+		// from the input stream by consuming it.
+		// The caller of ReadFrame can then choose to type-assert for *UnknownFrame and explicitly ignore it
+		// or log its occurrence if desired for debugging, without treating it as a parsing error for the frame itself.
+		// If an unknown frame type is received in a context where it is not permitted (e.g., certain frames on stream 0
+		// after the connection preface), it is the responsibility of higher-level logic (e.g., the connection or stream manager)
+		// to identify this as a protocol violation and
+		// to identify this as a protocol violation and potentially issue a CONNECTION_ERROR(PROTOCOL_ERROR).
 		frame = &UnknownFrame{}
-
-		// Let's read and discard payload as per RFC 7540, Section 4.1
-		// and return a special error or indication.
-		// For now, UnknownFrame reads it. If a connection error is needed, that's a higher-level decision.
 	}
 
 	err = frame.ParsePayload(r, fh)
