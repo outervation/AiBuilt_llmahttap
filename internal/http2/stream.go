@@ -295,8 +295,8 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 	s.mu.Lock()
 	if !s.responseHeadersSent {
 		s.mu.Unlock()
-		s.conn.logger.Error("stream: WriteData called before WriteHeaders", logger.LogFields{"stream_id": s.id})
-		return 0, NewStreamError(s.id, ErrCodeInternalError, "WriteHeaders must be called before WriteData")
+		s.conn.logger.Error("stream: WriteData called before SendHeaders", logger.LogFields{"stream_id": s.id})
+		return 0, NewStreamError(s.id, ErrCodeInternalError, "SendHeaders must be called before WriteData")
 	}
 	if (s.state == StreamStateHalfClosedLocal && s.endStreamSentToClient) || s.state == StreamStateClosed || s.pendingRSTCode != nil {
 		s.mu.Unlock()
