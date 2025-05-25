@@ -153,15 +153,15 @@ func NewConnection(
 		conn.nextStreamIDClient = 1
 		// Server-initiated stream IDs are even. Clients don't initiate with even IDs.
 		// If this client were to support receiving PUSH_PROMISE, nextStreamIDServer would track expected even IDs.
-		conn.nextStreamIDServer = 0
+		conn.nextStreamIDServer = 0 // Will not be used by server-side Conn
 	} else { // Server side
-		conn.nextStreamIDClient = 0 // Server expects client to start with stream ID 1
+		conn.nextStreamIDClient = 0 // Server expects client to start with stream ID 1, this tracks highest processed.
 		conn.nextStreamIDServer = 2 // First server-initiated PUSH_PROMISE will use ID 2
 	}
 
 	// Initialize default settings values for peer (will be updated upon receiving peer's SETTINGS frame)
 	conn.peerSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
-	conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush // Assume peer server might push
+	conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush // Assume peer server might push if conn is client
 	conn.peerSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
 	conn.peerSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
 	conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff // Effectively unlimited until known
@@ -189,8 +189,6 @@ func NewConnection(
 	if !isClientSide && srvSettingsOverride != nil {
 		for id, val := range srvSettingsOverride {
 			// TODO: Add validation for settings values here (e.g. MaxFrameSize range, EnablePush 0 or 1)
-			// For example, SETTINGS_MAX_FRAME_SIZE must be between 16384 and 16777215.
-			// SETTINGS_ENABLE_PUSH must be 0 or 1.
 			conn.ourSettings[id] = val
 		}
 	}
