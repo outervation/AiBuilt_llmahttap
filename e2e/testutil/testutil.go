@@ -1,10 +1,16 @@
 package testutil
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
+	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync" // Added for ServerInstance.mu
 
 	"example.com/llmahttap/v2/internal/config"
@@ -109,4 +115,215 @@ const (
 type TestRunner interface {
 	Run(server *ServerInstance, req *TestRequest) (*ActualResponse, error)
 	Type() HTTPClientType
+}
+
+// CurlHTTPClient implements HTTPTestClient using the curl command-line tool.
+type CurlHTTPClient struct {
+	// CurlPath is the path to the curl executable. If empty, "curl" is used.
+	CurlPath string
+}
+
+// NewCurlHTTPClient creates a new CurlHTTPClient.
+func NewCurlHTTPClient(curlPath string) *CurlHTTPClient {
+	cp := curlPath
+	if cp == "" {
+		cp = "curl" // Default to "curl" if path is not specified
+	}
+	return &CurlHTTPClient{CurlPath: cp}
+}
+
+// Type returns the client type. Useful for test runners or logging.
+// Note: This method is not part of the HTTPTestClient interface as currently defined.
+func (c *CurlHTTPClient) Type() HTTPClientType {
+	return CurlClient
+}
+
+// Do executes an HTTP request using curl.
+func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
+	actualRes := ActualResponse{
+		Headers: make(http.Header),
+	}
+
+	// Create temporary files for response headers and body
+	respHeaderFile, err := os.CreateTemp("", "curl_resp_headers_*.txt")
+	if err != nil {
+		actualRes.Error = fmt.Errorf("failed to create temp file for response headers: %w", err)
+		return actualRes, actualRes.Error
+	}
+	defer os.Remove(respHeaderFile.Name())
+	// We need the path, so close it now. Curl will open and write to it.
+	if err := respHeaderFile.Close(); err != nil {
+		actualRes.Error = fmt.Errorf("failed to close temp file for response headers: %w", err)
+		return actualRes, actualRes.Error
+	}
+
+	respBodyFile, err := os.CreateTemp("", "curl_resp_body_*.bin")
+	if err != nil {
+		actualRes.Error = fmt.Errorf("failed to create temp file for response body: %w", err)
+		return actualRes, actualRes.Error
+	}
+	defer os.Remove(respBodyFile.Name())
+	if err := respBodyFile.Close(); err != nil {
+		actualRes.Error = fmt.Errorf("failed to close temp file for response body: %w", err)
+		return actualRes, actualRes.Error
+	}
+
+	// URL construction
+	scheme := "http://"
+	if strings.HasPrefix(serverAddr, "http://") || strings.HasPrefix(serverAddr, "https://") {
+		scheme = "" // serverAddr already has scheme
+	}
+	if !strings.HasPrefix(request.Path, "/") && request.Path != "" {
+		request.Path = "/" + request.Path
+	}
+	url := fmt.Sprintf("%s%s%s", scheme, serverAddr, request.Path)
+
+	// Method
+	if request.Method == "" {
+		request.Method = "GET" // Default to GET
+	}
+
+	// Construct curl arguments
+	var finalArgs []string
+	finalArgs = append(finalArgs, "--http2-prior-knowledge")
+	finalArgs = append(finalArgs, "--silent")
+	finalArgs = append(finalArgs, "--show-error") // Show curl specific errors on stderr
+	finalArgs = append(finalArgs, "-X", request.Method)
+
+	// Request Headers
+	if request.Headers != nil {
+		for name, values := range request.Headers {
+			for _, value := range values {
+				finalArgs = append(finalArgs, "-H", fmt.Sprintf("%s: %s", name, value))
+			}
+		}
+	}
+
+	// Request Body
+	if len(request.Body) > 0 {
+		finalArgs = append(finalArgs, "--data-binary", "@-")
+	}
+
+	// Output options and URL
+	finalArgs = append(finalArgs,
+		"-o", respBodyFile.Name(),
+		"-D", respHeaderFile.Name(),
+		// Using \n directly in -w string, shell usually handles escaping. Go's exec passes args directly.
+		// Curl's -w format wants literal newlines if you want multi-line output for its variables.
+		// Let's use a single line for now, and parse space-separated, or use a unique separator.
+		// A simple %{http_code} is safest for now.
+		"-w", "%{http_code}", // This will be the _only_ thing on stdout
+		url,
+	)
+
+	cmd := exec.Command(c.CurlPath, finalArgs...)
+
+	if len(request.Body) > 0 {
+		cmd.Stdin = bytes.NewReader(request.Body)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	execRunErr := cmd.Run()
+
+	stdoutStr := strings.TrimSpace(stdoutBuf.String())
+	stderrStr := strings.TrimSpace(stderrBuf.String())
+
+	if execRunErr != nil {
+		actualRes.Error = fmt.Errorf("curl command execution failed: %w. Stderr: '%s'. Stdout: '%s'", execRunErr, stderrStr, stdoutStr)
+		// Continue to try to parse status code if curl printed it before erroring
+	} else if stderrStr != "" {
+		// Some curl versions might print informational messages to stderr (e.g., redirect info)
+		// Or --show-error might print "curl: (22) The requested URL returned error: 404" here and exit 0 if --fail is not set.
+		// Consider if this should always be an error or just logged.
+		// For now, if execRunErr is nil, we assume stderrStr is informational or a handled error response.
+		// If actualRes.StatusCode later indicates an error (4xx, 5xx), this stderrStr could be useful context.
+	}
+
+	// Parse status code from stdout (from -w %{http_code})
+	if stdoutStr != "" {
+		statusCode, parseErr := strconv.Atoi(stdoutStr)
+		if parseErr == nil {
+			actualRes.StatusCode = statusCode
+		} else {
+			err := fmt.Errorf("failed to parse http_code '%s' from curl stdout: %w. Stderr: '%s'", stdoutStr, parseErr, stderrStr)
+			if actualRes.Error == nil {
+				actualRes.Error = err
+			} else {
+				actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+			}
+		}
+	} else if actualRes.Error == nil { // No status code from -w and no prior error like exec error
+		actualRes.Error = fmt.Errorf("curl stdout was empty, cannot parse status code. Stderr: '%s'", stderrStr)
+	}
+
+	// Read and parse response headers from the temporary file
+	headerData, readHeadErr := os.ReadFile(respHeaderFile.Name())
+	if readHeadErr != nil {
+		err := fmt.Errorf("failed to read response headers temp file '%s': %w", respHeaderFile.Name(), readHeadErr)
+		if actualRes.Error == nil {
+			actualRes.Error = err
+		} else {
+			actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+		}
+	} else if len(headerData) > 0 {
+		headerReader := bufio.NewReader(bytes.NewReader(headerData))
+		// First line is status line, e.g., "HTTP/2 200" or "HTTP/1.1 404 Not Found"
+		statusLine, httpErr := headerReader.ReadString('\n')
+		if httpErr != nil && httpErr != io.EOF {
+			err := fmt.Errorf("failed to read status line from header data: %w", httpErr)
+			if actualRes.Error == nil {
+				actualRes.Error = err
+			} else {
+				actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+			}
+		} else {
+			tp := textproto.NewReader(headerReader)
+			mimeHeader, parseMimeErr := tp.ReadMIMEHeader()
+			if parseMimeErr != nil && parseMimeErr != io.EOF { // io.EOF is fine if there are no headers.
+				err := fmt.Errorf("failed to parse MIME headers: %w", parseMimeErr)
+				if actualRes.Error == nil {
+					actualRes.Error = err
+				} else {
+					actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+				}
+			} else {
+				actualRes.Headers = http.Header(mimeHeader)
+			}
+
+			// If status code wasn't parsed from -w (e.g. actualRes.StatusCode == 0),
+			// try to parse from the status line from the header dump.
+			if actualRes.StatusCode == 0 && strings.TrimSpace(statusLine) != "" {
+				parts := strings.Fields(statusLine) // e.g., ["HTTP/2", "200"] or ["HTTP/1.1", "404", "Not", "Found"]
+				if len(parts) >= 2 {
+					sc, convErr := strconv.Atoi(parts[1])
+					if convErr == nil && sc > 0 {
+						actualRes.StatusCode = sc
+					}
+				}
+			}
+		}
+	}
+
+	// Read response body from the temporary file
+	bodyData, readBodyErr := os.ReadFile(respBodyFile.Name())
+	if readBodyErr != nil {
+		err := fmt.Errorf("failed to read response body temp file '%s': %w", respBodyFile.Name(), readBodyErr)
+		if actualRes.Error == nil {
+			actualRes.Error = err
+		} else {
+			actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+		}
+	} else {
+		actualRes.Body = bodyData
+	}
+
+	// If StatusCode is 0 after all attempts and no other error reported, it's an issue.
+	if actualRes.StatusCode == 0 && actualRes.Error == nil {
+		actualRes.Error = fmt.Errorf("failed to determine status code from curl response. Stdout: '%s', Stderr: '%s', Headers: '%s'", stdoutStr, stderrStr, string(headerData))
+	}
+
+	return actualRes, actualRes.Error
 }
