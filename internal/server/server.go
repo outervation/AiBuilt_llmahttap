@@ -500,13 +500,20 @@ cleanupLoopExit: // Label to break out of the waiting loop
 
 // Run starts the server, initializes listeners, handles signals, and accepts connections.
 // It blocks until the server is shut down.
-func (s *Server) Run() error {
+
+// Start starts the server, initializes listeners, handles signals, and accepts connections.
+// It blocks until the server is shut down.
+// If the server is starting as a child process (detected by presence of READINESS_PIPE_FD),
+// and initialization is successful, it signals readiness to the parent.
+// It returns an error if startup fails.
+func (s *Server) Start() error {
 	s.log.Info("Starting server...", logger.LogFields{"config_path": s.configFilePath})
+
+	var startErr error // To capture startup errors
 
 	if err := s.initializeListeners(); err != nil {
 		s.log.Error("Failed to initialize listeners", logger.LogFields{"error": err.Error()})
-		// Ensure doneChan is closed if Run exits early.
-		s.mu.Lock()
+		s.mu.Lock() // Lock to safely close doneChan
 		select {
 		case <-s.doneChan: // Already closed
 		default:
@@ -516,20 +523,45 @@ func (s *Server) Run() error {
 		return err
 	}
 
+	// Signal readiness if this is a child process that inherited a readiness pipe.
+	// This happens after listeners are initialized and before starting to accept or handle signals.
+	readinessFD, foundPipe, errPipe := util.GetInheritedReadinessPipeFD()
+	if errPipe != nil {
+		s.log.Error("Error getting readiness pipe FD during startup", logger.LogFields{"error": errPipe.Error()})
+		// This is potentially problematic for hot reload but child might still function.
+		// Parent process will time out waiting for readiness if this path fails to signal.
+	}
+	if foundPipe {
+		s.log.Info("Child process detected by presence of readiness pipe FD. Signaling readiness.", logger.LogFields{"fd": readinessFD})
+		if errSignal := util.SignalChildReadyByClosingFD(readinessFD); errSignal != nil {
+			s.log.Error("Child process: Error signaling readiness by closing pipe FD", logger.LogFields{"fd": readinessFD, "error": errSignal.Error()})
+		} else {
+			s.log.Info("Child process: Successfully signaled readiness.", logger.LogFields{"fd": readinessFD})
+		}
+	}
+
 	go s.handleSignals()
 
 	if err := s.StartAccepting(); err != nil {
 		s.log.Error("Failed to start accepting connections", logger.LogFields{"error": err.Error()})
+		startErr = fmt.Errorf("failed to start accepting connections: %w", err)
 		// Attempt to gracefully shut down if we can't start accepting.
 		// Pass the error as the reason for shutdown.
-		go s.Shutdown(fmt.Errorf("failed to start accepting connections: %w", err))
-		// Fall through to wait on doneChan, Shutdown will eventually close it.
+		// s.Shutdown will close s.doneChan.
+		go s.Shutdown(startErr)
+	} else {
+		s.log.Info("Server started successfully. Waiting for shutdown signal...", logger.LogFields{"listeners_count": len(s.listeners)})
 	}
 
-	s.log.Info("Server started successfully. Waiting for shutdown signal...", logger.LogFields{"listeners_count": len(s.listeners)})
 	// Block until shutdown is complete. s.doneChan is closed at the end of s.Shutdown().
 	<-s.doneChan
-	s.log.Info("Server Run() method finished.", nil)
+
+	if startErr != nil {
+		s.log.Info("Server Start() method finished due to startup error.", logger.LogFields{"error": startErr.Error()})
+		return startErr
+	}
+
+	s.log.Info("Server Start() method finished.", nil)
 	return nil
 }
 
