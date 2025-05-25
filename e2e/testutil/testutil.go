@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"testing"
+
 	"crypto/tls"
 	"example.com/llmahttap/v2/internal/config"
 	"github.com/BurntSushi/toml"
@@ -734,4 +736,108 @@ func (c *CurlHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualR
 
 	actualResp, err := c.Do(server.Address, *req)
 	return &actualResp, err
+}
+
+// Assertion helper functions
+
+// AssertStatusCode checks if the actual status code matches the expected status code.
+func AssertStatusCode(t *testing.T, expected ExpectedResponse, actual ActualResponse) {
+	t.Helper()
+	if actual.StatusCode != expected.StatusCode {
+		t.Errorf("expected status code %d, got %d. Body: %s, Error: %v",
+			expected.StatusCode, actual.StatusCode, string(actual.Body), actual.Error)
+	}
+}
+
+// AssertHeaderEquals checks if a specific header in the actual response has the expected value.
+func AssertHeaderEquals(t *testing.T, actualHeaders http.Header, headerName string, expectedValue string) {
+	t.Helper()
+	actualValue := actualHeaders.Get(headerName)
+	if actualValue != expectedValue {
+		t.Errorf("expected header '%s' to be '%s', got '%s'", headerName, expectedValue, actualValue)
+	}
+}
+
+// AssertHeaderContains checks if a specific header in the actual response contains the expected substring.
+func AssertHeaderContains(t *testing.T, actualHeaders http.Header, headerName string, expectedSubstring string) {
+	t.Helper()
+	actualValue := actualHeaders.Get(headerName)
+	if !strings.Contains(actualValue, expectedSubstring) {
+		t.Errorf("expected header '%s' ('%s') to contain '%s'", headerName, actualValue, expectedSubstring)
+	}
+}
+
+// AssertBodyEquals checks if the actual response body matches the expected body byte-for-byte.
+func AssertBodyEquals(t *testing.T, expectedBody []byte, actualBody []byte) {
+	t.Helper()
+	if !bytes.Equal(expectedBody, actualBody) {
+		t.Errorf("expected body '%s', got '%s'", string(expectedBody), string(actualBody))
+	}
+}
+
+// AssertBodyContains checks if the actual response body contains the expected substring.
+func AssertBodyContains(t *testing.T, expectedSubstring string, actualBody []byte) {
+	t.Helper()
+	if !strings.Contains(string(actualBody), expectedSubstring) {
+		t.Errorf("expected body to contain '%s', got '%s'", expectedSubstring, string(actualBody))
+	}
+}
+
+// AssertJSONBodyFields checks if the actual JSON response body (provided as bytes) contains the expected fields
+// with the specified values. It performs a shallow comparison for map[string]interface{} values.
+// For nested objects or more complex structures, a more sophisticated deep comparison or dedicated library might be needed.
+func AssertJSONBodyFields(t *testing.T, expectedFields map[string]interface{}, actualBodyJSON []byte) {
+	t.Helper()
+	var actualData map[string]interface{}
+	if err := json.Unmarshal(actualBodyJSON, &actualData); err != nil {
+		t.Errorf("failed to unmarshal actual body JSON: %v. Body: '%s'", err, string(actualBodyJSON))
+		return
+	}
+
+	for key, expectedValue := range expectedFields {
+		actualValue, ok := actualData[key]
+		if !ok {
+			t.Errorf("expected JSON field '%s' not found in response body: %s", key, string(actualBodyJSON))
+			continue
+		}
+
+		// Basic comparison. For more complex types (slices, nested maps), this might need enhancement.
+		// Using Sprintf to handle various types for comparison, though this is not a perfect deep equal.
+		expectedValueStr := fmt.Sprintf("%v", expectedValue)
+		actualValueStr := fmt.Sprintf("%v", actualValue)
+
+		if expectedValueStr != actualValueStr {
+			// Attempt a more direct comparison for common types before relying on string representation
+			// This helps with type mismatches like int vs float64 from JSON unmarshalling.
+			var match bool
+			switch ev := expectedValue.(type) {
+			case string:
+				if av, ok := actualValue.(string); ok && ev == av {
+					match = true
+				}
+			case float64: // Numbers in JSON often become float64
+				if av, ok := actualValue.(float64); ok && ev == av {
+					match = true
+				}
+			case int: // If expected is int, try to compare with float64 if actual is float64
+				if av, ok := actualValue.(float64); ok && float64(ev) == av {
+					match = true
+				} else if avInt, ok := actualValue.(int); ok && ev == avInt {
+					match = true
+				}
+			case bool:
+				if av, ok := actualValue.(bool); ok && ev == av {
+					match = true
+				}
+			default:
+				// For other types, fall back to string comparison or consider deep equality checks.
+				// For simplicity here, if not matched above, it will fail the string comparison below.
+			}
+
+			if !match && expectedValueStr != actualValueStr {
+				t.Errorf("expected JSON field '%s' to be '%v' (type %T), got '%v' (type %T) in response body: %s",
+					key, expectedValue, expectedValue, actualValue, actualValue, string(actualBodyJSON))
+			}
+		}
+	}
 }
