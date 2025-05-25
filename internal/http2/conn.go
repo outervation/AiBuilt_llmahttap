@@ -18,6 +18,9 @@ import (
 	"example.com/llmahttap/v2/internal/server"
 )
 
+// SettingsAckTimeoutDuration is the default time to wait for a SETTINGS ACK.
+const SettingsAckTimeoutDuration = 10 * time.Second
+
 // Default settings values (RFC 7540 Section 6.5.2)
 // MinMaxFrameSize is the minimum value for SETTINGS_MAX_FRAME_SIZE (2^14).
 const MinMaxFrameSize uint32 = 1 << 14
@@ -2117,6 +2120,9 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 
 // serve is the main goroutine for reading frames from the connection.
 // It runs after the handshake is complete (or immediately for server if no handshake needed beyond preface).
+
+// serve is the main goroutine for reading frames from the connection.
+// It runs after the handshake is complete (or immediately for server if no handshake needed beyond preface).
 func (c *Connection) serve() {
 	var err error
 	// Ensure that Close is called eventually to clean up resources and signal other goroutines.
@@ -2131,82 +2137,238 @@ func (c *Connection) serve() {
 		}
 		c.streamsMu.RUnlock()
 
-		c.log.Debug("Serve loop exiting.", logger.LogFields{"final_error_for_close": finalErr, "original_loop_term_error": err})
+		c.log.Debug("Serve (reader) loop exiting.", logger.LogFields{"final_error_for_close": finalErr, "original_loop_term_error": err})
 
 		// Ensure readerDone is closed to signal that this goroutine has finished.
-		// This should happen before c.Close might wait on it.
-		// However, c.Close also closes the net.Conn which unblocks readFrame.
-		// The main point is readerDone is closed when this goroutine actually exits.
-		if c.readerDone != nil { // Check for nil in case of premature exit before full init
-			close(c.readerDone)
+		if c.readerDone != nil {
+			select {
+			case <-c.readerDone: // Already closed
+			default:
+				close(c.readerDone)
+			}
 		}
 
 		// c.Close will be called with the 'finalErr' that caused the loop to terminate or was set elsewhere.
 		c.Close(finalErr)
 	}()
 
-	c.log.Info("HTTP/2 connection serving started.", logger.LogFields{"remote_addr": c.remoteAddrStr, "is_client": c.isClient})
+	c.log.Info("HTTP/2 connection (reader loop) serving started.", logger.LogFields{"remote_addr": c.remoteAddrStr, "is_client": c.isClient})
 
+	// Start the writer goroutine.
+	go c.writerLoop()
+
+	// Handle connection preface.
+	if !c.isClient { // Server-side
+		// 1. Send our initial SETTINGS frame.
+		if prefaceErr := c.sendInitialSettings(); prefaceErr != nil {
+			c.log.Error("Failed to send initial server SETTINGS frame, closing connection.",
+				logger.LogFields{"error": prefaceErr, "remote_addr": c.remoteAddrStr})
+			err = prefaceErr // This error will be used by the defer c.Close(err)
+			return
+		}
+
+		// 2. Read and validate client's connection preface (magic string + SETTINGS frame).
+		// TODO: Implement reading and validating client preface.
+		// For now, skip this and go directly to frame reading loop.
+		// This means the server currently doesn't wait for client's SETTINGS before processing other frames.
+		// A robust server MUST process client preface first.
+		c.log.Debug("Server-side: Initial SETTINGS sent. TODO: Implement client preface handling.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	} else { // Client-side
+		// TODO: Client-side preface logic:
+		// 1. Send client magic (PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n).
+		// 2. Send client's initial SETTINGS frame (similar to sendInitialSettings but for client).
+		// 3. Then proceed to read server's SETTINGS (first frame from server).
+		c.log.Debug("Client-side: TODO: Implement client preface sending.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	}
+
+	// Main frame reading loop
 	for {
 		// Check for shutdown signal before attempting to read.
-		// This ensures that if another goroutine initiates shutdown (e.g., via c.Close()),
-		// this reader loop will terminate promptly.
 		select {
-		case <-c.shutdownChan: // shutdownChan is closed by initiateShutdown, called by c.Close
-			c.log.Info("Serve loop: shutdown signal received, terminating.", logger.LogFields{})
-			// Retrieve the error that caused the shutdown, if already set.
+		case <-c.shutdownChan:
+			c.log.Info("Serve (reader) loop: shutdown signal received, terminating.", logger.LogFields{})
 			c.streamsMu.RLock()
-			err = c.connError
+			err = c.connError // Use error that triggered shutdown if available
 			c.streamsMu.RUnlock()
 			if err == nil {
-				// If no specific error, assume graceful shutdown or context cancellation.
-				err = context.Canceled // Or a more specific "ErrConnectionShutdown"
+				err = errors.New("connection shutdown initiated") // Generic if no specific error
 			}
-			return // Exit loop, defer will handle Close with this 'err'.
+			return
 		default:
-			// Continue to read frame, non-blocking check of shutdownChan.
+			// Continue to read frame.
 		}
 
 		var frame Frame
 		frame, err = c.readFrame()
 		if err != nil {
-			// Error reading frame. This could be EOF, context cancellation, or a network error.
-			// The specific error 'err' will be passed to c.Close() via the defer.
 			if errors.Is(err, io.EOF) {
-				c.log.Info("Serve loop: peer closed connection (EOF).", logger.LogFields{"remote_addr": c.remoteAddrStr})
-				// EOF is a common way for peers to close. Our c.Close(io.EOF) will handle it.
-			} else if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-				c.log.Info("Serve loop: connection context cancelled or connection closed locally.", logger.LogFields{"error_type": fmt.Sprintf("%T", err), "error": err.Error(), "remote_addr": c.remoteAddrStr})
-				// If our context was cancelled, or net.Conn was closed locally (e.g. by c.Close itself).
+				c.log.Info("Serve (reader) loop: peer closed connection (EOF).", logger.LogFields{"remote_addr": c.remoteAddrStr})
+			} else if se, ok := err.(net.Error); ok && se.Timeout() {
+				c.log.Info("Serve (reader) loop: net.Conn read timeout.", logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err})
+				// Optional: Implement PING frames for keepalive or specific idle timeout logic.
+				// For now, any read timeout is fatal for the loop.
+			} else if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
 			} else {
-				c.log.Error("Serve loop: error reading frame.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
-				// Other network errors.
+				c.log.Error("Serve (reader) loop: error reading frame.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
 			}
-			// Any error from readFrame is considered fatal for this loop.
-			// The defer c.Close(err) will handle cleanup.
-			return
+			return // Exit loop, defer will handle Close with this 'err'.
 		}
 
-		// Frame successfully read, dispatch it.
-		// dispatchFrame should return a ConnectionError for fatal issues, or nil for success/stream-level errors handled by RST.
 		dispatchErr := c.dispatchFrame(frame)
 		if dispatchErr != nil {
-			// Error dispatching frame. This is usually a ConnectionError indicating a protocol violation
-			// or an internal server error that requires tearing down the connection.
-			c.log.Error("Serve loop: error dispatching frame, terminating connection.",
+			c.log.Error("Serve (reader) loop: error dispatching frame, terminating connection.",
 				logger.LogFields{"error": dispatchErr.Error(), "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
-
-			// Set connError before returning, so defer can use it.
-			// This dispatchErr becomes the primary reason for closure.
 			c.streamsMu.Lock()
 			if c.connError == nil {
 				c.connError = dispatchErr
 			}
 			c.streamsMu.Unlock()
-			err = dispatchErr // Ensure 'err' for the defer reflects this critical dispatch error.
+			err = dispatchErr
 			return
 		}
-		// If dispatchFrame returns nil, processing was successful or handled at stream level (e.g., RST_STREAM sent).
-		// Continue loop to read the next frame.
+	}
+}
+
+// writerLoop is the main goroutine for writing frames to the connection.
+// It serializes access to the underlying net.Conn for writes.
+func (c *Connection) writerLoop() {
+	defer func() {
+		if c.writerDone != nil {
+			// Ensure writerDone is closed only once, even if panicking.
+			// A sync.Once could be used, or a check like this.
+			select {
+			case <-c.writerDone: // Already closed
+			default:
+				close(c.writerDone)
+			}
+		}
+		c.log.Debug("Writer loop exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+		// If the writer loop exits (e.g., due to write error or shutdownChan closure),
+		// it means no more frames can be sent. The connection should be fully closed.
+		// c.Close() is idempotent and will handle the full shutdown sequence if not already started.
+		// We need to retrieve the error that might have caused the writer to exit.
+		// For now, if writer exits and shutdown is not initiated, it's an issue.
+		select {
+		case <-c.shutdownChan:
+			// Normal shutdown path, c.Close() is managing.
+		default:
+			// Writer loop exited prematurely.
+			c.log.Warn("Writer loop exited prematurely. Forcing connection closure.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+			// Use a generic error or retrieve c.connError if set by a write failure.
+			// c.Close itself might call initiateShutdown which closes writerChan, leading to exit.
+			// This path is more for unexpected exits.
+			go c.Close(errors.New("writer loop terminated unexpectedly"))
+		}
+	}()
+
+	c.log.Debug("Writer loop started.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	for {
+		select {
+		case <-c.shutdownChan: // Primary shutdown signal
+			c.log.Info("Writer loop: shutdown signal received. Draining writerChan.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+			// Drain any remaining frames in writerChan.
+			// This loop continues until writerChan is closed (by initiateShutdown) and empty.
+			for frame := range c.writerChan { // Loop until writerChan is closed
+				if err := c.writeFrame(frame); err != nil {
+					c.log.Error("Writer loop: error writing frame during shutdown drain.",
+						logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+					// Continue draining if possible, but log errors.
+				}
+			}
+			c.log.Info("Writer loop: writerChan drained and closed. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+			return
+
+		case frame, ok := <-c.writerChan:
+			if !ok { // writerChan was closed by initiateShutdown.
+				c.log.Info("Writer loop: writerChan closed. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+				return
+			}
+
+			if err := c.writeFrame(frame); err != nil {
+				c.log.Error("Writer loop: error writing frame.",
+					logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+
+				// A write error is fatal for the connection.
+				// Store the error and initiate connection closure.
+				c.streamsMu.Lock()
+				if c.connError == nil {
+					c.connError = err
+				}
+				c.streamsMu.Unlock()
+
+				// Use a goroutine for c.Close to avoid potential deadlock if Close()
+				// tries to interact with the writerLoop (e.g., by closing writerChan and waiting for writerDone).
+				// Since writerLoop is the one calling Close here, direct call should be fine if Close is robust
+				// to being called from its own worker goroutines. However, goroutine is safer.
+				go c.Close(err)
+				return // Exit writer loop as the connection is now considered failed.
+			}
+		}
+	}
+}
+
+// sendInitialSettings constructs and queues the server's initial SETTINGS frame.
+// It also starts a timer to await the client's SETTINGS ACK.
+// This should only be called for server-side connections.
+func (c *Connection) sendInitialSettings() error {
+	if c.isClient {
+		return nil // Clients send a different preface.
+	}
+
+	c.settingsMu.Lock() // Protects c.ourSettings and c.settingsAckTimeoutTimer
+	defer c.settingsMu.Unlock()
+
+	if c.settingsAckTimeoutTimer != nil {
+		// This implies sendInitialSettings might have been called before, which is a logic error.
+		c.log.Error("sendInitialSettings called, but settingsAckTimeoutTimer already exists.", logger.LogFields{})
+		return errors.New("initial SETTINGS frame likely already sent or being sent")
+	}
+
+	var settingsPayload []Setting
+	for id, val := range c.ourSettings {
+		settingsPayload = append(settingsPayload, Setting{ID: id, Value: val})
+	}
+	// Sort settings by ID for deterministic frame content (optional, but good for testing/debugging)
+	// sort.Slice(settingsPayload, func(i, j int) bool { return settingsPayload[i].ID < settingsPayload[j].ID })
+
+	initialSettingsFrame := &SettingsFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameSettings,
+			Flags:    0, // Initial SETTINGS frame must not have ACK flag.
+			StreamID: 0, // SETTINGS frames are always on stream 0.
+			Length:   uint32(len(settingsPayload) * 6),
+		},
+		Settings: settingsPayload,
+	}
+
+	c.log.Debug("Queuing initial server SETTINGS frame.", logger.LogFields{"num_settings": len(settingsPayload)})
+
+	// Queue the frame for sending.
+	select {
+	case c.writerChan <- initialSettingsFrame:
+		// Successfully queued. Now start the ACK timeout timer.
+		c.settingsAckTimeoutTimer = time.AfterFunc(SettingsAckTimeoutDuration, func() {
+			errMsg := "timeout waiting for client's SETTINGS ACK"
+			c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr, "timeout_duration": SettingsAckTimeoutDuration.String()})
+			// Create a ConnectionError and close the connection.
+			// The Close method will handle sending GOAWAY.
+			connErr := NewConnectionError(ErrCodeSettingsTimeout, errMsg)
+			c.Close(connErr)
+		})
+		return nil
+	case <-c.shutdownChan:
+		errMsg := "connection shutting down, cannot send initial SETTINGS frame"
+		c.log.Warn(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeConnectError, errMsg) // Or a more specific shutdown error
+	default:
+		// writerChan is full. This is a critical problem, indicating the writerLoop is blocked or dead.
+		errMsg := "failed to queue initial SETTINGS frame: writer channel full or blocked"
+		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
+		// This situation likely means the connection is already unusable.
+		return NewConnectionError(ErrCodeInternalError, errMsg)
 	}
 }
