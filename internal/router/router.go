@@ -78,6 +78,54 @@ type MatchedRouteInfo struct {
 	HandlerConfig config.Route // Includes PathPattern, MatchType, HandlerType, and Opaque HandlerConfig
 }
 
+// Match finds a route and instantiates its handler based on the request path.
+// It applies matching logic: exact match first, then longest prefix match.
+// If a route is found, it uses the stored handlerRegistry to create the handler instance.
+// Returns the matched route config, the instantiated handler, or an error.
+// If no route matches, it returns (nil, nil, nil).
+// If a route matches but handler creation fails, it returns (nil, nil, error).
+func (r *Router) Match(path string) (matchedRoute *config.Route, handler http2.Handler, err error) {
+	// 1. Attempt Exact Match
+	if routeConfig, ok := r.exactRoutes[path]; ok {
+		h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.errorLogger)
+		if e != nil {
+			r.errorLogger.Error("Failed to create handler for exact match route", logger.LogFields{
+				"path":        path,
+				"pattern":     routeConfig.PathPattern,
+				"handlerType": routeConfig.HandlerType,
+				"error":       e.Error(),
+			})
+			return nil, nil, fmt.Errorf("handler creation failed for path '%s' (route pattern '%s', type '%s'): %w", path, routeConfig.PathPattern, routeConfig.HandlerType, e)
+		}
+		// Return a pointer to a copy of the route config
+		routeCopy := routeConfig
+		return &routeCopy, h, nil
+	}
+
+	// 2. Attempt Prefix Match
+	// r.prefixRoutes is already sorted by length (longest first).
+	for _, routeConfig := range r.prefixRoutes {
+		if strings.HasPrefix(path, routeConfig.PathPattern) {
+			h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.errorLogger)
+			if e != nil {
+				r.errorLogger.Error("Failed to create handler for prefix match route", logger.LogFields{
+					"path":        path,
+					"pattern":     routeConfig.PathPattern,
+					"handlerType": routeConfig.HandlerType,
+					"error":       e.Error(),
+				})
+				return nil, nil, fmt.Errorf("handler creation failed for path '%s' (route pattern '%s', type '%s'): %w", path, routeConfig.PathPattern, routeConfig.HandlerType, e)
+			}
+			// Return a pointer to a copy of the route config
+			routeCopy := routeConfig
+			return &routeCopy, h, nil
+		}
+	}
+
+	// 3. No route matched
+	return nil, nil, nil
+}
+
 // FindRoute matches the given request path against the configured routes.
 // It follows the precedence rules:
 // 1. Exact matches take precedence over prefix matches.
