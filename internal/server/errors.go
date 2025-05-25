@@ -4,20 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"math"
 	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"example.com/llmahttap/v2/internal/http2"
+	"example.com/llmahttap/v2/internal/http2" // This is used by SendDefaultErrorResponse and WriteErrorResponse type signature
 	"example.com/llmahttap/v2/internal/logger"
 
 	"golang.org/x/net/http2/hpack"
-	// golang.org/x/net/http2/hpack is not directly used by this file's logic
-	// but keeping it in case http2.ResponseWriter implies its necessity elsewhere
-	// or if SendDefaultErrorResponse might use it via stream object later.
 )
+
+// jsonMarshalFunc allows swapping out json.Marshal for testing.
+var jsonMarshalFunc = json.Marshal
 
 // ErrorDetail represents the inner structure of a JSON error response.
 // As per spec 5.2.1:
@@ -35,34 +34,34 @@ type ErrorResponseJSON struct {
 
 // defaultHTMLMessages maps HTTP status codes to their default HTML messages.
 var defaultHTMLMessages = map[int]struct {
-	title   string
-	heading string
-	message string
+	Title   string
+	Heading string
+	Message string
 }{
 	http.StatusNotFound: {
-		title:   "404 Not Found",
-		heading: "Not Found",
-		message: "The requested resource was not found on this server.",
+		Title:   "404 Not Found",
+		Heading: "Not Found",
+		Message: "The requested resource was not found on this server.",
 	},
 	http.StatusInternalServerError: {
-		title:   "500 Internal Server Error",
-		heading: "Internal Server Error",
-		message: "The server encountered an internal error and was unable to complete your request.",
+		Title:   "500 Internal Server Error",
+		Heading: "Internal Server Error",
+		Message: "The server encountered an internal error and was unable to complete your request.",
 	},
 	http.StatusForbidden: {
-		title:   "403 Forbidden",
-		heading: "Forbidden",
-		message: "You do not have permission to access this resource.",
+		Title:   "403 Forbidden",
+		Heading: "Forbidden",
+		Message: "You do not have permission to access this resource.",
 	},
 	http.StatusMethodNotAllowed: {
-		title:   "405 Method Not Allowed",
-		heading: "Method Not Allowed",
-		message: "The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.",
+		Title:   "405 Method Not Allowed",
+		Heading: "Method Not Allowed",
+		Message: "The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.",
 	},
 	http.StatusBadRequest: {
-		title:   "400 Bad Request",
-		heading: "Bad Request",
-		message: "The server cannot or will not process the request due to an apparent client error.",
+		Title:   "400 Bad Request",
+		Heading: "Bad Request",
+		Message: "The server cannot or will not process the request due to an apparent client error.",
 	},
 	// Add more as needed
 }
@@ -97,150 +96,138 @@ func parseQValue(qStr string) float64 {
 // - "application/json is the first listed type with q > 0"
 // - "or */* is present and no other type has higher q-value than application/json"
 // - "or application/json is present with q=1.0"
-func prefersJSON(acceptHeaderValue string) bool {
+func PrefersJSON(acceptHeaderValue string) bool {
 	if acceptHeaderValue == "" {
 		return false // No Accept header, default to HTML
 	}
 
-	rawOfferStrings := strings.Split(acceptHeaderValue, ",")
-
-	// Condition 1: "application/json is the first listed type with q > 0"
-	// Check this first as it's based on the raw first part of the header.
-	if len(rawOfferStrings) > 0 {
-		firstRawOffer := strings.TrimSpace(rawOfferStrings[0])
-		if firstRawOffer != "" {
-			mt, ps, err := mime.ParseMediaType(firstRawOffer)
-			if err == nil {
-				qVal := 1.0
-				if qStr, ok := ps["q"]; ok {
-					qVal = parseQValue(qStr)
-				}
-				if strings.ToLower(mt) == "application/json" && qVal > 0.0 {
-					return true
-				}
-			}
-		}
+	type offer struct {
+		mediaType string
+		q         float64
+		// index      int // Original index for tie-breaking - not strictly needed for this rule evaluation
+		isJson     bool
+		isHtml     bool
+		isAppStar  bool
+		isStarStar bool
 	}
 
-	// For conditions 2 and 3, parse all valid offers first.
-	parsedOffers := make([]anOffer, 0, len(rawOfferStrings))
-	for _, partStr := range rawOfferStrings {
+	rawOffers := strings.Split(acceptHeaderValue, ",")
+	parsedOffers := make([]offer, 0, len(rawOffers))
+
+	for _, partStr := range rawOffers {
 		trimmedPart := strings.TrimSpace(partStr)
 		if trimmedPart == "" {
 			continue
 		}
-
 		mediaType, params, err := mime.ParseMediaType(trimmedPart)
 		if err != nil {
-			continue // Skip malformed parts
+			continue // Skip malformed
 		}
-
-		q := 1.0
+		qVal := 1.0
 		if qStr, ok := params["q"]; ok {
-			q = parseQValue(qStr)
+			qVal = parseQValue(qStr)
 		}
-
-		if q == 0.0 { // q=0 means "not acceptable", so skip this offer
+		if qVal == 0.0 { // q=0 means "not acceptable"
 			continue
 		}
-		parsedOffers = append(parsedOffers, anOffer{mediaType: strings.ToLower(mediaType), q: q})
+		lowerMediaType := strings.ToLower(mediaType)
+		parsedOffers = append(parsedOffers, offer{
+			mediaType:  lowerMediaType,
+			q:          qVal,
+			isJson:     lowerMediaType == "application/json",
+			isHtml:     lowerMediaType == "text/html",
+			isAppStar:  lowerMediaType == "application/*",
+			isStarStar: lowerMediaType == "*/*",
+		})
 	}
 
-	if len(parsedOffers) == 0 { // All offers were malformed or had q=0
-		return false
+	if len(parsedOffers) == 0 {
+		return false // All malformed or q=0
 	}
 
-	// Condition 3: "application/json is present with q=1.0"
-	for _, offer := range parsedOffers {
-		if offer.mediaType == "application/json" && offer.q == 1.0 {
-			return true
+	// Rule A: "application/json is the first listed type with q > 0" (or application/*)
+	ruleA_satisfied := false
+	if len(parsedOffers) > 0 {
+		firstOffer := parsedOffers[0]
+		if (firstOffer.isJson || firstOffer.isAppStar) && firstOffer.q > 0 {
+			ruleA_satisfied = true
 		}
 	}
+	if ruleA_satisfied {
+		return true
+	}
 
-	// Condition 2: "or */* is present and no other type has higher q-value than application/json"
-
-	isWildcardStarStarPresent := false
-	highestQForWildcardStarStar := 0.0
-	for _, offer := range parsedOffers {
-		if offer.mediaType == "*/*" { // implies offer.q > 0 due to earlier filter
-			isWildcardStarStarPresent = true
-			highestQForWildcardStarStar = math.Max(highestQForWildcardStarStar, offer.q)
+	// Rule C: "application/json is present with q=1.0"
+	ruleC_satisfied := false
+	for _, o := range parsedOffers {
+		if o.isJson && o.q == 1.0 { // Strictly application/json for Rule C
+			ruleC_satisfied = true
+			break
 		}
 	}
-
-	if !isWildcardStarStarPresent { // If "*/*" (with q>0) is not present, condition 2 cannot be met.
-		return false
+	if ruleC_satisfied {
+		return true
 	}
 
-	// Determine the effective q-value for "application/json" (Q_eff_json).
-	// This considers explicit "application/json", then "application/*", then "*/*".
-	qActualAppJson := 0.0
-	foundActualAppJson := false
-	qActualAppStar := 0.0
-	foundActualAppStar := false
+	// Rule B: "or */* is present and no other type has higher q-value than application/json"
+	ruleB_satisfied := false
+	starStarPresent := false
+	highestQExplicitAppJson := 0.0
+	highestQAppStar := 0.0
+	highestQStarStar := 0.0
 
-	for _, offer := range parsedOffers { // offers here all have q > 0
-		if offer.mediaType == "application/json" {
-			qActualAppJson = math.Max(qActualAppJson, offer.q)
-			foundActualAppJson = true
-		} else if offer.mediaType == "application/*" {
-			qActualAppStar = math.Max(qActualAppStar, offer.q)
-			foundActualAppStar = true
+	for _, o := range parsedOffers {
+		if o.isStarStar {
+			starStarPresent = true
+			if o.q > highestQStarStar {
+				highestQStarStar = o.q
+			}
 		}
-	}
-
-	var qEffJson float64
-	if foundActualAppJson { // qActualAppJson will be >0 if found due to prior filtering
-		qEffJson = qActualAppJson
-	} else if foundActualAppStar { // qActualAppStar will be >0 if found
-		qEffJson = qActualAppStar
-	} else {
-		// isWildcardStarStarPresent is true, so highestQForWildcardStarStar > 0.
-		qEffJson = highestQForWildcardStarStar
-	}
-
-	// If, after all considerations, the effective q-value for application/json is 0
-	// (e.g. all relevant offers had q=0, which were filtered, or no relevant offers found),
-	// then it's not acceptable via this path.
-	// This check is implicitly handled as qEffJson would be 0 if no matching q>0 offers were found.
-	// And earlier, if all offers resulted in q=0, parsedOffers would be empty.
-	// qEffJson here will be > 0 if we reached this point because:
-	//   - foundActualAppJson => qActualAppJson > 0
-	//   - OR foundActualAppStar => qActualAppStar > 0
-	//   - OR highestQForWildcardStarStar > 0 (because isWildcardStarStarPresent is true)
-
-	// Check if any *other* specific media type has a q-value strictly higher than qEffJson.
-	// "Other" means not "application/json", not "application/*", not "*/*".
-	for _, offer := range parsedOffers { // offers here all have q > 0
-		if offer.mediaType != "application/json" &&
-			offer.mediaType != "application/*" &&
-			offer.mediaType != "*/*" {
-			// This is a specific different type (e.g., "text/html", "image/png")
-			if offer.q > qEffJson {
-				return false // Another specific type is strictly more preferred.
+		if o.isJson {
+			if o.q > highestQExplicitAppJson {
+				highestQExplicitAppJson = o.q
+			}
+		}
+		if o.isAppStar {
+			if o.q > highestQAppStar {
+				highestQAppStar = o.q
 			}
 		}
 	}
 
-	// If we reach here, "*/*" was present (with q>0), and no other specific type
-	// had a q-value strictly greater than the effective q-value of application/json.
-	return true
-}
+	if starStarPresent {
+		// Determine the effective q-value for "application/json" interest in Rule B.
+		// This includes q-values from application/json, application/*, and */*.
+		effectiveQJsonForRuleB := 0.0
+		if highestQExplicitAppJson > effectiveQJsonForRuleB {
+			effectiveQJsonForRuleB = highestQExplicitAppJson
+		}
+		if highestQAppStar > effectiveQJsonForRuleB {
+			effectiveQJsonForRuleB = highestQAppStar
+		}
+		if highestQStarStar > effectiveQJsonForRuleB {
+			effectiveQJsonForRuleB = highestQStarStar
+		}
 
-// SendDefaultErrorResponse generates and sends a default HTTP error response on the given stream.
-// It performs content negotiation based on the Accept header.
-// stream: The HTTP/2 stream to send the response on.
+		allOtherSpecificTypesNotHigher := true
+		for _, o := range parsedOffers {
+			if !o.isJson && !o.isAppStar && !o.isStarStar { // It's a specific type other than JSON-likes and wildcard
+				if o.q > effectiveQJsonForRuleB { // Compare against the new effective Q
+					allOtherSpecificTypesNotHigher = false
+					break
+				}
+			}
+		}
+		if allOtherSpecificTypesNotHigher {
+			ruleB_satisfied = true
+		}
+	}
 
-// generateHTMLResponseBody creates a minimal HTML error page.
-// title and heading are plain text (e.g., from http.StatusText or default messages) and will be HTML-escaped.
-// htmlSafeMessage is a string that is already HTML-safe (e.g., pre-escaped dynamic content or static HTML-safe text).
-func generateHTMLResponseBody(title, heading, htmlSafeMessage string) []byte {
-	return []byte(fmt.Sprintf(
-		"<html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>",
-		html.EscapeString(title),
-		html.EscapeString(heading),
-		htmlSafeMessage, // Already HTML-safe
-	))
+	if ruleB_satisfied {
+		return true
+	}
+
+	return false // None of A, B, or C were met
 }
 
 // WriteErrorResponse generates and sends a default HTTP error response on the given stream.
@@ -281,7 +268,7 @@ func WriteErrorResponse(stream http2.ResponseWriter, statusCode int, requestHead
 	jsonMarshalFailed := false
 
 	// Determine if JSON response is preferred
-	shouldSendJSON := prefersJSON(acceptHeaderValue)
+	shouldSendJSON := PrefersJSON(acceptHeaderValue)
 
 	if shouldSendJSON {
 		contentType = "application/json; charset=utf-8"
@@ -293,7 +280,7 @@ func WriteErrorResponse(stream http2.ResponseWriter, statusCode int, requestHead
 			},
 		}
 		var marshalErr error
-		body, marshalErr = json.Marshal(errorResp)
+		body, marshalErr = jsonMarshalFunc(errorResp)
 		if marshalErr != nil {
 			// JSON marshaling failed. Per spec, if "SHOULD" send JSON cannot be met,
 			// then "MUST" send HTML (the "Otherwise" condition).
@@ -312,9 +299,9 @@ func WriteErrorResponse(stream http2.ResponseWriter, statusCode int, requestHead
 		defaultMsgData, isKnownCode := defaultHTMLMessages[statusCode]
 
 		if isKnownCode {
-			finalTitle = defaultMsgData.title
-			finalHeading = defaultMsgData.heading
-			baseMessage = defaultMsgData.message
+			finalTitle = defaultMsgData.Title
+			finalHeading = defaultMsgData.Heading
+			baseMessage = defaultMsgData.Message
 		} else { // Generic error for unknown status codes
 			finalTitle = fmt.Sprintf("%d %s", statusCode, statusText)
 			finalHeading = statusText
@@ -334,7 +321,7 @@ func WriteErrorResponse(stream http2.ResponseWriter, statusCode int, requestHead
 			}
 		}
 
-		body = generateHTMLResponseBody(finalTitle, finalHeading, htmlSafeMessageBody)
+		body = GenerateHTMLResponseBodyForTest(finalTitle, finalHeading, htmlSafeMessageBody)
 	}
 
 	responseHPACKHeaders := []hpack.HeaderField{
@@ -403,7 +390,7 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 			},
 		}
 		var err error
-		body, err = json.Marshal(errorResp)
+		body, err = jsonMarshalFunc(errorResp)
 		if err != nil {
 			fields := logger.LogFields{"error": err}
 			if log != nil { // Check logger is not nil before using
@@ -424,9 +411,9 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 		defaultMsgData, isKnownCode := defaultHTMLMessages[statusCode]
 
 		if isKnownCode {
-			finalTitle = defaultMsgData.title
-			finalHeading = defaultMsgData.heading
-			baseMessage = defaultMsgData.message
+			finalTitle = defaultMsgData.Title
+			finalHeading = defaultMsgData.Heading
+			baseMessage = defaultMsgData.Message
 		} else { // Generic error
 			finalTitle = fmt.Sprintf("%d %s", statusCode, statusText)
 			finalHeading = statusText
@@ -452,7 +439,7 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 			return baseMessage // from map (safe plain text)
 		}() // Call the func immediately
 
-		body = generateHTMLResponseBody(finalTitle, finalHeading, htmlSafeMessageBody)
+		body = GenerateHTMLResponseBodyForTest(finalTitle, finalHeading, htmlSafeMessageBody)
 	}
 
 	headers := []hpack.HeaderField{
@@ -482,6 +469,17 @@ func SendDefaultErrorResponse(stream http2.ResponseWriter, statusCode int, req *
 	}
 }
 
+// generateHTMLResponseBody creates a simple HTML error page.
+func GenerateHTMLResponseBodyForTest(title, heading, message string) []byte {
+	titleEsc := html.EscapeString(title)
+	headingEsc := html.EscapeString(heading)
+	// message is assumed to be already escaped or safe static text
+	// If message comes from user input/detail, it should be escaped before calling this.
+	// However, WriteErrorResponse does escape detailMessage before forming the final message string passed here.
+	body := fmt.Sprintf(`<html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>`, titleEsc, headingEsc, message)
+	return []byte(body)
+}
+
 // streamID tries to extract stream ID from ResponseWriter if it's a Stream.
 // This is a helper for logging, actual type assertion might be needed.
 func streamID(s http2.ResponseWriter) interface{} {
@@ -489,4 +487,23 @@ func streamID(s http2.ResponseWriter) interface{} {
 		return st.ID()
 	}
 	return "unknown"
+}
+
+// TestingOnlySetJSONMarshal is used by tests to mock json.Marshal behavior.
+// It sets the internal json.Marshal function and returns the original.
+func TestingOnlySetJSONMarshal(fn func(v interface{}) ([]byte, error)) func(v interface{}) ([]byte, error) {
+	original := jsonMarshalFunc
+	jsonMarshalFunc = fn
+	return original
+}
+
+// GetDefaultHTMLMessageInfo is used by tests to access default HTML message components.
+// It returns the title and message for a given status code, and a boolean indicating if found.
+func GetDefaultHTMLMessageInfo(statusCode int) (info struct {
+	Title   string
+	Heading string
+	Message string
+}, found bool) {
+	info, found = defaultHTMLMessages[statusCode]
+	return
 }
