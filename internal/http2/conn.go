@@ -66,16 +66,10 @@ type Connection struct {
 	headerFragmentTotalSize   uint32    // Cumulative size of received fragments for current block
 	headerFragmentInitialType FrameType // Type of the frame that started the header block (HEADERS or PUSH_PROMISE)
 	headerFragmentPromisedID  uint32    // PromisedStreamID if initial frame was PUSH_PROMISE
-	// headerFragmentEndStream field was already added in previous step
-
-	// Settings state
-	settingsMu sync.Mutex // Protects all settings-related fields below
-	// Our settings that we advertise/enforce
-	ourSettings map[SettingID]uint32
-	// Peer's settings that they advertise/enforce
-
-	headerFragmentEndStream bool // Records if the initial HEADERS indicated END_STREAM for the logical header block.
-	peerSettings            map[SettingID]uint32
+	ourSettings               map[SettingID]uint32
+	settingsMu                sync.RWMutex // Protects ourSettings and peerSettings
+	headerFragmentEndStream   bool         // Records if the initial HEADERS indicated END_STREAM for the logical header block.
+	peerSettings              map[SettingID]uint32
 
 	// Derived operational values from settings
 	// Our capabilities / limits we impose on peer:
