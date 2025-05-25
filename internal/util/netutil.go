@@ -236,6 +236,32 @@ func GetInheritedListeners() ([]net.Listener, error) {
 	return listeners, nil
 }
 
+// ParseInheritedListenerFDs retrieves a list of file descriptor numbers
+// passed via the specified environment variable.
+// It expects FDs to be colon-separated numbers.
+func ParseInheritedListenerFDs(envVarName string) ([]uintptr, error) {
+	fdsEnv := os.Getenv(envVarName)
+	if fdsEnv == "" {
+		return nil, nil // No inherited FDs specified by this variable
+	}
+
+	fdStrings := strings.Split(fdsEnv, ":")
+	fds := make([]uintptr, 0, len(fdStrings))
+
+	for _, fdStr := range fdStrings {
+		fdInt, err := strconv.Atoi(fdStr)
+		if err != nil {
+			// Return nil for the FDs list if any part of the string is invalid
+			return nil, fmt.Errorf("invalid FD number in environment variable %s (value: %q): %s (%w)", envVarName, fdsEnv, fdStr, err)
+		}
+		if fdInt < 0 { // File descriptors are non-negative.
+			return nil, fmt.Errorf("invalid negative FD number in environment variable %s (value: %q): %d", envVarName, fdsEnv, fdInt)
+		}
+		fds = append(fds, uintptr(fdInt))
+	}
+	return fds, nil
+}
+
 // PrepareExecEnv prepares environment variables for the child process,
 // including the listening socket FDs and readiness pipe FD.
 // It takes a slice of net.Listener and the write end of the readiness pipe (as an *os.File).
