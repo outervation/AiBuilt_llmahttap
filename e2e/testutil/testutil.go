@@ -85,6 +85,17 @@ type ServerInstance struct {
 	CleanupFuncs  []func() error // Functions to run to clean up (e.g., remove temp files)
 }
 
+// HTTPTestClient defines an interface for making HTTP requests for testing purposes.
+// This allows test cases to be written independently of the specific HTTP client
+// implementation (e.g., Go standard library HTTP client, or an external tool like curl).
+type HTTPTestClient interface {
+	// Do executes an HTTP request against the server at serverAddr.
+	// It takes the server's address (e.g., "host:port") and a TestRequest object.
+	// It returns an ActualResponse object containing the server's response details
+	// and any error encountered during the request execution.
+	Do(serverAddr string, request TestRequest) (ActualResponse, error)
+}
+
 // HTTPClientType identifies the type of HTTP client used for a test.
 type HTTPClientType string
 
