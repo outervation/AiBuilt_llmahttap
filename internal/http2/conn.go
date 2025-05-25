@@ -848,17 +848,25 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 	if c.isClient {
 		// Client received HEADERS (response or pushed response)
 
-		_, exists := c.getStream(streamID)
+		stream, exists := c.getStream(streamID)
 		if !exists {
+			// If this is a PUSH_PROMISE response (streamID is even for pushed responses),
+			// we might need to create the stream in reserved (remote) state first if PUSH_PROMISE logic dictates.
+			// For now, assume stream must exist if HEADERS are for it.
 			c.log.Error("Client received HEADERS for unknown or closed stream", logger.LogFields{"stream_id": streamID})
-			// Specific error depends on whether streamID was expected (e.g. after PUSH_PROMISE)
-			// For now, treat as a protocol error if stream not found.
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client received HEADERS for non-existent stream %d", streamID))
 		}
-		// TODO: Implement stream.processResponseHeaders(headers, endStream) in stream.go
-		// return stream.processResponseHeaders(headers, endStream)
-		c.log.Debug("Client-side header handling not fully implemented yet.", logger.LogFields{"stream_id": streamID})
-		return nil // Placeholder for client-side
+
+		errClientProcess := stream.processResponseHeaders(headers, endStream)
+		if errClientProcess != nil {
+			if _, ok := errClientProcess.(*ConnectionError); ok {
+				return errClientProcess
+			}
+			c.log.Error("Error from stream.processResponseHeaders",
+				logger.LogFields{"stream_id": streamID, "error": errClientProcess.Error()})
+			// Stream-level error, stream should handle RST if necessary.
+		}
+		return nil
 
 	} else {
 		// Server received HEADERS (client request)
@@ -870,11 +878,8 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		}
 
 		// Check if stream already exists (client re-using an ID for a new request)
-		// N.B. lastProcessedStreamID is updated by createStream.
-		// A client MUST NOT reuse stream IDs.
 		c.streamsMu.RLock()
 		_, exists := c.streams[streamID]
-		// highestKnownClientStream := c.nextStreamIDClient - 2 // This logic needs more robust tracking if used.
 		c.streamsMu.RUnlock()
 
 		if exists {
@@ -890,7 +895,7 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			return nil                                               // Don't kill connection for this, just the stream.
 		}
 
-		// Create the stream. Handler and Cfg are nil initially; router will set them.
+		// Create the stream.
 		newStream, streamErr := c.createStream(streamID, nil /*handler*/, nil /*handlerCfg*/, prioInfo, true /*isPeerInitiated*/)
 		if streamErr != nil {
 			c.log.Error("Failed to create stream for incoming client HEADERS", logger.LogFields{"stream_id": streamID, "error": streamErr.Error()})
@@ -901,18 +906,12 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			return streamErr // Propagate other fatal connection errors from createStream.
 		}
 
-		// Delegate to the stream to process headers and dispatch via the router.
-		// TODO: Implement stream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher) in stream.go
-		// For now, to avoid undefined method, just mark headers as received by stream (conceptually)
-		c.log.Debug("Server-side stream created, header/dispatch logic in stream pending.", logger.LogFields{"stream_id": newStream.id})
-		newStream.requestHeaders = headers // Temporary direct set for stubbing
-
+		// Transition stream state based on HEADERS
 		newStream.mu.Lock()
-		// Initial state for a newly created stream is Idle. Transition based on HEADERS.
 		if newStream.state != StreamStateIdle {
-			// This would be very odd, as createStream should set it to Idle before returning it to us.
 			c.log.Error("Newly created stream is not in Idle state before header processing", logger.LogFields{"stream_id": newStream.id, "state": newStream.state.String()})
 			newStream.mu.Unlock()
+			_ = newStream.Close(NewStreamError(newStream.id, ErrCodeInternalError, "stream in unexpected state"))
 			return NewConnectionError(ErrCodeInternalError, "newly created stream in unexpected state")
 		}
 
@@ -927,10 +926,19 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		}
 		newStream.mu.Unlock()
 
-		// TODO: After stream.processRequestHeadersAndDispatch is implemented, call it here.
-		// Example: err := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
-		// if err != nil { ... handle error, maybe RST stream ... }
-		return nil // Placeholder
+		// Delegate to the stream to process headers and dispatch via the router.
+		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
+		if errDispatch != nil {
+			// processRequestHeadersAndDispatch should handle sending RST_STREAM if appropriate.
+			// If it returns a ConnectionError, propagate it.
+			if _, ok := errDispatch.(*ConnectionError); ok {
+				return errDispatch
+			}
+			c.log.Error("Error from stream.processRequestHeadersAndDispatch",
+				logger.LogFields{"stream_id": newStream.id, "error": errDispatch.Error()})
+			// No specific action here if it's not a ConnectionError, assuming stream handles its own termination.
+		}
+		return nil
 	}
 }
 
