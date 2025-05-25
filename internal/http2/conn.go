@@ -481,11 +481,50 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 // sendRSTStreamFrame sends an RST_STREAM frame.
 // This is a stub implementation.
 func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
-	c.log.Debug("sendRSTStreamFrame called (stub)", logger.LogFields{"streamID": streamID, "errorCode": errorCode.String()})
-	// TODO: Implement actual frame creation and sending via c.writerChan
-	// 1. Construct RST_STREAM frame.
-	// 2. Send to c.writerChan.
-	return nil
+	c.log.Debug("Queuing RST_STREAM frame for sending", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+
+	// Check if stream is 0, RST_STREAM is not allowed on stream 0.
+	// RFC 7540, Section 6.4: "RST_STREAM frames MUST be associated with a stream.
+	// If a RST_STREAM frame is received with a stream identifier of 0x0, the recipient MUST
+	// treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+	// This check is for *sending*; our server should never try to send RST_STREAM on stream 0.
+	if streamID == 0 {
+		errMsg := "internal error: attempted to send RST_STREAM on stream 0"
+		c.log.Error(errMsg, logger.LogFields{"error_code": errorCode.String()})
+		// This is an internal server error if our code tries this.
+		return NewConnectionError(ErrCodeInternalError, errMsg)
+	}
+
+	rstFrame := &RSTStreamFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameRSTStream,
+			Flags:    0, // RST_STREAM frames do not define any flags.
+			StreamID: streamID,
+			Length:   4, // RST_STREAM payload is always 4 octets (ErrorCode)
+		},
+		ErrorCode: errorCode,
+	}
+
+	// Send the frame to the writer goroutine.
+	select {
+	case c.writerChan <- rstFrame:
+		c.log.Debug("RST_STREAM frame queued", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		return nil // Successfully queued
+	case <-c.shutdownChan:
+		// Connection is shutting down, cannot send new frames.
+		c.log.Warn("Connection shutting down, cannot send RST_STREAM frame.",
+			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		// Return an error indicating the connection state.
+		return NewConnectionError(ErrCodeConnectError, // Using ConnectError as a general "connection unavailable"
+			fmt.Sprintf("connection shutting down, cannot send RST_STREAM for stream %d", streamID))
+	default:
+		// writerChan is full, indicates writer is blocked or not processing. This is a critical internal issue.
+		c.log.Error("Failed to queue RST_STREAM frame: writer channel full or blocked.",
+			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		// This implies the connection is unhealthy and likely needs to be terminated.
+		return NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("writer channel congested, cannot send RST_STREAM for stream %d", streamID))
+	}
 }
 
 // sendWindowUpdateFrame sends a WINDOW_UPDATE frame.
