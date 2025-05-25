@@ -645,6 +645,21 @@ func (s *Stream) closeStreamResourcesProtected() {
 	}
 
 	// Cancel the stream's context.
+
+	// Close flow control manager
+	if s.fcManager != nil {
+		// The error passed to fcManager.Close() can be used to signal waiters.
+		// If pendingRSTCode is set, use that, otherwise a generic stream closed error.
+		var fcCloseReason error
+		if s.pendingRSTCode != nil {
+			fcCloseReason = NewStreamError(s.id, *s.pendingRSTCode, "stream reset affecting flow control")
+		} else {
+			// Consider if it was a graceful closure (ErrCodeNoError) vs other non-RST.
+			// For now, using StreamClosed for non-RST.
+			fcCloseReason = NewStreamError(s.id, ErrCodeStreamClosed, "stream closed affecting flow control")
+		}
+		s.fcManager.Close(fcCloseReason)
+	}
 	if s.cancelCtx != nil {
 		s.cancelCtx()
 	}
@@ -924,4 +939,40 @@ func serverToServerHpackHeaders(serverHeaders []server.HeaderField) []hpack.Head
 		hpackHeaders[i] = hpack.HeaderField{Name: sh.Name, Value: sh.Value}
 	}
 	return hpackHeaders
+}
+
+// handleRSTStreamFrame processes an RST_STREAM frame received from the peer.
+// It transitions the stream to the Closed state and ensures resources are cleaned up.
+func (s *Stream) handleRSTStreamFrame(errorCode ErrorCode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.state == StreamStateClosed {
+		// If already closed, nothing more to do.
+		// Log if the RST code is different, might indicate a race or peer sending multiple RSTs.
+		if s.pendingRSTCode != nil && *s.pendingRSTCode != errorCode {
+			s.conn.log.Debug("Stream already closed, received another RST_STREAM with different code",
+				logger.LogFields{"stream_id": s.id, "original_rst_code": s.pendingRSTCode.String(), "new_rst_code": errorCode.String()})
+		}
+		return
+	}
+
+	s.conn.log.Info("Received RST_STREAM from peer",
+		logger.LogFields{
+			"stream_id":  s.id,
+			"error_code": errorCode.String(),
+			"old_state":  s.state.String(),
+		})
+
+	// Mark that an RST was received and what the code was.
+	// This is important for closeStreamResourcesProtected to potentially use in error propagation.
+	s.pendingRSTCode = &errorCode
+
+	// Transition to closed state. This will trigger resource cleanup.
+	s._setState(StreamStateClosed)
+
+	// Note: No RST_STREAM is sent back in response to a received RST_STREAM.
+	// The stream is now considered terminated.
+	// Cleanup of pipes, context, fcManager, and removal from conn.streams/priorityTree
+	// is handled by _setState(StreamStateClosed) -> closeStreamResourcesProtected -> conn.removeClosedStream.
 }
