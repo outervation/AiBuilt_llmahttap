@@ -183,8 +183,9 @@ func newStream(
 	conn *Connection,
 	id uint32,
 	initialOurWindowSize uint32,
+
 	initialPeerWindowSize uint32,
-	handler Handler,
+	handler server.Handler, // Changed from http2.Handler to server.Handler
 	handlerCfg json.RawMessage,
 	prioWeight uint8,
 	prioParentID uint32,
