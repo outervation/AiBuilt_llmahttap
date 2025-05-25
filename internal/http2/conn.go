@@ -48,19 +48,20 @@ type Connection struct {
 	connError    error         // Stores the first fatal connection error
 
 	// HTTP/2 state
-	streamsMu             sync.RWMutex
-	streams               map[uint32]*Stream
-	nextStreamIDClient    uint32 // Next client-initiated stream ID (odd), server consumes
-	nextStreamIDServer    uint32 // Next server-initiated stream ID (even), server produces (for PUSH)
-	lastProcessedStreamID uint32 // Highest stream ID processed or accepted for GOAWAY
-	priorityTree          *PriorityTree
-	hpackAdapter          *HpackAdapter
-	connFCManager         *ConnectionFlowControlManager
-	goAwaySent            bool
-	goAwayReceived        bool
-	gracefulShutdownTimer *time.Timer
-	activePings           map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
-	activePingsMu         sync.Mutex
+	streamsMu                sync.RWMutex
+	streams                  map[uint32]*Stream
+	nextStreamIDClient       uint32 // Next client-initiated stream ID (odd), server consumes
+	nextStreamIDServer       uint32 // Next server-initiated stream ID (even), server produces (for PUSH)
+	lastProcessedStreamID    uint32 // Highest stream ID processed or accepted for GOAWAY
+	peerReportedLastStreamID uint32 // Highest stream ID peer reported processing in a GOAWAY frame (initially max_uint32)
+	priorityTree             *PriorityTree
+	hpackAdapter             *HpackAdapter
+	connFCManager            *ConnectionFlowControlManager
+	goAwaySent               bool
+	goAwayReceived           bool
+	gracefulShutdownTimer    *time.Timer
+	activePings              map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
+	activePingsMu            sync.Mutex
 
 	// Header block assembly state
 	activeHeaderBlockStreamID     uint32                // Stream ID of the current header block being assembled
@@ -129,23 +130,24 @@ func NewConnection(
 	}
 
 	conn := &Connection{
-		netConn:       nc,
-		log:           lg,
-		isClient:      isClientSide,
-		ctx:           ctx,
-		cancelCtx:     cancel,
-		readerDone:    make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		shutdownChan:  make(chan struct{}),
-		streams:       make(map[uint32]*Stream),
-		priorityTree:  NewPriorityTree(),
-		connFCManager: NewConnectionFlowControlManager(),
-		writerChan:    make(chan Frame, 64), // Increased buffer
-		activePings:   make(map[[8]byte]*time.Timer),
-		ourSettings:   make(map[SettingID]uint32),
-		peerSettings:  make(map[SettingID]uint32),
-		remoteAddrStr: nc.RemoteAddr().String(),
-		dispatcher:    dispatcher, // Store dispatcher
+		netConn:                  nc,
+		log:                      lg,
+		isClient:                 isClientSide,
+		ctx:                      ctx,
+		cancelCtx:                cancel,
+		readerDone:               make(chan struct{}),
+		writerDone:               make(chan struct{}),
+		shutdownChan:             make(chan struct{}),
+		streams:                  make(map[uint32]*Stream),
+		priorityTree:             NewPriorityTree(),
+		connFCManager:            NewConnectionFlowControlManager(),
+		writerChan:               make(chan Frame, 64), // Increased buffer
+		activePings:              make(map[[8]byte]*time.Timer),
+		ourSettings:              make(map[SettingID]uint32),
+		peerSettings:             make(map[SettingID]uint32),
+		remoteAddrStr:            nc.RemoteAddr().String(),
+		dispatcher:               dispatcher, // Store dispatcher
+		peerReportedLastStreamID: 0xffffffff, // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
 	}
 
 	// Initialize client/server stream ID counters
@@ -1759,4 +1761,94 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 
 	// Reader/writer goroutines will signal their exit by closing readerDone/writerDone.
 	// The Close() method waits for these.
+}
+
+// handleGoAwayFrame processes an incoming GOAWAY frame from the peer.
+// It logs the frame, updates connection state regarding peer's last processed stream ID,
+// and initiates a graceful shutdown of the connection.
+func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
+	c.streamsMu.Lock() // Lock for goAwayReceived, peerReportedLastStreamID, and isShuttingDownLocked checks
+
+	if c.isShuttingDownLocked() {
+		c.log.Info("Received GOAWAY frame while connection already shutting down.",
+			logger.LogFields{
+				"last_stream_id_from_peer": frame.LastStreamID,
+				"error_code_from_peer":     frame.ErrorCode.String(),
+			})
+		// Peer can send multiple GOAWAY frames, each with a possibly lower LastStreamID.
+		// Update our record if the new LastStreamID is more restrictive.
+		if frame.LastStreamID < c.peerReportedLastStreamID {
+			c.peerReportedLastStreamID = frame.LastStreamID
+			c.log.Info("Updated peerReportedLastStreamID from GOAWAY during shutdown.",
+				logger.LogFields{"new_peer_last_stream_id": c.peerReportedLastStreamID})
+		}
+		c.streamsMu.Unlock()
+		return nil // Already shutting down, no new shutdown initiation needed.
+	}
+
+	if c.goAwayReceived {
+		// Subsequent GOAWAY frame received.
+		c.log.Warn("Subsequent GOAWAY frame received.",
+			logger.LogFields{
+				"new_last_stream_id":      frame.LastStreamID,
+				"new_error_code":          frame.ErrorCode.String(),
+				"old_peer_last_stream_id": c.peerReportedLastStreamID,
+			})
+
+		// RFC 7540, Section 6.8: "An endpoint that receives multiple GOAWAY frames MUST
+		// treat a subsequent GOAWAY frame as a connection error ... of type PROTOCOL_ERROR
+		// if the stream identifier in the subsequent frame is greater than the stream
+		// identifier in the previous GOAWAY frame."
+		if frame.LastStreamID > c.peerReportedLastStreamID {
+			msg := fmt.Sprintf("subsequent GOAWAY has LastStreamID %d, which is greater than previous %d",
+				frame.LastStreamID, c.peerReportedLastStreamID)
+			c.log.Error(msg, logger.LogFields{})
+			c.streamsMu.Unlock()
+			// The reader loop should call c.Close(err) upon receiving this error.
+			return NewConnectionError(ErrCodeProtocolError, msg)
+		}
+
+		// If LastStreamID is the same or lower, it's permissible. Update if lower.
+		if frame.LastStreamID < c.peerReportedLastStreamID {
+			c.peerReportedLastStreamID = frame.LastStreamID
+		}
+		c.streamsMu.Unlock()
+		// No need to re-trigger initiateShutdown; the first GOAWAY processing should have done so,
+		// or the connection is already in the process of shutting down due to other reasons.
+		return nil
+	}
+
+	// This is the first GOAWAY frame received on this connection.
+	c.goAwayReceived = true
+	c.peerReportedLastStreamID = frame.LastStreamID // Store the peer's reported last stream ID
+
+	c.log.Info("Received first GOAWAY frame from peer.",
+		logger.LogFields{
+			"last_stream_id_from_peer": c.peerReportedLastStreamID,
+			"error_code_from_peer":     frame.ErrorCode.String(),
+			"debug_data_len":           len(frame.AdditionalDebugData),
+		})
+
+	// Determine our last processed stream ID for our own GOAWAY frame (if we send one via initiateShutdown).
+	ourGoAwayLastStreamID := c.lastProcessedStreamID
+	c.streamsMu.Unlock() // Unlock before calling initiateShutdown
+
+	// Determine graceful timeout based on peer's GOAWAY error code.
+	var gracefulTimeout time.Duration
+	if frame.ErrorCode == ErrCodeNoError {
+		// TODO: Use a configured graceful shutdown timeout from server config.
+		// This timeout is for our server to allow its active streams (up to our GOAWAY's LastStreamID)
+		// to complete. Example value:
+		gracefulTimeout = 5 * time.Second
+	} else {
+		// Peer indicated an error, so we might shut down more quickly.
+		gracefulTimeout = 0
+	}
+
+	// Initiate our own shutdown sequence in response to receiving GOAWAY.
+	// We send ErrCodeNoError in our GOAWAY as we are now gracefully closing in response to peer's signal.
+	// Debug data from peer's GOAWAY is not typically propagated to our GOAWAY.
+	go c.initiateShutdown(ourGoAwayLastStreamID, ErrCodeNoError, nil, gracefulTimeout)
+
+	return nil
 }
