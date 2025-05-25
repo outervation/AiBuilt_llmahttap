@@ -1295,6 +1295,56 @@ func (c *Connection) removeClosedStream(s *Stream) {
 	// cleaned by stream.closeStreamResourcesProtected() when it transitioned to StreamStateClosed.
 }
 
+// dispatchFrame routes an incoming frame to its specific handler.
+// This method is typically called by the connection's main reader loop.
+func (c *Connection) dispatchFrame(frame Frame) error {
+	// Common validations that apply to many frame types before specific dispatch
+	// (e.g., stream ID 0 checks for frames that require non-zero ID)
+	// can be done here, or left to individual handlers if they vary significantly.
+	// Individual handlers currently perform many of these checks.
+
+	switch f := frame.(type) {
+	case *DataFrame:
+		return c.dispatchDataFrame(f)
+	case *HeadersFrame:
+		return c.processHeadersFrame(f)
+	case *PriorityFrame:
+		return c.dispatchPriorityFrame(f)
+	case *RSTStreamFrame:
+		return c.dispatchRSTStreamFrame(f)
+	case *SettingsFrame:
+		return c.handleSettingsFrame(f)
+	case *PushPromiseFrame:
+		// Server-side connections typically don't process PUSH_PROMISE frames they receive.
+		// Clients process PUSH_PROMISE frames sent by servers.
+		if c.isClient {
+			return c.processPushPromiseFrame(f)
+		}
+		c.log.Warn("Server received PUSH_PROMISE frame, treating as protocol error.", logger.LogFields{"stream_id": frame.Header().StreamID})
+		return NewConnectionError(ErrCodeProtocolError, "server received PUSH_PROMISE frame")
+	case *PingFrame:
+		return c.handlePingFrame(f)
+	case *GoAwayFrame:
+		return c.handleGoAwayFrame(f)
+	case *WindowUpdateFrame:
+		return c.dispatchWindowUpdateFrame(f)
+	case *ContinuationFrame:
+		return c.processContinuationFrame(f)
+	case *UnknownFrame:
+		// RFC 7540, Section 4.1: "Implementations MUST ignore and discard
+		// any frame of a type that is unknown."
+		c.log.Warn("Received unknown frame type, ignoring.", logger.LogFields{"type_val": frame.Header().Type, "stream_id": frame.Header().StreamID})
+		return nil
+	default:
+		// This case should ideally not be reached if ReadFrame correctly maps all known types
+		// or returns UnknownFrame for types it doesn't specifically parse.
+		// If it is reached, it implies an internal inconsistency in frame parsing or type handling.
+		errMsg := fmt.Sprintf("dispatchFrame received a frame of an unexpected underlying type: %T", frame)
+		c.log.Error(errMsg, logger.LogFields{"frame_header_type": frame.Header().Type.String()})
+		return NewConnectionError(ErrCodeInternalError, errMsg)
+	}
+}
+
 // dispatchRSTStreamFrame handles an incoming RST_STREAM frame.
 // It finds the target stream, instructs it to handle the RST (which closes it),
 // and then removes the stream from connection tracking.
