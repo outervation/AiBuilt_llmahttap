@@ -695,21 +695,31 @@ func (l *Logger) Access(req *http.Request, streamID uint32, status int, response
 
 // CloseLogFiles closes any open log files.
 // This would be called during server shutdown.
-func (l *Logger) CloseLogFiles() {
+
+func (l *Logger) CloseLogFiles() error {
+	var firstErr error
 	if l.accessLog != nil && l.accessLog.output != nil {
-		if f, ok := l.accessLog.output.(*os.File); ok {
-			if f != os.Stdout && f != os.Stderr {
-				f.Close()
+		if config.IsFilePath(l.accessLog.config.Target) { // Only close if it's a file
+			if err := l.accessLog.output.Close(); err != nil {
+				l.Error("Failed to close access log file", LogFields{"target": l.accessLog.config.Target, "error": err.Error()})
+				if firstErr == nil {
+					firstErr = fmt.Errorf("closing access log '%s': %w", l.accessLog.config.Target, err)
+				}
 			}
 		}
 	}
 	if l.errorLog != nil && l.errorLog.output != nil {
-		if f, ok := l.errorLog.output.(*os.File); ok {
-			if f != os.Stdout && f != os.Stderr {
-				f.Close()
+		if config.IsFilePath(l.errorLog.config.Target) { // Only close if it's a file
+			if err := l.errorLog.output.Close(); err != nil {
+				// Use a more primitive logger here if the main one is compromised
+				fmt.Fprintf(os.Stderr, "[ERRORLOGGER] Failed to close error log file %s: %v\n", l.errorLog.config.Target, err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("closing error log '%s': %w", l.errorLog.config.Target, err)
+				}
 			}
 		}
 	}
+	return firstErr
 }
 
 // ReopenLogFiles is intended for SIGHUP handling.
