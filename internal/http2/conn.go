@@ -1424,3 +1424,64 @@ func (c *Connection) writeFrame(frame Frame) error {
 	}
 	return nil
 }
+
+// handlePingFrame processes an incoming PING frame.
+// If the PING is not an ACK, it sends back a PING ACK.
+// If it is an ACK, it processes it against outstanding PINGs.
+func (c *Connection) handlePingFrame(frame *PingFrame) error {
+	header := frame.Header()
+
+	if header.StreamID != 0 {
+		errMsg := fmt.Sprintf("PING frame received with non-zero stream ID %d", header.StreamID)
+		c.log.Error(errMsg, logger.LogFields{})
+		return NewConnectionError(ErrCodeProtocolError, errMsg)
+	}
+	if header.Length != 8 {
+		errMsg := fmt.Sprintf("PING frame received with invalid length %d, expected 8", header.Length)
+		c.log.Error(errMsg, logger.LogFields{})
+		return NewConnectionError(ErrCodeFrameSizeError, errMsg)
+	}
+
+	if header.Flags&FlagPingAck != 0 {
+		// This is an ACK for a PING we sent.
+		c.activePingsMu.Lock()
+		defer c.activePingsMu.Unlock()
+
+		timer, ok := c.activePings[frame.OpaqueData]
+		if ok {
+			timer.Stop() // Stop the timeout timer
+			delete(c.activePings, frame.OpaqueData)
+			c.log.Debug("Received PING ACK", logger.LogFields{"opaque_data": fmt.Sprintf("%x", frame.OpaqueData)})
+			// TODO: Optionally, calculate RTT if PINGs are used for that.
+		} else {
+			// Unsolicited PING ACK, or ACK for an already timed-out PING.
+			c.log.Warn("Received unsolicited or late PING ACK", logger.LogFields{"opaque_data": fmt.Sprintf("%x", frame.OpaqueData)})
+		}
+	} else {
+		// This is a PING request from the peer, send an ACK.
+		c.log.Debug("Received PING request, sending ACK", logger.LogFields{"opaque_data": fmt.Sprintf("%x", frame.OpaqueData)})
+		ackPingFrame := &PingFrame{
+			FrameHeader: FrameHeader{
+				Type:     FramePing,
+				Flags:    FlagPingAck,
+				StreamID: 0, // PING frames are always on stream 0
+				Length:   8, // PING payload is always 8 octets
+			},
+			OpaqueData: frame.OpaqueData,
+		}
+		// Send the ACK PING frame via the writer channel.
+		select {
+		case c.writerChan <- ackPingFrame:
+			// Successfully queued PING ACK
+		case <-c.shutdownChan:
+			c.log.Warn("Connection shutting down, cannot send PING ACK", logger.LogFields{"opaque_data": fmt.Sprintf("%x", frame.OpaqueData)})
+			return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send PING ACK")
+		default:
+			// This case indicates writerChan is full, which suggests a problem with the writer goroutine
+			// or severe congestion. This is a critical state.
+			c.log.Error("Failed to queue PING ACK: writer channel full or blocked", logger.LogFields{"opaque_data": fmt.Sprintf("%x", frame.OpaqueData)})
+			return NewConnectionError(ErrCodeInternalError, "failed to send PING ACK: writer channel congested")
+		}
+	}
+	return nil
+}
