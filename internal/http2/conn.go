@@ -2,6 +2,10 @@ package http2
 
 import (
 	"context"
+	"encoding/json" // Added for json.RawMessage
+
+	"fmt" // Added for fmt.Errorf
+	"golang.org/x/net/http2/hpack"
 	"net"
 	"sync"
 	"time"
@@ -84,6 +88,9 @@ type Connection struct {
 	// Writer goroutine coordination
 	writerChan              chan Frame  // Frames to be sent by the writer goroutine
 	settingsAckTimeoutTimer *time.Timer // Timer for waiting for SETTINGS ACK
+
+	// Added fields
+	maxFrameSize uint32 // To satisfy stream.go, should eventually alias to peerMaxFrameSize or ourCurrentMaxFrameSize depending on context
 
 	remoteAddrStr string // Cached remote address string
 }
@@ -214,4 +221,267 @@ func (c *Connection) applyPeerSettings() {
 		peerHpackTableSize := c.peerSettings[SettingHeaderTableSize]
 		c.hpackAdapter.SetMaxEncoderDynamicTableSize(peerHpackTableSize)
 	}
+}
+
+// canCreateStream checks if a new stream can be created based on concurrency limits.
+// isInitiatedByPeer indicates if the stream creation is initiated by the peer.
+func (c *Connection) canCreateStream(isInitiatedByPeer bool) bool {
+	c.settingsMu.Lock()
+	c.streamsMu.RLock() // RLock for reading concurrent stream counts
+
+	var limit uint32
+	var currentCount int
+
+	if isInitiatedByPeer {
+		limit = c.ourMaxConcurrentStreams
+		currentCount = c.concurrentStreamsInbound
+	} else {
+		limit = c.peerMaxConcurrentStreams
+		currentCount = c.concurrentStreamsOutbound
+	}
+	// Unlock order: streamsMu first, then settingsMu
+	c.streamsMu.RUnlock()
+	c.settingsMu.Unlock()
+
+	// A setting of 0 for MAX_CONCURRENT_STREAMS means no new streams of that type are allowed.
+	// RFC 7540, Section 5.1.2: "A value of 0 for SETTINGS_MAX_CONCURRENT_STREAMS SHOULD NOT be treated as special by endpoints."
+	// However, a common interpretation (and practical one for servers setting a limit) is that 0 means "disallow".
+	// The spec also states: "SETTINGS_MAX_CONCURRENT_STREAMS (0x3): ...This limit is directional: it applies to the number of streams that the sender of the setting can create."
+	// So, if WE send MAX_CONCURRENT_STREAMS = N, the PEER can open N streams.
+	// If PEER sends MAX_CONCURRENT_STREAMS = M, WE can open M streams.
+	// If isInitiatedByPeer is true, PEER is opening, so our limit (ourMaxConcurrentStreams) applies.
+	// If isInitiatedByPeer is false, WE are opening, so PEER's limit (peerMaxConcurrentStreams) applies.
+
+	if limit == 0 { // If the limit is explicitly set to 0, no streams allowed.
+		return false
+	}
+	// If limit is not 0 (common case: large default or specific value), check count.
+	// Note: MaxConcurrentStreams is often treated as "effectively infinite" (e.g. 2^31-1) by default if not set.
+	// Our defaults handle this appropriately (0xffffffff before peer settings are known).
+	return uint32(currentCount) < limit
+}
+
+// createStream creates a new stream, initializes it, and adds it to the connection.
+// id: The stream ID, must be validated by the caller for parity and sequence.
+// handler: The handler for server-initiated processing of client requests.
+// handlerCfg: Configuration for the handler.
+// prioInfo: Priority information for the new stream. If nil, default priority is used.
+// isInitiatedByPeer: True if the stream is being created due to a peer's action (e.g., receiving HEADERS).
+func (c *Connection) createStream(id uint32, handler Handler, handlerCfg json.RawMessage, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
+	// Check concurrency limits first, without holding the full streamsMu write lock yet.
+	if !c.canCreateStream(isInitiatedByPeer) {
+		return nil, NewConnectionError(ErrCodeRefusedStream, fmt.Sprintf("cannot create stream %d: max concurrent streams limit reached", id))
+	}
+
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+
+	// Re-check concurrency under the full lock, in case counts changed.
+	// canCreateStream handles its own locking, so this is a fresh check.
+	if !c.canCreateStream(isInitiatedByPeer) {
+		return nil, NewConnectionError(ErrCodeRefusedStream, fmt.Sprintf("cannot create stream %d: max concurrent streams limit reached (re-check)", id))
+	}
+
+	if _, ok := c.streams[id]; ok {
+		return nil, NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("cannot create stream %d: stream already exists", id))
+	}
+
+	// Determine priority values
+	var weight uint8
+	var parentID uint32
+	var exclusive bool
+
+	if prioInfo != nil {
+		weight = prioInfo.Weight
+		parentID = prioInfo.StreamDependency
+		exclusive = prioInfo.Exclusive
+	} else {
+		// Default priority: weight 16 (frame value 15), parent 0, not exclusive
+		weight = 15 // Default weight of 16 is represented by frame value 15
+		parentID = 0
+		exclusive = false
+	}
+
+	// Use current initial window sizes from settings
+	c.settingsMu.Lock()
+	currentOurInitialWindowSize := c.ourInitialWindowSize
+	currentPeerInitialWindowSize := c.peerInitialWindowSize
+	c.settingsMu.Unlock()
+
+	stream, err := newStream(
+		c, // parent connection
+		id,
+		currentOurInitialWindowSize,
+		currentPeerInitialWindowSize,
+		handler,
+		handlerCfg,
+		weight,
+		parentID,
+		exclusive,
+	)
+	if err != nil {
+		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to create new stream object for ID %d: %v", id, err))
+	}
+
+	c.streams[id] = stream
+
+	// Add to priority tree using the resolved priority info
+	actualPrioInfoForTree := &streamDependencyInfo{
+		StreamDependency: parentID,
+		Weight:           weight,
+		Exclusive:        exclusive,
+	}
+	if errPrio := c.priorityTree.AddStream(id, actualPrioInfoForTree); errPrio != nil {
+		delete(c.streams, id) // Rollback adding to c.streams
+		c.log.Error("Failed to add stream to priority tree", logger.LogFields{"streamID": id, "error": errPrio.Error()})
+		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to add stream %d to priority tree: %v", id, errPrio))
+	}
+
+	if isInitiatedByPeer {
+		c.concurrentStreamsInbound++
+	} else {
+		c.concurrentStreamsOutbound++
+	}
+
+	// Update lastProcessedStreamID if this stream ID is higher.
+	// This is relevant for GOAWAY processing.
+	if id > c.lastProcessedStreamID {
+		c.lastProcessedStreamID = id
+	}
+
+	c.log.Debug("Stream created", logger.LogFields{"streamID": id, "isPeerInitiated": isInitiatedByPeer, "handlerType": fmt.Sprintf("%T", handler)})
+	return stream, nil
+}
+
+// getStream retrieves an active stream by its ID.
+// Returns the stream and true if found, otherwise nil and false.
+func (c *Connection) getStream(id uint32) (*Stream, bool) {
+	c.streamsMu.RLock()
+	defer c.streamsMu.RUnlock()
+	stream, ok := c.streams[id]
+	return stream, ok
+}
+
+// removeStream removes a stream from the connection's active list and cleans up its resources.
+// id: The ID of the stream to remove.
+// initiatedByPeer: Must accurately reflect if the stream was initiated by the peer,
+//
+//	used for decrementing the correct concurrent stream counter.
+//
+// errCode: The HTTP/2 error code to use if an RST_STREAM needs to be sent or for logging the reason for removal.
+func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode ErrorCode) {
+	var streamToClose *Stream
+	var found bool
+
+	c.streamsMu.Lock()
+	streamToClose, found = c.streams[id]
+	if found {
+		delete(c.streams, id)
+		if initiatedByPeer {
+			if c.concurrentStreamsInbound > 0 {
+				c.concurrentStreamsInbound--
+			}
+		} else {
+			if c.concurrentStreamsOutbound > 0 {
+				c.concurrentStreamsOutbound--
+			}
+		}
+	}
+	c.streamsMu.Unlock()
+
+	if !found {
+		c.log.Debug("Attempted to remove non-existent stream", logger.LogFields{"streamID": id})
+		return
+	}
+
+	c.log.Debug("Removing stream", logger.LogFields{"streamID": id, "reasonCode": errCode.String()})
+
+	// Remove from priority tree
+	if err := c.priorityTree.RemoveStream(id); err != nil {
+		c.log.Warn("Error removing stream from priority tree", logger.LogFields{"streamID": id, "error": err.Error()})
+		// Continue with stream closure anyway
+	}
+
+	// Close the stream itself. This should handle state transitions and resource cleanup.
+	// Pass a StreamError to stream.Close if an error code is provided.
+	var closeErr error
+	if errCode != ErrCodeNoError && errCode != ErrCodeCancel { // NoError and Cancel might imply graceful or already handled RST
+		closeErr = NewStreamError(id, errCode, "stream removed by connection")
+	}
+	// streamToClose.Close might send an RST_STREAM if the stream isn't already closed from both ends.
+	// The error from stream.Close() is typically about failures to send RST_STREAM, etc.
+	if err := streamToClose.Close(closeErr); err != nil {
+		c.log.Warn("Error during stream.Close() while removing stream", logger.LogFields{"streamID": id, "error": err.Error()})
+	}
+
+	// Notify the connection that the stream's handler goroutine (if any) should be considered done,
+	// allowing the connection to potentially decrement a counter of active handlers.
+	// This logic might be part of a more comprehensive server.activeHandlers accounting.
+	// For now, this is a placeholder for where such a call would go.
+	// c.streamHandlerDone(streamToClose)
+}
+
+// sendHeadersFrame sends a HEADERS frame.
+// This is a stub implementation.
+func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, endStream bool) error {
+	// TODO: Implement actual frame creation and sending via c.writerChan
+	c.log.Debug("sendHeadersFrame called (stub)", logger.LogFields{"streamID": s.id, "num_headers": len(headers), "endStream": endStream})
+	if s == nil {
+		return fmt.Errorf("sendHeadersFrame: stream is nil")
+	}
+	// Simulate sending by logging. In a real implementation, this would:
+	// 1. Construct a HEADERS frame.
+	// 2. Encode headers using HPACK (c.hpackAdapter).
+	// 3. Fragment into HEADERS and CONTINUATION if necessary, respecting c.peerMaxFrameSize.
+	// 4. Send frame(s) to c.writerChan.
+	return nil
+}
+
+// sendDataFrame sends a DATA frame.
+// This is a stub implementation.
+func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int, error) {
+	// TODO: Implement actual frame creation and sending via c.writerChan
+	c.log.Debug("sendDataFrame called (stub)", logger.LogFields{"streamID": s.id, "data_len": len(data), "endStream": endStream})
+	if s == nil {
+		return 0, fmt.Errorf("sendDataFrame: stream is nil")
+	}
+	// Simulate sending by logging. In a real implementation, this would:
+	// 1. Construct a DATA frame.
+	// 2. Send frame to c.writerChan.
+	// (Flow control acquisition is handled by the Stream's WriteData method before calling this)
+	return len(data), nil
+}
+
+// sendRSTStreamFrame sends an RST_STREAM frame.
+// This is a stub implementation.
+func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
+	c.log.Debug("sendRSTStreamFrame called (stub)", logger.LogFields{"streamID": streamID, "errorCode": errorCode.String()})
+	// TODO: Implement actual frame creation and sending via c.writerChan
+	// 1. Construct RST_STREAM frame.
+	// 2. Send to c.writerChan.
+	return nil
+}
+
+// sendWindowUpdateFrame sends a WINDOW_UPDATE frame.
+// This is a stub for stream.go, which expects this method on connection.
+func (c *Connection) sendWindowUpdateFrame(streamID uint32, increment uint32) error {
+	c.log.Debug("sendWindowUpdateFrame called (stub)", logger.LogFields{"streamID": streamID, "increment": increment})
+	// In a real implementation:
+	// 1. Create a WindowUpdateFrame.
+	// 2. Set its StreamID and WindowSizeIncrement.
+	// 3. Send it to c.writerChan.
+	return nil
+}
+
+// isTLS is a stub to satisfy stream.go
+func (c *Connection) isTLS() bool {
+	// TODO: Determine this properly, e.g., by checking c.netConn type or a flag.
+	return true // Assuming TLS for now for default "https" scheme
+}
+
+// streamHandlerDone is a stub to satisfy stream.go
+func (c *Connection) streamHandlerDone(s *Stream) {
+	c.log.Debug("streamHandlerDone called (stub)", logger.LogFields{"streamID": s.id})
+	// This would typically be used to manage lifecycle of handler goroutines,
+	// perhaps decrementing an active handler counter for graceful shutdown.
 }
