@@ -60,6 +60,14 @@ type Connection struct {
 	activePings           map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
 	activePingsMu         sync.Mutex
 
+	// Header block assembly state
+	activeHeaderBlockStreamID uint32    // Stream ID of the current header block being assembled
+	headerFragments           [][]byte  // Buffer for incoming header block fragments
+	headerFragmentTotalSize   uint32    // Cumulative size of received fragments for current block
+	headerFragmentInitialType FrameType // Type of the frame that started the header block (HEADERS or PUSH_PROMISE)
+	headerFragmentPromisedID  uint32    // PromisedStreamID if initial frame was PUSH_PROMISE
+	// headerFragmentEndStream field was already added in previous step
+
 	// Settings state
 	settingsMu sync.Mutex // Protects all settings-related fields below
 	// Our settings that we advertise/enforce
@@ -557,6 +565,144 @@ func (c *Connection) dispatchDataFrame(frame *DataFrame) error {
 		}
 		// If it's a ConnectionError or other fatal error, propagate it.
 		return err
+	}
+
+	return nil
+}
+
+// resetHeaderAssemblyState clears the state related to assembling a header block.
+func (c *Connection) resetHeaderAssemblyState() {
+	c.activeHeaderBlockStreamID = 0
+	c.headerFragments = nil // Allow GC to collect the slices
+	c.headerFragmentTotalSize = 0
+	c.headerFragmentInitialType = 0
+	c.headerFragmentPromisedID = 0
+	c.headerFragmentEndStream = false
+}
+
+// processContinuationFrame processes an incoming CONTINUATION frame.
+func (c *Connection) processContinuationFrame(frame *ContinuationFrame) error {
+	header := frame.Header()
+
+	if c.activeHeaderBlockStreamID == 0 || len(c.headerFragments) == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "CONTINUATION frame received without active HEADERS/PUSH_PROMISE")
+	}
+	if header.StreamID != c.activeHeaderBlockStreamID {
+		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("CONTINUATION frame on stream %d does not match active header block stream %d", header.StreamID, c.activeHeaderBlockStreamID))
+	}
+
+	// Max header list size check (cumulative, on compressed size)
+	c.settingsMu.Lock()
+	maxHeaderListSizeBytes := c.ourMaxHeaderListSize
+	c.settingsMu.Unlock()
+
+	newTotalSize := c.headerFragmentTotalSize + uint32(len(frame.HeaderBlockFragment))
+	if newTotalSize > maxHeaderListSizeBytes && maxHeaderListSizeBytes > 0 {
+		msg := fmt.Sprintf("CONTINUATION frame causes header block (stream %d) to exceed preliminary max size (%d > %d)",
+			c.activeHeaderBlockStreamID, newTotalSize, maxHeaderListSizeBytes)
+		c.log.Error(msg, logger.LogFields{})
+		c.resetHeaderAssemblyState()                         // Abort assembly
+		return NewConnectionError(ErrCodeProtocolError, msg) // Or ENHANCE_YOUR_CALM
+	}
+
+	c.headerFragments = append(c.headerFragments, frame.HeaderBlockFragment)
+	c.headerFragmentTotalSize = newTotalSize
+
+	if header.Flags&FlagContinuationEndHeaders != 0 {
+		// END_HEADERS is set, this completes the block.
+		return c.finalizeHeaderBlockAndDispatch()
+	}
+	// END_HEADERS not set, expect more CONTINUATION frames.
+	return nil
+}
+
+// finalizeHeaderBlockAndDispatch is called when a complete header block (HEADERS/PUSH_PROMISE + any CONTINUATIONs)
+// has been received (indicated by END_HEADERS flag). It concatenates fragments, decodes,
+// validates, and then dispatches the headers.
+func (c *Connection) finalizeHeaderBlockAndDispatch() error {
+	if c.activeHeaderBlockStreamID == 0 || len(c.headerFragments) == 0 {
+		// Should not happen if called correctly.
+		c.resetHeaderAssemblyState() // Ensure clean state even if this happens
+		return NewConnectionError(ErrCodeInternalError, "finalizeHeaderBlockAndDispatch called with no active header block")
+	}
+
+	// Concatenate all fragments
+	totalLen := 0
+	for _, frag := range c.headerFragments {
+		totalLen += len(frag)
+	}
+	fullHeaderBlock := make([]byte, 0, totalLen)
+	for _, frag := range c.headerFragments {
+		fullHeaderBlock = append(fullHeaderBlock, frag...)
+	}
+
+	// Decode using HPACK
+	c.hpackAdapter.ResetDecoderState() // Ensure clean state for new block
+	if err := c.hpackAdapter.DecodeFragment(fullHeaderBlock); err != nil {
+		c.log.Error("HPACK decoding error (fragment processing)", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": err})
+		c.resetHeaderAssemblyState()
+		return NewConnectionError(ErrCodeCompressionError, "HPACK decode fragment error: "+err.Error())
+	}
+	decodedHeaders, err := c.hpackAdapter.FinishDecoding()
+	if err != nil {
+		c.log.Error("HPACK decoding error (finish decoding)", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": err})
+		c.resetHeaderAssemblyState()
+		return NewConnectionError(ErrCodeCompressionError, "HPACK finish decoding error: "+err.Error())
+	}
+
+	// Check MAX_HEADER_LIST_SIZE (uncompressed)
+	var uncompressedSize uint32
+	for _, hf := range decodedHeaders {
+		uncompressedSize += uint32(len(hf.Name)) + uint32(len(hf.Value)) + 32 // As per RFC 7540, Section 6.5.2
+	}
+
+	c.settingsMu.Lock()
+	actualMaxHeaderListSize := c.ourMaxHeaderListSize
+	c.settingsMu.Unlock()
+
+	if actualMaxHeaderListSize > 0 && uncompressedSize > actualMaxHeaderListSize {
+		msg := fmt.Sprintf("decoded header list size (%d) exceeds SETTINGS_MAX_HEADER_LIST_SIZE (%d) for stream %d",
+			uncompressedSize, actualMaxHeaderListSize, c.activeHeaderBlockStreamID)
+		c.log.Error(msg, logger.LogFields{})
+		c.resetHeaderAssemblyState()
+		// This is a resource limit violation. ENHANCE_YOUR_CALM or PROTOCOL_ERROR.
+		return NewConnectionError(ErrCodeEnhanceYourCalm, msg)
+	}
+
+	// Store relevant state before resetting, as dispatch might be complex.
+	streamID := c.activeHeaderBlockStreamID
+	initialType := c.headerFragmentInitialType
+	promisedID := c.headerFragmentPromisedID
+	endStreamFlag := c.headerFragmentEndStream // This flag is from the *initial* HEADERS frame.
+
+	c.resetHeaderAssemblyState() // Reset state *before* dispatching.
+
+	switch initialType {
+	case FrameHeaders:
+		c.log.Debug("Dispatching assembled HEADERS", logger.LogFields{"stream_id": streamID, "num_headers": len(decodedHeaders), "end_stream_flag_on_headers": endStreamFlag})
+		// TODO: Implement logic to find/create stream and pass headers to it.
+		// This involves:
+		// 1. Validating streamID (is it new, is it allowed by client/server, concurrency).
+		// 2. Creating a new stream object or finding an existing one (e.g. for trailers).
+		// 3. Setting requestHeaders on the stream.
+		// 4. Transitioning stream state (e.g., to Open or HalfClosedRemote if endStreamFlag is true).
+		// 5. If endStreamFlag is true, also close the stream's requestBodyWriter.
+		// 6. Launching the handler goroutine.
+		// Example placeholder:
+		// err = c.handleIncomingHeaders(streamID, decodedHeaders, endStreamFlag)
+		// if err != nil { return err }
+
+	case FramePushPromise:
+		c.log.Debug("Dispatching assembled PUSH_PROMISE", logger.LogFields{"associated_stream_id": streamID, "promised_stream_id": promisedID, "num_headers": len(decodedHeaders)})
+		// TODO: Implement client-side PUSH_PROMISE handling.
+		// This involves:
+		// 1. Validating promisedID.
+		// 2. Creating a new stream in "reserved (remote)" state for promisedID.
+		// 3. Storing the pushed request headers.
+		// 4. Client application logic decides whether to accept or RST_STREAM(CANCEL) the pushed stream.
+	default:
+		// This should be unreachable if state is managed correctly.
+		return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("invalid initial frame type %v in finalizeHeaderBlockAndDispatch", initialType))
 	}
 
 	return nil
