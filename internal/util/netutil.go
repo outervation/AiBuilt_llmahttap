@@ -45,6 +45,73 @@ func SetCloexec(fd uintptr, enabled bool) error {
 	return nil
 }
 
+// getFileFromListener attempts to get the underlying *os.File from a net.Listener.
+// This is needed to access the raw file descriptor.
+// The returned *os.File is a duplicate of the listener's file descriptor
+// and MUST be closed by the caller.
+func getFileFromListener(l net.Listener) (*os.File, error) {
+	switch typedListener := l.(type) {
+	case *net.TCPListener:
+		return typedListener.File()
+	case *net.UnixListener:
+		return typedListener.File()
+	// Add other common listener types if they become relevant for the server.
+	default:
+		return nil, fmt.Errorf("unsupported listener type for GetFile: %T", typedListener)
+	}
+}
+
+// NewListenerFromFD creates a net.Listener from an inherited file descriptor.
+// It ensures that the file descriptor managed by the returned listener
+// does NOT have FD_CLOEXEC set, making it suitable for further handoff
+// in subsequent zero-downtime restarts.
+// The provided fd uintptr is assumed to be a valid, open file descriptor
+// for a listening socket.
+func NewListenerFromFD(fd uintptr) (net.Listener, error) {
+	// Step 1: Create an os.File from the raw file descriptor.
+	// The name is arbitrary and primarily for debugging.
+	file := os.NewFile(fd, fmt.Sprintf("listener-from-fd-%d", fd))
+	if file == nil {
+		// This can happen if fd is not a valid descriptor.
+		return nil, fmt.Errorf("os.NewFile returned nil for FD %d", fd)
+	}
+
+	// Step 2: Create a net.Listener from the os.File.
+	// net.FileListener takes ownership of the file's descriptor if successful.
+	listener, err := net.FileListener(file)
+	if err != nil {
+		file.Close() // Must close the os.File if net.FileListener fails, as it still owns the FD.
+		return nil, fmt.Errorf("net.FileListener failed for FD %d: %w", fd, err)
+	}
+	// If net.FileListener succeeds, 'listener' now owns the FD from 'file'.
+	// 'file' itself should not be closed directly by us from this point,
+	// as closing 'listener' will handle closing the underlying FD.
+
+	// Step 3: Ensure FD_CLOEXEC is cleared on the FD actually managed by the listener.
+	// The task specification implies that net.FileListener might set FD_CLOEXEC.
+	// To counteract this, we get a (duplicate) *os.File from the listener,
+	// get its FD, clear CLOEXEC on that FD, and then close this temporary *os.File.
+	// The original listener will continue to use its internal FD, which should now
+	// reflect the cleared CLOEXEC status.
+	tempListenerFile, err := getFileFromListener(listener)
+	if err != nil {
+		// The listener was created, but we can't confirm/set its FD_CLOEXEC status.
+		// To be safe, close the listener and report the error.
+		listener.Close()
+		return nil, fmt.Errorf("failed to get file from listener (for FD %d) to clear CLOEXEC: %w", fd, err)
+	}
+	// tempListenerFile must be closed to release the duplicated FD.
+	defer tempListenerFile.Close()
+
+	listenerInternalFD := tempListenerFile.Fd()
+	if err := SetCloexec(listenerInternalFD, false); err != nil {
+		listener.Close() // Close the main listener as we failed to configure its FD properly.
+		return nil, fmt.Errorf("failed to clear FD_CLOEXEC on listener's internal FD %d (from original FD %d): %w", listenerInternalFD, fd, err)
+	}
+
+	return listener, nil
+}
+
 // CreateListener creates a net.Listener on the given address.
 // It ensures that the underlying file descriptor does NOT have FD_CLOEXEC set,
 // making it suitable for passing to a child process during zero-downtime restarts.
