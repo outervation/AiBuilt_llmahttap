@@ -86,3 +86,69 @@ func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, or
 
 	return s, nil
 }
+
+// initializeListeners sets up the server's network listeners.
+// If the server is a child process (s.isChild is true), it uses inherited file descriptors
+// from s.listenerFDs (parsed from LISTEN_FDS env var by NewServer).
+// Otherwise, it creates new listeners based on s.cfg.Server.Address.
+// All listeners will have FD_CLOEXEC cleared.
+// The method populates s.listeners and s.listenerFDs.
+func (s *Server) initializeListeners() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isChild {
+		if len(s.listenerFDs) == 0 {
+			return fmt.Errorf("server marked as child (isChild=true), but no inherited listener FDs found in s.listenerFDs")
+		}
+		s.log.Info("Initializing server with inherited listener FDs", logger.LogFields{"fds": s.listenerFDs})
+
+		listeners := make([]net.Listener, len(s.listenerFDs))
+		for i, fd := range s.listenerFDs {
+			listener, err := util.NewListenerFromFD(fd)
+			if err != nil {
+				// Clean up already created listeners in this attempt
+				for j := 0; j < i; j++ {
+					if listeners[j] != nil {
+						listeners[j].Close()
+					}
+				}
+				return fmt.Errorf("failed to create listener from inherited FD %d: %w", fd, err)
+			}
+			// util.NewListenerFromFD ensures FD_CLOEXEC is cleared.
+			listeners[i] = listener
+			s.log.Info("Successfully created listener from inherited FD", logger.LogFields{"fd": fd, "localAddr": listener.Addr().String()})
+		}
+		s.listeners = listeners
+		// s.listenerFDs was already populated by NewServer for a child process.
+	} else {
+		s.log.Info("Initializing server with new listeners (not inherited)", nil)
+
+		var listenAddress string
+		if s.cfg.Server == nil {
+			return fmt.Errorf("server configuration section (server) is missing, cannot determine listen address")
+		}
+		if s.cfg.Server.Address == nil {
+			return fmt.Errorf("server listen address (server.address) is not configured (is nil)")
+		}
+		if *s.cfg.Server.Address == "" {
+			return fmt.Errorf("server listen address (server.address) is configured but is an empty string")
+		}
+		listenAddress = *s.cfg.Server.Address
+
+		listener, fd, err := util.CreateListenerAndGetFD(listenAddress)
+		if err != nil {
+			return fmt.Errorf("failed to create new listener on %s: %w", listenAddress, err)
+		}
+		// util.CreateListenerAndGetFD ensures FD_CLOEXEC is cleared.
+		s.listeners = []net.Listener{listener}
+		s.listenerFDs = []uintptr{fd}
+		s.log.Info("Successfully created new listener", logger.LogFields{"address": listenAddress, "fd": fd, "localAddr": listener.Addr().String()})
+	}
+
+	if len(s.listeners) == 0 {
+		return fmt.Errorf("no listeners were initialized for the server")
+	}
+
+	return nil
+}
