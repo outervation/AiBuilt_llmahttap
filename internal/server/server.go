@@ -8,14 +8,12 @@ import (
 	"net"
 	"net/http" // For http.Request in dispatcherFunc
 	"os"
+	"os/signal" // Added for signal handling
 	"sync"
-	// "crypto/tls"
-	// "os/signal"
-	// "strings"
-	// "syscall"
+	"syscall" // Added for signal types
 	"time"
 
-	"example.com/llmahttap/v2/internal/config"
+	"example.com/llmahttap/v2/internal/config" // Used by handleSIGHUP placeholder
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/util"
@@ -277,28 +275,8 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 		// For now, this remains nil, relying on defaults in http2.NewConnection.
 	}
 
-	// Create the dispatcher function by wrapping s.router.ServeHTTP
-	dispatcherFunc := func(stream http2.StreamWriter, req *http.Request) {
-		// We need to adapt http2.StreamWriter to server.ResponseWriterStream for the router.
-		// This is a bit of a shim. Ideally, the router would accept http2.StreamWriter directly,
-		// or http2.Stream would fully implement server.ResponseWriterStream.
-		// For now, we assume http2.StreamWriter also has ID() and Context() if router needs them.
-		// If http2.StreamWriter is indeed an *http2.Stream, this cast would work if *http2.Stream implements server.ResponseWriterStream.
-
-		// Check if stream implements server.ResponseWriterStream
-		// This is a temporary check. The types should align eventually.
-		serverStream, ok := stream.(ResponseWriterStream)
-		if !ok {
-			s.log.Error("Dispatcher: stream does not implement server.ResponseWriterStream", logger.LogFields{"streamID": stream.ID(), "type": fmt.Sprintf("%T", stream)})
-			// Handle error: perhaps send 500 on the stream if possible, or just log and close.
-			// This indicates a type mismatch that needs fixing.
-			// For now, let's try to send a basic 500 if headers not sent.
-			// This is simplified.
-			_ = stream.SendHeaders([]http2.HeaderField{{Name: ":status", Value: "500"}}, true)
-			return
-		}
-		s.router.ServeHTTP(serverStream, req)
-	}
+	// The dispatcherFunc uses s.dispatchRequest which correctly handles type assertions.
+	dispatcherFunc := s.dispatchRequest
 
 	h2conn := http2.NewConnection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, dispatcherFunc)
 
@@ -378,4 +356,267 @@ func (s *Server) dispatchRequest(stream http2.StreamWriter, req *http.Request) {
 	}
 
 	s.router.ServeHTTP(responseStream, req)
+}
+
+// Shutdown initiates a graceful shutdown of the server.
+// It stops accepting new connections, sends GOAWAY to active connections,
+// waits for them to finish, and then cleans up resources.
+func (s *Server) Shutdown(reason error) error {
+	s.log.Info("Shutdown initiated", logger.LogFields{"reason": reason})
+
+	// 1. Signal shutdown initiation and stop accepting new connections
+	s.mu.Lock()
+	select {
+	case <-s.shutdownChan:
+		// Already shutting down
+		s.mu.Unlock()
+		s.log.Info("Shutdown already in progress", nil)
+		// Wait for existing shutdown to complete, but prevent re-entry if called concurrently.
+		// If Shutdown is called again while one is in progress, the second call waits for the first to finish.
+		<-s.doneChan
+		return nil
+	default:
+		close(s.shutdownChan)
+		// s.stopAccepting is closed here to immediately signal acceptLoops.
+		// If acceptLoops check s.shutdownChan as well, this might be redundant but safe.
+		// Spec focuses on s.stopAccepting for acceptLoops.
+		close(s.stopAccepting)
+	}
+
+	// Keep a local copy of listeners to close them outside the main server lock
+	// to avoid deadlocks if listener.Close() calls something that tries to acquire s.mu.
+	listenersToClose := make([]net.Listener, len(s.listeners))
+	copy(listenersToClose, s.listeners)
+	s.mu.Unlock() // Unlock before closing listeners
+
+	// 2. Stop all listeners from accepting new connections
+	s.log.Info("Closing listeners...", nil)
+	for _, l := range listenersToClose {
+		if err := l.Close(); err != nil {
+			s.log.Warn("Error closing listener", logger.LogFields{"address": l.Addr().String(), "error": err.Error()})
+		}
+	}
+	s.log.Info("Listeners closed.", nil)
+
+	// 3. Determine GOAWAY error code
+	var goAwayErrorCode http2.ErrorCode = http2.ErrCodeNoError
+	var goAwayDebugData []byte
+	if reason != nil {
+		if connErr, ok := reason.(*http2.ConnectionError); ok {
+			goAwayErrorCode = connErr.Code
+			goAwayDebugData = connErr.DebugData
+		} else {
+			goAwayErrorCode = http2.ErrCodeInternalError
+			goAwayDebugData = []byte(reason.Error())
+			// Truncate debug data if too long for GOAWAY. RFC 7540 Sec 6.8 doesn't specify a limit,
+			// but it's good practice to keep it reasonable.
+			const maxDebugDataLen = 256
+			if len(goAwayDebugData) > maxDebugDataLen {
+				goAwayDebugData = goAwayDebugData[:maxDebugDataLen]
+			}
+		}
+	}
+
+	// 4. Iterate all active http2.Connection's and call their Close() method
+	s.mu.RLock()
+	activeConnections := make([]*http2.Connection, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		activeConnections = append(activeConnections, conn)
+	}
+	s.mu.RUnlock()
+
+	s.log.Info("Sending GOAWAY and closing active HTTP/2 connections", logger.LogFields{"count": len(activeConnections)})
+	// The GOAWAY frame itself will be constructed by the http2.Connection's Close method.
+	// It will use its own lastProcessedStreamID.
+	goAwayErrForConn := &http2.ConnectionError{Code: goAwayErrorCode, DebugData: goAwayDebugData, LastStreamID: 0} // LastStreamID will be set by conn.Close()
+
+	for _, h2conn := range activeConnections {
+		go h2conn.Close(goAwayErrForConn)
+	}
+
+	// 5. Wait for all active http2.Connection's to complete their own graceful shutdown
+	gracefulTimeout := 30 * time.Second // Default
+	if s.cfg.Server != nil && s.cfg.Server.GracefulShutdownTimeout != nil && *s.cfg.Server.GracefulShutdownTimeout != "" {
+		parsedTimeout, err := time.ParseDuration(*s.cfg.Server.GracefulShutdownTimeout)
+		if err == nil && parsedTimeout > 0 {
+			gracefulTimeout = parsedTimeout
+		} else if err != nil {
+			s.log.Warn("Failed to parse graceful_shutdown_timeout, using default", logger.LogFields{"value": *s.cfg.Server.GracefulShutdownTimeout, "default": gracefulTimeout, "error": err.Error()})
+		}
+	}
+	s.log.Info("Waiting for active connections to close", logger.LogFields{"timeout": gracefulTimeout.String()})
+
+	timeout := time.After(gracefulTimeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		s.mu.RLock()
+		numActive := len(s.activeConns)
+		s.mu.RUnlock()
+
+		if numActive == 0 {
+			s.log.Info("All active connections closed.", nil)
+			break
+		}
+
+		select {
+		case <-timeout:
+			s.log.Warn("Graceful shutdown timeout reached, some connections may not have closed cleanly.", logger.LogFields{"remaining_connections": numActive})
+			goto cleanupLoopExit // Exit the waiting loop
+		case <-ticker.C:
+			s.log.Debug("Waiting for connections to close...", logger.LogFields{"remaining_connections": numActive})
+			// No direct check on s.doneChan here; if another shutdown completed, this one would have already returned from the top.
+			// If it was closed by THIS goroutine (which is not possible before this point), it means a logic error.
+		}
+	}
+
+cleanupLoopExit: // Label to break out of the waiting loop
+
+	// 6. Close server-level resources
+	s.log.Info("Closing server-level resources (e.g., log files).", nil)
+	if err := s.log.CloseLogFiles(); err != nil {
+		// Log this error, but don't let it stop the shutdown.
+		// Use a more primitive log if the main logger is what's failing.
+		fmt.Fprintf(os.Stderr, "[CRITICAL] Error closing log files during shutdown: %v\n", err)
+	}
+
+	// 7. Signal that the server has fully stopped
+	s.mu.Lock() // Need lock to safely close doneChan if not already closed
+	select {
+	case <-s.doneChan:
+		// Already closed, do nothing
+	default:
+		close(s.doneChan)
+	}
+	s.mu.Unlock()
+
+	s.log.Info("Server shutdown complete.", nil)
+	return nil
+}
+
+// Run starts the server, initializes listeners, handles signals, and accepts connections.
+// It blocks until the server is shut down.
+func (s *Server) Run() error {
+	s.log.Info("Starting server...", logger.LogFields{"config_path": s.configFilePath})
+
+	if err := s.initializeListeners(); err != nil {
+		s.log.Error("Failed to initialize listeners", logger.LogFields{"error": err.Error()})
+		// Ensure doneChan is closed if Run exits early.
+		s.mu.Lock()
+		select {
+		case <-s.doneChan: // Already closed
+		default:
+			close(s.doneChan)
+		}
+		s.mu.Unlock()
+		return err
+	}
+
+	go s.handleSignals()
+
+	if err := s.StartAccepting(); err != nil {
+		s.log.Error("Failed to start accepting connections", logger.LogFields{"error": err.Error()})
+		// Attempt to gracefully shut down if we can't start accepting.
+		// Pass the error as the reason for shutdown.
+		go s.Shutdown(fmt.Errorf("failed to start accepting connections: %w", err))
+		// Fall through to wait on doneChan, Shutdown will eventually close it.
+	}
+
+	s.log.Info("Server started successfully. Waiting for shutdown signal...", logger.LogFields{"listeners_count": len(s.listeners)})
+	// Block until shutdown is complete. s.doneChan is closed at the end of s.Shutdown().
+	<-s.doneChan
+	s.log.Info("Server Run() method finished.", nil)
+	return nil
+}
+
+// Done returns a channel that is closed when the server has completely shut down.
+func (s *Server) Done() <-chan struct{} {
+	return s.doneChan
+}
+
+// handleSignals listens for OS signals and acts accordingly.
+// It stops listening when the server's shutdownChan is closed.
+func (s *Server) handleSignals() {
+	// Register for notifications. s.reloadChan is buffered.
+	signal.Notify(s.reloadChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	s.log.Info("Signal handler started. Listening for SIGINT, SIGTERM, SIGHUP.", nil)
+
+	defer func() {
+		signal.Stop(s.reloadChan) // Clean up: stop notifying this channel.
+		// Do not close s.reloadChan here if other goroutines might still select on it,
+		// or if it's closed elsewhere. However, if this is the sole manager, closing is fine.
+		// Given its name and usage, it's likely specific to this signal handling.
+		// Let's assume it's safe to close *if* no other part of the system writes to it.
+		// For safety, and since `Stop` is the primary cleanup, let's not close it here
+		// unless explicitly designed for single writer/closer.
+		s.log.Info("Signal handler stopped.", nil)
+	}()
+
+	for {
+		select {
+		case sig, ok := <-s.reloadChan:
+			if !ok {
+				// s.reloadChan was closed, perhaps by a previous signal handler instance exiting.
+				s.log.Info("Signal channel (reloadChan) closed, signal handler exiting.", nil)
+				return
+			}
+			s.log.Info("Received signal", logger.LogFields{"signal": sig.String()})
+			switch sig {
+			case syscall.SIGINT, syscall.SIGTERM:
+				s.log.Info("SIGINT/SIGTERM received, initiating graceful shutdown.", logger.LogFields{"signal": sig.String()})
+				// s.Shutdown is idempotent and handles being called multiple times.
+				// Run in a goroutine so that if Shutdown blocks for a long time,
+				// this loop can still exit if s.shutdownChan closes independently.
+				go s.Shutdown(fmt.Errorf("received signal %s", sig.String()))
+				// The loop will exit via the s.shutdownChan case below.
+			case syscall.SIGHUP:
+				s.log.Info("SIGHUP received, handling.", nil)
+				// handleSIGHUP might be a long-running operation if it involves forking.
+				// For complex operations, it should manage its own goroutines.
+				// For now, direct call is fine as it's mostly logging and log reopening.
+				s.handleSIGHUP()
+			}
+		case <-s.shutdownChan: // This channel is closed by s.Shutdown() when shutdown starts
+			s.log.Info("Shutdown initiated (detected via shutdownChan), signal handler exiting.", nil)
+			return // Exit signal handling loop
+		}
+	}
+}
+
+// handleSIGHUP handles the SIGHUP signal.
+// This function is the entry point for configuration reload and/or binary upgrade.
+// Currently, it reopens log files as per spec 3.5.1.
+// The full logic for config reload and binary upgrade (spec section 4) will be
+// implemented here or called from here in future steps.
+func (s *Server) handleSIGHUP() {
+	s.mu.RLock() // RLock for reading s.log and s.configFilePath
+	cfgPath := s.configFilePath
+	currentLog := s.log
+	s.mu.RUnlock()
+
+	currentLog.Info("SIGHUP received. Processing...", nil)
+
+	// Spec 3.5.1: Reopen log files
+	currentLog.Info("Attempting to reopen log files due to SIGHUP...", nil)
+	if err := currentLog.ReopenLogFiles(); err != nil {
+		currentLog.Error("Failed to reopen log files on SIGHUP", logger.LogFields{"error": err.Error()})
+	} else {
+		currentLog.Info("Successfully reopened log files (if configured for file output).", nil)
+	}
+
+	// Spec 4: Configuration Reload and Binary Upgrade
+	// The logic for this is complex and involves potentially forking a new process.
+	// It will be triggered from here. For now, we log and indicate it's pending.
+	currentLog.Warn("SIGHUP: Full configuration reload and binary upgrade mechanism (spec 4) needs to be implemented.", logger.LogFields{"config_path_for_reload": cfgPath})
+	// TODO: Implement full configuration reload and binary upgrade logic as per spec 4.3.
+	// This involves:
+	// 1. Loading new configuration from cfgPath.
+	// 2. Validating it.
+	// 3. If valid, determining new executable path (from new config or current).
+	// 4. Forking and exec-ing the new process.
+	// 5. Passing listener FDs (s.listenerFDs) and readiness pipe FD.
+	// 6. Current (old parent) process waits for child readiness signal with timeout.
+	// 7. If child ready: Old parent stops accepting, sends GOAWAY on existing conns, waits for graceful_shutdown_timeout, then exits.
+	// 8. If child fails readiness: Old parent logs error, aborts reload, and continues service.
 }
