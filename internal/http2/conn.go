@@ -1553,15 +1553,14 @@ func (c *Connection) Close(err error) error {
 		// For now, let's assume a short default or that it's passed via initiateShutdown.
 		// Let's set gracefulTimeout to a small value for clean close, or 0 for error-driven close.
 		gracefulTimeout = 5 * time.Second // Example: 5 seconds for graceful stream completion
+
 	} else if ce, ok := err.(*ConnectionError); ok {
 		errCode = ce.Code
-		// If LastStreamID is set in ConnectionError, respect it. Otherwise, use current highest.
-		if ce.LastStreamID > 0 { // Note: LastStreamID in ConnectionError is not standard. GOAWAY uses its own.
-			// This logic might need refinement. For now, trust highest processed if not specified.
-		}
+		// LastStreamID for GOAWAY is determined by c.lastProcessedStreamID.
+		// ConnectionError.Code and ConnectionError.DebugData are used if present.
 		debugData = ce.DebugData
 		gracefulTimeout = 0 // Connection errors usually imply immediate shutdown
-	} else { // Other errors (e.g. io.EOF, net.OpError from underlying connection)
+	} else { // Other errors
 		errCode = ErrCodeProtocolError // Or InternalError if it's from our side
 		if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "broken pipe") {
 			errCode = ErrCodeConnectError // Peer likely disappeared
