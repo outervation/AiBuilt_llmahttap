@@ -974,9 +974,10 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		// This is not ideal for interface segregation but helps proceed.
 		actualRouter, ok := c.dispatcher.(*router.Router)
 		if !ok {
-			c.log.Error("Dispatcher is not of expected type *router.Router, cannot perform routing", logger.LogFields{"stream_id": streamID})
-			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError)
-			return nil
+			errMsg := "Dispatcher is not of expected type *router.Router, connection cannot perform routing"
+			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID})
+			// This is a fundamental issue with the connection's setup.
+			return NewConnectionError(ErrCodeInternalError, errMsg)
 		}
 
 		matchedRoute, instantiatedHandler, errMatch := actualRouter.Match(path)
