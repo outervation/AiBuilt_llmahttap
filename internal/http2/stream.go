@@ -134,17 +134,18 @@ type Stream struct {
 	conn *Connection // Parent connection, defined in connection.go
 
 	// HTTP/2 specific properties
-	fcManager         *StreamFlowControlManager // Stream-level flow control manager
-	priorityWeight    uint8                     // Stream weight (0-255, effective 1-256)
-	priorityParentID  uint32                    // Parent stream ID for priority
-	priorityExclusive bool                      // Exclusive flag for priority dependency
+	fcManager        *StreamFlowControlManager // Stream-level flow control manager
+	priorityWeight   uint8                     // Stream weight (0-255, effective 1-256)
+	priorityParentID uint32                    // Parent stream ID for priority
+
+	priorityExclusive bool // Exclusive flag for priority dependency
 
 	// Request handling
 	requestHeaders    []hpack.HeaderField
 	requestTrailers   []hpack.HeaderField // For storing received trailer headers
 	requestBodyReader *io.PipeReader      // For handler to read incoming DATA frames
 	requestBodyWriter *io.PipeWriter      // For stream to write incoming DATA frames into
-	handler           Handler             // Handler responsible for this stream
+	handler           server.Handler      // Changed from http2.Handler to server.Handler
 	handlerConfig     json.RawMessage     // Configuration for the handler
 
 	// Response handling (Stream implements ResponseWriter or provides one)
