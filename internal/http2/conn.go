@@ -7,6 +7,7 @@ import (
 	"fmt" // Added for fmt.Errorf
 	"golang.org/x/net/http2/hpack"
 	"net"
+	"strings" // Added to fix undefined: strings
 	"sync"
 	"time"
 
@@ -836,7 +837,164 @@ func (c *Connection) processPushPromiseFrame(frame *PushPromiseFrame) error {
 }
 
 func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hpack.HeaderField, endStream bool, prioInfo *streamDependencyInfo) error {
-	// TODO: Implement actual header handling and request dispatching logic.
-	c.log.Debug("handleIncomingCompleteHeaders called (stub)", logger.LogFields{"stream_id": streamID, "num_headers": len(headers), "endStream": endStream, "prioInfoPresent": prioInfo != nil})
-	return nil
+	c.log.Debug("Handling complete headers",
+		logger.LogFields{
+			"stream_id":         streamID,
+			"num_headers":       len(headers),
+			"end_stream":        endStream,
+			"prio_info_present": prioInfo != nil,
+			"is_client_conn":    c.isClient,
+		})
+
+	if c.isClient {
+		// Client received HEADERS (response or pushed response)
+
+		_, exists := c.getStream(streamID)
+		if !exists {
+			c.log.Error("Client received HEADERS for unknown or closed stream", logger.LogFields{"stream_id": streamID})
+			// Specific error depends on whether streamID was expected (e.g. after PUSH_PROMISE)
+			// For now, treat as a protocol error if stream not found.
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client received HEADERS for non-existent stream %d", streamID))
+		}
+		// TODO: Implement stream.processResponseHeaders(headers, endStream) in stream.go
+		// return stream.processResponseHeaders(headers, endStream)
+		c.log.Debug("Client-side header handling not fully implemented yet.", logger.LogFields{"stream_id": streamID})
+		return nil // Placeholder for client-side
+
+	} else {
+		// Server received HEADERS (client request)
+		if streamID == 0 {
+			return NewConnectionError(ErrCodeProtocolError, "server received HEADERS on stream 0")
+		}
+		if streamID%2 == 0 { // Client-initiated stream ID must be odd
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("server received HEADERS on even stream ID %d from client", streamID))
+		}
+
+		// Check if stream already exists (client re-using an ID for a new request)
+		// N.B. lastProcessedStreamID is updated by createStream.
+		// A client MUST NOT reuse stream IDs.
+		c.streamsMu.RLock()
+		_, exists := c.streams[streamID]
+		// highestKnownClientStream := c.nextStreamIDClient - 2 // This logic needs more robust tracking if used.
+		c.streamsMu.RUnlock()
+
+		if exists {
+			c.log.Error("Server received HEADERS for an already existing stream ID from client", logger.LogFields{"stream_id": streamID})
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client attempted to reuse stream ID %d", streamID))
+		}
+		// TODO: Add more robust tracking of highest client-initiated stream ID successfully processed
+		// to prevent re-use if stream was closed quickly. For now, `exists` check catches active re-use.
+
+		if c.dispatcher == nil {
+			c.log.Error("Dispatcher is nil, cannot route request for new stream", logger.LogFields{"stream_id": streamID})
+			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError) // Best effort RST
+			return nil                                               // Don't kill connection for this, just the stream.
+		}
+
+		// Create the stream. Handler and Cfg are nil initially; router will set them.
+		newStream, streamErr := c.createStream(streamID, nil /*handler*/, nil /*handlerCfg*/, prioInfo, true /*isPeerInitiated*/)
+		if streamErr != nil {
+			c.log.Error("Failed to create stream for incoming client HEADERS", logger.LogFields{"stream_id": streamID, "error": streamErr.Error()})
+			if ce, ok := streamErr.(*ConnectionError); ok && ce.Code == ErrCodeRefusedStream {
+				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream) // Send RST for refused stream
+				return nil                                               // Stream refused, RST sent, not a connection-terminating error in itself.
+			}
+			return streamErr // Propagate other fatal connection errors from createStream.
+		}
+
+		// Delegate to the stream to process headers and dispatch via the router.
+		// TODO: Implement stream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher) in stream.go
+		// For now, to avoid undefined method, just mark headers as received by stream (conceptually)
+		c.log.Debug("Server-side stream created, header/dispatch logic in stream pending.", logger.LogFields{"stream_id": newStream.id})
+		newStream.requestHeaders = headers // Temporary direct set for stubbing
+
+		newStream.mu.Lock()
+		// Initial state for a newly created stream is Idle. Transition based on HEADERS.
+		if newStream.state != StreamStateIdle {
+			// This would be very odd, as createStream should set it to Idle before returning it to us.
+			c.log.Error("Newly created stream is not in Idle state before header processing", logger.LogFields{"stream_id": newStream.id, "state": newStream.state.String()})
+			newStream.mu.Unlock()
+			return NewConnectionError(ErrCodeInternalError, "newly created stream in unexpected state")
+		}
+
+		if endStream {
+			newStream.endStreamReceivedFromClient = true
+			if newStream.requestBodyWriter != nil { // Should exist
+				_ = newStream.requestBodyWriter.Close() // Signal EOF to potential reader
+			}
+			newStream._setState(StreamStateHalfClosedRemote)
+		} else {
+			newStream._setState(StreamStateOpen)
+		}
+		newStream.mu.Unlock()
+
+		// TODO: After stream.processRequestHeadersAndDispatch is implemented, call it here.
+		// Example: err := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
+		// if err != nil { ... handle error, maybe RST stream ... }
+		return nil // Placeholder
+	}
+}
+
+// extractPseudoHeaders extracts common pseudo-headers like :method, :path, :scheme, :authority.
+// It returns the values and an error if required pseudo-headers are missing or malformed.
+// This is a simplified helper. A robust implementation needs to handle case-insensitivity for values (though names are fixed)
+// and potentially multiple values for other headers (though not for pseudo-headers).
+func (c *Connection) extractPseudoHeaders(headers []hpack.HeaderField) (method, path, scheme, authority string, err error) {
+	pseudoHeadersFound := 0
+	// For server-side request processing, :method and :path are mandatory.
+	// :scheme and :authority are also mandatory for requests not to origin servers
+	// (RFC 7540, 8.1.2.3). For direct connections, :authority might be from Host header.
+	// For this simplified server, we'll require :method and :path.
+	requiredPseudoHeaders := map[string]bool{
+		":method": false,
+		":path":   false,
+	}
+	pseudoHeadersDone := false
+
+	for _, hf := range headers {
+		if !strings.HasPrefix(hf.Name, ":") {
+			pseudoHeadersDone = true // First regular header marks end of pseudo-headers
+			continue                 // No need to check non-pseudo headers in this switch
+		}
+		if pseudoHeadersDone {
+			// We found a pseudo-header after a regular header. This is a PROTOCOL_ERROR.
+			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("pseudo-header %s found after regular header fields", hf.Name))
+		}
+
+		switch hf.Name {
+		case ":method":
+			method = hf.Value
+			requiredPseudoHeaders[":method"] = true
+			pseudoHeadersFound++
+		case ":path":
+			path = hf.Value
+			if path == "" || (path[0] != '/' && path != "*") { // Path must not be empty, and must start with / or be *
+				return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid :path pseudo-header value: %s", path))
+			}
+			requiredPseudoHeaders[":path"] = true
+			pseudoHeadersFound++
+		case ":scheme":
+			scheme = hf.Value
+			pseudoHeadersFound++
+		case ":authority": // Often corresponds to Host header in HTTP/1.1
+			authority = hf.Value
+			pseudoHeadersFound++
+		default:
+			// Unknown pseudo-header
+			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("unknown or invalid pseudo-header: %s", hf.Name))
+		}
+	}
+
+	if !requiredPseudoHeaders[":method"] {
+		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :method pseudo-header")
+	}
+	if !requiredPseudoHeaders[":path"] {
+		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :path pseudo-header")
+	}
+	// For server requests, :scheme and :authority are also generally required.
+	// Depending on strictness, might enforce them here too.
+	// Example RFC 7540 8.1.2.3: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields"
+	// For now, this simplified version only hard-fails on :method and :path.
+
+	return method, path, scheme, authority, nil
 }
