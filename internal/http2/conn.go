@@ -12,6 +12,7 @@ import (
 
 	// "example.com/llmahttap/v2/internal/config" // Assuming config provides Http2Settings eventually
 	"example.com/llmahttap/v2/internal/logger"
+	"example.com/llmahttap/v2/internal/server" // Added as per system intervention
 )
 
 // Default settings values (RFC 7540 Section 6.5.2)
@@ -61,15 +62,16 @@ type Connection struct {
 	activePingsMu         sync.Mutex
 
 	// Header block assembly state
-	activeHeaderBlockStreamID uint32    // Stream ID of the current header block being assembled
-	headerFragments           [][]byte  // Buffer for incoming header block fragments
-	headerFragmentTotalSize   uint32    // Cumulative size of received fragments for current block
-	headerFragmentInitialType FrameType // Type of the frame that started the header block (HEADERS or PUSH_PROMISE)
-	headerFragmentPromisedID  uint32    // PromisedStreamID if initial frame was PUSH_PROMISE
-	ourSettings               map[SettingID]uint32
-	settingsMu                sync.RWMutex // Protects ourSettings and peerSettings
-	headerFragmentEndStream   bool         // Records if the initial HEADERS indicated END_STREAM for the logical header block.
-	peerSettings              map[SettingID]uint32
+	activeHeaderBlockStreamID     uint32                // Stream ID of the current header block being assembled
+	headerFragments               [][]byte              // Buffer for incoming header block fragments
+	headerFragmentTotalSize       uint32                // Cumulative size of received fragments for current block
+	headerFragmentInitialType     FrameType             // Type of the frame that started the header block (HEADERS or PUSH_PROMISE)
+	headerFragmentPromisedID      uint32                // PromisedStreamID if initial frame was PUSH_PROMISE
+	headerFragmentEndStream       bool                  // Records if the initial HEADERS indicated END_STREAM for the logical header block.
+	headerFragmentInitialPrioInfo *streamDependencyInfo // Priority info from the initial HEADERS frame, if present
+	ourSettings                   map[SettingID]uint32
+	settingsMu                    sync.RWMutex // Protects ourSettings and peerSettings
+	peerSettings                  map[SettingID]uint32
 
 	// Derived operational values from settings
 	// Our capabilities / limits we impose on peer:
@@ -97,6 +99,8 @@ type Connection struct {
 	maxFrameSize uint32 // To satisfy stream.go, should eventually alias to peerMaxFrameSize or ourCurrentMaxFrameSize depending on context
 
 	remoteAddrStr string // Cached remote address string
+
+	dispatcher server.RouterInterface // For dispatching requests to application layer
 }
 
 // NewConnection creates and initializes a new HTTP/2 Connection.
@@ -111,8 +115,17 @@ func NewConnection(
 	lg *logger.Logger,
 	isClientSide bool,
 	srvSettingsOverride map[SettingID]uint32,
+	dispatcher server.RouterInterface, // Added dispatcher
 ) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	if dispatcher == nil && !isClientSide { // Dispatcher is crucial for server-side operations
+		// For client side, it might be nil if client doesn't process responses in a complex way (e.g. just one request)
+		// but for a server, it's required.
+		lg.Error("NewConnection: server-side connection created without a dispatcher", logger.LogFields{})
+		// Depending on how critical this is, might panic or return error.
+		// For now, log and continue, but this setup is likely problematic.
+	}
 
 	conn := &Connection{
 		netConn:       nc,
@@ -131,6 +144,7 @@ func NewConnection(
 		ourSettings:   make(map[SettingID]uint32),
 		peerSettings:  make(map[SettingID]uint32),
 		remoteAddrStr: nc.RemoteAddr().String(),
+		dispatcher:    dispatcher, // Store dispatcher
 	}
 
 	// Initialize client/server stream ID counters
@@ -604,7 +618,8 @@ func (c *Connection) processContinuationFrame(frame *ContinuationFrame) error {
 
 	if header.Flags&FlagContinuationEndHeaders != 0 {
 		// END_HEADERS is set, this completes the block.
-		return c.finalizeHeaderBlockAndDispatch()
+		// Use the stored priority info from the *initial* frame of this block.
+		return c.finalizeHeaderBlockAndDispatch(c.headerFragmentInitialPrioInfo)
 	}
 	// END_HEADERS not set, expect more CONTINUATION frames.
 	return nil
@@ -613,7 +628,7 @@ func (c *Connection) processContinuationFrame(frame *ContinuationFrame) error {
 // finalizeHeaderBlockAndDispatch is called when a complete header block (HEADERS/PUSH_PROMISE + any CONTINUATIONs)
 // has been received (indicated by END_HEADERS flag). It concatenates fragments, decodes,
 // validates, and then dispatches the headers.
-func (c *Connection) finalizeHeaderBlockAndDispatch() error {
+func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *streamDependencyInfo) error {
 	if c.activeHeaderBlockStreamID == 0 || len(c.headerFragments) == 0 {
 		// Should not happen if called correctly.
 		c.resetHeaderAssemblyState() // Ensure clean state even if this happens
@@ -669,22 +684,18 @@ func (c *Connection) finalizeHeaderBlockAndDispatch() error {
 	promisedID := c.headerFragmentPromisedID
 	endStreamFlag := c.headerFragmentEndStream // This flag is from the *initial* HEADERS frame.
 
+	// The prioInfo passed to this function is from the initial frame.
+	// It's `initialFramePrioInfo`.
+
 	c.resetHeaderAssemblyState() // Reset state *before* dispatching.
 
 	switch initialType {
 	case FrameHeaders:
 		c.log.Debug("Dispatching assembled HEADERS", logger.LogFields{"stream_id": streamID, "num_headers": len(decodedHeaders), "end_stream_flag_on_headers": endStreamFlag})
-		// TODO: Implement logic to find/create stream and pass headers to it.
-		// This involves:
-		// 1. Validating streamID (is it new, is it allowed by client/server, concurrency).
-		// 2. Creating a new stream object or finding an existing one (e.g. for trailers).
-		// 3. Setting requestHeaders on the stream.
-		// 4. Transitioning stream state (e.g., to Open or HalfClosedRemote if endStreamFlag is true).
-		// 5. If endStreamFlag is true, also close the stream's requestBodyWriter.
-		// 6. Launching the handler goroutine.
-		// Example placeholder:
-		// err = c.handleIncomingHeaders(streamID, decodedHeaders, endStreamFlag)
-		// if err != nil { return err }
+		err = c.handleIncomingCompleteHeaders(streamID, decodedHeaders, endStreamFlag, initialFramePrioInfo)
+		if err != nil {
+			return err
+		}
 
 	case FramePushPromise:
 		c.log.Debug("Dispatching assembled PUSH_PROMISE", logger.LogFields{"associated_stream_id": streamID, "promised_stream_id": promisedID, "num_headers": len(decodedHeaders)})
@@ -742,16 +753,27 @@ func (c *Connection) processHeadersFrame(frame *HeadersFrame) error {
 		return NewConnectionError(ErrCodeEnhanceYourCalm, msg) // Or PROTOCOL_ERROR
 	}
 
+	var prioInfoOnThisFrame *streamDependencyInfo
+	if header.Flags&FlagHeadersPriority != 0 {
+		prioInfoOnThisFrame = &streamDependencyInfo{
+			StreamDependency: frame.StreamDependency,
+			Weight:           frame.Weight,
+			Exclusive:        frame.Exclusive,
+		}
+	}
+
 	c.activeHeaderBlockStreamID = header.StreamID
-	c.headerFragments = append(c.headerFragments, frame.HeaderBlockFragment) // Start new list
+	c.headerFragments = append([][]byte{}, frame.HeaderBlockFragment) // Start new list
 	c.headerFragmentTotalSize = uint32(len(frame.HeaderBlockFragment))
 	c.headerFragmentInitialType = FrameHeaders
 	c.headerFragmentPromisedID = 0 // Not a PUSH_PROMISE
 	c.headerFragmentEndStream = (header.Flags & FlagHeadersEndStream) != 0
+	c.headerFragmentInitialPrioInfo = prioInfoOnThisFrame // Store priority from this frame
 
 	if header.Flags&FlagHeadersEndHeaders != 0 {
 		// END_HEADERS is set, this is a complete block.
-		return c.finalizeHeaderBlockAndDispatch()
+		// Pass prioInfoOnThisFrame as it's from the current, initial frame of the block.
+		return c.finalizeHeaderBlockAndDispatch(prioInfoOnThisFrame)
 	}
 	// END_HEADERS not set, expect CONTINUATION frames.
 	return nil
@@ -808,7 +830,13 @@ func (c *Connection) processPushPromiseFrame(frame *PushPromiseFrame) error {
 	c.headerFragmentEndStream = false // PUSH_PROMISE itself doesn't end the associated stream.
 
 	if header.Flags&FlagPushPromiseEndHeaders != 0 {
-		return c.finalizeHeaderBlockAndDispatch()
+		return c.finalizeHeaderBlockAndDispatch(nil) // PUSH_PROMISE frames don't have their own priority info in this context.
 	}
+	return nil
+}
+
+func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hpack.HeaderField, endStream bool, prioInfo *streamDependencyInfo) error {
+	// TODO: Implement actual header handling and request dispatching logic.
+	c.log.Debug("handleIncomingCompleteHeaders called (stub)", logger.LogFields{"stream_id": streamID, "num_headers": len(headers), "endStream": endStream, "prioInfoPresent": prioInfo != nil})
 	return nil
 }
