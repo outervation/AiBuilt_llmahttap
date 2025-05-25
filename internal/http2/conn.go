@@ -1019,62 +1019,90 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 // It returns the values and an error if required pseudo-headers are missing or malformed.
 // This is a simplified helper. A robust implementation needs to handle case-insensitivity for values (though names are fixed)
 // and potentially multiple values for other headers (though not for pseudo-headers).
+
+// extractPseudoHeaders extracts common pseudo-headers like :method, :path, :scheme, :authority.
+// It also enforces that pseudo-headers appear before regular headers and that :method, :path, and :scheme are present.
+// For :authority, it's typically required but can be inferred from Host for direct origin requests (not fully handled here yet).
 func (c *Connection) extractPseudoHeaders(headers []hpack.HeaderField) (method, path, scheme, authority string, err error) {
-	pseudoHeadersFound := 0
-	// For server-side request processing, :method and :path are mandatory.
-	// :scheme and :authority are also mandatory for requests not to origin servers
-	// (RFC 7540, 8.1.2.3). For direct connections, :authority might be from Host header.
-	// For this simplified server, we'll require :method and :path.
-	requiredPseudoHeaders := map[string]bool{
-		":method": false,
-		":path":   false,
+	required := map[string]*string{
+		":method":    &method,
+		":path":      &path,
+		":scheme":    &scheme,
+		":authority": &authority, // :authority is often present, treat as mostly required for now
 	}
+	found := map[string]bool{
+		":method":    false,
+		":path":      false,
+		":scheme":    false,
+		":authority": false,
+	}
+
 	pseudoHeadersDone := false
 
 	for _, hf := range headers {
 		if !strings.HasPrefix(hf.Name, ":") {
-			pseudoHeadersDone = true // First regular header marks end of pseudo-headers
-			continue                 // No need to check non-pseudo headers in this switch
+			pseudoHeadersDone = true
+			continue // Skip regular headers in this pseudo-header validation phase
 		}
 		if pseudoHeadersDone {
-			// We found a pseudo-header after a regular header. This is a PROTOCOL_ERROR.
 			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("pseudo-header %s found after regular header fields", hf.Name))
 		}
 
-		switch hf.Name {
-		case ":method":
-			method = hf.Value
-			requiredPseudoHeaders[":method"] = true
-			pseudoHeadersFound++
-		case ":path":
-			path = hf.Value
-			if path == "" || (path[0] != '/' && path != "*") { // Path must not be empty, and must start with / or be *
-				return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid :path pseudo-header value: %s", path))
+		target, isRequired := required[hf.Name]
+		if !isRequired { // Unknown pseudo-header
+			// Allow :status for client-side response processing, but this function is primarily for server-side request validation.
+			// If this is server side and we see :status, it's an error.
+			if hf.Name == ":status" && c.isClient {
+				// This function is less about client-side validation. If client calls, let :status pass through.
+			} else {
+				return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("unknown or invalid pseudo-header: %s", hf.Name))
 			}
-			requiredPseudoHeaders[":path"] = true
-			pseudoHeadersFound++
-		case ":scheme":
-			scheme = hf.Value
-			pseudoHeadersFound++
-		case ":authority": // Often corresponds to Host header in HTTP/1.1
-			authority = hf.Value
-			pseudoHeadersFound++
-		default:
-			// Unknown pseudo-header
-			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("unknown or invalid pseudo-header: %s", hf.Name))
+		}
+
+		if found[hf.Name] { // Duplicate pseudo-header
+			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("duplicate pseudo-header: %s", hf.Name))
+		}
+
+		*target = hf.Value
+		found[hf.Name] = true
+
+		if hf.Name == ":path" && (hf.Value == "" || (hf.Value[0] != '/' && hf.Value != "*")) {
+			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid :path pseudo-header value: %s", hf.Value))
 		}
 	}
 
-	if !requiredPseudoHeaders[":method"] {
+	if !found[":method"] {
 		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :method pseudo-header")
 	}
-	if !requiredPseudoHeaders[":path"] {
+	if !found[":path"] {
 		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :path pseudo-header")
 	}
-	// For server requests, :scheme and :authority are also generally required.
-	// Depending on strictness, might enforce them here too.
-	// Example RFC 7540 8.1.2.3: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields"
-	// For now, this simplified version only hard-fails on :method and :path.
+	if !found[":scheme"] {
+		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :scheme pseudo-header")
+	}
+	// :authority is also generally required (RFC 7540, 8.1.2.3).
+	// "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields,
+	// unless it is a CONNECT request (Section 8.3). An HTTP/2 request that omits mandatory pseudo-header fields is malformed (Section 8.1.2.6)."
+	// :authority is mandatory if the request target is not an origin server (e.g. proxy request) or if there's no Host header.
+	// For simplicity, require :authority or ensure Host header provides it (more complex logic not added here).
+	if !found[":authority"] {
+		// Check if 'host' header is present as an alternative (though :authority is preferred).
+		// This part is simplified; a full server would handle Host header vs :authority nuances.
+		hostHeaderPresent := false
+		for _, hf := range headers {
+			if !strings.HasPrefix(hf.Name, ":") && strings.ToLower(hf.Name) == "host" {
+				if hf.Value != "" {
+					authority = hf.Value // Use host header if :authority is missing
+					found[":authority"] = true
+					hostHeaderPresent = true
+				}
+				break
+			}
+		}
+		if !hostHeaderPresent {
+			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing :authority pseudo-header and no Host header")
+		}
+	}
 
 	return method, path, scheme, authority, nil
 }
