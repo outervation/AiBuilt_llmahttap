@@ -2,17 +2,19 @@ package http2
 
 import (
 	"context"
-	"encoding/json" // Added for json.RawMessage
-	"fmt"           // Added for fmt.Errorf
+	"encoding/json"
+	"errors"
+	"fmt"
 	"golang.org/x/net/http2/hpack"
+	"io"
 	"net"
-	"strings" // Ensure this import is present
+	"strings"
 	"sync"
 	"time"
 
-	"example.com/llmahttap/v2/internal/config" // Added import
+	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/logger"
-	"example.com/llmahttap/v2/internal/router" // Added import
+	"example.com/llmahttap/v2/internal/router"
 	"example.com/llmahttap/v2/internal/server"
 )
 
@@ -2111,4 +2113,100 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 	go c.initiateShutdown(ourGoAwayLastStreamID, ErrCodeNoError, nil, gracefulTimeout)
 
 	return nil
+}
+
+// serve is the main goroutine for reading frames from the connection.
+// It runs after the handshake is complete (or immediately for server if no handshake needed beyond preface).
+func (c *Connection) serve() {
+	var err error
+	// Ensure that Close is called eventually to clean up resources and signal other goroutines.
+	// The actual error passed to Close will be the first fatal error encountered.
+	defer func() {
+		// If connError was set by dispatchFrame or another source, use that.
+		// Otherwise, the 'err' from readFrame loop termination is the cause.
+		finalErr := err
+		c.streamsMu.RLock() // Safely read c.connError
+		if c.connError != nil {
+			finalErr = c.connError
+		}
+		c.streamsMu.RUnlock()
+
+		c.log.Debug("Serve loop exiting.", logger.LogFields{"final_error_for_close": finalErr, "original_loop_term_error": err})
+
+		// Ensure readerDone is closed to signal that this goroutine has finished.
+		// This should happen before c.Close might wait on it.
+		// However, c.Close also closes the net.Conn which unblocks readFrame.
+		// The main point is readerDone is closed when this goroutine actually exits.
+		if c.readerDone != nil { // Check for nil in case of premature exit before full init
+			close(c.readerDone)
+		}
+
+		// c.Close will be called with the 'finalErr' that caused the loop to terminate or was set elsewhere.
+		c.Close(finalErr)
+	}()
+
+	c.log.Info("HTTP/2 connection serving started.", logger.LogFields{"remote_addr": c.remoteAddrStr, "is_client": c.isClient})
+
+	for {
+		// Check for shutdown signal before attempting to read.
+		// This ensures that if another goroutine initiates shutdown (e.g., via c.Close()),
+		// this reader loop will terminate promptly.
+		select {
+		case <-c.shutdownChan: // shutdownChan is closed by initiateShutdown, called by c.Close
+			c.log.Info("Serve loop: shutdown signal received, terminating.", logger.LogFields{})
+			// Retrieve the error that caused the shutdown, if already set.
+			c.streamsMu.RLock()
+			err = c.connError
+			c.streamsMu.RUnlock()
+			if err == nil {
+				// If no specific error, assume graceful shutdown or context cancellation.
+				err = context.Canceled // Or a more specific "ErrConnectionShutdown"
+			}
+			return // Exit loop, defer will handle Close with this 'err'.
+		default:
+			// Continue to read frame, non-blocking check of shutdownChan.
+		}
+
+		var frame Frame
+		frame, err = c.readFrame()
+		if err != nil {
+			// Error reading frame. This could be EOF, context cancellation, or a network error.
+			// The specific error 'err' will be passed to c.Close() via the defer.
+			if errors.Is(err, io.EOF) {
+				c.log.Info("Serve loop: peer closed connection (EOF).", logger.LogFields{"remote_addr": c.remoteAddrStr})
+				// EOF is a common way for peers to close. Our c.Close(io.EOF) will handle it.
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				c.log.Info("Serve loop: connection context cancelled or connection closed locally.", logger.LogFields{"error_type": fmt.Sprintf("%T", err), "error": err.Error(), "remote_addr": c.remoteAddrStr})
+				// If our context was cancelled, or net.Conn was closed locally (e.g. by c.Close itself).
+			} else {
+				c.log.Error("Serve loop: error reading frame.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+				// Other network errors.
+			}
+			// Any error from readFrame is considered fatal for this loop.
+			// The defer c.Close(err) will handle cleanup.
+			return
+		}
+
+		// Frame successfully read, dispatch it.
+		// dispatchFrame should return a ConnectionError for fatal issues, or nil for success/stream-level errors handled by RST.
+		dispatchErr := c.dispatchFrame(frame)
+		if dispatchErr != nil {
+			// Error dispatching frame. This is usually a ConnectionError indicating a protocol violation
+			// or an internal server error that requires tearing down the connection.
+			c.log.Error("Serve loop: error dispatching frame, terminating connection.",
+				logger.LogFields{"error": dispatchErr.Error(), "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+
+			// Set connError before returning, so defer can use it.
+			// This dispatchErr becomes the primary reason for closure.
+			c.streamsMu.Lock()
+			if c.connError == nil {
+				c.connError = dispatchErr
+			}
+			c.streamsMu.Unlock()
+			err = dispatchErr // Ensure 'err' for the defer reflects this critical dispatch error.
+			return
+		}
+		// If dispatchFrame returns nil, processing was successful or handled at stream level (e.g., RST_STREAM sent).
+		// Continue loop to read the next frame.
+	}
 }
