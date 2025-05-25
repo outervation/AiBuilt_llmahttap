@@ -1609,8 +1609,8 @@ func (c *Connection) Close(err error) error {
 		gracefulTimeout = 0 // Connection errors usually imply immediate shutdown
 	} else { // Other errors
 		errCode = ErrCodeProtocolError // Or InternalError if it's from our side
-		if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "broken pipe") {
-			errCode = ErrCodeConnectError // Peer likely disappeared
+		if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "forcibly closed") || err == context.Canceled || err == context.DeadlineExceeded || strings.Contains(err.Error(), "EOF") {
+			errCode = ErrCodeConnectError // Peer likely disappeared or connection was aborted
 		}
 		gracefulTimeout = 0
 	}
@@ -1635,6 +1635,7 @@ func (c *Connection) Close(err error) error {
 	// Wait for reader and writer goroutines to finish.
 	// This wait should have a timeout to prevent hanging indefinitely if goroutines misbehave.
 	// For now, direct wait.
+	// TODO: Add timeout for these waits.
 	if c.readerDone != nil {
 		<-c.readerDone
 	}
@@ -1647,7 +1648,8 @@ func (c *Connection) Close(err error) error {
 }
 
 // isShuttingDownLocked checks if the shutdown process has started.
-// Assumes c.streamsMu is held.
+// Assumes c.streamsMu is held by the caller or called in a context where it's safe.
+// For checking outside a c.streamsMu lock, use a select on c.shutdownChan directly.
 func (c *Connection) isShuttingDownLocked() bool {
 	select {
 	case <-c.shutdownChan:
@@ -1695,8 +1697,12 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 		for time.Now().Before(deadline) {
 			c.streamsMu.RLock()
 			activeStreamsBelowGoAwayID := 0
-			for streamID, stream := range c.streams {
-				if streamID <= lastStreamID { // Only consider streams that peer might expect to complete
+			for streamIDIter, stream := range c.streams {
+				// Only consider streams the peer might expect to complete.
+				// If GOAWAY was from us due to error, lastStreamID is OUR last processed.
+				// If GOAWAY was from peer, their lastStreamID is relevant.
+				// For simplicity, our lastStreamID in the GOAWAY we send is the limit.
+				if streamIDIter <= lastStreamID {
 					stream.mu.RLock()
 					isStreamEffectivelyClosed := stream.state == StreamStateClosed ||
 						(stream.state == StreamStateHalfClosedLocal && stream.endStreamReceivedFromClient) ||
@@ -1714,6 +1720,8 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 				break
 			}
 			c.log.Debug("Waiting for streams to close gracefully.", logger.LogFields{"active_streams_below_goaway_id": activeStreamsBelowGoAwayID, "time_remaining": deadline.Sub(time.Now())})
+			// TODO: Replace time.Sleep with a more robust mechanism, e.g., a condition variable signaled by stream closures.
+			// For now, simple polling.
 			time.Sleep(100 * time.Millisecond) // Check interval
 		}
 		if time.Now().After(deadline) {
@@ -1745,19 +1753,30 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	c.log.Debug("Closing network connection.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if err := c.netConn.Close(); err != nil {
 		c.log.Warn("Error closing network connection.", logger.LogFields{"error": err.Error()})
+		// Store this error if it's the first network-related one, but don't overwrite existing primary error.
+		c.streamsMu.Lock()
+		if c.connError == nil {
+			c.connError = err
+		}
+		c.streamsMu.Unlock()
 	}
 
 	// 5. Signal writer goroutine to terminate and clean up.
 	// Closing writerChan signals the writerLoop to drain remaining frames and then exit.
 	if c.writerChan != nil {
-		// Check if writerChan is already closed to prevent panic on double close
-		// This requires careful synchronization or a select-based check in the writer.
-		// For now, assume single close.
-		// TODO: Add a mechanism in writerLoop to detect c.shutdownChan and exit if writerChan is empty,
-		// rather than relying solely on writerChan close if it might be closed elsewhere.
-		// If initiateShutdown can be called by the writer itself (e.g. write error), closing here is problematic.
-		// One approach: have a separate 'writerCloseSignal chan struct{}'.
-		// For now, direct close:
+		// Ensure writerChan is closed only once. A select-based approach for sending to a
+		// possibly already closed channel could be used, or a sync.Once around close(c.writerChan).
+		// For now, assuming a single call path to here for the actual close.
+		// The writer goroutine itself should handle reading from a closed channel.
+		// One common pattern: use a dedicated signal channel for the writer to stop,
+		// then it closes writerChan after draining. Or, check if already closed.
+		// A simple way to check if a channel is closed is to try to send a non-blocking message or use recover.
+		// The safest is often for the producer (here, connection methods adding to writerChan) to stop producing
+		// and the consumer (writerLoop) to detect shutdown (e.g. via c.shutdownChan) and then drain and exit.
+		// Forcing close of writerChan from here is fine if writerLoop correctly handles reads from a closed channel.
+
+		// TODO: Refine writerChan closure to be safer with concurrent access if initiateShutdown could be called from writerLoop.
+		// For now, direct close assuming writerLoop handles it.
 		close(c.writerChan)
 		c.log.Debug("Writer channel closed.", logger.LogFields{})
 	}
@@ -1778,6 +1797,7 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 		fcCloseErr = c.connError
 		c.streamsMu.RUnlock()
 		if fcCloseErr == nil {
+			// If no primary error, use the error code from the GOAWAY frame.
 			fcCloseErr = NewConnectionError(errCode, "connection closed")
 		}
 		c.connFCManager.Close(fcCloseErr)
@@ -1805,6 +1825,7 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	c.log.Info("Connection shutdown sequence complete.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
 	// Reader/writer goroutines will signal their exit by closing readerDone/writerDone.
+	// The Close() method waits for these.
 	// The Close() method waits for these.
 }
 
