@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	NetHPack "golang.org/x/net/http2/hpack" // Alias for debugging
+	"golang.org/x/net/http2/hpack"
 
 	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/http2"
@@ -147,10 +147,10 @@ func (r *Router) ServeHTTP(s *http2.Stream, req *http.Request) {
 		})
 		// Send 500 Internal Server Error
 		// Pass req.Header as hpack.HeaderField for Accept header inspection
-		var headers []NetHPack.HeaderField
+		var headers []hpack.HeaderField
 		for k, vv := range req.Header {
 			for _, v := range vv {
-				headers = append(headers, NetHPack.HeaderField{Name: strings.ToLower(k), Value: v})
+				headers = append(headers, hpack.HeaderField{Name: strings.ToLower(k), Value: v})
 			}
 		}
 		// This uses the server's default error response mechanism.
@@ -164,10 +164,10 @@ func (r *Router) ServeHTTP(s *http2.Stream, req *http.Request) {
 			"path":   requestPath,
 			"stream": s.ID(),
 		})
-		var headers []NetHPack.HeaderField
+		var headers []hpack.HeaderField
 		for k, vv := range req.Header {
 			for _, v := range vv {
-				headers = append(headers, NetHPack.HeaderField{Name: strings.ToLower(k), Value: v})
+				headers = append(headers, hpack.HeaderField{Name: strings.ToLower(k), Value: v})
 			}
 		}
 		server.WriteErrorResponse(s, http.StatusNotFound, headers, "The requested resource was not found.")
