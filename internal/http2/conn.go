@@ -1394,3 +1394,33 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 		logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "new_stream_send_window": stream.fcManager.GetStreamSendAvailable()})
 	return nil
 }
+
+// readFrame reads a single HTTP/2 frame from the connection.
+// It uses the package-level ReadFrame function.
+func (c *Connection) readFrame() (Frame, error) {
+	frame, err := ReadFrame(c.netConn) // ReadFrame is in the same http2 package (frame.go)
+	if err != nil {
+		// TODO: Differentiate between io.EOF (clean close by peer), timeout, and other errors.
+		// For now, log and return.
+		// c.log.Error("Error reading frame from connection", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+		return nil, err
+	}
+	c.log.Debug("Frame read from connection", logger.LogFields{"type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID, "length": frame.Header().Length, "flags": frame.Header().Flags})
+	return frame, nil
+}
+
+// writeFrame writes a single HTTP/2 frame to the connection.
+// It uses the package-level WriteFrame function.
+// This method is intended to be called by the connection's dedicated writer goroutine
+// to ensure serialized access to the net.Conn.
+func (c *Connection) writeFrame(frame Frame) error {
+	c.log.Debug("Writing frame to connection", logger.LogFields{"type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID, "length": frame.Header().Length, "flags": frame.Header().Flags})
+	err := WriteFrame(c.netConn, frame) // WriteFrame is in the same http2 package (frame.go)
+	if err != nil {
+		// TODO: Handle specific write errors, e.g., connection closed by peer.
+		// For now, log and return.
+		// c.log.Error("Error writing frame to connection", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+		return err
+	}
+	return nil
+}
