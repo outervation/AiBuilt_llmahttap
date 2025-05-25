@@ -1291,3 +1291,106 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 
 	return nil
 }
+
+// handleWindowUpdateFrameConnLevel processes a WINDOW_UPDATE frame for stream ID 0.
+// It increases the connection-level send flow control window.
+func (c *Connection) handleWindowUpdateFrameConnLevel(frame *WindowUpdateFrame) error {
+	header := frame.Header()
+	if header.StreamID != 0 {
+		// This function should only be called for connection-level WINDOW_UPDATEs.
+		// If called with a non-zero stream ID, it's an internal logic error.
+		c.log.Error("handleWindowUpdateFrameConnLevel called with non-zero stream ID",
+			logger.LogFields{"stream_id": header.StreamID, "expected_stream_id": 0})
+		return NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("internal: handleWindowUpdateFrameConnLevel called for stream %d", header.StreamID))
+	}
+
+	increment := frame.WindowSizeIncrement
+	if increment == 0 {
+		// RFC 7540, Section 6.9: "A WINDOW_UPDATE frame with a flow-control window increment of 0 MUST be treated as a connection error
+		// (Section 5.4.1) of type PROTOCOL_ERROR; errors on stream 0 MUST be treated as a connection error."
+		errMsg := "received connection-level WINDOW_UPDATE with zero increment"
+		c.log.Error(errMsg, logger.LogFields{})
+		return NewConnectionError(ErrCodeProtocolError, errMsg)
+	}
+
+	err := c.connFCManager.HandleWindowUpdateFromPeer(increment)
+	if err != nil {
+		// HandleWindowUpdateFromPeer can return an error if the increment causes the window to overflow.
+		// This is a FLOW_CONTROL_ERROR.
+		c.log.Error("Error handling connection-level WINDOW_UPDATE from peer",
+			logger.LogFields{"increment": increment, "error": err.Error()})
+		// err from connFCManager.HandleWindowUpdateFromPeer should already be a ConnectionError type with FLOW_CONTROL_ERROR.
+		// If not, wrap it.
+		if _, ok := err.(*ConnectionError); !ok {
+			return NewConnectionErrorWithCause(ErrCodeFlowControlError,
+				fmt.Sprintf("failed to apply connection window update increment %d: %v", increment, err), err)
+		}
+		return err // Propagate the ConnectionError
+	}
+
+	c.log.Debug("Connection-level WINDOW_UPDATE processed",
+		logger.LogFields{"increment": increment, "new_conn_send_window": c.connFCManager.GetConnectionSendAvailable()})
+	return nil
+}
+
+// dispatchWindowUpdateFrame handles an incoming WINDOW_UPDATE frame.
+// It routes the frame to either connection-level or stream-level processing.
+func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
+	streamID := frame.Header().StreamID
+
+	if streamID == 0 {
+		return c.handleWindowUpdateFrameConnLevel(frame)
+	}
+
+	// Stream-level WINDOW_UPDATE
+	stream, found := c.getStream(streamID)
+	if !found {
+		// RFC 7540, Section 6.9: "WINDOW_UPDATE can be specific to a stream or to the entire connection.
+		// In the former case, the frame's stream identifier indicates the affected stream; in the latter,
+		// the value "0" indicates that the entire connection is the subject of the frame."
+		// "An endpoint MUST treat a WINDOW_UPDATE frame on a closed stream as a connection error (Section 5.4.1) of type PROTOCOL_ERROR." (This seems to be for stream 0)
+		// For non-zero streams: "Receiving a WINDOW_UPDATE on a stream in the "half-closed (remote)" or "closed" state MUST be treated as a stream error (Section 5.4.2) of type STREAM_CLOSED."
+		// And "A receiver that receives a WINDOW_UPDATE frame on a stream that is not open or half-closed (local) MUST treat this as a stream error (Section 5.4.2) of type STREAM_CLOSED."
+
+		c.streamsMu.RLock()
+		lastKnownStreamID := c.lastProcessedStreamID
+		c.streamsMu.RUnlock()
+
+		if streamID <= lastKnownStreamID && streamID != 0 {
+			// Stream was known but is now closed. This implies a stream error.
+			c.log.Warn("WINDOW_UPDATE for closed or non-existent stream (was known)", logger.LogFields{"stream_id": streamID})
+			rstErr := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed)
+			if rstErr != nil {
+				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE on closed stream %d", streamID), rstErr)
+			}
+			return nil // RST sent, error handled.
+		}
+		// Stream ID is higher than any we've processed or otherwise invalid (e.g. client uses even ID for stream specific WU).
+		// This is a connection error.
+		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("WINDOW_UPDATE on unknown or invalid stream ID %d", streamID))
+	}
+
+	// Stream found, delegate to stream's flow control manager.
+	if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
+		// fcManager.HandleWindowUpdateFromPeer returns an error for 0 increment or overflow.
+		// This should be treated as a stream error.
+		c.log.Error("Error handling stream-level WINDOW_UPDATE from peer",
+			logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
+
+		var streamErrCode ErrorCode = ErrCodeFlowControlError
+		if frame.WindowSizeIncrement == 0 { // Zero increment specifically leads to PROTOCOL_ERROR for the stream
+			streamErrCode = ErrCodeProtocolError
+		}
+
+		rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
+		if rstErr != nil {
+			return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d", streamID), rstErr)
+		}
+		return nil // RST sent, stream error handled.
+	}
+
+	c.log.Debug("Stream-level WINDOW_UPDATE processed",
+		logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "new_stream_send_window": stream.fcManager.GetStreamSendAvailable()})
+	return nil
+}
