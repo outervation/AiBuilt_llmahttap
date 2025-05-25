@@ -1023,6 +1023,9 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 // extractPseudoHeaders extracts common pseudo-headers like :method, :path, :scheme, :authority.
 // It also enforces that pseudo-headers appear before regular headers and that :method, :path, and :scheme are present.
 // For :authority, it's typically required but can be inferred from Host for direct origin requests (not fully handled here yet).
+// extractPseudoHeaders extracts common pseudo-headers like :method, :path, :scheme, :authority.
+// It also enforces that pseudo-headers appear before regular headers and that :method, :path, and :scheme are present.
+// For :authority, it's typically required but can be inferred from Host for direct origin requests (not fully handled here yet).
 func (c *Connection) extractPseudoHeaders(headers []hpack.HeaderField) (method, path, scheme, authority string, err error) {
 	required := map[string]*string{
 		":method":    &method,
@@ -1048,8 +1051,8 @@ func (c *Connection) extractPseudoHeaders(headers []hpack.HeaderField) (method, 
 			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("pseudo-header %s found after regular header fields", hf.Name))
 		}
 
-		target, isRequired := required[hf.Name]
-		if !isRequired { // Unknown pseudo-header
+		target, isRequiredPseudo := required[hf.Name] // Renamed to avoid conflict with local `isRequired`
+		if !isRequiredPseudo {                        // Unknown pseudo-header
 			// Allow :status for client-side response processing, but this function is primarily for server-side request validation.
 			// If this is server side and we see :status, it's an error.
 			if hf.Name == ":status" && c.isClient {
@@ -1063,9 +1066,13 @@ func (c *Connection) extractPseudoHeaders(headers []hpack.HeaderField) (method, 
 			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("duplicate pseudo-header: %s", hf.Name))
 		}
 
-		*target = hf.Value
-		found[hf.Name] = true
+		// Only assign if target is not nil (i.e., it's one of the pseudo-headers we track)
+		if target != nil {
+			*target = hf.Value
+		}
+		found[hf.Name] = true // Mark as found even if it was an "allowed but not tracked" one like :status on client
 
+		// Validate :path value specifically if it's the :path header
 		if hf.Name == ":path" && (hf.Value == "" || (hf.Value[0] != '/' && hf.Value != "*")) {
 			return "", "", "", "", NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid :path pseudo-header value: %s", hf.Value))
 		}
