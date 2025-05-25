@@ -492,3 +492,17 @@ func IsAddrInUse(err error) bool {
 	// Go's net package often wraps these, e.g. *net.OpError
 	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
 }
+
+// SignalChildReadyByClosingFD closes the given file descriptor.
+// This is used by a child process to signal readiness to its parent,
+// typically by closing the write-end of a readiness pipe.
+func SignalChildReadyByClosingFD(fd uintptr) error {
+	// syscall.Close directly takes an int, so we cast uintptr to int.
+	// On POSIX systems, file descriptors are small non-negative integers.
+	// This cast is generally safe for valid FDs.
+	err := syscall.Close(int(fd))
+	if err != nil {
+		return fmt.Errorf("failed to close readiness FD %d: %w", fd, err)
+	}
+	return nil
+}
