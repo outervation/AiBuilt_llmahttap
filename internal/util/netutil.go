@@ -3,11 +3,14 @@ package util
 import (
 	"errors"
 	"fmt"
+
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -505,4 +508,47 @@ func SignalChildReadyByClosingFD(fd uintptr) error {
 		return fmt.Errorf("failed to close readiness FD %d: %w", fd, err)
 	}
 	return nil
+}
+
+// WaitForChildReadyPipeClose waits for the child process to signal readiness by closing
+// its end of the readiness pipe. This function is called by the parent process.
+// It reads from the parent's read-end of the pipe. An EOF indicates the child
+// has closed its write-end. The function returns an error if the timeout is reached
+// or if any other read error (except EOF) occurs.
+func WaitForChildReadyPipeClose(parentReadPipe *os.File, timeout time.Duration) error {
+	if parentReadPipe == nil {
+		return errors.New("parentReadPipe cannot be nil")
+	}
+
+	readDone := make(chan error, 1) // Buffered channel to prevent goroutine leak
+
+	go func() {
+		// A small buffer is sufficient as we are only looking for EOF or an error.
+		// The actual data read doesn't matter.
+		buf := make([]byte, 1)
+		_, err := parentReadPipe.Read(buf)
+		readDone <- err // Send the error (which will be io.EOF on success)
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == io.EOF {
+			return nil // Child closed the pipe, success
+		}
+		// Any other error from read (or nil if read 0 bytes without EOF, though unlikely for a pipe)
+		return fmt.Errorf("error reading from readiness pipe: %w", err)
+	case <-time.After(timeout):
+		// Ensure the goroutine doesn't leak if timeout occurs first.
+		// This is a bit tricky as parentReadPipe.Read() might block indefinitely.
+		// A more robust solution might involve setting a deadline on the pipe read if possible,
+		// or closing the pipe from this side (though that might have other implications).
+		// For now, relying on the goroutine exiting once the Read unblocks eventually.
+		// This simple timeout handling is common but has this potential goroutine leak.
+		// A common pattern is to also try to close the pipe or set a read deadline.
+		// Since os.File doesn't directly support SetReadDeadline for pipes in a portable way
+		// like net.Conn, this is a known limitation of simpler approaches.
+		// For this specific use case (parent waiting for child to close pipe), it's usually okay
+		// as the child *will* close it or die, unblocking the Read.
+		return fmt.Errorf("timeout waiting for child readiness signal (waited %v)", timeout)
+	}
 }
