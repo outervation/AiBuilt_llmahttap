@@ -707,3 +707,114 @@ func (c *Connection) finalizeHeaderBlockAndDispatch() error {
 
 	return nil
 }
+
+func (c *Connection) processHeadersFrame(frame *HeadersFrame) error {
+	header := frame.Header()
+	if header.StreamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "HEADERS frame received on stream 0")
+	}
+	// Server: Stream ID must be odd for client-initiated.
+	if !c.isClient && (header.StreamID%2 == 0) {
+		// Client should not send HEADERS on an even stream ID unless it's related to a PUSH_PROMISE
+		// it initiated (which isn't a thing). Or if client is broken.
+		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("server received HEADERS on even stream ID %d", header.StreamID))
+	}
+	// Client: Stream ID should be odd for requests it sent, or even for server pushed responses.
+	// For a HEADERS frame received by a client, it could be a response to its own request (odd ID)
+	// or the start of a pushed response (even ID, after a PUSH_PROMISE for that ID).
+
+	if c.activeHeaderBlockStreamID != 0 {
+		// A new HEADERS frame arrived while another header block (possibly on a different stream)
+		// was still being assembled (expecting CONTINUATION). This is a PROTOCOL_ERROR.
+		// Section 6.10: "A CONTINUATION frame MUST be preceded by a HEADERS, PUSH_PROMISE or
+		// CONTINUATION frame without the END_HEADERS flag set."
+		// Implicitly, any other frame type terminates the sequence.
+		msg := fmt.Sprintf("HEADERS frame for stream %d received while header block for stream %d is active", header.StreamID, c.activeHeaderBlockStreamID)
+		c.log.Error(msg, logger.LogFields{})
+		c.resetHeaderAssemblyState() // Clear previous partial state.
+		return NewConnectionError(ErrCodeProtocolError, msg)
+	}
+
+	// Max header list size check (preliminary, on compressed size of this first fragment)
+	c.settingsMu.Lock()
+	maxHeaderListSizeBytes := c.ourMaxHeaderListSize
+	c.settingsMu.Unlock()
+
+	if uint32(len(frame.HeaderBlockFragment)) > maxHeaderListSizeBytes && maxHeaderListSizeBytes > 0 {
+		msg := fmt.Sprintf("HEADERS frame fragment size (%d) exceeds preliminary max header list size (%d) for stream %d",
+			len(frame.HeaderBlockFragment), maxHeaderListSizeBytes, header.StreamID)
+		c.log.Error(msg, logger.LogFields{})
+		// This is a fatal error for the connection, as per MAX_HEADER_LIST_SIZE description.
+		return NewConnectionError(ErrCodeEnhanceYourCalm, msg) // Or PROTOCOL_ERROR
+	}
+
+	c.activeHeaderBlockStreamID = header.StreamID
+	c.headerFragments = append(c.headerFragments, frame.HeaderBlockFragment) // Start new list
+	c.headerFragmentTotalSize = uint32(len(frame.HeaderBlockFragment))
+	c.headerFragmentInitialType = FrameHeaders
+	c.headerFragmentPromisedID = 0 // Not a PUSH_PROMISE
+	c.headerFragmentEndStream = (header.Flags & FlagHeadersEndStream) != 0
+
+	if header.Flags&FlagHeadersEndHeaders != 0 {
+		// END_HEADERS is set, this is a complete block.
+		return c.finalizeHeaderBlockAndDispatch()
+	}
+	// END_HEADERS not set, expect CONTINUATION frames.
+	return nil
+}
+
+func (c *Connection) processPushPromiseFrame(frame *PushPromiseFrame) error {
+	header := frame.Header()
+	if header.StreamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "PUSH_PROMISE frame received on stream 0")
+	}
+	if frame.PromisedStreamID == 0 || frame.PromisedStreamID%2 != 0 { // Promised ID must be non-zero and even
+		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid PromisedStreamID %d in PUSH_PROMISE on stream %d", frame.PromisedStreamID, header.StreamID))
+	}
+	if !c.isClient { // Only clients should receive PUSH_PROMISE
+		return NewConnectionError(ErrCodeProtocolError, "server received PUSH_PROMISE frame")
+	}
+
+	if c.activeHeaderBlockStreamID != 0 {
+		msg := fmt.Sprintf("PUSH_PROMISE frame for stream %d (promised %d) received while header block for stream %d is active", header.StreamID, frame.PromisedStreamID, c.activeHeaderBlockStreamID)
+		c.log.Error(msg, logger.LogFields{})
+		c.resetHeaderAssemblyState()
+		return NewConnectionError(ErrCodeProtocolError, msg)
+	}
+
+	c.settingsMu.Lock()
+	serverPushEnabled := c.ourEnablePush
+	maxHeaderListSizeBytes := c.ourMaxHeaderListSize
+	c.settingsMu.Unlock()
+
+	if !serverPushEnabled {
+		// Client has disabled push, server should not send PUSH_PROMISE.
+		// Client RSTs the *promised* stream ID.
+		// Since we haven't created it, we just note the protocol violation from peer.
+		c.log.Warn("Received PUSH_PROMISE when server push is disabled by client settings.", logger.LogFields{"promisedStreamID": frame.PromisedStreamID})
+		// We should RST_STREAM the promised stream with CANCEL or PROTOCOL_ERROR.
+		// Since the stream doesn't exist locally yet, we can't use stream.sendRSTStream.
+		// The spec (8.2) says "An endpoint that receives a PUSH_PROMISE frame for which it has SETTINGS_ENABLE_PUSH set to 0 MUST treat the PUSH_PROMISE frame as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+		return NewConnectionError(ErrCodeProtocolError, "received PUSH_PROMISE when server push is disabled by client")
+
+	}
+
+	if uint32(len(frame.HeaderBlockFragment)) > maxHeaderListSizeBytes && maxHeaderListSizeBytes > 0 {
+		msg := fmt.Sprintf("PUSH_PROMISE frame fragment size (%d) exceeds preliminary max header list size (%d) for stream %d, promised %d",
+			len(frame.HeaderBlockFragment), maxHeaderListSizeBytes, header.StreamID, frame.PromisedStreamID)
+		c.log.Error(msg, logger.LogFields{})
+		return NewConnectionError(ErrCodeEnhanceYourCalm, msg) // Or PROTOCOL_ERROR
+	}
+
+	c.activeHeaderBlockStreamID = header.StreamID // Associated stream, NOT promised stream
+	c.headerFragments = append(c.headerFragments, frame.HeaderBlockFragment)
+	c.headerFragmentTotalSize = uint32(len(frame.HeaderBlockFragment))
+	c.headerFragmentInitialType = FramePushPromise
+	c.headerFragmentPromisedID = frame.PromisedStreamID
+	c.headerFragmentEndStream = false // PUSH_PROMISE itself doesn't end the associated stream.
+
+	if header.Flags&FlagPushPromiseEndHeaders != 0 {
+		return c.finalizeHeaderBlockAndDispatch()
+	}
+	return nil
+}
