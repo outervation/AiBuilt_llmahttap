@@ -17,6 +17,9 @@ const (
 	ReadinessPipeEnvKey = "READINESS_PIPE_FD"
 )
 
+// ErrPipeFDEnvVarNotSet indicates that the expected environment variable for a pipe FD was not set.
+var ErrPipeFDEnvVarNotSet = errors.New("pipe FD environment variable not set")
+
 // SetCloexec sets or clears the close-on-exec flag for a file descriptor.
 // This is crucial for ensuring that inherited file descriptors (like listening sockets)
 // are not closed when a new process is exec'd during a zero-downtime upgrade.
@@ -356,6 +359,27 @@ func GetInheritedReadinessPipeFD() (fd uintptr, found bool, err error) {
 		return 0, true, fmt.Errorf("invalid negative FD for readiness pipe: %d", fdInt)
 	}
 	return uintptr(fdInt), true, nil
+}
+
+// GetChildWritePipeFD retrieves a file descriptor number from the specified environment variable.
+// It is intended for child processes to get pipe FDs (e.g., for readiness signaling).
+// If the environment variable is not set, it returns ErrPipeFDEnvVarNotSet.
+// If the value is not a valid non-negative integer, it returns an error detailing the issue.
+func GetChildWritePipeFD(envVarName string) (uintptr, error) {
+	fdStr := os.Getenv(envVarName)
+	if fdStr == "" {
+		return 0, fmt.Errorf("%w: %s", ErrPipeFDEnvVarNotSet, envVarName)
+	}
+
+	fdInt, err := strconv.Atoi(fdStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer value for FD in environment variable %s (%q): %w", envVarName, fdStr, err)
+	}
+
+	if fdInt < 0 { // FDs are non-negative.
+		return 0, fmt.Errorf("invalid negative FD value in environment variable %s: %d", envVarName, fdInt)
+	}
+	return uintptr(fdInt), nil
 }
 
 // IsAddrInUse checks if the error indicates an "address already in use" condition.
