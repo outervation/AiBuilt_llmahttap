@@ -28,21 +28,21 @@ type Router struct {
 	prefixRoutes []config.Route
 
 	handlerRegistry *server.HandlerRegistry
-	errorLogger     *logger.ErrorLogger // For logging router-specific errors, e.g., handler creation failure
+	mainLogger      *logger.Logger // Changed from errorLogger to mainLogger (*logger.Logger)
 }
 
 // NewRouter creates and initializes a new Router.
 // It processes the routes from the configuration, sorts them for efficient matching,
 // and stores them internally. It also requires a HandlerRegistry to create handlers
-// and an ErrorLogger for logging.
+// and a Logger for logging.
 // Errors during route validation (as per spec 1.2.3 and 1.2.4 ambiguity) should be
 // handled by the config loader, so NewRouter assumes valid routes are passed.
-func NewRouter(routes []config.Route, registry *server.HandlerRegistry, errorLogger *logger.ErrorLogger) (*Router, error) {
+func NewRouter(routes []config.Route, registry *server.HandlerRegistry, lg *logger.Logger) (*Router, error) { // Changed errorLogger to lg
 	if registry == nil {
 		return nil, fmt.Errorf("handler registry cannot be nil")
 	}
-	if errorLogger == nil {
-		return nil, fmt.Errorf("error logger cannot be nil")
+	if lg == nil { // Changed from errorLogger
+		return nil, fmt.Errorf("logger cannot be nil") // Changed message
 	}
 
 	exactMap := make(map[string]config.Route)
@@ -67,15 +67,30 @@ func NewRouter(routes []config.Route, registry *server.HandlerRegistry, errorLog
 		exactRoutes:     exactMap,
 		prefixRoutes:    prefixList,
 		handlerRegistry: registry,
-		errorLogger:     errorLogger,
+		mainLogger:      lg, // Changed from errorLogger
 	}
 	return router, nil
 }
 
+// convertHpackHeadersToServerHeaders converts a slice of hpack.HeaderField
+// to a slice of server.HeaderField.
+
+// convertHpackHeadersToHttp2Headers converts []hpack.HeaderField to []http2.HeaderField.
+func convertHpackHeadersToHttp2Headers(hpackHeaders []hpack.HeaderField) []http2.HeaderField {
+	if hpackHeaders == nil {
+		return nil
+	}
+	http2Headers := make([]http2.HeaderField, len(hpackHeaders))
+	for i, hf := range hpackHeaders {
+		http2Headers[i] = http2.HeaderField{Name: hf.Name, Value: hf.Value}
+	}
+	return http2Headers
+}
+
 // MatchedRouteInfo holds information about the matched route and the handler.
 type MatchedRouteInfo struct {
-	Handler       http2.Handler
-	HandlerConfig config.Route // Includes PathPattern, MatchType, HandlerType, and Opaque HandlerConfig
+	Handler       server.Handler // Changed from http2.Handler
+	HandlerConfig config.Route   // Includes PathPattern, MatchType, HandlerType, and Opaque HandlerConfig
 }
 
 // Match finds a route and instantiates its handler based on the request path.
@@ -84,12 +99,12 @@ type MatchedRouteInfo struct {
 // Returns the matched route config, the instantiated handler, or an error.
 // If no route matches, it returns (nil, nil, nil).
 // If a route matches but handler creation fails, it returns (nil, nil, error).
-func (r *Router) Match(path string) (matchedRoute *config.Route, handler http2.Handler, err error) {
+func (r *Router) Match(path string) (matchedRoute *config.Route, handler server.Handler, err error) {
 	// 1. Attempt Exact Match
 	if routeConfig, ok := r.exactRoutes[path]; ok {
-		h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.errorLogger)
+		h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.mainLogger) // Use r.mainLogger
 		if e != nil {
-			r.errorLogger.Error("Failed to create handler for exact match route", logger.LogFields{
+			r.mainLogger.Error("Failed to create handler for exact match route", logger.LogFields{ // Use r.mainLogger
 				"path":        path,
 				"pattern":     routeConfig.PathPattern,
 				"handlerType": routeConfig.HandlerType,
@@ -106,9 +121,9 @@ func (r *Router) Match(path string) (matchedRoute *config.Route, handler http2.H
 	// r.prefixRoutes is already sorted by length (longest first).
 	for _, routeConfig := range r.prefixRoutes {
 		if strings.HasPrefix(path, routeConfig.PathPattern) {
-			h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.errorLogger)
+			h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.mainLogger) // Use r.mainLogger
 			if e != nil {
-				r.errorLogger.Error("Failed to create handler for prefix match route", logger.LogFields{
+				r.mainLogger.Error("Failed to create handler for prefix match route", logger.LogFields{ // Use r.mainLogger
 					"path":        path,
 					"pattern":     routeConfig.PathPattern,
 					"handlerType": routeConfig.HandlerType,
@@ -134,44 +149,38 @@ func (r *Router) Match(path string) (matchedRoute *config.Route, handler http2.H
 // If a route is found, it returns the instantiated handler and the route's configuration.
 // If no route matches, it returns nil for both.
 func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
-	// 1. Attempt Exact Match (Spec 1.2.4: "An Exact match MUST take precedence over a Prefix match.")
+	// First, check exact matches.
 	if route, ok := r.exactRoutes[path]; ok {
-		handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.errorLogger)
+		handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.mainLogger)
 		if err != nil {
-			// Log the error, as handler creation failure is a server-side issue.
-			r.errorLogger.Error("Failed to create handler for exact match route", logger.LogFields{
+			r.mainLogger.Error("Failed to create handler for exact route", logger.LogFields{
 				"path":        path,
 				"handlerType": route.HandlerType,
-				"error":       err.Error(),
+				"error":       err, // Note: err might not be a string here, consider err.Error() if logging structured fields.
 			})
-			// This error will likely lead to a 500 response upstream.
-			return nil, err
+			return nil, fmt.Errorf("creating handler for '%s' (type %s): %w", path, route.HandlerType, err)
 		}
 		return &MatchedRouteInfo{Handler: handler, HandlerConfig: route}, nil
 	}
 
-	// 2. Attempt Prefix Match (Spec 1.2.4: "If multiple Prefix matches are possible,
-	//    the longest (most specific) PathPattern MUST be chosen.")
-	// The prefixRoutes slice is already sorted by length (longest first).
+	// Then, check prefix matches (sorted by longest prefix first).
 	for _, route := range r.prefixRoutes {
 		if strings.HasPrefix(path, route.PathPattern) {
-			// Ensure prefix match logic is correct: "/static/" should match "/static/foo.txt"
-			// but also "/static/" itself.
-			handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.errorLogger)
+			handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.mainLogger)
 			if err != nil {
-				r.errorLogger.Error("Failed to create handler for prefix match route", logger.LogFields{
+				r.mainLogger.Error("Failed to create handler for prefix route", logger.LogFields{
 					"path":        path,
 					"pattern":     route.PathPattern,
 					"handlerType": route.HandlerType,
-					"error":       err.Error(),
+					"error":       err, // Note: err might not be a string here, consider err.Error()
 				})
-				return nil, err
+				return nil, fmt.Errorf("creating handler for '%s' (pattern %s, type %s): %w", path, route.PathPattern, route.HandlerType, err)
 			}
 			return &MatchedRouteInfo{Handler: handler, HandlerConfig: route}, nil
 		}
 	}
 
-	// 3. No route matched
+	// No route matched.
 	return nil, nil
 }
 
@@ -179,7 +188,7 @@ func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 // If no route matches, it sends a 404 Not Found response.
 // If a handler is found but fails to be created, it sends a 500 Internal Server Error response.
 // This method would be called by the HTTP/2 connection/server layer for each request stream.
-func (r *Router) ServeHTTP(s *http2.Stream, req *http.Request) {
+func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
 	// Path is extracted from :path pseudo-header, typically available in req.URL.Path
 	// For HTTP/2, the :path pseudo-header includes the query string.
 	// The routing is based on the path component only.
@@ -188,34 +197,34 @@ func (r *Router) ServeHTTP(s *http2.Stream, req *http.Request) {
 	matchedInfo, err := r.FindRoute(requestPath)
 
 	if err != nil { // Error during handler creation
-		r.errorLogger.Error("Handler creation failed for request", logger.LogFields{
+		r.mainLogger.Error("Handler creation failed for request", logger.LogFields{ // Use r.mainLogger
 			"path":   requestPath,
 			"stream": s.ID(),
 			"error":  err.Error(),
 		})
 		// Send 500 Internal Server Error
 		// Pass req.Header as hpack.HeaderField for Accept header inspection
-		var headers []hpack.HeaderField
+		var headers []http2.HeaderField
 		for k, vv := range req.Header {
 			for _, v := range vv {
-				headers = append(headers, hpack.HeaderField{Name: strings.ToLower(k), Value: v})
+				headers = append(headers, http2.HeaderField{Name: strings.ToLower(k), Value: v})
 			}
 		}
 		// This uses the server's default error response mechanism.
-		// Ensure the error logger is not nil, though it should be guaranteed by NewRouter.
+		// Ensure the logger is not nil, though it should be guaranteed by NewRouter.
 		server.WriteErrorResponse(s, http.StatusInternalServerError, headers, "Failed to initialize request handler.")
 		return
 	}
 
 	if matchedInfo == nil { // No route matched
-		r.errorLogger.Info("No route matched for request", logger.LogFields{ // INFO level for 404s is common
+		r.mainLogger.Info("No route matched for request", logger.LogFields{ // Use r.mainLogger.Info
 			"path":   requestPath,
 			"stream": s.ID(),
 		})
-		var headers []hpack.HeaderField
+		var headers []http2.HeaderField
 		for k, vv := range req.Header {
 			for _, v := range vv {
-				headers = append(headers, hpack.HeaderField{Name: strings.ToLower(k), Value: v})
+				headers = append(headers, http2.HeaderField{Name: strings.ToLower(k), Value: v})
 			}
 		}
 		server.WriteErrorResponse(s, http.StatusNotFound, headers, "The requested resource was not found.")
@@ -226,5 +235,5 @@ func (r *Router) ServeHTTP(s *http2.Stream, req *http.Request) {
 	// The HandlerConfig specific to this handler is available in matchedInfo.HandlerConfig.HandlerConfig
 	// The http2.Handler interface's ServeHTTP2 method expects the stream and the request.
 	// The handler itself should have received its config during creation via the factory.
-	matchedInfo.Handler.ServeHTTP2(s, req)
+	matchedInfo.Handler.ServeHTTP2(s, req) // s is already server.ResponseWriterStream
 }
