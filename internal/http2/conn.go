@@ -65,7 +65,9 @@ type Connection struct {
 	// Our settings that we advertise/enforce
 	ourSettings map[SettingID]uint32
 	// Peer's settings that they advertise/enforce
-	peerSettings map[SettingID]uint32
+
+	headerFragmentEndStream bool // Records if the initial HEADERS indicated END_STREAM for the logical header block.
+	peerSettings            map[SettingID]uint32
 
 	// Derived operational values from settings
 	// Our capabilities / limits we impose on peer:
