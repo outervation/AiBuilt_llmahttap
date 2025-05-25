@@ -134,11 +134,10 @@ type Stream struct {
 	conn *Connection // Parent connection, defined in connection.go
 
 	// HTTP/2 specific properties
-	fcManager        *StreamFlowControlManager // Stream-level flow control manager
-	priorityWeight   uint8                     // Stream weight (0-255, effective 1-256)
-	priorityParentID uint32                    // Parent stream ID for priority
-
-	priorityExclusive bool // Exclusive flag for priority dependency
+	fcManager         *StreamFlowControlManager // Stream-level flow control manager
+	priorityWeight    uint8                     // Stream weight (0-255, effective 1-256)
+	priorityParentID  uint32                    // Parent stream ID for priority
+	priorityExclusive bool                      // Exclusive flag for priority dependency
 
 	// Request handling
 	requestHeaders    []hpack.HeaderField
@@ -157,7 +156,8 @@ type Stream struct {
 	cancelCtx                   context.CancelFunc // Cancels the stream context
 	endStreamReceivedFromClient bool               // True if client sent END_STREAM flag
 	endStreamSentToClient       bool               // True if server sent END_STREAM flag
-	pendingRSTCode              *ErrorCode         // If non-nil, an RST_STREAM with this code needs to be sent
+	pendingRSTCode              *ErrorCode         // If non-nil, an RST_STREAM with this code needs to be sent (or was received)
+	initiatedByPeer             bool               // True if this stream was initiated by the peer
 
 	// Channels for internal coordination (examples, might evolve)
 	// headersComplete chan struct{} // Signals that all request headers (and CONTINUATIONs) have been received
@@ -191,6 +191,7 @@ func newStream(
 	prioWeight uint8,
 	prioParentID uint32,
 	prioExclusive bool,
+	isInitiatedByPeer bool, // Added parameter
 ) (*Stream, error) {
 	ctx, cancel := context.WithCancel(conn.ctx)
 
@@ -212,6 +213,7 @@ func newStream(
 		cancelCtx:                   cancel,
 		endStreamReceivedFromClient: false,
 		endStreamSentToClient:       false,
+		initiatedByPeer:             isInitiatedByPeer, // Set the field
 		responseHeadersSent:         false,
 	}
 
