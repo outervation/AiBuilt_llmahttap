@@ -221,6 +221,78 @@ func PrepareExecEnv(currentEnv []string, listeners []net.Listener, readinessPipe
 	return newEnv, nil
 }
 
+// CreateListenerAndGetFD creates a net.Listener on the given address (assuming "tcp" network)
+// and returns it along with its raw file descriptor.
+// FD_CLOEXEC is cleared on this descriptor so it can be inherited by a child process.
+// The caller (parent process) uses the net.Listener, and can pass the uintptr FD
+// number to a child process (which would then typically use net.FileListener on its end).
+func CreateListenerAndGetFD(address string) (net.Listener, uintptr, error) {
+	network := "tcp" // Defaulting to "tcp" for an HTTP server
+
+	// Step 1: Create a temporary listener.
+	// The Go standard library net.Listen functions (as of Go 1.11+)
+	// automatically set FD_CLOEXEC on new sockets.
+	tempListener, err := net.Listen(network, address)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create temporary listener on %s %s: %w", network, address, err)
+	}
+
+	// Step 2: Get the file descriptor from the temporary listener.
+	// This requires type assertion. Supporting TCPListener as it's standard for HTTP.
+	tcpListener, ok := tempListener.(*net.TCPListener)
+	if !ok {
+		// If it's not a TCPListener, we can't call .File() in this simple way.
+		// Other listener types (like UnixListener) also have a File() method.
+		// A more robust implementation might use a type switch or interface check.
+		tempListener.Close()
+		return nil, 0, fmt.Errorf("listener on %s %s is not a TCPListener (type: %T), cannot get FD", network, address, tempListener)
+	}
+
+	file, err := tcpListener.File() // This duplicates the file descriptor.
+	if err != nil {
+		tempListener.Close()
+		return nil, 0, fmt.Errorf("failed to get listener file from TCPListener on %s %s: %w", network, address, err)
+	}
+	// `file` now owns the duplicated FD.
+
+	// Step 3: Close the temporary listener.
+	// This is crucial. It closes the *original* FD associated with tempListener.
+	// If we don't do this, and then create a new listener from `file.Fd()`,
+	// we might have two listeners on the same port, or `net.FileListener` might fail
+	// with "address already in use" if the OS hasn't fully released the original socket.
+	if err := tempListener.Close(); err != nil {
+		file.Close() // Clean up the duplicated FD as well
+		// Log this error, as it's unusual but might not be fatal for the overall goal if FileListener later works.
+		// However, for robustness, treat as failure.
+		return nil, 0, fmt.Errorf("failed to close temporary listener on %s %s: %w", network, address, err)
+	}
+	// Now, only `file` (with its duplicated FD) potentially holds the port binding.
+
+	// Step 4: Get the raw FD from the os.File.
+	listenerFD := file.Fd()
+
+	// Step 5: Clear FD_CLOEXEC on the duplicated FD.
+	// This ensures the FD can be inherited by child processes.
+	if err := SetCloexec(listenerFD, false); err != nil {
+		file.Close() // Close the duplicated FD if SetCloexec fails.
+		return nil, 0, fmt.Errorf("failed to clear FD_CLOEXEC for FD %d from %s %s: %w", listenerFD, network, address, err)
+	}
+
+	// Step 6: Create the final net.Listener from the os.File (which owns listenerFD).
+	// This finalListener will use listenerFD, which now has FD_CLOEXEC cleared.
+	finalListener, err := net.FileListener(file)
+	if err != nil {
+		file.Close() // Close the duplicated FD if FileListener fails.
+		return nil, 0, fmt.Errorf("failed to create final listener from file (FD %d) for %s %s: %w", listenerFD, network, address, err)
+	}
+	// If net.FileListener succeeds, it takes ownership of `file`'s FD.
+	// `file.Close()` should NOT be called by us after this point if successful,
+	// as closing `finalListener` will close the underlying FD.
+
+	// Step 7: Return the final listener and its FD.
+	return finalListener, listenerFD, nil
+}
+
 // CreateReadinessPipe creates a pipe for readiness signaling.
 // The read end is for the parent to wait on, the write end for the child to close.
 // It ensures FD_CLOEXEC is set on the read end (parent's side) and cleared on
