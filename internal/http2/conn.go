@@ -10,9 +10,10 @@ import (
 	"sync"
 	"time"
 
-	// "example.com/llmahttap/v2/internal/config" // Assuming config provides Http2Settings eventually
+	"example.com/llmahttap/v2/internal/config" // Added import
 	"example.com/llmahttap/v2/internal/logger"
-	"example.com/llmahttap/v2/internal/server" // Added as per system intervention
+	"example.com/llmahttap/v2/internal/router" // Added import
+	"example.com/llmahttap/v2/internal/server"
 )
 
 // Default settings values (RFC 7540 Section 6.5.2)
@@ -285,7 +286,7 @@ func (c *Connection) canCreateStream(isInitiatedByPeer bool) bool {
 // handlerCfg: Configuration for the handler.
 // prioInfo: Priority information for the new stream. If nil, default priority is used.
 // isInitiatedByPeer: True if the stream is being created due to a peer's action (e.g., receiving HEADERS).
-func (c *Connection) createStream(id uint32, handler Handler, handlerCfg json.RawMessage, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
+func (c *Connection) createStream(id uint32, handler server.Handler, handlerCfg json.RawMessage, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
 	// Check concurrency limits first, without holding the full streamsMu write lock yet.
 	if !c.canCreateStream(isInitiatedByPeer) {
 		return nil, NewConnectionError(ErrCodeRefusedStream, fmt.Sprintf("cannot create stream %d: max concurrent streams limit reached", id))
@@ -847,12 +848,8 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 	if c.isClient {
 		// Client received HEADERS (response or pushed response)
-
 		stream, exists := c.getStream(streamID)
 		if !exists {
-			// If this is a PUSH_PROMISE response (streamID is even for pushed responses),
-			// we might need to create the stream in reserved (remote) state first if PUSH_PROMISE logic dictates.
-			// For now, assume stream must exist if HEADERS are for it.
 			c.log.Error("Client received HEADERS for unknown or closed stream", logger.LogFields{"stream_id": streamID})
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client received HEADERS for non-existent stream %d", streamID))
 		}
@@ -864,7 +861,6 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			}
 			c.log.Error("Error from stream.processResponseHeaders",
 				logger.LogFields{"stream_id": streamID, "error": errClientProcess.Error()})
-			// Stream-level error, stream should handle RST if necessary.
 		}
 		return nil
 
@@ -886,24 +882,102 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			c.log.Error("Server received HEADERS for an already existing stream ID from client", logger.LogFields{"stream_id": streamID})
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client attempted to reuse stream ID %d", streamID))
 		}
-		// TODO: Add more robust tracking of highest client-initiated stream ID successfully processed
-		// to prevent re-use if stream was closed quickly. For now, `exists` check catches active re-use.
 
 		if c.dispatcher == nil {
 			c.log.Error("Dispatcher is nil, cannot route request for new stream", logger.LogFields{"stream_id": streamID})
-			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError) // Best effort RST
-			return nil                                               // Don't kill connection for this, just the stream.
+			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError)
+			return nil
 		}
 
-		// Create the stream.
-		newStream, streamErr := c.createStream(streamID, nil /*handler*/, nil /*handlerCfg*/, prioInfo, true /*isPeerInitiated*/)
+		// Extract pseudo-headers to determine path for routing BEFORE creating the stream.
+		_, path, _, _, pseudoErr := c.extractPseudoHeaders(headers)
+		if pseudoErr != nil {
+			c.log.Error("Error extracting pseudo headers for routing", logger.LogFields{"stream_id": streamID, "error": pseudoErr.Error()})
+			_ = c.sendRSTStreamFrame(streamID, ErrCodeProtocolError) // Send RST for malformed request
+			// If pseudoErr is a ConnectionError, it will be propagated up.
+			// If it's a simple error, it might be handled locally by RSTing the stream.
+			// For now, assume extractPseudoHeaders returns a ConnectionError for fatal issues.
+			return pseudoErr
+		}
+
+		// Use the router to find the handler and its config based on the path.
+		// The dispatcher is server.RouterInterface. Its Match method would be ideal if it existed.
+		// Assuming c.dispatcher is a *router.Router which has a Match method.
+		// We need to cast or ensure the interface provides this.
+		// For now, let's assume a method like `Match(path string) (*config.Route, server.Handler, error)` exists.
+		// This part is a bit tricky as router.Match returns (route, handler, err)
+		// and the handler is already instantiated. We need the HandlerConfig to pass to newStream.
+		// Let's refine this: The router should give us the route, and we get the handler from the registry *inside* createStream or similar.
+		// For now, let's assume we can get HandlerType and HandlerConfig from the router.
+
+		var routeConfig *config.Route
+		var resolvedHandler server.Handler // This should be instantiated later by the stream
+		// var handlerType string // Removed unused variable
+		var opaqueHandlerConfig json.RawMessage
+
+		// This is conceptual. The actual router interaction needs to be defined.
+		// For now, assume c.dispatcher.Match can give us route details.
+		// The router.Router.Match in router.go finds a config.Route and then creates a handler.
+		// This needs rethinking. The stream needs the HandlerConfig *at creation*.
+		// A possible flow:
+		// 1. Router.FindRoute(path) -> returns *config.Route, error
+		// 2. If route found, use route.HandlerType and route.HandlerConfig for stream creation.
+		// 3. The stream.handler field will be instantiated by the stream itself using its config.
+
+		// Quick check if dispatcher is *router.Router to access its Match method directly for now
+		// This is not ideal for interface segregation but helps proceed.
+		actualRouter, ok := c.dispatcher.(*router.Router)
+		if !ok {
+			c.log.Error("Dispatcher is not of expected type *router.Router, cannot perform routing", logger.LogFields{"stream_id": streamID})
+			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError)
+			return nil
+		}
+
+		matchedRoute, instantiatedHandler, errMatch := actualRouter.Match(path)
+		if errMatch != nil {
+			c.log.Error("Router Match failed", logger.LogFields{"stream_id": streamID, "path": path, "error": errMatch.Error()})
+			// Handle router errors, e.g., if handler creation in Match failed.
+			// Send 500 Internal Server Error (if handler creation failed)
+			// Server.WriteErrorResponse would be used here on a temporary stream or a way to write directly.
+			// For now, RST stream.
+			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError) // Or specific error from router if possible
+			return nil                                               // Don't kill connection, just this stream attempt
+		}
+		if matchedRoute == nil { // No route matched
+			c.log.Info("No route matched for path", logger.LogFields{"stream_id": streamID, "path": path})
+			// Need to send a 404. This requires creating a minimal stream to send the response.
+			// This is complex here. For now, let's RST. A proper 404 is better.
+			// A better approach: create a "dummy" stream, send 404, then close.
+			// Or, the main server loop should handle 404 if no handler is found after stream creation.
+			// For now, if router.Match returns nil handler for no match:
+			if instantiatedHandler == nil {
+				// Create a temporary stream to send a 404 Not Found.
+				// This requires a way to send an error response without a full handler.
+				// This is a simplification:
+				// TODO: Implement proper 404 response. This requires creating a stream,
+				// sending headers and body, then closing. For now, RST the stream.
+				c.log.Warn("TODO: Implement 404 response for stream", logger.LogFields{"stream_id": streamID, "path": path})
+				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream) // Using RefusedStream as a placeholder for "no service"
+				return nil
+			}
+		}
+
+		// We have a matchedRoute and an instantiatedHandler.
+		// The stream needs the raw HandlerConfig.
+		routeConfig = matchedRoute
+		// handlerType = routeConfig.HandlerType // Removed unused variable
+		opaqueHandlerConfig = routeConfig.HandlerConfig
+		resolvedHandler = instantiatedHandler // This is the instantiated handler
+
+		// Create the stream with the specific handler and its config.
+		newStream, streamErr := c.createStream(streamID, resolvedHandler, opaqueHandlerConfig, prioInfo, true /*isPeerInitiated*/)
 		if streamErr != nil {
 			c.log.Error("Failed to create stream for incoming client HEADERS", logger.LogFields{"stream_id": streamID, "error": streamErr.Error()})
 			if ce, ok := streamErr.(*ConnectionError); ok && ce.Code == ErrCodeRefusedStream {
-				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream) // Send RST for refused stream
-				return nil                                               // Stream refused, RST sent, not a connection-terminating error in itself.
+				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream)
+				return nil
 			}
-			return streamErr // Propagate other fatal connection errors from createStream.
+			return streamErr
 		}
 
 		// Transition stream state based on HEADERS
@@ -917,8 +991,8 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 		if endStream {
 			newStream.endStreamReceivedFromClient = true
-			if newStream.requestBodyWriter != nil { // Should exist
-				_ = newStream.requestBodyWriter.Close() // Signal EOF to potential reader
+			if newStream.requestBodyWriter != nil {
+				_ = newStream.requestBodyWriter.Close()
 			}
 			newStream._setState(StreamStateHalfClosedRemote)
 		} else {
@@ -926,17 +1000,16 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		}
 		newStream.mu.Unlock()
 
-		// Delegate to the stream to process headers and dispatch via the router.
-		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
+		// Delegate to the stream to process headers and dispatch.
+		// The stream's handler is already set from createStream.
+		// stream.processRequestHeadersAndDispatch will build the http.Request and call the handler.
+		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher) // dispatcher is passed for context, though stream has its own handler now.
 		if errDispatch != nil {
-			// processRequestHeadersAndDispatch should handle sending RST_STREAM if appropriate.
-			// If it returns a ConnectionError, propagate it.
 			if _, ok := errDispatch.(*ConnectionError); ok {
 				return errDispatch
 			}
 			c.log.Error("Error from stream.processRequestHeadersAndDispatch",
 				logger.LogFields{"stream_id": newStream.id, "error": errDispatch.Error()})
-			// No specific action here if it's not a ConnectionError, assuming stream handles its own termination.
 		}
 		return nil
 	}
