@@ -841,3 +841,112 @@ func AssertJSONBodyFields(t *testing.T, expectedFields map[string]interface{}, a
 		}
 	}
 }
+
+// E2ETestCase represents a single request-response pair within a larger E2E test definition.
+type E2ETestCase struct {
+	Name     string // Optional, for descriptive test names in output
+	Request  TestRequest
+	Expected ExpectedResponse
+}
+
+// E2ETestDefinition defines a complete end-to-end test scenario.
+type E2ETestDefinition struct {
+	Name                string        // For the overall test set, used in t.Run
+	ServerBinaryPath    string        // Path to the server executable
+	ServerConfigData    interface{}   // Data to be marshalled into the config file
+	ServerConfigFormat  string        // "json" or "toml"
+	ServerConfigArgName string        // Command-line argument name for config file (e.g., "-config")
+	ServerListenAddress string        // e.g., "127.0.0.1:8080" or "127.0.0.1:0" for dynamic port
+	ExtraServerArgs     []string      // Any additional command-line arguments for the server
+	TestCases           []E2ETestCase // The sequence of test requests and their expected outcomes
+	CurlPath            string        // Optional: path to curl executable, defaults to "curl" if empty
+}
+
+// RunE2ETest executes a defined E2E test scenario.
+// It handles server setup, execution of test cases with multiple clients, and assertions.
+func RunE2ETest(t *testing.T, def E2ETestDefinition) {
+	t.Helper()
+
+	listenAddress := def.ServerListenAddress
+	if strings.HasSuffix(listenAddress, ":0") {
+		host := strings.TrimSuffix(listenAddress, ":0")
+		if host == "" { // e.g. if listenAddress was just ":0"
+			host = "127.0.0.1"
+		}
+		port, err := GetFreePort()
+		if err != nil {
+			t.Fatalf("Failed to get free port for E2E test '%s': %v", def.Name, err)
+		}
+		listenAddress = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	configPath, cleanupConfig, err := WriteTempConfig(def.ServerConfigData, def.ServerConfigFormat)
+	if err != nil {
+		t.Fatalf("E2E test '%s': Failed to write temp config: %v", def.Name, err)
+	}
+	// Note: cleanupConfig will be called by server.Stop() if added as a cleanup func,
+	// or we can defer it here. Adding it to server instance is cleaner.
+
+	server, err := StartTestServer(def.ServerBinaryPath, configPath, def.ServerConfigArgName, listenAddress, def.ExtraServerArgs...)
+	if err != nil {
+		t.Fatalf("E2E test '%s': Failed to start server: %v", def.Name, err)
+	}
+	server.AddCleanupFunc(func() error { cleanupConfig(); return nil }) // Ensure temp config file is removed
+	defer server.Stop()
+
+	testRunners := []TestRunner{
+		NewGoNetHTTPClient(),
+		NewCurlHTTPClient(def.CurlPath), // Uses def.CurlPath, or "curl" if empty
+	}
+
+	for i, tc := range def.TestCases {
+		caseName := tc.Name
+		if caseName == "" {
+			caseName = fmt.Sprintf("Case%d_%s", i+1, tc.Request.Path)
+		}
+
+		t.Run(caseName, func(st *testing.T) {
+			st.Helper()
+			for _, runner := range testRunners {
+				st.Run(fmt.Sprintf("Client_%s", runner.Type()), func(ct *testing.T) {
+					ct.Helper()
+					actualResp, execErr := runner.Run(server, &tc.Request)
+
+					if tc.Expected.ErrorContains != "" {
+						if execErr == nil {
+							ct.Errorf("Expected error containing '%s', but got no error. Response Status: %d, Body: %s",
+								tc.Expected.ErrorContains, actualResp.StatusCode, string(actualResp.Body))
+						} else if !strings.Contains(execErr.Error(), tc.Expected.ErrorContains) {
+							ct.Errorf("Expected error to contain '%s', got: %v", tc.Expected.ErrorContains, execErr)
+						}
+						return // Test case check ends here if an error was expected
+					}
+
+					if execErr != nil {
+						ct.Fatalf("Unexpected error during request: %v. Server logs:\n%s", execErr, server.LogBuffer.String())
+					}
+
+					// Perform assertions on the actual response
+					AssertStatusCode(ct, tc.Expected, *actualResp)
+
+					if tc.Expected.Headers != nil {
+						for headerName, expectedValue := range tc.Expected.Headers {
+							AssertHeaderEquals(ct, actualResp.Headers, headerName, expectedValue)
+						}
+					}
+
+					if tc.Expected.ExpectNoBody {
+						if len(actualResp.Body) > 0 {
+							ct.Errorf("Expected no response body, but got %d bytes: %s", len(actualResp.Body), string(actualResp.Body))
+						}
+					} else if tc.Expected.BodyMatcher != nil {
+						match, desc := tc.Expected.BodyMatcher.Match(actualResp.Body)
+						if !match {
+							ct.Errorf("Response body mismatch: %s", desc)
+						}
+					}
+				})
+			}
+		})
+	}
+}
