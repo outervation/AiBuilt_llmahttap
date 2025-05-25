@@ -7,8 +7,8 @@ import (
 	"net/http" // Added for http.Request and http.Header
 	"sync"
 
+	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
-	// "example.com/llmahttap/v2/internal/http2" // Cycle broken
 )
 
 // HandlerFactory defines the function signature for creating handler instances.
@@ -89,24 +89,19 @@ func (r *HandlerRegistry) ClearFactories() {
 type ResponseWriter interface {
 	// SendHeaders sends response headers.
 	// If endStream is true, this also signals the end of the response body.
-	SendHeaders(headers []HeaderField, endStream bool) error // Using server.HeaderField
+	SendHeaders(headers []http2.HeaderField, endStream bool) error // Using http2.HeaderField
 
 	// WriteData sends a chunk of the response body.
 	// If endStream is true, this is the final chunk.
 	WriteData(p []byte, endStream bool) (n int, err error)
 
 	// WriteTrailers sends trailing headers. This implicitly ends the stream.
-	WriteTrailers(trailers []HeaderField) error // Using server.HeaderField
+	WriteTrailers(trailers []http2.HeaderField) error // Using http2.HeaderField
 }
 
 // HeaderField represents a single HTTP header field (name-value pair).
 // This is defined here to avoid internal/http2 depending on golang.org/x/net/http2/hpack directly
 // for interface definitions used by handlers.
-type HeaderField struct {
-	Name  string
-	Value string
-	// Sensitive bool // HPACK: true if value should never be indexed
-}
 
 // Handler is the interface that processes requests for a given route.
 // Feature Spec 1.4.2: "Each handler implementation MUST conform to a server-defined internal interface
@@ -124,12 +119,14 @@ type Handler interface {
 	// `resp` is the ResponseWriter for sending the HTTP/2 response.
 	// `req` contains the parsed HTTP request details.
 	// The handler receives its specific configuration during its instantiation via the factory.
-	ServeHTTP2(resp ResponseWriterStream, req *http.Request)
+
+	ServeHTTP2(resp http2.StreamWriter, req *http.Request)
 }
 
 // RouterInterface defines the interface for request routing.
 // It ensures that the router can be swapped out with different implementations
 // if needed, and facilitates testing by allowing mock routers.
+
 type RouterInterface interface {
 	// ServeHTTP is responsible for finding a handler for the request and invoking it.
 	// If no handler is found, it should generate an appropriate error response (e.g., 404).
