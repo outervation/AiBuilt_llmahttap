@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/tls"
 	"example.com/llmahttap/v2/internal/config"
 	"github.com/BurntSushi/toml"
+	"golang.org/x/net/http2"
 )
 
 // TestRequest models an HTTP request for E2E testing.
@@ -604,4 +606,132 @@ func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualRespo
 		actualRes.Error = fmt.Errorf("failed to determine status code from curl response. Stdout: '%s', Stderr: '%s', HeaderFile Content: '%s'", stdoutStr, stderrStr, string(headerData))
 	}
 	return actualRes, actualRes.Error
+}
+
+// GoNetHTTPClient implements HTTPTestClient using Go's net/http package for H2C.
+type GoNetHTTPClient struct {
+	client *http.Client
+}
+
+// NewGoNetHTTPClient creates a new GoNetHTTPClient configured for HTTP/2 Cleartext (H2C).
+func NewGoNetHTTPClient() *GoNetHTTPClient {
+	transport := &http2.Transport{
+		AllowHTTP: true, // Allow non-HTTPS H2
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		// Ensure the TLSClientConfig is nil for H2C if not providing a custom DialTLS that handles schemes.
+		// For x/net/http2.Transport, if DialTLSContext is provided and AllowHTTP is true,
+		// it should correctly handle "http" scheme by calling DialTLSContext which then dials cleartext.
+		TLSClientConfig: nil,
+	}
+
+	return &GoNetHTTPClient{
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   10 * time.Second, // Default timeout for requests
+		},
+	}
+}
+
+// Type returns the client type.
+func (c *GoNetHTTPClient) Type() HTTPClientType {
+	return GoHTTPClient
+}
+
+// Do executes an HTTP request using Go's net/http client configured for H2C.
+func (c *GoNetHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
+	actualRes := ActualResponse{
+		Headers: make(http.Header),
+	}
+
+	scheme := "http://"
+	// Remove existing scheme if present, as we force http for H2C
+	if i := strings.Index(serverAddr, "://"); i != -1 {
+		serverAddr = serverAddr[i+3:]
+	}
+
+	path := request.Path
+	if !strings.HasPrefix(path, "/") && path != "" {
+		path = "/" + path
+	}
+	url := fmt.Sprintf("%s%s%s", scheme, serverAddr, path)
+
+	method := request.Method
+	if method == "" {
+		method = "GET"
+	}
+
+	var bodyReader io.Reader
+	if len(request.Body) > 0 {
+		bodyReader = bytes.NewReader(request.Body)
+	}
+
+	httpReq, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		actualRes.Error = fmt.Errorf("failed to create http.Request: %w", err)
+		return actualRes, actualRes.Error
+	}
+
+	// http.NewRequest initializes httpReq.Header to a non-nil map.
+	// Populate it from request.Headers.
+	if request.Headers != nil {
+		for k, vv := range request.Headers {
+			for _, v := range vv {
+				httpReq.Header.Add(k, v)
+			}
+		}
+	}
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		actualRes.Error = fmt.Errorf("http client failed to execute request: %w", err)
+		return actualRes, actualRes.Error
+	}
+	defer resp.Body.Close()
+
+	actualRes.StatusCode = resp.StatusCode
+	actualRes.Headers = resp.Header
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		actualRes.Error = fmt.Errorf("failed to read response body: %w", readErr)
+		// actualRes.Error will be returned by the function if it's the first error.
+	}
+	actualRes.Body = respBody
+
+	// If readErr occurred after a successful HTTP exchange, actualRes.Error might be nil here.
+	// Ensure actualRes.Error captures readErr if it happened.
+	if actualRes.Error == nil && readErr != nil {
+		actualRes.Error = readErr
+	}
+
+	return actualRes, actualRes.Error
+}
+
+// Run implements the TestRunner interface for GoNetHTTPClient.
+func (c *GoNetHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualResponse, error) {
+	if server == nil {
+		return nil, fmt.Errorf("server instance cannot be nil for GoNetHTTPClient.Run")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("TestRequest cannot be nil for GoNetHTTPClient.Run")
+	}
+
+	actualResp, err := c.Do(server.Address, *req)
+	return &actualResp, err
+}
+
+// Run implements the TestRunner interface for CurlHTTPClient.
+func (c *CurlHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualResponse, error) {
+	if server == nil {
+		return nil, fmt.Errorf("server instance cannot be nil for CurlHTTPClient.Run")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("TestRequest cannot be nil for CurlHTTPClient.Run")
+	}
+
+	actualResp, err := c.Do(server.Address, *req)
+	return &actualResp, err
 }
