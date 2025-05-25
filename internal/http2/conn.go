@@ -17,6 +17,12 @@ import (
 )
 
 // Default settings values (RFC 7540 Section 6.5.2)
+// MinMaxFrameSize is the minimum value for SETTINGS_MAX_FRAME_SIZE (2^14).
+const MinMaxFrameSize uint32 = 1 << 14
+
+// MaxAllowedFrameSizeValue is the maximum value for SETTINGS_MAX_FRAME_SIZE (2^24-1).
+const MaxAllowedFrameSizeValue uint32 = (1 << 24) - 1
+
 const (
 	DefaultSettingsHeaderTableSize   uint32 = 4096
 	DefaultSettingsInitialWindowSize uint32 = 65535 // (2^16 - 1)
@@ -1761,6 +1767,149 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 
 	// Reader/writer goroutines will signal their exit by closing readerDone/writerDone.
 	// The Close() method waits for these.
+}
+
+// handleSettingsFrame processes an incoming SETTINGS frame.
+// It validates the settings, applies them to the connection, and sends an ACK if required.
+func (c *Connection) handleSettingsFrame(frame *SettingsFrame) error {
+	header := frame.Header()
+
+	if header.StreamID != 0 {
+		return NewConnectionError(ErrCodeProtocolError, "SETTINGS frame received with non-zero stream ID")
+	}
+
+	if header.Flags&FlagSettingsAck != 0 {
+		// This is an ACK from the peer for SETTINGS we sent.
+		if header.Length != 0 {
+			return NewConnectionError(ErrCodeFrameSizeError, "SETTINGS ACK frame received with non-zero length")
+		}
+		// Process ACK
+		c.settingsMu.Lock()
+		if c.settingsAckTimeoutTimer != nil {
+			c.settingsAckTimeoutTimer.Stop()
+			c.settingsAckTimeoutTimer = nil
+			c.log.Debug("Received SETTINGS ACK from peer.", logger.LogFields{})
+		} else {
+			// This is not necessarily an error by spec if peer sends unsolicited ACK.
+			// It could be an ACK for settings we sent but whose timer already fired, or some race.
+			c.log.Warn("Received SETTINGS ACK, but no outstanding SETTINGS frame was tracked by timer.", logger.LogFields{})
+		}
+		c.settingsMu.Unlock()
+		return nil
+	}
+
+	// This is a SETTINGS frame from the peer (not an ACK), detailing their settings.
+	if header.Length%6 != 0 { // Each setting is 6 octets (ID + Value)
+		return NewConnectionError(ErrCodeFrameSizeError, "SETTINGS frame received with length not a multiple of 6")
+	}
+
+	var oldPeerInitialWindowSize uint32
+	var newPeerInitialWindowSize uint32
+	var peerInitialWindowSizeChanged bool
+
+	c.settingsMu.Lock()
+	oldPeerInitialWindowSize = c.peerInitialWindowSize // Capture current effective peer initial window size
+
+	for _, setting := range frame.Settings {
+		// Validate setting ID and value
+		switch setting.ID {
+		case SettingHeaderTableSize:
+			// Max value is effectively bounded by uint32.
+			c.peerSettings[SettingHeaderTableSize] = setting.Value
+			c.log.Debug("Peer SETTINGS_HEADER_TABLE_SIZE received", logger.LogFields{"value": setting.Value})
+		case SettingEnablePush:
+			if setting.Value != 0 && setting.Value != 1 {
+				c.settingsMu.Unlock()
+				return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid SETTINGS_ENABLE_PUSH value: %d (must be 0 or 1)", setting.Value))
+			}
+			c.peerSettings[SettingEnablePush] = setting.Value
+			c.log.Debug("Peer SETTINGS_ENABLE_PUSH received", logger.LogFields{"value": setting.Value})
+		case SettingMaxConcurrentStreams:
+			// Max value effectively bounded by uint32.
+			c.peerSettings[SettingMaxConcurrentStreams] = setting.Value
+			c.log.Debug("Peer SETTINGS_MAX_CONCURRENT_STREAMS received", logger.LogFields{"value": setting.Value})
+		case SettingInitialWindowSize:
+			if setting.Value > MaxWindowSize { // MaxWindowSize is 2^31 - 1 from flowcontrol.go
+				c.settingsMu.Unlock()
+				return NewConnectionError(ErrCodeFlowControlError, fmt.Sprintf("invalid SETTINGS_INITIAL_WINDOW_SIZE value %d exceeds maximum %d", setting.Value, MaxWindowSize))
+			}
+			c.peerSettings[SettingInitialWindowSize] = setting.Value
+			c.log.Debug("Peer SETTINGS_INITIAL_WINDOW_SIZE received", logger.LogFields{"value": setting.Value})
+		case SettingMaxFrameSize:
+			// MinMaxFrameSize (2^14) and MaxAllowedFrameSizeValue (2^24-1)
+			if setting.Value < MinMaxFrameSize || setting.Value > MaxAllowedFrameSizeValue {
+				c.settingsMu.Unlock()
+				return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("invalid SETTINGS_MAX_FRAME_SIZE value: %d (must be between %d and %d)", setting.Value, MinMaxFrameSize, MaxAllowedFrameSizeValue))
+			}
+			c.peerSettings[SettingMaxFrameSize] = setting.Value
+			c.log.Debug("Peer SETTINGS_MAX_FRAME_SIZE received", logger.LogFields{"value": setting.Value})
+		case SettingMaxHeaderListSize:
+			// Max value effectively bounded by uint32.
+			c.peerSettings[SettingMaxHeaderListSize] = setting.Value
+			c.log.Debug("Peer SETTINGS_MAX_HEADER_LIST_SIZE received", logger.LogFields{"value": setting.Value})
+		default:
+			// RFC 7540, 6.5.2: "An endpoint that receives a SETTINGS frame with any unknown or unsupported identifier MUST ignore that setting."
+			c.log.Debug("Peer sent unknown/unsupported SETTINGS identifier, ignoring.", logger.LogFields{"id": setting.ID, "value": setting.Value})
+		}
+	}
+
+	// After loop, c.peerSettings map is updated. Now apply these changes to c.peerInitialWindowSize, etc.
+	c.applyPeerSettings() // This reads from c.peerSettings and updates c.peerInitialWindowSize, c.peerMaxFrameSize etc.
+
+	newPeerInitialWindowSize = c.peerInitialWindowSize // This is the new effective value
+	if newPeerInitialWindowSize != oldPeerInitialWindowSize {
+		peerInitialWindowSizeChanged = true
+	}
+	c.settingsMu.Unlock() // Unlock before stream iterations or sending ACK
+
+	// If SETTINGS_INITIAL_WINDOW_SIZE changed, update all streams' send flow control windows.
+	if peerInitialWindowSizeChanged {
+		c.log.Debug("Peer's SETTINGS_INITIAL_WINDOW_SIZE changed, updating streams.", logger.LogFields{"old_value": oldPeerInitialWindowSize, "new_value": newPeerInitialWindowSize})
+		var streamsToUpdate []*Stream
+		c.streamsMu.RLock()
+		for _, stream := range c.streams {
+			streamsToUpdate = append(streamsToUpdate, stream)
+		}
+		c.streamsMu.RUnlock()
+
+		for _, stream := range streamsToUpdate {
+			// HandlePeerSettingsInitialWindowSizeChange applies the delta to the stream's *send* window.
+			if err := stream.fcManager.HandlePeerSettingsInitialWindowSizeChange(newPeerInitialWindowSize); err != nil {
+				// This is a connection error if a stream's send window overflows.
+				c.log.Error("Error updating stream send window for new peer SETTINGS_INITIAL_WINDOW_SIZE",
+					logger.LogFields{"stream_id": stream.id, "new_initial_size": newPeerInitialWindowSize, "error": err.Error()})
+				// The error from HandlePeerSettingsInitialWindowSizeChange should be a ConnectionError.
+				return err // This will tear down the connection.
+			}
+		}
+	}
+
+	// Send SETTINGS ACK
+	ackFrame := &SettingsFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameSettings,
+			Flags:    FlagSettingsAck,
+			StreamID: 0,
+			Length:   0, // ACK has no payload length
+		},
+		Settings: nil, // ACK has no settings payload
+	}
+
+	select {
+	case c.writerChan <- ackFrame:
+		c.log.Debug("SETTINGS ACK queued for sending.", logger.LogFields{})
+	case <-c.shutdownChan:
+		c.log.Warn("Connection shutting down, cannot send SETTINGS ACK.", logger.LogFields{})
+		// Return an error that indicates the connection is closing rather than an internal server error.
+		return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send SETTINGS ACK")
+	default:
+		// This case indicates writerChan is full, which suggests a problem with the writer goroutine
+		// or severe congestion. This is a critical state.
+		c.log.Error("Failed to queue SETTINGS ACK: writer channel full or blocked.", logger.LogFields{})
+		return NewConnectionError(ErrCodeInternalError, "failed to send SETTINGS ACK: writer channel congested")
+	}
+
+	return nil
 }
 
 // handleGoAwayFrame processes an incoming GOAWAY frame from the peer.
