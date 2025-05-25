@@ -1533,3 +1533,233 @@ func (c *Connection) sendGoAway(lastStreamID uint32, errorCode ErrorCode, debugD
 		return NewConnectionError(ErrCodeInternalError, "failed to send GOAWAY: writer channel congested")
 	}
 }
+
+// Close initiates the shutdown of the connection.
+// It determines the appropriate GOAWAY parameters based on the provided error
+// and then calls initiateShutdown. It waits for the connection's goroutines to complete.
+// This method is idempotent.
+func (c *Connection) Close(err error) error {
+	// Determine GOAWAY parameters based on the error
+	var lastStreamID uint32
+	var errCode ErrorCode
+	var debugData []byte
+	var gracefulTimeout time.Duration // For now, default to immediate if error, or short graceful if no error
+
+	c.streamsMu.RLock()
+	lastStreamID = c.lastProcessedStreamID
+	c.streamsMu.RUnlock()
+
+	if err == nil { // Graceful shutdown initiated by server logic (e.g., server stopping)
+		errCode = ErrCodeNoError
+		// A configured server-wide graceful timeout could be used here.
+		// For now, let's assume a short default or that it's passed via initiateShutdown.
+		// Let's set gracefulTimeout to a small value for clean close, or 0 for error-driven close.
+		gracefulTimeout = 5 * time.Second // Example: 5 seconds for graceful stream completion
+	} else if ce, ok := err.(*ConnectionError); ok {
+		errCode = ce.Code
+		// If LastStreamID is set in ConnectionError, respect it. Otherwise, use current highest.
+		if ce.LastStreamID > 0 { // Note: LastStreamID in ConnectionError is not standard. GOAWAY uses its own.
+			// This logic might need refinement. For now, trust highest processed if not specified.
+		}
+		debugData = ce.DebugData
+		gracefulTimeout = 0 // Connection errors usually imply immediate shutdown
+	} else { // Other errors (e.g. io.EOF, net.OpError from underlying connection)
+		errCode = ErrCodeProtocolError // Or InternalError if it's from our side
+		if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "broken pipe") {
+			errCode = ErrCodeConnectError // Peer likely disappeared
+		}
+		gracefulTimeout = 0
+	}
+
+	// Store the primary error that caused the shutdown.
+	c.streamsMu.Lock() // Protect connError
+	if c.connError == nil {
+		c.connError = err
+	}
+	isShuttingDown := c.isShuttingDownLocked()
+	c.streamsMu.Unlock()
+
+	if isShuttingDown {
+		c.log.Debug("Close called, but connection already shutting down.", logger.LogFields{"error": err})
+		// Wait for completion anyway
+	} else {
+		c.log.Info("Closing connection.", logger.LogFields{"error": err, "last_stream_id": lastStreamID, "error_code": errCode.String()})
+		// initiateShutdown should be called only once.
+		go c.initiateShutdown(lastStreamID, errCode, debugData, gracefulTimeout)
+	}
+
+	// Wait for reader and writer goroutines to finish.
+	// This wait should have a timeout to prevent hanging indefinitely if goroutines misbehave.
+	// For now, direct wait.
+	if c.readerDone != nil {
+		<-c.readerDone
+	}
+	if c.writerDone != nil {
+		<-c.writerDone
+	}
+
+	c.log.Info("Connection closed completely.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	return c.connError // Return the original or stored error
+}
+
+// isShuttingDownLocked checks if the shutdown process has started.
+// Assumes c.streamsMu is held.
+func (c *Connection) isShuttingDownLocked() bool {
+	select {
+	case <-c.shutdownChan:
+		return true
+	default:
+		return false
+	}
+}
+
+// initiateShutdown performs the actual connection shutdown sequence.
+// It sends GOAWAY, closes streams, closes the net.Conn, and cleans up resources.
+// This method should be called at most once, typically by Close().
+func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, debugData []byte, gracefulStreamTimeout time.Duration) {
+	c.streamsMu.Lock()
+	if c.isShuttingDownLocked() {
+		c.streamsMu.Unlock()
+		return // Already shutting down
+	}
+	// Mark that shutdown has started.
+	// This MUST be done before releasing streamsMu for the first time in this function,
+	// to prevent race conditions with multiple calls to initiateShutdown or Close.
+	close(c.shutdownChan)
+	c.streamsMu.Unlock()
+
+	c.log.Debug("Initiating connection shutdown sequence.",
+		logger.LogFields{
+			"last_stream_id_for_goaway": lastStreamID,
+			"error_code":                errCode.String(),
+			"graceful_stream_timeout":   gracefulStreamTimeout.String(),
+		})
+
+	// 1. Send GOAWAY frame if not already sent.
+	// sendGoAway method itself checks c.goAwaySent.
+	if err := c.sendGoAway(lastStreamID, errCode, debugData); err != nil {
+		c.log.Error("Failed to send GOAWAY frame during shutdown.", logger.LogFields{"error": err})
+		// Continue shutdown regardless
+	}
+
+	// 2. Graceful stream handling
+	if gracefulStreamTimeout > 0 && !c.isClient { // Graceful only for server-side handling of existing streams for now
+		c.log.Debug("Starting graceful stream shutdown period.", logger.LogFields{"timeout": gracefulStreamTimeout})
+		startTime := time.Now()
+		deadline := startTime.Add(gracefulStreamTimeout)
+
+		for time.Now().Before(deadline) {
+			c.streamsMu.RLock()
+			activeStreamsBelowGoAwayID := 0
+			for streamID, stream := range c.streams {
+				if streamID <= lastStreamID { // Only consider streams that peer might expect to complete
+					stream.mu.RLock()
+					isStreamEffectivelyClosed := stream.state == StreamStateClosed ||
+						(stream.state == StreamStateHalfClosedLocal && stream.endStreamReceivedFromClient) ||
+						(stream.state == StreamStateHalfClosedRemote && stream.endStreamSentToClient)
+					stream.mu.RUnlock()
+					if !isStreamEffectivelyClosed {
+						activeStreamsBelowGoAwayID++
+					}
+				}
+			}
+			c.streamsMu.RUnlock()
+
+			if activeStreamsBelowGoAwayID == 0 {
+				c.log.Debug("All relevant streams closed gracefully.", logger.LogFields{})
+				break
+			}
+			c.log.Debug("Waiting for streams to close gracefully.", logger.LogFields{"active_streams_below_goaway_id": activeStreamsBelowGoAwayID, "time_remaining": deadline.Sub(time.Now())})
+			time.Sleep(100 * time.Millisecond) // Check interval
+		}
+		if time.Now().After(deadline) {
+			c.log.Warn("Graceful stream shutdown period timed out.", logger.LogFields{})
+		}
+	}
+
+	// 3. Forcefully close all remaining active streams
+	c.log.Debug("Forcefully closing any remaining active streams.", logger.LogFields{})
+	var streamsToClose []*Stream
+	c.streamsMu.RLock()
+	for _, stream := range c.streams {
+		streamsToClose = append(streamsToClose, stream)
+	}
+	c.streamsMu.RUnlock()
+
+	for _, stream := range streamsToClose {
+		streamErr := NewStreamError(stream.id, ErrCodeCancel, "connection shutting down")
+		// Stream.Close is idempotent and handles its own state.
+		// It might send RST_STREAM if appropriate.
+		if err := stream.Close(streamErr); err != nil {
+			c.log.Warn("Error closing stream during connection shutdown.", logger.LogFields{"stream_id": stream.id, "error": err.Error()})
+		}
+	}
+	// After this, removeClosedStream (called by stream.Close via state transition) should have cleaned them from c.streams.
+
+	// 4. Close the underlying network connection.
+	// This will unblock the reader goroutine if it's stuck in netConn.Read().
+	c.log.Debug("Closing network connection.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	if err := c.netConn.Close(); err != nil {
+		c.log.Warn("Error closing network connection.", logger.LogFields{"error": err.Error()})
+	}
+
+	// 5. Signal writer goroutine to terminate and clean up.
+	// Closing writerChan signals the writerLoop to drain remaining frames and then exit.
+	if c.writerChan != nil {
+		// Check if writerChan is already closed to prevent panic on double close
+		// This requires careful synchronization or a select-based check in the writer.
+		// For now, assume single close.
+		// TODO: Add a mechanism in writerLoop to detect c.shutdownChan and exit if writerChan is empty,
+		// rather than relying solely on writerChan close if it might be closed elsewhere.
+		// If initiateShutdown can be called by the writer itself (e.g. write error), closing here is problematic.
+		// One approach: have a separate 'writerCloseSignal chan struct{}'.
+		// For now, direct close:
+		close(c.writerChan)
+		c.log.Debug("Writer channel closed.", logger.LogFields{})
+	}
+
+	// 6. Cancel the connection's context.
+	// This signals any operations using c.ctx to stop.
+	if c.cancelCtx != nil {
+		c.cancelCtx()
+		c.log.Debug("Connection context cancelled.", logger.LogFields{})
+	}
+
+	// 7. Clean up other connection-level resources.
+	c.log.Debug("Cleaning up connection resources.", logger.LogFields{})
+	if c.connFCManager != nil {
+		// Pass the primary shutdown error to flow control, so waiters can unblock with reason.
+		var fcCloseErr error
+		c.streamsMu.RLock() // Safely read connError
+		fcCloseErr = c.connError
+		c.streamsMu.RUnlock()
+		if fcCloseErr == nil {
+			fcCloseErr = NewConnectionError(errCode, "connection closed")
+		}
+		c.connFCManager.Close(fcCloseErr)
+	}
+
+	// Stop settings ACK timer
+	c.settingsMu.Lock()
+	if c.settingsAckTimeoutTimer != nil {
+		c.settingsAckTimeoutTimer.Stop()
+		c.settingsAckTimeoutTimer = nil
+	}
+	c.settingsMu.Unlock()
+
+	// Stop active PING timers
+	c.activePingsMu.Lock()
+	for data, timer := range c.activePings {
+		timer.Stop()
+		delete(c.activePings, data)
+	}
+	c.activePingsMu.Unlock()
+
+	// HpackAdapter doesn't currently have explicit cleanup.
+	// PriorityTree also doesn't. If they did, call here.
+
+	c.log.Info("Connection shutdown sequence complete.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	// Reader/writer goroutines will signal their exit by closing readerDone/writerDone.
+	// The Close() method waits for these.
+}
