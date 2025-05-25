@@ -337,6 +337,7 @@ func (c *Connection) createStream(id uint32, handler server.Handler, handlerCfg 
 		weight,
 		parentID,
 		exclusive,
+		isInitiatedByPeer, // Added missing argument
 	)
 	if err != nil {
 		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to create new stream object for ID %d: %v", id, err))
@@ -1183,5 +1184,110 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 			"weight":     frame.Weight,
 			"exclusive":  frame.Exclusive,
 		})
+	return nil
+}
+
+// removeClosedStream removes a stream that is already in a closed state from the connection's tracking.
+// This method assumes the stream's state transition to Closed (and associated actions like sending RST if needed)
+// has already been handled by the stream itself.
+func (c *Connection) removeClosedStream(s *Stream) {
+	if s == nil {
+		c.log.Warn("removeClosedStream called with nil stream", logger.LogFields{})
+		return
+	}
+	id := s.ID()
+
+	// Ensure stream is actually closed before removing.
+	// This read of stream state is primarily for logging/assertion,
+	// as the main decision to call this function implies the stream should be closed.
+	s.mu.RLock()
+	streamState := s.state
+	isPeerInit := s.initiatedByPeer
+	s.mu.RUnlock()
+
+	if streamState != StreamStateClosed {
+		c.log.Error("removeClosedStream called on a non-closed stream", logger.LogFields{"stream_id": id, "current_state": streamState.String()})
+		// This indicates a logic error elsewhere. For robustness, one might force-close the stream here,
+		// but it's better if the caller ensures the stream is closed.
+		// For now, we'll proceed with removing it from connection tracking to prevent leaks.
+	}
+
+	c.streamsMu.Lock()
+	_, foundInMap := c.streams[id]
+	if foundInMap {
+		delete(c.streams, id)
+		if isPeerInit {
+			if c.concurrentStreamsInbound > 0 {
+				c.concurrentStreamsInbound--
+			} else {
+				c.log.Warn("concurrentStreamsInbound was 0 when decrementing", logger.LogFields{"stream_id": id})
+			}
+		} else {
+			if c.concurrentStreamsOutbound > 0 {
+				c.concurrentStreamsOutbound--
+			} else {
+				c.log.Warn("concurrentStreamsOutbound was 0 when decrementing", logger.LogFields{"stream_id": id})
+			}
+		}
+	}
+	c.streamsMu.Unlock()
+
+	if !foundInMap {
+		// Stream might have been removed by a concurrent operation or was never fully added.
+		c.log.Debug("removeClosedStream: stream not found in map or already removed", logger.LogFields{"stream_id": id})
+		return // No further action if not in map.
+	}
+
+	c.log.Debug("Removing closed stream from connection tracking", logger.LogFields{"stream_id": id})
+
+	// Remove from priority tree
+	if err := c.priorityTree.RemoveStream(id); err != nil {
+		c.log.Warn("Error removing stream from priority tree during removeClosedStream", logger.LogFields{"stream_id": id, "error": err.Error()})
+	}
+
+	// Local resources for the stream object (pipes, context, fcManager) should have been
+	// cleaned by stream.closeStreamResourcesProtected() when it transitioned to StreamStateClosed.
+}
+
+// dispatchRSTStreamFrame handles an incoming RST_STREAM frame.
+// It finds the target stream, instructs it to handle the RST (which closes it),
+// and then removes the stream from connection tracking.
+func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
+	streamID := frame.Header().StreamID
+	errorCode := frame.ErrorCode
+
+	c.log.Debug("Dispatching RST_STREAM frame",
+		logger.LogFields{
+			"stream_id":  streamID,
+			"error_code": errorCode.String(),
+		})
+
+	if streamID == 0 {
+		errMsg := "RST_STREAM frame received on stream 0"
+		c.log.Error(errMsg, logger.LogFields{})
+		return NewConnectionError(ErrCodeProtocolError, errMsg)
+	}
+
+	stream, found := c.getStream(streamID) // getStream uses RLock
+
+	if !found {
+		// Stream does not exist or was already closed and removed.
+		// RFC 7540, Section 6.4: "An endpoint that receives a RST_STREAM frame on a closed stream MUST ignore it."
+		c.log.Warn("RST_STREAM received for unknown or already closed stream, ignoring.",
+			logger.LogFields{
+				"stream_id":  streamID,
+				"error_code": errorCode.String(),
+			})
+		return nil
+	}
+
+	// Stream found. Delegate to the stream to handle its state transition to Closed
+	// and to clean up its local resources (pipes, context, fcManager).
+	stream.handleRSTStreamFrame(errorCode)
+
+	// After the stream has processed the RST_STREAM internally (is marked as closed and resources cleaned),
+	// remove it from the connection's active streams map and priority tree.
+	c.removeClosedStream(stream)
+
 	return nil
 }
