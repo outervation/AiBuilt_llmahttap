@@ -18,6 +18,9 @@ import (
 	"example.com/llmahttap/v2/internal/server"
 )
 
+// ClientPreface is the connection preface string that clients must send.
+const ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
 // SettingsAckTimeoutDuration is the default time to wait for a SETTINGS ACK.
 const SettingsAckTimeoutDuration = 10 * time.Second
 
@@ -2118,6 +2121,70 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 	return nil
 }
 
+// ServerHandshake performs the server-side HTTP/2 connection handshake.
+// It reads the client's connection preface, sends the server's initial SETTINGS,
+// and then reads and processes the client's initial SETTINGS frame.
+func (c *Connection) ServerHandshake() error {
+	// 1. Read and validate client connection preface
+	prefaceBuffer := make([]byte, len(ClientPreface))
+	// TODO: Set a reasonable read deadline for the preface.
+	// For now, rely on net.Conn's default or externally set deadlines.
+	if _, err := io.ReadFull(c.netConn, prefaceBuffer); err != nil {
+		c.log.Error("Failed to read client connection preface", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return NewConnectionError(ErrCodeProtocolError, "client preface incomplete or missing")
+		}
+		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client preface", err)
+	}
+
+	if string(prefaceBuffer) != ClientPreface {
+		c.log.Error("Invalid client connection preface received", logger.LogFields{"received_preface": string(prefaceBuffer), "remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeProtocolError, "invalid client connection preface")
+	}
+	c.log.Debug("Client connection preface validated.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	// 2. Send server's initial SETTINGS frame.
+	// c.sendInitialSettings() queues the frame and starts the ACK timer.
+	if err := c.sendInitialSettings(); err != nil {
+		c.log.Error("Failed to send initial server SETTINGS frame during handshake",
+			logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+		return err // sendInitialSettings already returns a ConnectionError or nil
+	}
+	c.log.Debug("Initial server SETTINGS frame queued for sending.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	// 3. Read and process client's initial SETTINGS frame.
+	// This MUST be the first frame from the client after their preface.
+	// TODO: Set a reasonable read deadline for this first frame.
+	frame, err := c.readFrame()
+	if err != nil {
+		c.log.Error("Failed to read client's initial SETTINGS frame", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client's initial SETTINGS frame", err)
+	}
+
+	settingsFrame, ok := frame.(*SettingsFrame)
+	if !ok {
+		errMsg := fmt.Sprintf("expected client's initial frame to be SETTINGS, got %s", frame.Header().Type.String())
+		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeProtocolError, errMsg)
+	}
+
+	if settingsFrame.Header().Flags&FlagSettingsAck != 0 {
+		errMsg := "client's initial SETTINGS frame must not have ACK flag set"
+		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeProtocolError, errMsg)
+	}
+
+	// Process the client's SETTINGS frame. This will apply their settings and queue an ACK from us.
+	if err := c.handleSettingsFrame(settingsFrame); err != nil {
+		c.log.Error("Error processing client's initial SETTINGS frame",
+			logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+		return err // handleSettingsFrame should return a ConnectionError if issues occur
+	}
+
+	c.log.Info("Server handshake completed successfully.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	return nil
+}
+
 // serve is the main goroutine for reading frames from the connection.
 // It runs after the handshake is complete (or immediately for server if no handshake needed beyond preface).
 
@@ -2155,31 +2222,32 @@ func (c *Connection) serve() {
 	c.log.Info("HTTP/2 connection (reader loop) serving started.", logger.LogFields{"remote_addr": c.remoteAddrStr, "is_client": c.isClient})
 
 	// Start the writer goroutine.
+
 	go c.writerLoop()
 
-	// Handle connection preface.
+	// Handle connection preface and initial SETTINGS exchange.
 	if !c.isClient { // Server-side
-		// 1. Send our initial SETTINGS frame.
-		if prefaceErr := c.sendInitialSettings(); prefaceErr != nil {
-			c.log.Error("Failed to send initial server SETTINGS frame, closing connection.",
-				logger.LogFields{"error": prefaceErr, "remote_addr": c.remoteAddrStr})
-			err = prefaceErr // This error will be used by the defer c.Close(err)
+		handshakeErr := c.ServerHandshake()
+		if handshakeErr != nil {
+			c.log.Error("Server handshake failed, closing connection.",
+				logger.LogFields{"error": handshakeErr, "remote_addr": c.remoteAddrStr})
+			err = handshakeErr // This error will be used by the defer c.Close(err)
+
+			// Store the error if it's the first one for this connection
+			c.streamsMu.Lock()
+			if c.connError == nil {
+				c.connError = err
+			}
+			c.streamsMu.Unlock()
 			return
 		}
-
-		// 2. Read and validate client's connection preface (magic string + SETTINGS frame).
-		// TODO: Implement reading and validating client preface.
-		// For now, skip this and go directly to frame reading loop.
-		// This means the server currently doesn't wait for client's SETTINGS before processing other frames.
-		// A robust server MUST process client preface first.
-		c.log.Debug("Server-side: Initial SETTINGS sent. TODO: Implement client preface handling.", logger.LogFields{"remote_addr": c.remoteAddrStr})
-
+		c.log.Debug("Server-side handshake successful.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	} else { // Client-side
 		// TODO: Client-side preface logic:
 		// 1. Send client magic (PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n).
-		// 2. Send client's initial SETTINGS frame (similar to sendInitialSettings but for client).
-		// 3. Then proceed to read server's SETTINGS (first frame from server).
-		c.log.Debug("Client-side: TODO: Implement client preface sending.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		// 2. Send client's initial SETTINGS frame.
+		// 3. Then proceed to read server's SETTINGS (first frame from server) and other frames.
+		c.log.Debug("Client-side: TODO: Implement client preface sending and initial SETTINGS processing.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	}
 
 	// Main frame reading loop
