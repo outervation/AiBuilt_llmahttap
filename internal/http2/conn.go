@@ -1418,7 +1418,7 @@ func (c *Connection) writeFrame(frame Frame) error {
 	err := WriteFrame(c.netConn, frame) // WriteFrame is in the same http2 package (frame.go)
 	if err != nil {
 		// TODO: Handle specific write errors, e.g., connection closed by peer.
-		// For now, log and return.
+		// For now, log and return. The writer goroutine will likely detect this and shut down.
 		// c.log.Error("Error writing frame to connection", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
 		return err
 	}
