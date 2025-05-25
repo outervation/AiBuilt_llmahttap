@@ -3,11 +3,10 @@ package http2
 import (
 	"context"
 	"encoding/json" // Added for json.RawMessage
-
-	"fmt" // Added for fmt.Errorf
+	"fmt"           // Added for fmt.Errorf
 	"golang.org/x/net/http2/hpack"
 	"net"
-	"strings" // Added to fix undefined: strings
+	"strings" // Ensure this import is present
 	"sync"
 	"time"
 
