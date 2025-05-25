@@ -925,32 +925,3 @@ func serverToServerHpackHeaders(serverHeaders []server.HeaderField) []hpack.Head
 	}
 	return hpackHeaders
 }
-
-// handleRSTStreamFrame processes a received RST_STREAM frame for this stream.
-// It transitions the stream to the Closed state and ensures resources are cleaned up.
-// The actual removal from the connection's stream map is handled by the connection.
-func (s *Stream) handleRSTStreamFrame(errorCode ErrorCode) error {
-	s.mu.Lock()
-	if s.state == StreamStateClosed {
-		// Stream is already closed, ignore the RST_STREAM.
-		s.mu.Unlock()
-		s.conn.log.Debug("RST_STREAM received for already closed stream, ignoring.",
-			logger.LogFields{"stream_id": s.id, "error_code": errorCode.String()})
-		return nil
-	}
-
-	s.conn.log.Debug("Handling received RST_STREAM frame",
-		logger.LogFields{"stream_id": s.id, "error_code": errorCode.String(), "current_state": s.state.String()})
-
-	// Store the error code that caused the stream to be reset.
-	// This might be useful for diagnostics or for error propagation to pending operations.
-	s.pendingRSTCode = &errorCode
-
-	// Transition the stream to the Closed state.
-	// _setState will call closeStreamResourcesProtected, which handles
-	// closing pipes, canceling context, etc.
-	s._setState(StreamStateClosed)
-
-	s.mu.Unlock()
-	return nil
-}
