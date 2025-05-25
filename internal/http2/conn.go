@@ -485,3 +485,77 @@ func (c *Connection) streamHandlerDone(s *Stream) {
 	// This would typically be used to manage lifecycle of handler goroutines,
 	// perhaps decrementing an active handler counter for graceful shutdown.
 }
+
+// dispatchDataFrame handles an incoming DATA frame.
+// It performs connection-level flow control accounting and then dispatches
+// the frame to the appropriate stream for stream-level processing.
+func (c *Connection) dispatchDataFrame(frame *DataFrame) error {
+	streamID := frame.Header().StreamID
+	if streamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "DATA frame received on stream 0")
+	}
+
+	// Account for frame payload length. Assumes frame.Data is the actual data after de-padding.
+	payloadLen := uint32(len(frame.Data))
+
+	// 1. Connection-level flow control update
+	// This must happen regardless of the stream's state, as the bytes were received on the connection.
+	if err := c.connFCManager.DataReceived(payloadLen); err != nil {
+		c.log.Error("Connection flow control error on DATA frame",
+			logger.LogFields{"stream_id": streamID, "payload_len": payloadLen, "error": err.Error()})
+		// connFCManager.DataReceived should return a ConnectionError with FLOW_CONTROL_ERROR
+		return err
+	}
+
+	// 2. Find the stream
+	stream, found := c.getStream(streamID)
+
+	if !found {
+		// Stream does not exist in our active map.
+		c.streamsMu.RLock() // RLock to safely read lastProcessedStreamID
+		lastKnownStreamID := c.lastProcessedStreamID
+		c.streamsMu.RUnlock()
+
+		if streamID <= lastKnownStreamID {
+			// Stream was known but is now closed. Peer should not send DATA.
+			// Send RST_STREAM(STREAM_CLOSED). Connection FC already handled.
+			c.log.Warn("DATA frame for closed stream", logger.LogFields{"stream_id": streamID})
+			return c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed)
+		}
+		// Stream ID is higher than any we've processed. Client sent DATA before HEADERS.
+		// This is a connection error. Connection FC handled, but this error is fatal.
+		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame on unopened stream %d", streamID))
+	}
+
+	// 3. Check stream state (before dispatching to stream.handleDataFrame)
+	// stream.handleDataFrame will also check, but good to do a preliminary check here.
+	stream.mu.RLock()
+	state := stream.state
+	canReceiveData := (state == StreamStateOpen || state == StreamStateHalfClosedLocal)
+	stream.mu.RUnlock()
+
+	if !canReceiveData {
+		c.log.Warn("DATA frame for stream in invalid state",
+			logger.LogFields{"stream_id": streamID, "state": state.String()})
+		// Per RFC 7540, 6.1: "If an endpoint receives a DATA frame for a stream
+		// that is not in the "open" or "half-closed (local)" state, it MUST respond
+		// with a stream error (Section 5.4.2) of type STREAM_CLOSED."
+		// Connection FC already handled.
+		return c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed)
+	}
+
+	// 4. Dispatch to stream for stream-level processing
+	if err := stream.handleDataFrame(frame); err != nil {
+		// stream.handleDataFrame might return a StreamError (e.g., stream FC violation)
+		// or a ConnectionError if something catastrophic happened at stream level.
+		if se, ok := err.(*StreamError); ok {
+			c.log.Warn("Stream error handling DATA frame",
+				logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "msg": se.Msg})
+			return c.sendRSTStreamFrame(se.StreamID, se.Code)
+		}
+		// If it's a ConnectionError or other fatal error, propagate it.
+		return err
+	}
+
+	return nil
+}
