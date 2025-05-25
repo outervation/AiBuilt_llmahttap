@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors" // Standard errors package
 	"fmt"
+
+	"context"
 	"html"
 
 	"net/http"
@@ -13,7 +15,6 @@ import (
 	"testing"
 
 	isserver "example.com/llmahttap/v2/internal/server" // Alias for the package under test
-	"golang.org/x/net/http2/hpack"
 )
 
 // TestPrefersJSON tests the internal PrefersJSON logic from the server package.
@@ -101,7 +102,7 @@ type mockResponseWriter struct {
 	t *testing.T
 
 	headersSent   bool
-	sentHeaders   []hpack.HeaderField
+	sentHeaders   []isserver.HeaderField
 	sentData      bytes.Buffer
 	endStreamData bool // Was endStream true on the WriteData call
 	endStreamHead bool // Was endStream true on the SendHeaders call
@@ -115,7 +116,7 @@ func newMockResponseWriter(t *testing.T) *mockResponseWriter {
 	return &mockResponseWriter{t: t}
 }
 
-func (m *mockResponseWriter) SendHeaders(headers []hpack.HeaderField, endStream bool) error {
+func (m *mockResponseWriter) SendHeaders(headers []isserver.HeaderField, endStream bool) error {
 	if m.sendHeadersErr != nil {
 		return m.sendHeadersErr
 	}
@@ -124,7 +125,7 @@ func (m *mockResponseWriter) SendHeaders(headers []hpack.HeaderField, endStream 
 		m.t.Fatal("SendHeaders called more than once")
 	}
 	m.headersSent = true
-	m.sentHeaders = make([]hpack.HeaderField, len(headers))
+	m.sentHeaders = make([]isserver.HeaderField, len(headers)) // Changed type here
 	copy(m.sentHeaders, headers)
 	m.endStreamHead = endStream
 	return nil
@@ -156,13 +157,13 @@ func (m *mockResponseWriter) WriteData(p []byte, endStream bool) (n int, err err
 	return len(p), nil
 }
 
-func (m *mockResponseWriter) WriteTrailers(trailers []hpack.HeaderField) error {
+func (m *mockResponseWriter) WriteTrailers(trailers []isserver.HeaderField) error {
 	m.t.Helper()
 	m.t.Fatal("WriteTrailers should not be called by WriteErrorResponse")
 	return nil
 }
 
-func findHeaderValue(headers []hpack.HeaderField, name string) (string, bool) {
+func findHeaderValue(headers []isserver.HeaderField, name string) (string, bool) {
 	for _, h := range headers {
 		if h.Name == name {
 			return h.Value, true
@@ -374,9 +375,9 @@ func TestWriteErrorResponse(t *testing.T) {
 			mockRW.sendHeadersErr = tt.mockSendHeadersError
 			mockRW.writeDataErr = tt.mockWriteDataError
 
-			reqHeaders := []hpack.HeaderField{}
+			reqHeaders := []isserver.HeaderField{}
 			if tt.acceptHeader != "" {
-				reqHeaders = append(reqHeaders, hpack.HeaderField{Name: "accept", Value: tt.acceptHeader})
+				reqHeaders = append(reqHeaders, isserver.HeaderField{Name: "accept", Value: tt.acceptHeader})
 			}
 
 			err := isserver.WriteErrorResponse(mockRW, tt.statusCode, reqHeaders, tt.detailMessage)
@@ -552,4 +553,13 @@ func TestWriteErrorResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (m *mockResponseWriter) Context() context.Context {
+	return context.Background() // Basic implementation for mock
+}
+
+func (m *mockResponseWriter) ID() uint32 {
+	// For this mock, a static ID is fine, or it could be configurable if needed for specific tests.
+	return 1 // Example stream ID
 }
