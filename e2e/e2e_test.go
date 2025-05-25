@@ -3,14 +3,15 @@ package e2e
 import (
 	"bytes"
 	"fmt"
-	// "net/http" // Removed as unused for now
+	"net/http" // Re-added as per task description
 	"os"
-	"os/exec"
+	"os/exec" // Kept as it's used in TestMain
 	"path/filepath"
 	"strings"
 	"testing"
-	// "example.com/llmahttap/v2/e2e/testutil"    // Removed as unused for now
-	// "example.com/llmahttap/v2/internal/config" // Removed as unused for now
+
+	"example.com/llmahttap/v2/e2e/testutil"    // Re-added as per task description
+	"example.com/llmahttap/v2/internal/config" // Re-added as per task description
 )
 
 var serverBinaryPath string
@@ -73,4 +74,9 @@ func TestPlaceholder(t *testing.T) {
 	}
 	// This is just a basic check. More tests will use testutil.RunE2ETest.
 	t.Logf("TestMain successfully compiled server binary to: %s", serverBinaryPath)
+
+	// Add minimal usage of currently unused imports to satisfy compiler
+	_ = http.Header{}
+	_ = testutil.TestRequest{}
+	_ = config.Config{}
 }
