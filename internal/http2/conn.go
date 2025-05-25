@@ -1485,3 +1485,51 @@ func (c *Connection) handlePingFrame(frame *PingFrame) error {
 	}
 	return nil
 }
+
+// sendGoAway constructs and sends a GOAWAY frame.
+// This method ensures that a GOAWAY frame is sent at most once,
+// and updates the connection state accordingly.
+func (c *Connection) sendGoAway(lastStreamID uint32, errorCode ErrorCode, debugData []byte) error {
+	c.streamsMu.Lock() // Protects goAwaySent
+	if c.goAwaySent {
+		c.streamsMu.Unlock()
+		c.log.Debug("GOAWAY frame already sent, not sending another.",
+			logger.LogFields{"last_stream_id": lastStreamID, "error_code": errorCode.String()})
+		return nil
+	}
+	c.goAwaySent = true
+	c.streamsMu.Unlock()
+
+	c.log.Info("Sending GOAWAY frame",
+		logger.LogFields{
+			"last_stream_id": lastStreamID,
+			"error_code":     errorCode.String(),
+			"debug_data_len": len(debugData),
+		})
+
+	goAwayFrame := &GoAwayFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameGoAway,
+			Flags:    0,
+			StreamID: 0,
+			// Length will be set by WriteFrame based on payload
+		},
+		LastStreamID:        lastStreamID,
+		ErrorCode:           errorCode,
+		AdditionalDebugData: debugData,
+	}
+
+	select {
+	case c.writerChan <- goAwayFrame:
+		c.log.Debug("GOAWAY frame queued for sending.", logger.LogFields{})
+		return nil
+	case <-c.shutdownChan:
+		c.log.Warn("Connection shutting down, cannot send GOAWAY frame.",
+			logger.LogFields{"last_stream_id": lastStreamID, "error_code": errorCode.String()})
+		return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send GOAWAY")
+	default:
+		c.log.Error("Failed to queue GOAWAY frame: writer channel full or blocked.",
+			logger.LogFields{"last_stream_id": lastStreamID, "error_code": errorCode.String()})
+		return NewConnectionError(ErrCodeInternalError, "failed to send GOAWAY: writer channel congested")
+	}
+}
