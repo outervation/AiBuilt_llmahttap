@@ -294,30 +294,50 @@ func CreateListenerAndGetFD(address string) (net.Listener, uintptr, error) {
 }
 
 // CreateReadinessPipe creates a pipe for readiness signaling.
-// The read end is for the parent to wait on, the write end for the child to close.
-// It ensures FD_CLOEXEC is set on the read end (parent's side) and cleared on
-// the write end (child's side to be inherited).
-func CreateReadinessPipe() (parentRead *os.File, childWrite *os.File, err error) {
+// The parent process receives the read-end of the pipe (*os.File) to wait on.
+// The child process receives the file descriptor number (uintptr) of the write-end.
+// FD_CLOEXEC is set on the parent's read-end and cleared on the child's write-end FD.
+// The child signals readiness by closing its write-end FD.
+// The *os.File for the write-end is closed by this function after its FD is extracted
+// and configured.
+func CreateReadinessPipe() (parentReadPipe *os.File, childWriteFD uintptr, err error) {
 	r, w, errPipe := os.Pipe()
 	if errPipe != nil {
-		return nil, nil, fmt.Errorf("failed to create readiness pipe: %w", errPipe)
+		return nil, 0, fmt.Errorf("failed to create readiness pipe: %w", errPipe)
 	}
 
-	// Parent's read end should be closed on exec if parent execs something else (unlikely here, but good practice)
-	if err := SetCloexec(r.Fd(), true); err != nil {
+	// Ensure cleanup on error.
+	// If any step fails, both pipe ends (r and w) should be closed.
+
+	// Parent's read end should be closed on exec (FD_CLOEXEC = true)
+	if errSetCloexecRead := SetCloexec(r.Fd(), true); errSetCloexecRead != nil {
 		r.Close()
 		w.Close()
-		return nil, nil, fmt.Errorf("failed to set FD_CLOEXEC on readiness pipe read end: %w", err)
+		return nil, 0, fmt.Errorf("failed to set FD_CLOEXEC on readiness pipe read end: %w", errSetCloexecRead)
 	}
 
-	// Child's write end must be inherited, so clear FD_CLOEXEC
-	if err := SetCloexec(w.Fd(), false); err != nil {
+	// Child's write end FD must be inherited (FD_CLOEXEC = false)
+	fdForChild := w.Fd()
+	if errSetCloexecWrite := SetCloexec(fdForChild, false); errSetCloexecWrite != nil {
+		r.Close() // Close parent's read end
+		w.Close() // Close child's write end *os.File
+		return nil, 0, fmt.Errorf("failed to clear FD_CLOEXEC on readiness pipe write end FD %d: %w", fdForChild, errSetCloexecWrite)
+	}
+
+	// The child process only needs the FD number.
+	// Close the *os.File wrapper for the write end in the parent,
+	// as the FD itself (fdForChild) will be passed.
+	if errCloseW := w.Close(); errCloseW != nil {
+		// If w.Close() fails, it's problematic. The FD might still be valid for the child,
+		// but resources in the parent might not be cleaned up correctly.
+		// Parent should still close its read end.
 		r.Close()
-		w.Close()
-		return nil, nil, fmt.Errorf("failed to clear FD_CLOEXEC on readiness pipe write end: %w", err)
+		// Since SetCloexec on fdForChild succeeded, the child could potentially use it.
+		// However, this state is unclean. Treat as an error.
+		return nil, 0, fmt.Errorf("failed to close child's write end os.File (FD %d) after SetCloexec: %w", fdForChild, errCloseW)
 	}
 
-	return r, w, nil
+	return r, fdForChild, nil
 }
 
 // GetInheritedReadinessPipeFD retrieves the readiness pipe FD from environment.
