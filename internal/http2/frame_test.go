@@ -1298,3 +1298,131 @@ func TestPriorityFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestRSTStreamFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.RSTStreamFrame
+	}{
+		{
+			name: "basic RST_STREAM frame",
+			frame: &http2.RSTStreamFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameRSTStream,
+					Flags:    0,
+					StreamID: 123, // RST_STREAM must be on a valid stream
+				},
+				ErrorCode: http2.ErrCodeCancel,
+			},
+		},
+		{
+			name: "RST_STREAM frame with different error code",
+			frame: &http2.RSTStreamFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameRSTStream,
+					Flags:    0,
+					StreamID: 456,
+				},
+				ErrorCode: http2.ErrCodeProtocolError,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "RSTStreamFrame")
+		})
+	}
+}
+
+func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 1}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "payload too short",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 3 // RST_STREAM payload must be 4 bytes
+				return h
+			}(),
+			payload:     make([]byte, 3),
+			expectedErr: "RST_STREAM frame payload must be 4 bytes, got 3",
+		},
+		{
+			name: "payload too long",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 5 // RST_STREAM payload must be 4 bytes
+				return h
+			}(),
+			payload:     make([]byte, 5),
+			expectedErr: "RST_STREAM frame payload must be 4 bytes, got 5",
+		},
+		{
+			name: "error reading payload (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 4
+				return h
+			}(),
+			payload:     make([]byte, 2), // Provide only 2 of 4 bytes
+			expectedErr: "reading RST_STREAM error code: unexpected EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.RSTStreamFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestRSTStreamFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.RSTStreamFrame{
+		FrameHeader: http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 1, Length: 4},
+		ErrorCode:   http2.ErrCodeStreamClosed,
+	}
+	expectedErr := fmt.Errorf("custom writer error for rst_stream")
+
+	tests := []struct {
+		name      string
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{name: "fail immediately", failAfter: 0, expectedN: 0},
+		{name: "fail after partial write", failAfter: 1, expectedN: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
