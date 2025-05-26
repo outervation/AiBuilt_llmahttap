@@ -532,6 +532,20 @@ func TestLoadConfig_Validation_RoutingConfig(t *testing.T) {
 			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static/", "match_type": "Prefix", "handler_type": "StaticFileServer", "handler_config": {"document_root": "` + absPath + `", "mime_types_map": {".txt": ""}}}]}}`,
 			expectError: "mime_types_map value for key '.txt' cannot be empty",
 		},
+		{
+			name: "sfs handler_config malformed json (unexpected end)",
+			// The handler_config itself is malformed JSON.
+			// route.HandlerConfig would be `{"document_root": "...", "unclosed_object": {`
+			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static/", "match_type": "Prefix", "handler_type": "StaticFileServer", "handler_config": {"document_root":"` + absPath + `", "unclosed_key": {}}]}}`,
+			expectError: "invalid character ']' after object key:value pair",
+		},
+		{
+			name: "sfs handler_config malformed json (trailing comma)",
+			// The handler_config itself is malformed JSON.
+			// route.HandlerConfig would be `{"document_root": "...", "some_field": "value",}`
+			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static/", "match_type": "Prefix", "handler_type": "StaticFileServer", "handler_config": {"document_root":"` + absPath + `", "a_field": "a_value",}}]}}`,
+			expectError: "invalid character '}' looking for beginning of object key string",
+		},
 	}
 
 	for _, tc := range tests {
