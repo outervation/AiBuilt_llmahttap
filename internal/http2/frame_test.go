@@ -2619,3 +2619,58 @@ func (m *mockMisreportingFrame) WritePayload(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 func (m *mockMisreportingFrame) PayloadLen() uint32 { return m.reportedPayloadLen }
+
+func TestFrameType_String(t *testing.T) {
+	tests := []struct {
+		name     string
+		ft       http2.FrameType
+		expected string
+	}{
+		{name: "DATA", ft: http2.FrameData, expected: "DATA"},
+		{name: "HEADERS", ft: http2.FrameHeaders, expected: "HEADERS"},
+		{name: "PRIORITY", ft: http2.FramePriority, expected: "PRIORITY"},
+		{name: "RST_STREAM", ft: http2.FrameRSTStream, expected: "RST_STREAM"},
+		{name: "SETTINGS", ft: http2.FrameSettings, expected: "SETTINGS"},
+		{name: "PUSH_PROMISE", ft: http2.FramePushPromise, expected: "PUSH_PROMISE"},
+		{name: "PING", ft: http2.FramePing, expected: "PING"},
+		{name: "GOAWAY", ft: http2.FrameGoAway, expected: "GOAWAY"},
+		{name: "WINDOW_UPDATE", ft: http2.FrameWindowUpdate, expected: "WINDOW_UPDATE"},
+		{name: "CONTINUATION", ft: http2.FrameContinuation, expected: "CONTINUATION"},
+		{name: "Unknown FrameType (10)", ft: http2.FrameType(10), expected: "UNKNOWN_FRAME_TYPE_10"},
+		{name: "Unknown FrameType (255)", ft: http2.FrameType(255), expected: "UNKNOWN_FRAME_TYPE_255"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.ft.String(); got != tt.expected {
+				t.Errorf("FrameType.String() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSettingID_String(t *testing.T) {
+	tests := []struct {
+		name     string
+		sid      http2.SettingID
+		expected string
+	}{
+		{name: "SETTINGS_HEADER_TABLE_SIZE", sid: http2.SettingHeaderTableSize, expected: "SETTINGS_HEADER_TABLE_SIZE"},
+		{name: "SETTINGS_ENABLE_PUSH", sid: http2.SettingEnablePush, expected: "SETTINGS_ENABLE_PUSH"},
+		{name: "SETTINGS_MAX_CONCURRENT_STREAMS", sid: http2.SettingMaxConcurrentStreams, expected: "SETTINGS_MAX_CONCURRENT_STREAMS"},
+		{name: "SETTINGS_INITIAL_WINDOW_SIZE", sid: http2.SettingInitialWindowSize, expected: "SETTINGS_INITIAL_WINDOW_SIZE"},
+		{name: "SETTINGS_MAX_FRAME_SIZE", sid: http2.SettingMaxFrameSize, expected: "SETTINGS_MAX_FRAME_SIZE"},
+		{name: "SETTINGS_MAX_HEADER_LIST_SIZE", sid: http2.SettingMaxHeaderListSize, expected: "SETTINGS_MAX_HEADER_LIST_SIZE"},
+		{name: "Unknown SettingID (0)", sid: http2.SettingID(0), expected: "UNKNOWN_SETTING_ID_0"},
+		{name: "Unknown SettingID (7)", sid: http2.SettingID(7), expected: "UNKNOWN_SETTING_ID_7"},
+		{name: "Unknown SettingID (65535)", sid: http2.SettingID(65535), expected: "UNKNOWN_SETTING_ID_65535"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.sid.String(); got != tt.expected {
+				t.Errorf("SettingID.String() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
