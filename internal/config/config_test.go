@@ -939,3 +939,78 @@ func TestLoadConfig_OriginalFilePath(t *testing.T) {
 		t.Errorf("Expected OriginalFilePath() on nil config to be \"\", got %q", nilCfg.OriginalFilePath())
 	}
 }
+
+func TestDuration_DirectUnmarshalMethods(t *testing.T) {
+	t.Run("UnmarshalText", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			input     string
+			expectErr string
+			expectDur time.Duration
+		}{
+			{"valid", "30s", "", 30 * time.Second},
+			{"valid with minutes", "2m", "", 2 * time.Minute},
+			{"invalid format", "10", "invalid duration string \"10\": time: missing unit in duration", 0},
+			{"invalid chars", "abc", "invalid duration string \"abc\": time: invalid duration", 0},
+			{"non-positive zero", "0s", "duration must be positive, got \"0s\"", 0},
+			{"non-positive negative", "-5m", "duration must be positive, got \"-5m\"", 0},
+			{"empty string", "", "duration string cannot be empty", 0},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				var d Duration
+				err := d.UnmarshalText([]byte(tc.input))
+
+				if tc.expectErr != "" {
+					checkErrorContains(t, err, tc.expectErr)
+				} else {
+					if err != nil {
+						t.Fatalf("UnmarshalText(%q) unexpected error: %v", tc.input, err)
+					}
+					if d.Value() != tc.expectDur {
+						t.Errorf("UnmarshalText(%q) expected duration %v, got %v", tc.input, tc.expectDur, d.Value())
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("UnmarshalJSON", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			inputJSON string // Raw JSON bytes
+			expectErr string
+			expectDur time.Duration
+		}{
+			{"valid string", `"45s"`, "", 45 * time.Second},
+			{"valid string with hours", `"1h"`, "", 1 * time.Hour},
+			{"invalid format in string", `"20"`, "invalid duration string \"20\": time: missing unit in duration", 0},
+			{"invalid chars in string", `"xyz"`, "invalid duration string \"xyz\": time: invalid duration", 0},
+			{"non-positive zero in string", `"0s"`, "duration must be positive, got \"0s\"", 0},
+			{"non-positive negative in string", `"-30m"`, "duration must be positive, got \"-30m\"", 0},
+			{"empty string literal", `""`, "duration string cannot be empty", 0},
+			{"incorrect type (number)", `123`, "duration should be a string, got 123", 0},
+			{"incorrect type (boolean)", `true`, "duration should be a string, got true", 0},
+			{"incorrect type (null)", `null`, "duration string cannot be empty", 0}, // json.Unmarshal of "null" into string results in empty string, then UnmarshalText fails.
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				var d Duration
+				err := d.UnmarshalJSON([]byte(tc.inputJSON))
+
+				if tc.expectErr != "" {
+					checkErrorContains(t, err, tc.expectErr)
+				} else {
+					if err != nil {
+						t.Fatalf("UnmarshalJSON(%s) unexpected error: %v", tc.inputJSON, err)
+					}
+					if d.Value() != tc.expectDur {
+						t.Errorf("UnmarshalJSON(%s) expected duration %v, got %v", tc.inputJSON, tc.expectDur, d.Value())
+					}
+				}
+			})
+		}
+	})
+}
