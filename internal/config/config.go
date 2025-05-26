@@ -535,6 +535,14 @@ func validateConfig(cfg *Config) error {
 						}
 					}
 				}
+
+				if sfsCfg.IndexFiles != nil { // sfsCfg is populated from Unmarshal earlier in validateConfig
+					for idx, fName := range sfsCfg.IndexFiles {
+						if fName == "" {
+							return fmt.Errorf("routing.routes[%d].handler_config.index_files[%d] cannot be an empty string (path_pattern '%s')", i, idx, route.PathPattern)
+						}
+					}
+				}
 			}
 		}
 	}
