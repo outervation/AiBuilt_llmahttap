@@ -801,6 +801,95 @@ func TestHpackAdapter_Encode_ReturnsCopy(t *testing.T) {
 	}
 }
 
+// TestHpackAdapter_EncodeMethod_Legacy tests the `Encode` method which returns []byte
+// and does not propagate errors from internal hpack.Encoder.WriteField.
+// It primarily ensures basic encoding and decodability.
+func TestHpackAdapter_EncodeMethod_Legacy(t *testing.T) {
+	testCases := []struct {
+		name        string
+		headersIn   []hpack.HeaderField
+		setupNilEnc bool // if true, set adapter.encoder to nil
+		expectNil   bool // if true, expect nil output from Encode
+	}{
+		{
+			name: "Simple headers",
+			headersIn: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":path", Value: "/test.html"},
+				{Name: "x-custom", Value: "legacy-test"},
+			},
+			setupNilEnc: false,
+			expectNil:   false,
+		},
+		{
+			name:        "Empty headers list",
+			headersIn:   []hpack.HeaderField{},
+			setupNilEnc: false,
+			expectNil:   false, // Encode([]) should produce empty []byte, not nil
+		},
+		{
+			name: "Nil encoder",
+			headersIn: []hpack.HeaderField{
+				{Name: "a", Value: "b"},
+			},
+			setupNilEnc: true,
+			expectNil:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t)
+			if tc.setupNilEnc {
+				adapter.encoder = nil
+			}
+
+			encodedBytes := adapter.Encode(tc.headersIn)
+
+			if tc.expectNil {
+				if encodedBytes != nil {
+					t.Errorf("Encode() expected nil output, but got %x", encodedBytes)
+				}
+				return // No further checks if nil was expected
+			}
+
+			// If not expecting nil, but got nil (and not setting up nil encoder)
+			if encodedBytes == nil && !tc.setupNilEnc {
+				t.Fatal("Encode() returned nil unexpectedly for non-empty adapter")
+			}
+
+			// For empty input headers, Encode should return empty []byte, not nil.
+			if len(tc.headersIn) == 0 {
+				if encodedBytes == nil {
+					t.Errorf("Encode() with empty headers returned nil, want empty []byte")
+				} else if len(encodedBytes) != 0 {
+					t.Errorf("Encode() with empty headers returned %x, want empty []byte", encodedBytes)
+				}
+			} else if !tc.setupNilEnc && len(encodedBytes) == 0 {
+				// For non-empty input headers and valid encoder, expect non-empty output.
+				t.Errorf("Encode() returned empty byte slice for non-empty headers")
+			}
+
+			// Try to decode the bytes if encoding was expected to succeed.
+			if !tc.setupNilEnc {
+				adapter.ResetDecoderState() // Reset for decoding
+				err := adapter.DecodeFragment(encodedBytes)
+				if err != nil {
+					t.Fatalf("DecodeFragment failed for legacy Encode output: %v. Encoded bytes: %x", err, encodedBytes)
+				}
+				decodedHeaders, err := adapter.FinishDecoding()
+				if err != nil {
+					t.Fatalf("FinishDecoding failed for legacy Encode output: %v. Encoded bytes: %x", err, encodedBytes)
+				}
+
+				if !compareHeaderFields(tc.headersIn, decodedHeaders) {
+					t.Errorf("Decoded headers do not match original from legacy Encode.\nOriginal: %+v\nDecoded:  %+v", tc.headersIn, decodedHeaders)
+				}
+			}
+		})
+	}
+}
+
 // TestHpackAdapter_DecoderStateManagement tests ResetDecoderState and GetAndClearDecodedFields.
 func TestHpackAdapter_DecoderStateManagement(t *testing.T) {
 	t.Run("ResetDecoderState", func(t *testing.T) {
