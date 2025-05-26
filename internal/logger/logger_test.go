@@ -1013,39 +1013,33 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 // getExpectedLineNumberForErrorLog is a helper to estimate line number for source.
 // THIS IS FRAGILE and only for basic validation.
 // It assumes the call to el.Error/Warn/Info/Debug is on a specific line within the test.
+
 func getExpectedLineNumberForErrorLog(level config.LogLevel) int {
-	// These numbers need to be manually updated if the TestErrorLogFormatAndContent test changes structure.
-	// This points to the line calling el.Error(), el.Warn() etc.
-	// For "Error message, Error level, logged with auto source"
-	// The call is el.Error(tt.msg, tt.context)
-	// Current line number where el.Error(tt.msg, tt.context) for the specific test case
-	// ("Error message, Error level, logged with auto source") is called.
-	// This is an estimate and highly fragile.
-	// Line: el.Error(tt.msg, tt.context)
-	// Let's find it in the code above.
-	// Switch case:
-	// case config.LogLevelError:
-	// el.Error(tt.msg, tt.context) // <--- This line
-	// This is inside the loop. For the test case "Error message, Error level, logged with auto source",
-	// this line is executed.
-	// Looking at the current code, it's around line 487. (Adjusted for potential insertion point changes)
-	// Based on the structure of TestErrorLogFormatAndContent function being inserted:
-	// The call `el.Error(tt.msg, tt.context)` is within the switch statement inside the test loop.
-	// Counting lines from start of TestErrorLogFormatAndContent...
-	// Let's assume TestAccessLogFormatAndContent is roughly 130 lines.
-	// TestErrorLogFormatAndContent starts after that.
-	// The specific el.Error line is ~85 lines into TestErrorLogFormatAndContent.
-	// If TestAccessLogEnabledFlag ends at 394, TestAccessLogFormatAndContent starts at 395.
-	// So, 395 + 130 (approx len of TestAccessLogFormatAndContent) + 85 (into TestErrorLogFormatAndContent)
-	// = 395 + 130 = 525 (start of TestErrorLogFormatAndContent)
-	// 525 + 85 = 610. This is a very rough estimate.
-	// A better way is to count from the start of the `TestErrorLogFormatAndContent` function itself.
-	// If the `el.Error` call is on line X within its own function, and `TestErrorLogFormatAndContent` starts on line Y,
-	// then the absolute line number is Y+X-1.
-	// The line `el.Error(tt.msg, tt.context)` is the one in the `case config.LogLevelError:` block.
-	// It's approximately 87 lines from `func TestErrorLogFormatAndContent(t *testing.T) {`
-	// This is extremely fragile and will be updated by CI if it fails.
-	return 87 // Relative to start of TestErrorLogFormatAndContent; will be updated if test fails here.
+	// This helper returns the expected line number of the el.XXX call
+	// within TestErrorLogFormatAndContent for the specific test case:
+	// "Error message, Error level, logged with auto source"
+	// This test case calls el.Error(...).
+	// The line numbers are relative to the start of the file and can change if the file is edited.
+	// Current call sites in TestErrorLogFormatAndContent:
+	// el.Debug(...) -> line 873 approx.
+	// el.Info(...)  -> line 875 approx.
+	// el.Warn(...)  -> line 877 approx.
+	// el.Error(...) -> line 879 approx.
+
+	// The test "Error message, Error level, logged with auto source" specifically uses config.LogLevelError.
+	if level == config.LogLevelError {
+		return 879 // This is the line number of `el.Error(tt.msg, tt.context)` for that test case.
+	}
+
+	// Fallback for other levels if their auto-source line numbers were to be checked precisely.
+	// For now, only the LogLevelError case for "Error message, Error level, logged with auto source" uses this.
+	// If this helper is used for other levels in similar auto-source checks, their line numbers
+	// would need to be returned here.
+	// Defaulting to the Error line as it's the primary one checked.
+	// A panic or t.Fatalf might be better if an unexpected level is passed and needs precise checking.
+	t := &testing.T{} // Temporary testing.T for Fatalf if needed, though not ideal in a helper like this.
+	t.Logf("Warning: getExpectedLineNumberForErrorLog called with level %s, but precise line number check is primarily set up for LogLevelError.", level)
+	return 879 // Default or placeholder
 }
 
 func TestGetRealClientIP(t *testing.T) {
