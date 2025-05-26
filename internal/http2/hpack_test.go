@@ -47,26 +47,28 @@ func newTestHpackAdapter(t *testing.T) *HpackAdapter {
 }
 
 // TestNewHpackAdapter checks the initialization of HpackAdapter.
-func TestNewHpackAdapter(t *testing.T) {
+
+// TestHpackAdapter_Initialization checks the correct initialization of HpackAdapter.
+func TestHpackAdapter_Initialization(t *testing.T) {
 	adapter := NewHpackAdapter(defaultMaxTableSize)
 	if adapter == nil {
 		t.Fatal("NewHpackAdapter returned nil")
 	}
 	if adapter.encoder == nil {
-		t.Error("NewHpackAdapter did not initialize encoder")
+		t.Error("HpackAdapter.encoder not initialized")
 	}
 	if adapter.decoder == nil {
-		t.Error("NewHpackAdapter did not initialize decoder")
+		t.Error("HpackAdapter.decoder not initialized")
 	}
 	if adapter.encodeBuf == nil {
-		t.Error("NewHpackAdapter did not initialize encodeBuf")
+		t.Error("HpackAdapter.encodeBuf not initialized")
 	}
 	if adapter.maxTableSize != defaultMaxTableSize {
-		t.Errorf("NewHpackAdapter maxTableSize got %d, want %d", adapter.maxTableSize, defaultMaxTableSize)
+		t.Errorf("HpackAdapter.maxTableSize got %d, want %d", adapter.maxTableSize, defaultMaxTableSize)
 	}
 	// decodedFields should be nil or empty initially
 	if adapter.decodedFields != nil && len(adapter.decodedFields) != 0 {
-		t.Errorf("NewHpackAdapter decodedFields not initially empty: got %v", adapter.decodedFields)
+		t.Errorf("HpackAdapter.decodedFields not initially empty: got %v", adapter.decodedFields)
 	}
 }
 
