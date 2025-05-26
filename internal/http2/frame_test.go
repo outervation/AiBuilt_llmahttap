@@ -158,10 +158,6 @@ var validFramesTestCases = []struct {
 			HeaderBlockFragment: []byte("continued headers"),
 		},
 	},
-	// UnknownFrame is tested in TestReadFrame_UnknownFrameType separately for ReadFrame,
-	// For WriteFrame, we primarily test known frame types.
-	// Adding an UnknownFrame here would require WriteFrame to handle it gracefully,
-	// which it does by calling its PayloadLen and WritePayload.
 	{
 		name: "UnknownFrame from perspective of WriteFrame",
 		originalFrame: &http2.UnknownFrame{
