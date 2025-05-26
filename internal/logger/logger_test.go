@@ -2221,3 +2221,123 @@ func TestLogger_ReopenLogFiles_OpenFileFailure(t *testing.T) {
 		t.Errorf("CloseLogFiles after failed reopen errored: %v", err)
 	}
 }
+
+// TestLogger_ReopenLogFiles_OldFileCloseFailure tests the scenario where closing
+// an old log file descriptor fails during ReopenLogFiles, but os.OpenFile for
+// the new file subsequently succeeds.
+func TestLogger_ReopenLogFiles_OldFileCloseFailure(t *testing.T) {
+	// --- Setup: Capture standard log output (for log.Printf messages from logger.go) ---
+	var stdLogBuf bytes.Buffer
+	originalStdLogOutput := log.Writer()
+	log.SetOutput(&stdLogBuf)
+	defer func() {
+		log.SetOutput(originalStdLogOutput)
+	}()
+
+	// --- Setup: Create temporary files for logs ---
+	accessLogPath, accessCleanup := createTempLogFile(t, "access-oldclosefail-*.log")
+	defer accessCleanup()
+	errorLogPath, errorCleanup := createTempLogFile(t, "error-oldclosefail-*.log")
+	defer errorCleanup()
+
+	cfg := &config.LoggingConfig{
+		LogLevel: config.LogLevelDebug,
+		AccessLog: &config.AccessLogConfig{
+			Enabled:      boolPtr(true),
+			Target:       stringPtr(accessLogPath),
+			Format:       "json",
+			RealIPHeader: stringPtr("X-Forwarded-For"),
+		},
+		ErrorLog: &config.ErrorLogConfig{
+			Target: stringPtr(errorLogPath),
+		},
+	}
+
+	logger, err := NewLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewLogger() failed: %v", err)
+	}
+
+	// --- Log initial entries ---
+	initialReq := newMockHTTPRequest(t, "GET", "/initial-ac", accessLogPath, nil) // Path doesn't matter
+	logger.Access(initialReq, 1, http.StatusOK, 50, 5*time.Millisecond)
+	logger.Error("Initial error log", LogFields{"id": 1})
+
+	// --- Critical step: Manually close the access log's file descriptor ---
+	// This will cause the f.Close() call inside AccessLogger.Reopen() to fail.
+	accessFile, okAccess := logger.accessLog.output.(*os.File)
+	if !okAccess || accessFile == os.Stdout || accessFile == os.Stderr {
+		t.Fatalf("Access log output was not a distinct *os.File as expected.")
+	}
+	if err := accessFile.Close(); err != nil {
+		t.Fatalf("Failed to manually close access log file before ReopenLogFiles: %v", err)
+	}
+	// Note: Error log's file descriptor remains open and valid.
+
+	// --- Call ReopenLogFiles ---
+	reopenErr := logger.ReopenLogFiles()
+
+	// --- Assertions ---
+	if reopenErr != nil {
+		// ReopenLogFiles should return nil if the underlying Reopen methods (AccessLogger.Reopen, ErrorLogger.Reopen)
+		// return nil. Those methods return nil if os.OpenFile succeeds, even if the prior internal f.Close() failed.
+		t.Errorf("Expected ReopenLogFiles to return nil (overall success), but got: %v", reopenErr)
+	}
+
+	stdLogOutput := stdLogBuf.String()
+	expectedAccessCloseErrorMsg := fmt.Sprintf("Error closing access log file %s during reopen", accessLogPath)
+	// The specific error from a double close is OS-dependent, "file already closed" is common.
+	if !strings.Contains(stdLogOutput, expectedAccessCloseErrorMsg) {
+		t.Errorf("Expected standard log output to contain diagnostic about failing to close access log %q. Got:\n%s", accessLogPath, stdLogOutput)
+	}
+	// Ensure no "Error closing" message for the error log path
+	unexpectedErrorCloseErrorMsg := fmt.Sprintf("Error closing error log file %s during reopen", errorLogPath)
+	if strings.Contains(stdLogOutput, unexpectedErrorCloseErrorMsg) {
+		t.Errorf("Standard log output unexpectedly contained a close error for the error log %q. Got:\n%s", errorLogPath, stdLogOutput)
+	}
+
+	// --- Log new entries and verify they are written ---
+	// Close logger's handles to flush buffers before reading files.
+	// Need to log *before* this final close.
+	secondReq := newMockHTTPRequest(t, "GET", "/secondary-ac", accessLogPath, nil)
+	logger.Access(secondReq, 2, http.StatusAccepted, 60, 6*time.Millisecond)
+	logger.Error("Secondary error log", LogFields{"id": 2})
+
+	if err := logger.CloseLogFiles(); err != nil {
+		t.Fatalf("CloseLogFiles() after reopen testing failed: %v", err)
+	}
+
+	// Verify access log content (should have initial and secondary logs)
+	accessContent, err := ioutil.ReadFile(accessLogPath)
+	if err != nil {
+		t.Fatalf("Failed to read access log %s after reopen: %v", accessLogPath, err)
+	}
+	accessLines := strings.Split(strings.TrimSpace(string(accessContent)), "\n")
+	if len(accessLines) != 2 { // One initial, one secondary
+		t.Errorf("Expected 2 lines in access log after reopen, got %d. Content:\n%s", len(accessLines), string(accessContent))
+	} else {
+		var entry AccessLogEntry
+		if err := json.Unmarshal([]byte(accessLines[1]), &entry); err != nil { // Check second entry
+			t.Errorf("Failed to parse second access log entry: %v", err)
+		} else if entry.H2StreamID != 2 {
+			t.Errorf("Expected H2StreamID 2 in second access log entry, got %d", entry.H2StreamID)
+		}
+	}
+
+	// Verify error log content (should have initial and secondary logs)
+	errorContent, err := ioutil.ReadFile(errorLogPath)
+	if err != nil {
+		t.Fatalf("Failed to read error log %s after reopen: %v", errorLogPath, err)
+	}
+	errorLines := strings.Split(strings.TrimSpace(string(errorContent)), "\n")
+	if len(errorLines) != 2 { // One initial, one secondary
+		t.Errorf("Expected 2 lines in error log after reopen, got %d. Content:\n%s", len(errorLines), string(errorContent))
+	} else {
+		var entry ErrorLogEntry
+		if err := json.Unmarshal([]byte(errorLines[1]), &entry); err != nil { // Check second entry
+			t.Errorf("Failed to parse second error log entry: %v", err)
+		} else if entry.Details == nil || entry.Details["id"] != float64(2) { // JSON numbers are float64
+			t.Errorf("Expected 'id' 2 in second error log entry details, got %v", entry.Details)
+		}
+	}
+}
