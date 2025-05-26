@@ -1496,6 +1496,24 @@ func TestSettingsFrame(t *testing.T) {
 				Settings: []http2.Setting{},
 			},
 		},
+		{
+			name: "settings frame with mixed value settings",
+			frame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameSettings,
+					Flags:    0,
+					StreamID: 0,
+				},
+				Settings: []http2.Setting{
+					{ID: http2.SettingHeaderTableSize, Value: 4096},
+					{ID: http2.SettingEnablePush, Value: 0},                               // Disabled
+					{ID: http2.SettingMaxConcurrentStreams, Value: 250},                   // A custom high value
+					{ID: http2.SettingInitialWindowSize, Value: 131072},                   // 2 * DefaultInitialWindowSize
+					{ID: http2.SettingMaxFrameSize, Value: http2.DefaultMaxFrameSize * 4}, // e.g., 65536
+					{ID: http2.SettingMaxHeaderListSize, Value: 32768},                    // A custom limit
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
