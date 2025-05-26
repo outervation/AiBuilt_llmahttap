@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+
+	"sync"
 	// "path/filepath" // Removed as it was unused
 	"strings"
 	"testing"
@@ -1748,5 +1750,105 @@ func TestAccessLoggingToDifferentTargets(t *testing.T) {
 		}
 		// Direct verification of stderr content is not done in unit tests.
 		t.Log("Access log to stderr test completed. Manual output verification if running with -v.")
+	})
+}
+
+func TestAtomicLogWrites(t *testing.T) {
+	numGoroutines := 10
+	logsPerGoroutine := 100
+	totalLogs := numGoroutines * logsPerGoroutine
+
+	t.Run("AccessLoggerAtomicWrite", func(t *testing.T) {
+		var buf bytes.Buffer
+		enabled := true
+		accessLogCfg := &config.AccessLogConfig{
+			Enabled: &enabled,
+			Format:  "json",
+			Target:  stringPtr("buffer"), // Use buffer for easy capture
+		}
+
+		al, err := newTestAccessLogger(accessLogCfg, &buf)
+		if err != nil {
+			t.Fatalf("newTestAccessLogger failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(numGoroutines)
+
+		for i := 0; i < numGoroutines; i++ {
+			go func(goroutineID int) {
+				defer wg.Done()
+				for j := 0; j < logsPerGoroutine; j++ {
+					req := newMockHTTPRequest(t, "GET", fmt.Sprintf("/path/%d/%d", goroutineID, j), "1.2.3.4:1234", nil)
+					req.Proto = "HTTP/2.0"
+					// Vary stream ID to make entries somewhat unique, though content doesn't strictly need to be unique for this test.
+					// The key is that each JSON line is valid.
+					streamID := uint32(goroutineID*logsPerGoroutine + j)
+					al.LogAccess(req, streamID, http.StatusOK, int64(j*10), time.Duration(j)*time.Millisecond)
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		logLines := readLogBuffer(&buf)
+		if len(logLines) != totalLogs {
+			t.Errorf("Expected %d total log lines, got %d", totalLogs, len(logLines))
+		}
+
+		for i, line := range logLines {
+			var entry AccessLogEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Errorf("Failed to unmarshal access log line %d: %v. Line content: %s", i, err, line)
+			}
+		}
+	})
+
+	t.Run("ErrorLoggerAtomicWrite", func(t *testing.T) {
+		var buf bytes.Buffer
+		errorLogCfg := &config.ErrorLogConfig{
+			Target: stringPtr("buffer"),
+		}
+		el := newTestErrorLogger(errorLogCfg, config.LogLevelDebug, &buf)
+
+		var wg sync.WaitGroup
+		wg.Add(numGoroutines)
+
+		for i := 0; i < numGoroutines; i++ {
+			go func(goroutineID int) {
+				defer wg.Done()
+				for j := 0; j < logsPerGoroutine; j++ {
+					// Vary message or context to make entries somewhat unique.
+					// Using LogError directly to showcase context usage for details.
+					el.LogError(config.LogLevelInfo,
+						fmt.Sprintf("Error log from goroutine %d, message %d", goroutineID, j),
+						LogFields{
+							"goroutine_id": goroutineID,
+							"message_id":   j,
+							"h2_stream_id": uint32(goroutineID*logsPerGoroutine + j),
+						})
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		logLines := readLogBuffer(&buf)
+		if len(logLines) != totalLogs {
+			t.Errorf("Expected %d total log lines, got %d", totalLogs, len(logLines))
+		}
+
+		for i, line := range logLines {
+			var entry ErrorLogEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Errorf("Failed to unmarshal error log line %d: %v. Line content: %s", i, err, line)
+			}
+			// Optional: check some details from the context if needed, but main goal is unmarshal success.
+			if entry.Details == nil {
+				t.Errorf("Error log line %d details map is nil. Line: %s", i, line)
+				continue
+			}
+			if _, ok := entry.Details["goroutine_id"]; !ok {
+				t.Errorf("Error log line %d missing 'goroutine_id' in details. Line: %s", i, line)
+			}
+		}
 	})
 }
