@@ -1426,3 +1426,226 @@ func TestRSTStreamFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestSettingsFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.SettingsFrame
+	}{
+		{
+			name: "basic settings frame with one setting",
+			frame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameSettings,
+					Flags:    0,
+					StreamID: 0, // SETTINGS frames must be on stream 0
+				},
+				Settings: []http2.Setting{
+					{ID: http2.SettingMaxConcurrentStreams, Value: 100},
+				},
+			},
+		},
+		{
+			name: "settings frame with multiple settings",
+			frame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameSettings,
+					Flags:    0,
+					StreamID: 0,
+				},
+				Settings: []http2.Setting{
+					{ID: http2.SettingInitialWindowSize, Value: 65535},
+					{ID: http2.SettingMaxFrameSize, Value: 16384},
+					{ID: http2.SettingEnablePush, Value: 0},
+				},
+			},
+		},
+		{
+			name: "settings frame with ACK flag (empty payload)",
+			frame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameSettings,
+					Flags:    http2.FlagSettingsAck,
+					StreamID: 0,
+				},
+				Settings: []http2.Setting{}, // ACK frame must have no settings
+			},
+		},
+		{
+			name: "settings frame with no settings (not ACK)",
+			frame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameSettings,
+					Flags:    0,
+					StreamID: 0,
+				},
+				Settings: []http2.Setting{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "SettingsFrame")
+		})
+	}
+}
+
+func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0}
+	validSettingBytes := []byte{0x00, byte(http2.SettingInitialWindowSize), 0x00, 0x00, 0xFF, 0xFF} // ID=INITIAL_WINDOW_SIZE, Val=65535
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "ACK flag set but payload not empty",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagSettingsAck
+				h.Length = 6 // ACK must have 0 length
+				return h
+			}(),
+			payload:     validSettingBytes,
+			expectedErr: "SETTINGS ACK frame must have a payload length of 0, got 6",
+		},
+		{
+			name: "payload length not multiple of setting entry size",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 5 // Setting entry is 6 bytes
+				return h
+			}(),
+			payload:     make([]byte, 5),
+			expectedErr: "SETTINGS frame payload length 5 is not a multiple of 6",
+		},
+		{
+			name: "error reading payload (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 12 // Expect 2 settings
+				return h
+			}(),
+			payload:     append(validSettingBytes, make([]byte, 3)...), // Provide 1 full setting + 3 bytes of next
+			expectedErr: "reading SETTINGS payload: unexpected EOF",
+		},
+		{
+			name: "ACK flag, payload length is 0, valid", // Non-error case, implicitly tested by main test loop
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagSettingsAck
+				h.Length = 0
+				return h
+			}(),
+			payload:     []byte{},
+			expectedErr: "", // No error
+		},
+		{
+			name: "No ACK flag, payload length is 0, valid", // Non-error case
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = 0
+				h.Length = 0
+				return h
+			}(),
+			payload:     []byte{},
+			expectedErr: "", // No error
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.SettingsFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if tt.expectedErr == "" { // For cases that should not error
+				if err != nil {
+					t.Errorf("ParsePayload expected no error, got %v", err)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestSettingsFrame_WritePayload_Error(t *testing.T) {
+	frameWithSettings := &http2.SettingsFrame{
+		FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0, Length: 12},
+		Settings: []http2.Setting{
+			{ID: http2.SettingMaxHeaderListSize, Value: 1024},
+			{ID: http2.SettingHeaderTableSize, Value: 4096},
+		},
+	}
+	frameAck := &http2.SettingsFrame{
+		FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0, Flags: http2.FlagSettingsAck, Length: 0},
+		Settings:    nil,
+	}
+	expectedErr := fmt.Errorf("custom writer error for settings")
+
+	tests := []struct {
+		name      string
+		frame     *http2.SettingsFrame
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{
+			name:      "fail writing first setting",
+			frame:     frameWithSettings,
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name:      "fail writing part of first setting",
+			frame:     frameWithSettings,
+			failAfter: 3, expectedN: 3,
+		},
+		{
+			name:      "fail writing second setting",
+			frame:     frameWithSettings,
+			failAfter: 6, expectedN: 6, // Wrote first setting (6 bytes)
+		},
+		{
+			name:      "ACK frame (no payload), should not call writer for payload",
+			frame:     frameAck,
+			failAfter: 0, expectedN: 0, // WritePayload returns 0 for ACK
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := tt.frame.WritePayload(fw)
+
+			if tt.frame.Flags&http2.FlagSettingsAck != 0 { // ACK frame
+				if err != nil {
+					t.Errorf("WritePayload for ACK frame expected no error, got %v", err)
+				}
+				if n != 0 {
+					t.Errorf("WritePayload for ACK frame expected 0 bytes written, got %d", n)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
