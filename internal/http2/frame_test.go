@@ -118,21 +118,39 @@ func testFrameType(t *testing.T, originalFrame http2.Frame, frameName string) {
 // It doesn't really copy, more like returns the same frame.
 // This helper is more about illustrating the intent to compare payload structures.
 // For actual comparison, individual field checks or struct copies without uncomparable fields are better.
-func deepCopyFramePayload(f http2.Frame) interface{} {
-	// This is a bit of a hack. A proper way would be to use reflection to copy fields
-	// or have specific copy methods for each frame type.
-	// For now, we just return the frame itself, relying on the earlier specific checks.
-	// The idea is to have a representation that DeepEqual can use without tripping on FrameHeader.Raw.
-	// A better approach would be to define specific comparison functions for each frame type.
 
+func deepCopyFramePayload(f http2.Frame) interface{} {
+	// This function creates a copy of the frame's payload-specific parts
+	// by value, zeroing out the FrameHeader. This allows reflect.DeepEqual
+	// to compare the meaningful payload content without being affected by
+	// the unexported 'raw' field in FrameHeader or by pointer equality.
 	switch ft := f.(type) {
 	case *http2.DataFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{} // Zero out header for DeepEqual on payload
+		// Ensure slices are copied if they are not already by value when ft is dereferenced.
+		// For []byte, assignment creates a new slice header but points to the same underlying array.
+		// We need a true copy for independent comparison.
+		if ft.Data != nil {
+			cp.Data = make([]byte, len(ft.Data))
+			copy(cp.Data, ft.Data)
+		}
+		if ft.Padding != nil {
+			cp.Padding = make([]byte, len(ft.Padding))
+			copy(cp.Padding, ft.Padding)
+		}
 		return cp
 	case *http2.HeadersFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.HeaderBlockFragment != nil {
+			cp.HeaderBlockFragment = make([]byte, len(ft.HeaderBlockFragment))
+			copy(cp.HeaderBlockFragment, ft.HeaderBlockFragment)
+		}
+		if ft.Padding != nil {
+			cp.Padding = make([]byte, len(ft.Padding))
+			copy(cp.Padding, ft.Padding)
+		}
 		return cp
 	case *http2.PriorityFrame:
 		cp := *ft
@@ -145,18 +163,35 @@ func deepCopyFramePayload(f http2.Frame) interface{} {
 	case *http2.SettingsFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.Settings != nil {
+			cp.Settings = make([]http2.Setting, len(ft.Settings))
+			copy(cp.Settings, ft.Settings)
+		}
 		return cp
 	case *http2.PushPromiseFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.HeaderBlockFragment != nil {
+			cp.HeaderBlockFragment = make([]byte, len(ft.HeaderBlockFragment))
+			copy(cp.HeaderBlockFragment, ft.HeaderBlockFragment)
+		}
+		if ft.Padding != nil {
+			cp.Padding = make([]byte, len(ft.Padding))
+			copy(cp.Padding, ft.Padding)
+		}
 		return cp
 	case *http2.PingFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		// OpaqueData is an array, so simple assignment copies it.
 		return cp
 	case *http2.GoAwayFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.AdditionalDebugData != nil {
+			cp.AdditionalDebugData = make([]byte, len(ft.AdditionalDebugData))
+			copy(cp.AdditionalDebugData, ft.AdditionalDebugData)
+		}
 		return cp
 	case *http2.WindowUpdateFrame:
 		cp := *ft
@@ -165,10 +200,18 @@ func deepCopyFramePayload(f http2.Frame) interface{} {
 	case *http2.ContinuationFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.HeaderBlockFragment != nil {
+			cp.HeaderBlockFragment = make([]byte, len(ft.HeaderBlockFragment))
+			copy(cp.HeaderBlockFragment, ft.HeaderBlockFragment)
+		}
 		return cp
 	case *http2.UnknownFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
+		if ft.Payload != nil {
+			cp.Payload = make([]byte, len(ft.Payload))
+			copy(cp.Payload, ft.Payload)
+		}
 		return cp
 	default:
 		panic(fmt.Sprintf("unknown frame type for deep copy: %T", f))
@@ -459,4 +502,284 @@ func TestContinuationFrame_WritePayload_Error(t *testing.T) {
 			t.Errorf("WritePayload with partial write expected 2 bytes written, got %d", n)
 		}
 	})
+}
+
+func TestDataFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.DataFrame
+	}{
+		{
+			name: "basic data frame",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    0,
+					StreamID: 1,
+				},
+				Data: []byte("hello world"),
+			},
+		},
+		{
+			name: "data frame with END_STREAM",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    http2.FlagDataEndStream,
+					StreamID: 2,
+				},
+				Data: []byte("last data"),
+			},
+		},
+		{
+			name: "data frame with PADDED flag and padding",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    http2.FlagDataPadded,
+					StreamID: 3,
+				},
+				PadLength: 5,
+				Data:      []byte("padded data"),
+				Padding:   make([]byte, 5), // Will be filled with zeros by WriteFrame if not already
+			},
+		},
+		{
+			name: "data frame with PADDED and END_STREAM flags",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    http2.FlagDataPadded | http2.FlagDataEndStream,
+					StreamID: 4,
+				},
+				PadLength: 3,
+				Data:      []byte("final padded data"),
+				Padding:   make([]byte, 3),
+			},
+		},
+		{
+			name: "data frame with empty data, no padding",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    0,
+					StreamID: 5,
+				},
+				Data: []byte{},
+			},
+		},
+		{
+			name: "data frame with empty data, with padding",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    http2.FlagDataPadded,
+					StreamID: 6,
+				},
+				PadLength: 4,
+				Data:      []byte{},
+				Padding:   make([]byte, 4),
+			},
+		},
+		{
+			name: "data frame with PADDED flag and PadLength 0",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameData,
+					Flags:    http2.FlagDataPadded,
+					StreamID: 7,
+				},
+				PadLength: 0,
+				Data:      []byte("data with zero padlength field"),
+				Padding:   []byte{}, // Empty padding
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Auto-set length for the testFrameType helper
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "DataFrame")
+		})
+	}
+}
+
+func TestDataFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameData, StreamID: 1}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string // Substring of the expected error
+	}{
+		{
+			name: "PADDED flag set, PadLength octet missing",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 0 // PadLength itself is 1 byte, so 0 means it's missing
+				return h
+			}(),
+			payload:     []byte{}, // No data to provide the PadLength octet
+			expectedErr: "reading pad length: EOF",
+		},
+		{
+			name: "PadLength too large for payload (PadLength only)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 1 // Length for PadLength field itself
+				return h
+			}(),
+			payload:     []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
+			expectedErr: "pad length 5 exceeds payload length 0",
+		},
+		{
+			name: "PadLength too large for payload (PadLength + some data)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 1 + 2 // PadLength + 2 bytes of (supposed) data
+				return h
+			}(),
+			payload:     []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
+			expectedErr: "pad length 10 exceeds payload length 2",
+		},
+		{
+			name: "error reading data (PADDED)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 1 + 5 + 2 // PadLength(1) + Data(5) + Padding(2)
+				return h
+			}(),
+			payload:     []byte{2, 'd', 'a', 't'}, // PadLength=2, Data should be 5, but only 3 'dat' provided
+			expectedErr: "reading data: unexpected EOF",
+		},
+		{
+			name: "error reading data (not PADDED)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = 0
+				h.Length = 5 // Data(5)
+				return h
+			}(),
+			payload:     []byte{'d', 'a', 't'}, // Data should be 5, but only 3 'dat' provided
+			expectedErr: "reading data: unexpected EOF",
+		},
+		{
+			name: "error reading padding",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 1 + 2 + 5 // PadLength(1) + Data(2) + Padding(5)
+				return h
+			}(),
+			payload:     []byte{5, 'd', 'a', 'p', 'a', 'd'}, // PadLength=5, Data='da', Padding should be 5, but only 3 'pad' provided
+			expectedErr: "reading padding: unexpected EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.DataFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				// Allow direct match or substring match because of potential fmt.Errorf wrapping
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+// matchErr is a helper for error string matching, useful when errors are wrapped.
+func matchErr(err error, substr string) bool {
+	if err == nil {
+		return false
+	}
+	return bytes.Contains([]byte(err.Error()), []byte(substr))
+}
+
+func TestDataFrame_WritePayload_Error(t *testing.T) {
+	expectedErr := fmt.Errorf("custom writer error for data")
+
+	tests := []struct {
+		name          string
+		frame         *http2.DataFrame
+		failAfter     int // Bytes after which writer fails
+		expectedN     int64
+		expectedPanic bool // If construction itself is problematic, not write error
+	}{
+		{
+			name: "fail writing PadLength",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagDataPadded, Length: 1 + 5 + 2},
+				PadLength:   2, Data: []byte("hello"), Padding: make([]byte, 2),
+			},
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name: "fail writing Data (PADDED)",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagDataPadded, Length: 1 + 5 + 2},
+				PadLength:   2, Data: []byte("hello"), Padding: make([]byte, 2),
+			},
+			failAfter: 1, expectedN: 1, // Wrote PadLength
+		},
+		{
+			name: "fail writing Data (not PADDED)",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Flags: 0, Length: 5},
+				Data:        []byte("hello"),
+			},
+			failAfter: 2, expectedN: 2,
+		},
+		{
+			name: "fail writing Padding",
+			frame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagDataPadded, Length: 1 + 5 + 2},
+				PadLength:   2, Data: []byte("hello"), Padding: make([]byte, 2),
+			},
+			failAfter: 1 + 3, expectedN: 1 + 3, // Wrote PadLength + 3 bytes of Data
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+
+			defer func() {
+				if r := recover(); r != nil {
+					if !tt.expectedPanic {
+						t.Errorf("WritePayload panicked unexpectedly: %v", r)
+					}
+				} else if tt.expectedPanic {
+					t.Error("WritePayload expected a panic but did not get one")
+				}
+			}()
+			if tt.expectedPanic {
+				// If we expect a panic, the call to WritePayload might not happen
+				// or we might test a construction that leads to it.
+				// For these tests, we assume WritePayload is called.
+			}
+
+			n, err := tt.frame.WritePayload(fw)
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
 }
