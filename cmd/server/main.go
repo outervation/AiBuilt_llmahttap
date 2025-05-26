@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,8 +13,8 @@ import (
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/router"
 	"example.com/llmahttap/v2/internal/server"
-	// handler implementations will be registered, e.g.
-	// _ "example.com/llmahttap/v2/internal/handlers/staticfile"
+
+	"example.com/llmahttap/v2/internal/handlers/staticfile" // Assumed to exist for StaticFileServer
 )
 
 var (
@@ -57,10 +59,46 @@ func main() {
 
 	// 3. Initialize Handler Registry and register handlers
 	handlerRegistry := server.NewHandlerRegistry()
-	// TODO: Register actual handler implementations (e.g., StaticFileServer)
-	// Example:
-	// staticfile.Register(handlerRegistry, appLogger) // Assuming staticfile handler has a Register function
-	// For now, let's log if no handlers are registered (which will be the case)
+
+	// Register StaticFileServer Handler Factory
+	// The factory function is a closure, capturing 'configFilePath' and 'appLogger' from the main scope.
+	staticFileServerFactory := func(handlerConfig json.RawMessage, factoryLogger *logger.Logger) (server.Handler, error) {
+		// 'configFilePath' is the absolute path to the main config file, available from main() scope.
+		// It's used by ParseAndValidateStaticFileServerConfig to resolve relative paths within the static server's config (e.g., MimeTypesPath).
+		staticServerSpecificConfig, err := config.ParseAndValidateStaticFileServerConfig(handlerConfig, configFilePath)
+		if err != nil {
+			// The factory returns an error; the server/router layer (which calls CreateHandler, which calls this factory)
+			// will be responsible for logging this appropriately and likely returning a 500 error for the request.
+			return nil, fmt.Errorf("StaticFileServer: failed to parse/validate specific handler config: %w", err)
+		}
+
+		// Assume staticfile.New constructor exists in example.com/llmahttap/v2/internal/handlers/staticfile
+		// and its signature is: func New(cfg *config.StaticFileServerConfig, lg *logger.Logger) (server.Handler, error)
+		handler, err := staticfile.New(staticServerSpecificConfig, factoryLogger) // Pass the logger provided to the factory
+		if err != nil {
+			return nil, fmt.Errorf("StaticFileServer: failed to create handler instance: %w", err)
+		}
+		return handler, nil
+	}
+
+	if err := handlerRegistry.Register("StaticFileServer", staticFileServerFactory); err != nil {
+		appLogger.Error("Failed to register StaticFileServer handler factory", logger.LogFields{"error": err.Error()})
+		os.Exit(1) // Critical if core handler type registration fails
+	}
+	appLogger.Info("Registered StaticFileServer handler factory.", nil)
+
+	// Example of how another handler might be registered:
+	// myOtherHandlerFactory := func(handlerConfig json.RawMessage, factoryLogger *logger.Logger) (server.Handler, error) {
+	//     // ... parse handlerConfig, create and return handler ...
+	//     return myotherhandler.New(handlerConfig, factoryLogger)
+	// }
+	// if err := handlerRegistry.Register("MyOtherHandler", myOtherHandlerFactory); err != nil {
+	//     appLogger.Error("Failed to register MyOtherHandler handler factory", logger.LogFields{"error": err.Error()})
+	//     os.Exit(1)
+	// }
+	// appLogger.Info("Registered MyOtherHandler handler factory.", nil)
+
+	// (Actual handler registration will be done in subsequent steps when handlers are implemented)
 	if handlerRegistry == nil { // Should not happen if NewHandlerRegistry is correct
 		appLogger.Error("Handler registry is nil after initialization", nil)
 		os.Exit(1)

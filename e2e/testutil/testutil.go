@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	// "path/filepath" // Removed unused import
+	"reflect" // Added to fix undefined: reflect error
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +99,7 @@ type ServerInstance struct {
 	logCopyDone   chan struct{}
 	mu            sync.Mutex
 	CleanupFuncs  []func() error     // Functions to run to clean up (e.g., remove temp files)
+	cmdCtx        context.Context    // Context controlling the Cmd process
 	cancelCtx     context.CancelFunc // To cancel the server process context
 }
 
@@ -162,12 +164,14 @@ func WriteTempConfig(configData interface{}, format string) (filePath string, cl
 }
 
 // StartTestServer launches the server binary with the given configuration file and arguments.
-// It waits for the server to become responsive by checking if its listening port is open.
+// It waits for the server to log its actual listening address and then polls that address for readiness.
 // `serverBinaryPath` must be the path to the server binary.
 // `configFile` is the path to the configuration file.
 // `configArgName` is the command-line flag name used to pass the config file path (e.g., "-config").
-// `serverListenAddress` is the address the server is expected to listen on (e.g., "127.0.0.1:8080").
-func StartTestServer(serverBinaryPath string, configFile string, configArgName string, serverListenAddress string, extraArgs ...string) (*ServerInstance, error) {
+// `serverConfigAddress` is the address string AS CONFIGURED for the server (e.g., "127.0.0.1:0").
+// `extraArgs` are any additional command-line arguments for the server.
+// The actual listening address will be parsed from server logs and stored in ServerInstance.Address.
+func StartTestServer(serverBinaryPath string, configFile string, configArgName string, serverConfigAddress string, extraArgs ...string) (*ServerInstance, error) {
 	if serverBinaryPath == "" {
 		return nil, fmt.Errorf("serverBinaryPath cannot be empty")
 	}
@@ -184,9 +188,7 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 	if configArgName == "" {
 		return nil, fmt.Errorf("configArgName cannot be empty (e.g. -config)")
 	}
-	if serverListenAddress == "" {
-		return nil, fmt.Errorf("serverListenAddress cannot be empty (e.g. 127.0.0.1:8080)")
-	}
+	// serverConfigAddress can be "host:0", so not validating its format strictly here.
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -204,11 +206,12 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 	instance := &ServerInstance{
 		Cmd:           cmd,
 		ConfigPath:    configFile,
-		Address:       serverListenAddress,
+		Address:       "", // Will be populated by parsing logs
 		LogBuffer:     logBuffer,
 		logPipeReader: pipeReader,
 		logPipeWriter: pipeWriter,
 		logCopyDone:   make(chan struct{}),
+		cmdCtx:        ctx, // Store the context that controls the command
 		cancelCtx:     cancel,
 		CleanupFuncs:  make([]func() error, 0),
 	}
@@ -219,7 +222,6 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 		if instance.logPipeWriter != nil {
 			if err := instance.logPipeWriter.Close(); err != nil {
 				// This error can happen if reader is already closed, often not critical here
-				// errs = append(errs, fmt.Sprintf("logPipeWriter.Close: %v", err))
 			}
 		}
 		if instance.logCopyDone != nil {
@@ -240,49 +242,57 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 		}
 		return nil
 	})
-
+	fmt.Println("Copying test server logs to logPipeReader")
 	go func() {
 		defer close(instance.logCopyDone)
-		// Using TeeReader to also print to os.Stdout for live test debugging if needed
-		// but primarily capture to LogBuffer
-		// For now, just LogBuffer:
 		io.Copy(instance.LogBuffer, instance.logPipeReader)
 	}()
 
 	if err := cmd.Start(); err != nil {
-		// Ensure cleanup functions (like log pipe closure) are run if Start fails
-		instance.Stop()
+		instance.Stop() // calls cleanups
 		return nil, fmt.Errorf("failed to start server process '%s': %w. Logs captured:\n%s", serverBinaryPath, err, instance.LogBuffer.String())
 	}
 
-	// Wait for server to be ready
-	_, _, err = net.SplitHostPort(serverListenAddress)
+	fmt.Println("Waiting for server to log listening address")
+	// Wait for server to log its actual listening address
+	actualListenAddress, err := waitForServerAddressLog(instance, 5*time.Second)
 	if err != nil {
 		instance.Stop()
-		return nil, fmt.Errorf("invalid serverListenAddress format '%s': %w. Logs captured:\n%s", serverListenAddress, err, instance.LogBuffer.String())
+		return nil, fmt.Errorf("server did not log listening address or timed out: %w. Logs captured:\n%s", err, instance.SafeGetLogs())
 	}
-	// Port check is done with serverListenAddress directly
+	instance.Address = actualListenAddress // Set the parsed actual address
 
-	readyTimeout := 10 * time.Second
-	pollInterval := 200 * time.Millisecond
+	// Poll the actualListenAddress for readiness
+	readyTimeout := 2 * time.Second
+	pollInterval := 250 * time.Millisecond
 	startTime := time.Now()
-
 	var lastDialErr error
 	for {
 		if time.Since(startTime) > readyTimeout {
 			instance.Stop()
-			return nil, fmt.Errorf("server not ready at %s after %v. Last dial error: %v. Logs captured:\n%s", serverListenAddress, readyTimeout, lastDialErr, instance.LogBuffer.String())
+			return nil, fmt.Errorf("server not ready at parsed address %s after %v. Last dial error: %v. Logs captured:\n%s", actualListenAddress, readyTimeout, lastDialErr, instance.SafeGetLogs())
 		}
 
-		conn, dialErr := net.DialTimeout("tcp", serverListenAddress, pollInterval)
+		conn, dialErr := net.DialTimeout("tcp", actualListenAddress, pollInterval)
 		lastDialErr = dialErr
 		if dialErr == nil {
 			conn.Close()
+			// Add a small delay to allow server goroutines to spin up further
+			time.Sleep(200 * time.Millisecond)
 			break // Server is ready
+		}
+
+		// Check if the server process exited prematurely
+		select {
+		case <-instance.cmdCtx.Done(): // Use the stored context
+			instance.Stop()                // Ensure resources are cleaned up
+			exitErrVal := instance.Cmd.Err // Access field
+			return nil, fmt.Errorf("server process exited while waiting for readiness at %s. Last dial error: %v. ExitError: %v. Logs:\n%s",
+				actualListenAddress, lastDialErr, exitErrVal, instance.SafeGetLogs())
+		default:
 		}
 		time.Sleep(pollInterval)
 	}
-
 	return instance, nil
 }
 
@@ -474,9 +484,11 @@ func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualRespo
 
 	var finalArgs []string
 	finalArgs = append(finalArgs, "--http2-prior-knowledge")
-	finalArgs = append(finalArgs, "--silent")
-	finalArgs = append(finalArgs, "--show-error")
+	finalArgs = append(finalArgs, "--verbose") // More detailed output for debugging
+	// finalArgs = append(finalArgs, "--silent") // Replaced by --verbose for debugging
+	// finalArgs = append(finalArgs, "--show-error") // Verbose includes errors
 	finalArgs = append(finalArgs, "-X", request.Method)
+	finalArgs = append(finalArgs, "--noproxy", "*") // Prevent accidental proxy usage
 
 	if request.Headers != nil {
 		for name, values := range request.Headers {
@@ -867,29 +879,28 @@ type E2ETestDefinition struct {
 func RunE2ETest(t *testing.T, def E2ETestDefinition) {
 	t.Helper()
 
-	listenAddress := def.ServerListenAddress
-	if strings.HasSuffix(listenAddress, ":0") {
-		host := strings.TrimSuffix(listenAddress, ":0")
-		if host == "" { // e.g. if listenAddress was just ":0"
-			host = "127.0.0.1"
-		}
-		port, err := GetFreePort()
-		if err != nil {
-			t.Fatalf("Failed to get free port for E2E test '%s': %v", def.Name, err)
-		}
-		listenAddress = fmt.Sprintf("%s:%d", host, port)
-	}
+	// configuredListenAddress is the address string AS CONFIGURED for the server
+	// (e.g., "127.0.0.1:0" or ":0"). This goes into the server's config file.
+	// It's NOT pre-resolved to a specific port by the test runner anymore.
+	configuredListenAddress := def.ServerListenAddress
 
 	configPath, cleanupConfig, err := WriteTempConfig(def.ServerConfigData, def.ServerConfigFormat)
 	if err != nil {
 		t.Fatalf("E2E test '%s': Failed to write temp config: %v", def.Name, err)
 	}
-	// Note: cleanupConfig will be called by server.Stop() if added as a cleanup func,
-	// or we can defer it here. Adding it to server instance is cleaner.
+	// cleanupConfig will be added to server.AddCleanupFunc below
 
-	server, err := StartTestServer(def.ServerBinaryPath, configPath, def.ServerConfigArgName, listenAddress, def.ExtraServerArgs...)
+	// StartTestServer now takes configuredListenAddress.
+	// It will parse the actual listening port from server logs and store it in server.Address.
+	server, err := StartTestServer(def.ServerBinaryPath, configPath, def.ServerConfigArgName, configuredListenAddress, def.ExtraServerArgs...)
 	if err != nil {
-		t.Fatalf("E2E test '%s': Failed to start server: %v", def.Name, err)
+		// server might be nil here if StartTestServer returns an error early.
+		// If server is not nil, SafeGetLogs will try to get logs.
+		logStr := ""
+		if server != nil {
+			logStr = server.SafeGetLogs()
+		}
+		t.Fatalf("E2E test '%s': Failed to start server: %v. Logs (if available):\n%s", def.Name, err, logStr)
 	}
 	server.AddCleanupFunc(func() error { cleanupConfig(); return nil }) // Ensure temp config file is removed
 	defer server.Stop()
@@ -908,8 +919,16 @@ func RunE2ETest(t *testing.T, def E2ETestDefinition) {
 		t.Run(caseName, func(st *testing.T) {
 			st.Helper()
 			for _, runner := range testRunners {
+
 				st.Run(fmt.Sprintf("Client_%s", runner.Type()), func(ct *testing.T) {
 					ct.Helper()
+					ct.Cleanup(func() {
+						if ct.Failed() {
+							logs := server.SafeGetLogs()
+							ct.Logf("BEGIN Server logs for client %s, case %s (on failure):\n%s\nEND Server logs", runner.Type(), caseName, logs)
+						}
+					})
+
 					actualResp, execErr := runner.Run(server, &tc.Request)
 
 					if tc.Expected.ErrorContains != "" {
@@ -923,7 +942,7 @@ func RunE2ETest(t *testing.T, def E2ETestDefinition) {
 					}
 
 					if execErr != nil {
-						ct.Fatalf("Unexpected error during request: %v. Server logs:\n%s", execErr, server.LogBuffer.String())
+						ct.Fatalf("Unexpected error during request: %v", execErr) // Server logs will be printed by ct.Cleanup
 					}
 
 					// Perform assertions on the actual response
@@ -949,4 +968,156 @@ func RunE2ETest(t *testing.T, def E2ETestDefinition) {
 			}
 		})
 	}
+}
+
+// JSONFieldsBodyMatcher checks if the actual JSON response body (provided as bytes) contains the expected fields
+// with the specified values. It uses reflect.DeepEqual for comparison.
+type JSONFieldsBodyMatcher struct {
+	ExpectedFields map[string]interface{}
+}
+
+// Match implements BodyMatcher for JSONFieldsBodyMatcher.
+func (m *JSONFieldsBodyMatcher) Match(body []byte) (bool, string) {
+	var actualData map[string]interface{}
+	if err := json.Unmarshal(body, &actualData); err != nil {
+		return false, fmt.Sprintf("failed to unmarshal actual body JSON: %v. Body: '%s'", err, string(body))
+	}
+
+	if !reflect.DeepEqual(m.ExpectedFields, actualData) {
+		// For clearer error messages, marshal both expected and actual to formatted JSON.
+		expectedJSON, errExp := json.MarshalIndent(m.ExpectedFields, "", "  ")
+		if errExp != nil {
+			expectedJSON = []byte(fmt.Sprintf("(error marshalling expected fields: %v)", errExp))
+		}
+		actualJSON, errAct := json.MarshalIndent(actualData, "", "  ")
+		if errAct != nil {
+			actualJSON = []byte(fmt.Sprintf("(error marshalling actual data: %v)", errAct))
+		}
+		return false, fmt.Sprintf("JSON body mismatch.\nExpected Fields (as JSON):\n%s\nActual Body (as JSON):\n%s", string(expectedJSON), string(actualJSON))
+	}
+	return true, ""
+}
+
+// waitForServerAddressLog scans the server's log output for the listening address.
+// It polls the instance.LogBuffer for new log lines.
+func waitForServerAddressLog(instance *ServerInstance, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var lastParseAttemptError error
+
+	for time.Now().Before(deadline) {
+		logs := instance.LogBuffer.String() // Get current snapshot of all logs
+		lines := strings.Split(logs, "\n")
+
+		for i := len(lines) - 1; i >= 0; i-- { // Scan from recent lines first
+			line := lines[i]
+			if line == "" {
+				continue
+			}
+
+			var logEntry struct {
+				Msg     string                 `json:"msg"`
+				Level   string                 `json:"level"`
+				Details map[string]interface{} `json:"details"`
+			}
+
+			if err := json.Unmarshal([]byte(line), &logEntry); err == nil {
+				// Check for both possible log messages indicating a listener is active
+				isListenerLog := (logEntry.Msg == "Successfully created new listener" || logEntry.Msg == "Successfully created listener from inherited FD") &&
+					logEntry.Level == "INFO"
+
+				if isListenerLog {
+					if addrRaw, ok := logEntry.Details["localAddr"]; ok { // Changed from "address" to "localAddr"
+						if addrStr, okStr := addrRaw.(string); okStr && addrStr != "" {
+							// Basic validation that it looks like a host:port
+							_, _, errValidate := net.SplitHostPort(addrStr)
+							if errValidate == nil {
+								return addrStr, nil // Successfully found and parsed
+							}
+							lastParseAttemptError = fmt.Errorf("parsed address '%s' from log ('%s') is invalid: %w", addrStr, line, errValidate)
+						}
+					}
+				}
+			} else {
+				// Store the first parsing error of a non-empty line as a hint, but don't spam.
+				// Avoid filling 'lastParseAttemptError' with generic unmarshal errors if a valid line is still possible.
+				// if lastParseAttemptError == nil && len(line) > 10 { // arbitrary length to avoid tiny junk lines
+				// lastParseAttemptError = fmt.Errorf("failed to parse log line: '%s', error: %w", line, err)
+				// }
+			}
+		}
+
+		// Check if server process exited
+		if instance.Cmd != nil && instance.Cmd.ProcessState != nil && instance.Cmd.ProcessState.Exited() {
+			return "", fmt.Errorf("server process exited (code: %d) while waiting for address log", instance.Cmd.ProcessState.ExitCode())
+		}
+		if instance.Cmd != nil && instance.cmdCtx != nil { // Check if cmdCtx is available
+			select {
+			case <-instance.cmdCtx.Done(): // Use the stored context
+				exitErrStr := "unknown (context canceled)"
+				if instance.Cmd.ProcessState != nil {
+					exitErrStr = instance.Cmd.ProcessState.String()
+				} else if instance.Cmd.Err != nil { // Access Err field
+					exitErrStr = instance.Cmd.Err.Error()
+				}
+				return "", fmt.Errorf("server process context done (likely exited: %s) while waiting for address log", exitErrStr)
+			default:
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond) // Poll interval
+	}
+
+	/* 1050 */
+	if lastParseAttemptError != nil {
+		return "", fmt.Errorf("timeout waiting for server address log. Last error during parsing attempt: %w. Full logs:\n%s", lastParseAttemptError, instance.SafeGetLogs())
+	}
+	return "", fmt.Errorf("timeout waiting for server address log (no listener success log line found or parsed correctly from available logs). Full logs:\n%s", instance.SafeGetLogs())
+}
+
+// SafeGetLogs returns the content of the LogBuffer, or a placeholder if the instance/buffer is nil.
+func (s *ServerInstance) SafeGetLogs() string {
+	if s == nil {
+		return "<ServerInstance is nil>"
+	}
+	if s.LogBuffer == nil {
+		return "<ServerInstance.LogBuffer is nil>"
+	}
+	// Ensure access to LogBuffer is safe if it's mutated concurrently, though current design copies it.
+	// For String(), it's usually safe as it typically copies internal buffer.
+	return s.LogBuffer.String()
+}
+
+func StartingPollingAndPrintingBuffer(buffer *bytes.Buffer) {
+	if buffer == nil {
+		// It's good practice to handle nil inputs, though the prompt implies
+		// a valid buffer will be given.
+		fmt.Fprintln(os.Stderr, "Error: pollAndPrintBuffer received a nil buffer")
+		return
+	}
+
+	go func() {
+		const pollingRate = 50 * time.Millisecond // Hard-coded polling rate
+
+		for {
+			// Check if there's anything to read in the buffer.
+			// buffer.Len() gives the number of unread bytes.
+			if buffer.Len() > 0 {
+				// buffer.WriteTo reads all unread bytes from the buffer
+				// and writes them to the provided writer (os.Stdout).
+				// This also advances the buffer's internal read pointer,
+				// effectively "consuming" the data from the buffer's perspective.
+				_, err := buffer.WriteTo(os.Stdout)
+				if err != nil {
+					// Handle potential errors writing to stdout (e.g., pipe closed).
+					// For this example, we'll print to stderr and continue polling.
+					// In a real application, you might want more robust error handling
+					// or a way to stop the goroutine if stdout is permanently broken.
+					fmt.Fprintf(os.Stderr, "Error writing to stdout: %v\n", err)
+				}
+			}
+
+			// Wait for the next poll interval.
+			time.Sleep(pollingRate)
+		}
+	}()
 }

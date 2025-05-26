@@ -1,28 +1,37 @@
 package http2
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
+	"runtime/debug" // For stack trace in panic recovery
+
+	"encoding/hex" // Added for diagnosing preface issues
 	"fmt"
 	"golang.org/x/net/http2/hpack"
+
+	"errors"
+	"example.com/llmahttap/v2/internal/logger"
 	"io"
 	"net"
+	"net/http" // For http.Request, used by RequestDispatcherFunc
+	"os"       // ADDED: For os.Stdout.Sync()
 	"strings"
 	"sync"
 	"time"
-
-	"example.com/llmahttap/v2/internal/config"
-	"example.com/llmahttap/v2/internal/logger"
-	"example.com/llmahttap/v2/internal/router"
-	"example.com/llmahttap/v2/internal/server"
+	// "example.com/llmahttap/v2/internal/router" // REMOVED to break cycle
 )
+
+// RequestDispatcherFunc defines the signature for a function that can dispatch
+// an HTTP/2 request to the appropriate application handler.
+// It's used by Connection to decouple from a specific router implementation.
+type RequestDispatcherFunc func(stream StreamWriter, req *http.Request)
 
 // ClientPreface is the connection preface string that clients must send.
 const ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 // SettingsAckTimeoutDuration is the default time to wait for a SETTINGS ACK.
-const SettingsAckTimeoutDuration = 10 * time.Second
+const SettingsAckTimeoutDuration = 20 * time.Second         // Increased for robustness in tests
+const ServerHandshakeSettingsWriteTimeout = 5 * time.Second // Timeout for initial server SETTINGS to be written
 
 // Default settings values (RFC 7540 Section 6.5.2)
 // MinMaxFrameSize is the minimum value for SETTINGS_MAX_FRAME_SIZE (2^14).
@@ -108,15 +117,16 @@ type Connection struct {
 	concurrentStreamsInbound  int // Number of streams peer has initiated and are not closed/reset
 
 	// Writer goroutine coordination
-	writerChan              chan Frame  // Frames to be sent by the writer goroutine
-	settingsAckTimeoutTimer *time.Timer // Timer for waiting for SETTINGS ACK
+	writerChan              chan Frame    // Frames to be sent by the writer goroutine
+	settingsAckTimeoutTimer *time.Timer   // Timer for waiting for SETTINGS ACK
+	initialSettingsWritten  chan struct{} // Closed by writerLoop after initial server SETTINGS are written
 
 	// Added fields
 	maxFrameSize uint32 // To satisfy stream.go, should eventually alias to peerMaxFrameSize or ourCurrentMaxFrameSize depending on context
 
 	remoteAddrStr string // Cached remote address string
 
-	dispatcher server.RouterInterface // For dispatching requests to application layer
+	dispatcher RequestDispatcherFunc // For dispatching requests to application layer
 }
 
 // NewConnection creates and initializes a new HTTP/2 Connection.
@@ -131,16 +141,12 @@ func NewConnection(
 	lg *logger.Logger,
 	isClientSide bool,
 	srvSettingsOverride map[SettingID]uint32,
-	dispatcher server.RouterInterface, // Added dispatcher
+	dispatcher RequestDispatcherFunc, // CHANGED to RequestDispatcherFunc
 ) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	if dispatcher == nil && !isClientSide { // Dispatcher is crucial for server-side operations
-		// For client side, it might be nil if client doesn't process responses in a complex way (e.g. just one request)
-		// but for a server, it's required.
-		lg.Error("NewConnection: server-side connection created without a dispatcher", logger.LogFields{})
-		// Depending on how critical this is, might panic or return error.
-		// For now, log and continue, but this setup is likely problematic.
+		lg.Error("NewConnection: server-side connection created without a dispatcher func", logger.LogFields{})
 	}
 
 	conn := &Connection{
@@ -159,42 +165,38 @@ func NewConnection(
 		activePings:              make(map[[8]byte]*time.Timer),
 		ourSettings:              make(map[SettingID]uint32),
 		peerSettings:             make(map[SettingID]uint32),
+		initialSettingsWritten:   make(chan struct{}), // Initialize the new channel
 		remoteAddrStr:            nc.RemoteAddr().String(),
-		dispatcher:               dispatcher, // Store dispatcher
+		dispatcher:               dispatcher, // Store dispatcher func
 		peerReportedLastStreamID: 0xffffffff, // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
 	}
 
 	// Initialize client/server stream ID counters
 	if isClientSide {
 		conn.nextStreamIDClient = 1
-		// Server-initiated stream IDs are even. Clients don't initiate with even IDs.
-		// If this client were to support receiving PUSH_PROMISE, nextStreamIDServer would track expected even IDs.
-		conn.nextStreamIDServer = 0 // Will not be used by server-side Conn
+		conn.nextStreamIDServer = 0
 	} else { // Server side
-		conn.nextStreamIDClient = 0 // Server expects client to start with stream ID 1, this tracks highest processed.
-		conn.nextStreamIDServer = 2 // First server-initiated PUSH_PROMISE will use ID 2
+		conn.nextStreamIDClient = 0
+		conn.nextStreamIDServer = 2
 	}
 
 	// Initialize default settings values for peer (will be updated upon receiving peer's SETTINGS frame)
 	conn.peerSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
-	conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush // Assume peer server might push if conn is client
+	conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush
 	conn.peerSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
 	conn.peerSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
-	conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff // Effectively unlimited until known
-	conn.peerSettings[SettingMaxHeaderListSize] = 0xffffffff    // Effectively unlimited until known
+	conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff
+	conn.peerSettings[SettingMaxHeaderListSize] = 0xffffffff
 
 	// Initialize our settings
-	// Start with general defaults applicable to both client/server before role-specifics
 	conn.ourSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
 	conn.ourSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
 	conn.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
 
 	if isClientSide {
 		conn.ourSettings[SettingEnablePush] = DefaultClientEnablePush
-		// Clients typically don't aggressively limit server pushes via MAX_CONCURRENT_STREAMS,
-		// but they can. Using a reasonably high default.
 		conn.ourSettings[SettingMaxConcurrentStreams] = 100
-		conn.ourSettings[SettingMaxHeaderListSize] = DefaultServerMaxHeaderListSize // Client willing to accept large headers
+		conn.ourSettings[SettingMaxHeaderListSize] = DefaultServerMaxHeaderListSize
 	} else { // Server side
 		conn.ourSettings[SettingEnablePush] = DefaultServerEnablePush
 		conn.ourSettings[SettingMaxConcurrentStreams] = DefaultServerMaxConcurrentStreams
@@ -204,25 +206,25 @@ func NewConnection(
 	// Apply server-specific overrides if provided (only for server-side connections)
 	if !isClientSide && srvSettingsOverride != nil {
 		for id, val := range srvSettingsOverride {
-			// TODO: Add validation for settings values here (e.g. MaxFrameSize range, EnablePush 0 or 1)
 			conn.ourSettings[id] = val
 		}
 	}
 
 	// Apply initial settings to derive operational values
-	// These functions are called without holding settingsMu as this is during construction.
 	conn.applyOurSettings()
 	conn.applyPeerSettings()
 
 	// Initialize HPACK adapter.
-	// Our decoder's table size is set by our SETTINGS_HEADER_TABLE_SIZE.
 	ourHpackTableSize := conn.ourSettings[SettingHeaderTableSize]
 	conn.hpackAdapter = NewHpackAdapter(ourHpackTableSize)
 
-	// Our encoder's table size limit is initially constrained by the peer's default (assumed) SETTINGS_HEADER_TABLE_SIZE.
-	// This will be updated when we receive the peer's actual SETTINGS frame.
 	peerHpackTableSize := conn.peerSettings[SettingHeaderTableSize]
 	conn.hpackAdapter.SetMaxEncoderDynamicTableSize(peerHpackTableSize)
+
+	// Start the writer goroutine as soon as the connection object is created.
+	// This ensures it's ready to process frames queued during handshake (e.g. initial SETTINGS).
+	go conn.writerLoop()
+	// runtime.Gosched() // Give writerLoop a chance to start before handshake proceeds too far. (REMOVED
 
 	return conn
 }
@@ -231,6 +233,31 @@ func NewConnection(
 // This should be called when our settings are initialized or changed.
 // Assumes settingsMu is held if called outside constructor.
 func (c *Connection) applyOurSettings() {
+	// Ensure SettingMaxFrameSize is within RFC 7540 Section 6.5.2 limits.
+	// MinMaxFrameSize (16384) and MaxAllowedFrameSizeValue (2^24-1).
+	if val, ok := c.ourSettings[SettingMaxFrameSize]; ok {
+		if val < MinMaxFrameSize {
+			c.log.Warn("Configured SETTINGS_MAX_FRAME_SIZE is too low, adjusting to minimum allowed.", logger.LogFields{
+				"configured_value": val,
+				"minimum_value":    MinMaxFrameSize,
+			})
+			c.ourSettings[SettingMaxFrameSize] = MinMaxFrameSize
+		} else if val > MaxAllowedFrameSizeValue {
+			c.log.Warn("Configured SETTINGS_MAX_FRAME_SIZE is too high, adjusting to maximum allowed.", logger.LogFields{
+				"configured_value": val,
+				"maximum_value":    MaxAllowedFrameSizeValue,
+			})
+			c.ourSettings[SettingMaxFrameSize] = MaxAllowedFrameSizeValue
+		}
+		// If val is within limits, it's used as is.
+	} else {
+		// If SettingMaxFrameSize is not in ourSettings map (e.g., not initialized), set to valid default.
+		c.log.Warn("SETTINGS_MAX_FRAME_SIZE not found in ourSettings, setting to default.", logger.LogFields{
+			"default_value": DefaultSettingsMaxFrameSize, // DefaultSettingsMaxFrameSize is 16384
+		})
+		c.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
+	}
+
 	c.ourCurrentMaxFrameSize = c.ourSettings[SettingMaxFrameSize]
 	c.ourInitialWindowSize = c.ourSettings[SettingInitialWindowSize]
 	c.ourMaxConcurrentStreams = c.ourSettings[SettingMaxConcurrentStreams]
@@ -259,38 +286,22 @@ func (c *Connection) applyPeerSettings() {
 // canCreateStream checks if a new stream can be created based on concurrency limits.
 // isInitiatedByPeer indicates if the stream creation is initiated by the peer.
 func (c *Connection) canCreateStream(isInitiatedByPeer bool) bool {
-	c.settingsMu.Lock()
-	c.streamsMu.RLock() // RLock for reading concurrent stream counts
+	// Assumes caller holds c.settingsMu and c.streamsMu (RLock or Lock as appropriate)
 
 	var limit uint32
 	var currentCount int
 
 	if isInitiatedByPeer {
-		limit = c.ourMaxConcurrentStreams
-		currentCount = c.concurrentStreamsInbound
+		limit = c.ourMaxConcurrentStreams         // Read under c.settingsMu
+		currentCount = c.concurrentStreamsInbound // Read under c.streamsMu
 	} else {
-		limit = c.peerMaxConcurrentStreams
-		currentCount = c.concurrentStreamsOutbound
+		limit = c.peerMaxConcurrentStreams         // Read under c.settingsMu
+		currentCount = c.concurrentStreamsOutbound // Read under c.streamsMu
 	}
-	// Unlock order: streamsMu first, then settingsMu
-	c.streamsMu.RUnlock()
-	c.settingsMu.Unlock()
 
-	// A setting of 0 for MAX_CONCURRENT_STREAMS means no new streams of that type are allowed.
-	// RFC 7540, Section 5.1.2: "A value of 0 for SETTINGS_MAX_CONCURRENT_STREAMS SHOULD NOT be treated as special by endpoints."
-	// However, a common interpretation (and practical one for servers setting a limit) is that 0 means "disallow".
-	// The spec also states: "SETTINGS_MAX_CONCURRENT_STREAMS (0x3): ...This limit is directional: it applies to the number of streams that the sender of the setting can create."
-	// So, if WE send MAX_CONCURRENT_STREAMS = N, the PEER can open N streams.
-	// If PEER sends MAX_CONCURRENT_STREAMS = M, WE can open M streams.
-	// If isInitiatedByPeer is true, PEER is opening, so our limit (ourMaxConcurrentStreams) applies.
-	// If isInitiatedByPeer is false, WE are opening, so PEER's limit (peerMaxConcurrentStreams) applies.
-
-	if limit == 0 { // If the limit is explicitly set to 0, no streams allowed.
+	if limit == 0 {
 		return false
 	}
-	// If limit is not 0 (common case: large default or specific value), check count.
-	// Note: MaxConcurrentStreams is often treated as "effectively infinite" (e.g. 2^31-1) by default if not set.
-	// Our defaults handle this appropriately (0xffffffff before peer settings are known).
 	return uint32(currentCount) < limit
 }
 
@@ -300,26 +311,37 @@ func (c *Connection) canCreateStream(isInitiatedByPeer bool) bool {
 // handlerCfg: Configuration for the handler.
 // prioInfo: Priority information for the new stream. If nil, default priority is used.
 // isInitiatedByPeer: True if the stream is being created due to a peer's action (e.g., receiving HEADERS).
-func (c *Connection) createStream(id uint32, handler server.Handler, handlerCfg json.RawMessage, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
-	// Check concurrency limits first, without holding the full streamsMu write lock yet.
+
+// createStream creates a new stream, initializes it, and adds it to the connection.
+// id: The stream ID, must be validated by the caller for parity and sequence.
+// prioInfo: Priority information for the new stream. If nil, default priority is used.
+// isInitiatedByPeer: True if the stream is being created due to a peer's action (e.g., receiving HEADERS).
+func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
+	c.log.Debug("Conn: Entered createStream", logger.LogFields{"stream_id": id, "isPeerInitiated": isInitiatedByPeer, "prioInfo_present": prioInfo != nil})
+
+	// Acquire locks in consistent order: settingsMu THEN streamsMu
+	c.settingsMu.Lock()
+	c.streamsMu.Lock() // RLock for canCreateStream checks, then Lock for modification
+
+	c.log.Debug("Conn.createStream: Acquired settingsMu and streamsMu (Lock)", logger.LogFields{"stream_id": id})
+
+	// First check for canCreateStream
 	if !c.canCreateStream(isInitiatedByPeer) {
+		c.streamsMu.Unlock()
+		c.settingsMu.Unlock()
+		c.log.Warn("Conn.createStream: canCreateStream returned false (initial check)", logger.LogFields{"stream_id": id})
 		return nil, NewConnectionError(ErrCodeRefusedStream, fmt.Sprintf("cannot create stream %d: max concurrent streams limit reached", id))
 	}
-
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-
-	// Re-check concurrency under the full lock, in case counts changed.
-	// canCreateStream handles its own locking, so this is a fresh check.
-	if !c.canCreateStream(isInitiatedByPeer) {
-		return nil, NewConnectionError(ErrCodeRefusedStream, fmt.Sprintf("cannot create stream %d: max concurrent streams limit reached (re-check)", id))
-	}
+	c.log.Debug("Conn.createStream: canCreateStream check passed.", logger.LogFields{"stream_id": id})
 
 	if _, ok := c.streams[id]; ok {
+		c.streamsMu.Unlock()
+		c.settingsMu.Unlock()
+		c.log.Error("Conn.createStream: Stream already exists", logger.LogFields{"stream_id": id})
 		return nil, NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("cannot create stream %d: stream already exists", id))
 	}
+	c.log.Debug("Conn.createStream: Stream does not already exist.", logger.LogFields{"stream_id": id})
 
-	// Determine priority values
 	var weight uint8
 	var parentID uint32
 	var exclusive bool
@@ -328,62 +350,77 @@ func (c *Connection) createStream(id uint32, handler server.Handler, handlerCfg 
 		weight = prioInfo.Weight
 		parentID = prioInfo.StreamDependency
 		exclusive = prioInfo.Exclusive
+		c.log.Debug("Conn.createStream: Using priority from prioInfo", logger.LogFields{"stream_id": id, "weight": weight, "parentID": parentID, "exclusive": exclusive})
 	} else {
-		// Default priority: weight 16 (frame value 15), parent 0, not exclusive
-		weight = 15 // Default weight of 16 is represented by frame value 15
+		weight = 15
 		parentID = 0
 		exclusive = false
+		c.log.Debug("Conn.createStream: Using default priority", logger.LogFields{"stream_id": id, "weight": weight, "parentID": parentID, "exclusive": exclusive})
 	}
 
-	// Use current initial window sizes from settings
-	c.settingsMu.Lock()
+	// Window sizes are already protected by settingsMu which is held.
 	currentOurInitialWindowSize := c.ourInitialWindowSize
 	currentPeerInitialWindowSize := c.peerInitialWindowSize
-	c.settingsMu.Unlock()
+	c.log.Debug("Conn.createStream: Window sizes retrieved.", logger.LogFields{"stream_id": id, "ourInitial": currentOurInitialWindowSize, "peerInitial": currentPeerInitialWindowSize})
 
+	// Release settingsMu as it's no longer needed for newStream or priorityTree.AddStream.
+	// Keep streamsMu locked for map modification and counter increment.
+	c.settingsMu.Unlock()
+	c.log.Debug("Conn.createStream: Released settingsMu.", logger.LogFields{"stream_id": id})
+
+	c.log.Debug("Conn.createStream: About to call newStream", logger.LogFields{"stream_id": id})
 	stream, err := newStream(
-		c, // parent connection
+		c,
 		id,
-		currentOurInitialWindowSize,
+		currentOurInitialWindowSize, // These values are now from variables, settingsMu already released
 		currentPeerInitialWindowSize,
-		handler,
-		handlerCfg,
 		weight,
 		parentID,
 		exclusive,
-		isInitiatedByPeer, // Added missing argument
+		isInitiatedByPeer,
 	)
 	if err != nil {
+		c.streamsMu.Unlock() // Ensure streamsMu is unlocked before returning on error
+		c.log.Error("Conn.createStream: newStream call failed", logger.LogFields{"stream_id": id, "error": err.Error()})
 		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to create new stream object for ID %d: %v", id, err))
 	}
+	c.log.Debug("Conn.createStream: newStream call succeeded.", logger.LogFields{"stream_id": id, "stream_ptr": fmt.Sprintf("%p", stream)})
 
 	c.streams[id] = stream
+	c.log.Debug("Conn.createStream: Stream added to c.streams map.", logger.LogFields{"stream_id": id})
 
-	// Add to priority tree using the resolved priority info
 	actualPrioInfoForTree := &streamDependencyInfo{
 		StreamDependency: parentID,
 		Weight:           weight,
 		Exclusive:        exclusive,
 	}
+	c.log.Debug("Conn.createStream: About to add stream to priorityTree", logger.LogFields{"stream_id": id})
 	if errPrio := c.priorityTree.AddStream(id, actualPrioInfoForTree); errPrio != nil {
-		delete(c.streams, id) // Rollback adding to c.streams
+		delete(c.streams, id)
+		// Don't decrement concurrentStreams counters here yet as they haven't been incremented
+		c.streamsMu.Unlock() // Unlock before returning
 		c.log.Error("Failed to add stream to priority tree", logger.LogFields{"streamID": id, "error": errPrio.Error()})
 		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to add stream %d to priority tree: %v", id, errPrio))
 	}
+	c.log.Debug("Conn.createStream: Stream added to priorityTree.", logger.LogFields{"stream_id": id})
 
 	if isInitiatedByPeer {
 		c.concurrentStreamsInbound++
+		c.log.Debug("Conn.createStream: Incremented concurrentStreamsInbound", logger.LogFields{"stream_id": id, "new_count": c.concurrentStreamsInbound})
 	} else {
 		c.concurrentStreamsOutbound++
+		c.log.Debug("Conn.createStream: Incremented concurrentStreamsOutbound", logger.LogFields{"stream_id": id, "new_count": c.concurrentStreamsOutbound})
 	}
 
-	// Update lastProcessedStreamID if this stream ID is higher.
-	// This is relevant for GOAWAY processing.
 	if id > c.lastProcessedStreamID {
 		c.lastProcessedStreamID = id
+		c.log.Debug("Conn.createStream: Updated lastProcessedStreamID", logger.LogFields{"stream_id": id, "new_last_id": c.lastProcessedStreamID})
 	}
 
-	c.log.Debug("Stream created", logger.LogFields{"streamID": id, "isPeerInitiated": isInitiatedByPeer, "handlerType": fmt.Sprintf("%T", handler)})
+	c.streamsMu.Unlock() // Release streamsMu
+	c.log.Debug("Conn.createStream: Released streamsMu.", logger.LogFields{"stream_id": id})
+
+	c.log.Debug("Stream created (generically)", logger.LogFields{"streamID": id, "isPeerInitiated": isInitiatedByPeer})
 	return stream, nil
 }
 
@@ -457,33 +494,125 @@ func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode Error
 
 // sendHeadersFrame sends a HEADERS frame.
 // This is a stub implementation.
+
 func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, endStream bool) error {
-	// TODO: Implement actual frame creation and sending via c.writerChan
-	c.log.Debug("sendHeadersFrame called (stub)", logger.LogFields{"streamID": s.id, "num_headers": len(headers), "endStream": endStream})
-	if s == nil {
-		return fmt.Errorf("sendHeadersFrame: stream is nil")
+	c.log.Debug("sendHeadersFrame: Preparing to send HEADERS",
+		logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
+
+	// 1. Encode headers using HPACK
+	// For now, we assume the entire block fits into one HEADERS frame and does not exceed peerMaxFrameSize.
+	// A full implementation needs to handle fragmentation into CONTINUATION frames.
+	encodedBytes := c.hpackAdapter.Encode(headers)
+	// HPACK encoding errors are typically not returned directly by x/net/http2/hpack's Encode.
+	// If encoding fails in a way that the library detects (e.g., value too long for representation),
+	// it might panic or have other side effects. For now, assume Encode succeeds if it returns.
+
+	// Check against peer's max frame size for the header block fragment.
+	// This is simplified; a full implementation would fragment if encodedBytes > c.peerMaxFrameSize.
+	// Here, we'll error if it's too large for a single frame for now.
+	c.settingsMu.RLock()
+	peerFrameSizeLimit := c.peerMaxFrameSize
+	c.settingsMu.RUnlock()
+
+	if uint32(len(encodedBytes)) > peerFrameSizeLimit {
+		errMsg := fmt.Sprintf("encoded header block size (%d) exceeds peer's MAX_FRAME_SIZE (%d)", len(encodedBytes), peerFrameSizeLimit)
+		c.log.Error("sendHeadersFrame: "+errMsg, logger.LogFields{"stream_id": s.id})
+		// This should probably lead to a connection error (INTERNAL_ERROR) as we failed to respect peer settings.
+		// Or, if we were to implement fragmentation, we would do so here.
+		// For now, treat as internal error on our side.
+		return NewConnectionError(ErrCodeInternalError, errMsg)
 	}
-	// Simulate sending by logging. In a real implementation, this would:
-	// 1. Construct a HEADERS frame.
-	// 2. Encode headers using HPACK (c.hpackAdapter).
-	// 3. Fragment into HEADERS and CONTINUATION if necessary, respecting c.peerMaxFrameSize.
-	// 4. Send frame(s) to c.writerChan.
-	return nil
+
+	// 2. Construct HEADERS frame
+	var frameFlags Flags = FlagHeadersEndHeaders // Assume all headers fit in this one frame.
+	if endStream {
+		frameFlags |= FlagHeadersEndStream
+	}
+	// TODO: Add PRIORITY flag and fields if priority is being sent. For now, no priority.
+
+	headersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    frameFlags,
+			StreamID: s.id,
+			Length:   uint32(len(encodedBytes)), // Length of the header block fragment
+		},
+		// Priority fields (StreamDependency, Weight, Exclusive) are omitted if PRIORITY flag is not set.
+		HeaderBlockFragment: encodedBytes,
+	}
+
+	// 3. Send frame to writerChan
+	select {
+	case c.writerChan <- headersFrame:
+		c.log.Debug("sendHeadersFrame: HEADERS frame queued",
+			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(encodedBytes)})
+		return nil
+	case <-c.shutdownChan:
+		c.log.Warn("sendHeadersFrame: Connection shutting down, cannot send HEADERS frame.",
+			logger.LogFields{"stream_id": s.id})
+		return NewConnectionError(ErrCodeConnectError, // Or a more specific stream error if applicable
+			fmt.Sprintf("connection shutting down, cannot send HEADERS for stream %d", s.id))
+	default:
+		// writerChan is full, indicates writer is blocked or not processing. Critical internal issue.
+		c.log.Error("sendHeadersFrame: Failed to queue HEADERS frame: writer channel full or blocked.",
+			logger.LogFields{"stream_id": s.id})
+		return NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("writer channel congested, cannot send HEADERS for stream %d", s.id))
+	}
 }
 
 // sendDataFrame sends a DATA frame.
 // This is a stub implementation.
+
 func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int, error) {
-	// TODO: Implement actual frame creation and sending via c.writerChan
-	c.log.Debug("sendDataFrame called (stub)", logger.LogFields{"streamID": s.id, "data_len": len(data), "endStream": endStream})
-	if s == nil {
-		return 0, fmt.Errorf("sendDataFrame: stream is nil")
+	c.log.Debug("sendDataFrame: Preparing to send DATA",
+		logger.LogFields{"stream_id": s.id, "data_len": len(data), "end_stream": endStream})
+
+	// DATA frame specific checks
+	if s.id == 0 { // DATA frames MUST be associated with a stream.
+		errMsg := "internal error: attempted to send DATA frame on stream 0"
+		c.log.Error(errMsg, logger.LogFields{"data_len": len(data), "end_stream": endStream})
+		return 0, NewConnectionError(ErrCodeInternalError, errMsg)
 	}
-	// Simulate sending by logging. In a real implementation, this would:
-	// 1. Construct a DATA frame.
-	// 2. Send frame to c.writerChan.
-	// (Flow control acquisition is handled by the Stream's WriteData method before calling this)
-	return len(data), nil
+
+	// Construct DATA frame
+	// Note: Padding is not implemented in this basic version.
+	// If padding were implemented, FrameHeader.Length would include padding length.
+	var frameFlags Flags = 0
+	if endStream {
+		frameFlags |= FlagDataEndStream
+	}
+	// If padding were implemented, frameFlags |= FlagDataPadded would be set if PadLength > 0.
+
+	dataFrame := &DataFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameData,
+			Flags:    frameFlags,
+			StreamID: s.id,
+			Length:   uint32(len(data)), // Length of the data payload only
+		},
+		// PadLength: 0, // If padding was implemented
+		Data: data,
+	}
+
+	// Send frame to writerChan
+	select {
+	case c.writerChan <- dataFrame:
+		c.log.Debug("sendDataFrame: DATA frame queued",
+			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(data)})
+		return len(data), nil // Return number of bytes from the input data slice that were queued
+	case <-c.shutdownChan:
+		c.log.Warn("sendDataFrame: Connection shutting down, cannot send DATA frame.",
+			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
+		return 0, NewConnectionError(ErrCodeConnectError,
+			fmt.Sprintf("connection shutting down, cannot send DATA for stream %d", s.id))
+	default:
+		// writerChan is full, indicates writer is blocked or not processing. Critical internal issue.
+		c.log.Error("sendDataFrame: Failed to queue DATA frame: writer channel full or blocked.",
+			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
+		return 0, NewConnectionError(ErrCodeInternalError,
+			fmt.Sprintf("writer channel congested, cannot send DATA for stream %d", s.id))
+	}
 }
 
 // sendRSTStreamFrame sends an RST_STREAM frame.
@@ -902,24 +1031,25 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 	if c.isClient {
 		// Client received HEADERS (response or pushed response)
-		stream, exists := c.getStream(streamID)
-		if !exists {
-			c.log.Error("Client received HEADERS for unknown or closed stream", logger.LogFields{"stream_id": streamID})
-			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client received HEADERS for non-existent stream %d", streamID))
-		}
 
-		errClientProcess := stream.processResponseHeaders(headers, endStream)
-		if errClientProcess != nil {
-			if _, ok := errClientProcess.(*ConnectionError); ok {
-				return errClientProcess
-			}
-			c.log.Error("Error from stream.processResponseHeaders",
-				logger.LogFields{"stream_id": streamID, "error": errClientProcess.Error()})
-		}
+		// stream, exists := c.getStream(streamID)
+
+		// if !exists {
+		// 	c.log.Error("Client received HEADERS for unknown or closed stream", logger.LogFields{"stream_id": streamID})
+		// 	return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client received HEADERS for non-existent stream %d", streamID))
+		// }
+
+		// errClientProcess := stream.processResponseHeaders(headers, endStream)
+		// if errClientProcess != nil {
+		// 	if _, ok := errClientProcess.(*ConnectionError); ok {
+		// 		return errClientProcess
+		// 	}
+		// 	c.log.Error("Error from stream.processResponseHeaders",
+		// 		logger.LogFields{"stream_id": streamID, "error": errClientProcess.Error()})
+		// }
 		return nil
 
-	} else {
-		// Server received HEADERS (client request)
+	} else { // Server received HEADERS (client request)
 		if streamID == 0 {
 			return NewConnectionError(ErrCodeProtocolError, "server received HEADERS on stream 0")
 		}
@@ -927,125 +1057,119 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("server received HEADERS on even stream ID %d from client", streamID))
 		}
 
-		// Check if stream already exists (client re-using an ID for a new request)
+		c.log.Debug("Conn: About to check if stream exists (acquiring RLock)", logger.LogFields{"stream_id": streamID})
 		c.streamsMu.RLock()
 		_, exists := c.streams[streamID]
 		c.streamsMu.RUnlock()
+		c.log.Debug("Conn: Finished checking if stream exists (released RLock)", logger.LogFields{"stream_id": streamID, "exists": exists})
 
 		if exists {
 			c.log.Error("Server received HEADERS for an already existing stream ID from client", logger.LogFields{"stream_id": streamID})
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client attempted to reuse stream ID %d", streamID))
 		}
 
-		if c.dispatcher == nil {
-			c.log.Error("Dispatcher is nil, cannot route request for new stream", logger.LogFields{"stream_id": streamID})
-			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError)
-			return nil
-		}
-
-		// Extract pseudo-headers to determine path for routing BEFORE creating the stream.
-		_, path, _, _, pseudoErr := c.extractPseudoHeaders(headers)
-		if pseudoErr != nil {
-			c.log.Error("Error extracting pseudo headers for routing", logger.LogFields{"stream_id": streamID, "error": pseudoErr.Error()})
-			_ = c.sendRSTStreamFrame(streamID, ErrCodeProtocolError) // Send RST for malformed request
-			// If pseudoErr is a ConnectionError, it will be propagated up.
-			// If it's a simple error, it might be handled locally by RSTing the stream.
-			// For now, assume extractPseudoHeaders returns a ConnectionError for fatal issues.
-			return pseudoErr
-		}
-
-		// Use the router to find the handler and its config based on the path.
-		// The dispatcher is server.RouterInterface. Its Match method would be ideal if it existed.
-		// Assuming c.dispatcher is a *router.Router which has a Match method.
-		// We need to cast or ensure the interface provides this.
-		// For now, let's assume a method like `Match(path string) (*config.Route, server.Handler, error)` exists.
-		// This part is a bit tricky as router.Match returns (route, handler, err)
-		// and the handler is already instantiated. We need the HandlerConfig to pass to newStream.
-		// Let's refine this: The router should give us the route, and we get the handler from the registry *inside* createStream or similar.
-		// For now, let's assume we can get HandlerType and HandlerConfig from the router.
-
-		var routeConfig *config.Route
-		var resolvedHandler server.Handler // This should be instantiated later by the stream
-		// var handlerType string // Removed unused variable
-		var opaqueHandlerConfig json.RawMessage
-
-		// This is conceptual. The actual router interaction needs to be defined.
-		// For now, assume c.dispatcher.Match can give us route details.
-		// The router.Router.Match in router.go finds a config.Route and then creates a handler.
-		// This needs rethinking. The stream needs the HandlerConfig *at creation*.
-		// A possible flow:
-		// 1. Router.FindRoute(path) -> returns *config.Route, error
-		// 2. If route found, use route.HandlerType and route.HandlerConfig for stream creation.
-		// 3. The stream.handler field will be instantiated by the stream itself using its config.
-
-		// Quick check if dispatcher is *router.Router to access its Match method directly for now
-		// This is not ideal for interface segregation but helps proceed.
-		actualRouter, ok := c.dispatcher.(*router.Router)
-		if !ok {
-			errMsg := "Dispatcher is not of expected type *router.Router, connection cannot perform routing"
-			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID})
-			// This is a fundamental issue with the connection's setup.
-			return NewConnectionError(ErrCodeInternalError, errMsg)
-		}
-
-		matchedRoute, instantiatedHandler, errMatch := actualRouter.Match(path)
-		if errMatch != nil {
-			c.log.Error("Router Match failed", logger.LogFields{"stream_id": streamID, "path": path, "error": errMatch.Error()})
-			// Handle router errors, e.g., if handler creation in Match failed.
-			// Send 500 Internal Server Error (if handler creation failed)
-			// Server.WriteErrorResponse would be used here on a temporary stream or a way to write directly.
-			// For now, RST stream.
-			_ = c.sendRSTStreamFrame(streamID, ErrCodeInternalError) // Or specific error from router if possible
-			return nil                                               // Don't kill connection, just this stream attempt
-		}
-		if matchedRoute == nil { // No route matched
-			c.log.Info("No route matched for path", logger.LogFields{"stream_id": streamID, "path": path})
-			// Need to send a 404. This requires creating a minimal stream to send the response.
-			// This is complex here. For now, let's RST. A proper 404 is better.
-			// A better approach: create a "dummy" stream, send 404, then close.
-			// Or, the main server loop should handle 404 if no handler is found after stream creation.
-			// For now, if router.Match returns nil handler for no match:
-			if instantiatedHandler == nil {
-				// Create a temporary stream to send a 404 Not Found.
-				// This requires a way to send an error response without a full handler.
-				// This is a simplification:
-				// TODO: Implement proper 404 response. This requires creating a stream,
-				// sending headers and body, then closing. For now, RST the stream.
-				c.log.Warn("TODO: Implement 404 response for stream", logger.LogFields{"stream_id": streamID, "path": path})
-				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream) // Using RefusedStream as a placeholder for "no service"
-				return nil
-			}
-		}
-
-		// We have a matchedRoute and an instantiatedHandler.
-		// The stream needs the raw HandlerConfig.
-		routeConfig = matchedRoute
-		// handlerType = routeConfig.HandlerType // Removed unused variable
-		opaqueHandlerConfig = routeConfig.HandlerConfig
-		resolvedHandler = instantiatedHandler // This is the instantiated handler
-
-		// Create the stream with the specific handler and its config.
-		newStream, streamErr := c.createStream(streamID, resolvedHandler, opaqueHandlerConfig, prioInfo, true /*isPeerInitiated*/)
+		// Create the stream generically first.
+		c.log.Debug("Conn: About to call createStream", logger.LogFields{"stream_id": streamID, "prioInfo_present": prioInfo != nil})
+		// The dispatcher (c.dispatcher, type RequestDispatcherFunc) will be called by the stream
+		// after it processes its headers.
+		newStream, streamErr := c.createStream(streamID, prioInfo, true /*isPeerInitiated*/)
 		if streamErr != nil {
 			c.log.Error("Failed to create stream for incoming client HEADERS", logger.LogFields{"stream_id": streamID, "error": streamErr.Error()})
 			if ce, ok := streamErr.(*ConnectionError); ok && ce.Code == ErrCodeRefusedStream {
-				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream)
-				return nil
+				_ = c.sendRSTStreamFrame(streamID, ErrCodeRefusedStream) // Attempt to send RST
+				return nil                                               // Return nil as RefusedStream is a valid outcome, RST attempted.
 			}
-			return streamErr
+			return streamErr // Other creation errors are fatal for connection.
+		}
+		c.log.Debug("Connection.handleIncomingCompleteHeaders: PRE-DISPATCH CHECK (server path)", logger.LogFields{
+			"stream_id":                 streamID,
+			"newStream_id":              newStream.id,
+			"newStream_is_nil":          newStream == nil,
+			"newStream_conn_is_nil":     newStream != nil && newStream.conn == nil,
+			"newStream_conn_log_is_nil": newStream != nil && newStream.conn != nil && newStream.conn.log == nil,
+			"c_dispatcher_is_nil":       c.dispatcher == nil,
+			"num_headers_received":      len(headers),
+			"end_stream_flag":           endStream,
+		})
+
+		if newStream == nil {
+			c.log.Error("Connection.handleIncomingCompleteHeaders: newStream object is NIL after creation, cannot dispatch.", logger.LogFields{"stream_id": streamID})
+			// This should be a ConnectionError as it's an internal server problem.
+			// The defer in Serve() will call c.Close() with this error.
+			return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("internal error: newStream object is nil for stream ID %d after creation", streamID))
+		}
+		if newStream.conn != c {
+			c.log.Error("Connection.handleIncomingCompleteHeaders: newStream.conn does not point to the current connection `c`.", logger.LogFields{
+				"stream_id":          streamID,
+				"newStream_conn_ptr": fmt.Sprintf("%p", newStream.conn),
+				"c_conn_ptr":         fmt.Sprintf("%p", c),
+			})
+			return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("internal error: newStream.conn mismatch for stream ID %d", streamID))
+		}
+		if newStream.conn.log == nil { // Check specifically if the logger on the stream's connection is nil
+			c.log.Error("Connection.handleIncomingCompleteHeaders: newStream's connection logger (newStream.conn.log) is NIL, this is a critical issue.", logger.LogFields{"stream_id": streamID})
+			// This implies a severe problem during connection or stream setup.
+			return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("stream's connection logger is nil for stream ID %d", streamID))
+		}
+		if c.dispatcher == nil {
+			c.log.Error("Connection.handleIncomingCompleteHeaders: Connection's dispatcher (c.dispatcher) is NIL, cannot dispatch.", logger.LogFields{"stream_id": streamID})
+			return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("connection dispatcher is nil, cannot process stream ID %d", streamID))
+
+			// Transition stream state based on HEADERS
+			newStream.mu.Lock()
+			if newStream.state != StreamStateIdle {
+				newStream.mu.Unlock()
+				_ = newStream.Close(NewStreamError(newStream.id, ErrCodeInternalError, "stream in unexpected state after creation for HEADERS"))
+				return NewConnectionError(ErrCodeInternalError, "newly created stream in unexpected state for HEADERS")
+			}
+
+			if endStream {
+				newStream.endStreamReceivedFromClient = true
+				if newStream.requestBodyWriter != nil {
+					_ = newStream.requestBodyWriter.Close()
+				}
+				newStream._setState(StreamStateHalfClosedRemote)
+			} else {
+				newStream._setState(StreamStateOpen)
+			}
+			newStream.mu.Unlock()
+
+			// Delegate to the stream to process headers and call the dispatcher function.
+			// The dispatcher *func* (c.dispatcher) is passed to the stream's processing method.
+			// stream.go's processRequestHeadersAndDispatch will need to be updated to accept this dispatcher.
+
+			c.log.Debug("Conn: Attempting to call newStream.processRequestHeadersAndDispatch", logger.LogFields{"stream_id": newStream.id, "newStream_is_nil": newStream == nil, "dispatcher_is_nil": c.dispatcher == nil})
+
+			errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
+			if errDispatch != nil {
+				// If it's a connection error, propagate it.
+				if _, ok := errDispatch.(*ConnectionError); ok {
+					return errDispatch
+				}
+				// For stream-level errors during dispatch, log and potentially RST the stream.
+				// newStream.processRequestHeadersAndDispatch should handle its own errors appropriately
+				// (e.g., sending RST_STREAM or returning a ConnectionError if severe).
+				// If it returns a generic error here, it's logged.
+				c.log.Error("Error from stream.processRequestHeadersAndDispatch",
+					logger.LogFields{"stream_id": newStream.id, "error": errDispatch.Error()})
+				// Consider whether this should be a connection error or if the stream handled it.
+				// For now, if not ConnectionError, assume stream might have handled it or it's not fatal for connection.
+			}
+			return nil // Successfully processed server-side headers and dispatched.
 		}
 
 		// Transition stream state based on HEADERS
 		newStream.mu.Lock()
 		if newStream.state != StreamStateIdle {
-			c.log.Error("Newly created stream is not in Idle state before header processing", logger.LogFields{"stream_id": newStream.id, "state": newStream.state.String()})
 			newStream.mu.Unlock()
-			_ = newStream.Close(NewStreamError(newStream.id, ErrCodeInternalError, "stream in unexpected state"))
-			return NewConnectionError(ErrCodeInternalError, "newly created stream in unexpected state")
+			_ = newStream.Close(NewStreamError(newStream.id, ErrCodeInternalError, "stream in unexpected state after creation for HEADERS"))
+			return NewConnectionError(ErrCodeInternalError, "newly created stream in unexpected state for HEADERS")
 		}
 
 		if endStream {
+			c.log.Debug("Conn: Attempting to close requestBodyWriter", logger.LogFields{"stream_id": newStream.id, "requestBodyWriter_nil": newStream.requestBodyWriter == nil})
 			newStream.endStreamReceivedFromClient = true
+			c.log.Debug("Conn: Finished closing requestBodyWriter", logger.LogFields{"stream_id": newStream.id})
 			if newStream.requestBodyWriter != nil {
 				_ = newStream.requestBodyWriter.Close()
 			}
@@ -1055,16 +1179,29 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		}
 		newStream.mu.Unlock()
 
-		// Delegate to the stream to process headers and dispatch.
-		// The stream's handler is already set from createStream.
-		// stream.processRequestHeadersAndDispatch will build the http.Request and call the handler.
-		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher) // dispatcher is passed for context, though stream has its own handler now.
+		// Delegate to the stream to process headers and call the dispatcher function.
+		// The dispatcher *func* (c.dispatcher) is passed to the stream's processing method.
+		// stream.go's processRequestHeadersAndDispatch will need to be updated to accept this dispatcher.
+		fmt.Printf("CONN_DEBUG: newStream pointer before calling processRequestHeadersAndDispatch: %p, ID: %d\n", newStream, newStream.id)
+		os.Stdout.Sync()
+
+		c.log.Debug("Conn: Attempting to call newStream.processRequestHeadersAndDispatch", logger.LogFields{"stream_id": newStream.id, "newStream_is_nil": newStream == nil, "dispatcher_is_nil": c.dispatcher == nil})
+
+		c.log.Debug("Conn: Attempting to call newStream.processRequestHeadersAndDispatch", logger.LogFields{"stream_id": newStream.id, "newStream_is_nil": newStream == nil, "dispatcher_is_nil": c.dispatcher == nil})
+		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
 		if errDispatch != nil {
+			// If it's a connection error, propagate it.
 			if _, ok := errDispatch.(*ConnectionError); ok {
 				return errDispatch
 			}
+			// For stream-level errors during dispatch, log and potentially RST the stream.
+			// newStream.processRequestHeadersAndDispatch should handle its own errors appropriately
+			// (e.g., sending RST_STREAM or returning a ConnectionError if severe).
+			// If it returns a generic error here, it's logged.
 			c.log.Error("Error from stream.processRequestHeadersAndDispatch",
 				logger.LogFields{"stream_id": newStream.id, "error": errDispatch.Error()})
+			// Consider whether this should be a connection error or if the stream handled it.
+			// For now, if not ConnectionError, assume stream might have handled it or it's not fatal for connection.
 		}
 		return nil
 	}
@@ -1518,14 +1655,57 @@ func (c *Connection) readFrame() (Frame, error) {
 // This method is intended to be called by the connection's dedicated writer goroutine
 // to ensure serialized access to the net.Conn.
 func (c *Connection) writeFrame(frame Frame) error {
-	c.log.Debug("Writing frame to connection", logger.LogFields{"type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID, "length": frame.Header().Length, "flags": frame.Header().Flags})
-	err := WriteFrame(c.netConn, frame) // WriteFrame is in the same http2 package (frame.go)
+	// Create a temporary buffer to serialize the frame for logging and then writing.
+	var frameBuf bytes.Buffer
+	err := WriteFrame(&frameBuf, frame) // WriteFrame is in the same http2 package (frame.go)
 	if err != nil {
-		// TODO: Handle specific write errors, e.g., connection closed by peer.
-		// For now, log and return. The writer goroutine will likely detect this and shut down.
-		// c.log.Error("Error writing frame to connection", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
-		return err
+		// Error during frame serialization (before actual network write)
+		c.log.Error("Error serializing frame for writing", logger.LogFields{
+			"error":       err.Error(),
+			"remote_addr": c.remoteAddrStr,
+			"frame_type":  frame.Header().Type.String(),
+		})
+		return err // This error is from serialization, not network write.
 	}
+
+	frameBytes := frameBuf.Bytes()
+
+	// Log the frame details, including hex dump for initial SETTINGS
+	logFields := logger.LogFields{
+		"type":      frame.Header().Type.String(),
+		"stream_id": frame.Header().StreamID,
+		"length":    frame.Header().Length, // This is payload length from header
+		"flags":     frame.Header().Flags,
+		"total_len": len(frameBytes), // Total frame length (header + payload)
+	}
+	// Specifically log more for initial SETTINGS frame (server sending its settings, not ACK)
+	if frame.Header().Type == FrameSettings && (frame.Header().Flags&FlagSettingsAck == 0) && !c.isClient {
+		logFields["hex_dump"] = hex.EncodeToString(frameBytes)
+		c.log.Debug("Writing initial SETTINGS frame to connection", logFields)
+	} else {
+		c.log.Debug("Writing frame to connection", logFields)
+	}
+
+	// Actual write to the network connection
+	n, writeErr := c.netConn.Write(frameBytes)
+	if writeErr != nil {
+		c.log.Error("Error writing frame to network connection", logger.LogFields{
+			"error":                      writeErr.Error(),
+			"remote_addr":                c.remoteAddrStr,
+			"frame_type":                 frame.Header().Type.String(),
+			"bytes_written_before_error": n,
+		})
+		return writeErr
+	}
+	if n != len(frameBytes) {
+		errMsg := fmt.Sprintf("incomplete write to network connection: wrote %d bytes, expected %d", n, len(frameBytes))
+		c.log.Error(errMsg, logger.LogFields{
+			"remote_addr": c.remoteAddrStr,
+			"frame_type":  frame.Header().Type.String(),
+		})
+		return io.ErrShortWrite
+	}
+
 	return nil
 }
 
@@ -2125,63 +2305,120 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 // It reads the client's connection preface, sends the server's initial SETTINGS,
 // and then reads and processes the client's initial SETTINGS frame.
 func (c *Connection) ServerHandshake() error {
-	// 1. Read and validate client connection preface
-	prefaceBuffer := make([]byte, len(ClientPreface))
-	// TODO: Set a reasonable read deadline for the preface.
-	// For now, rely on net.Conn's default or externally set deadlines.
-	if _, err := io.ReadFull(c.netConn, prefaceBuffer); err != nil {
-		c.log.Error("Failed to read client connection preface", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return NewConnectionError(ErrCodeProtocolError, "client preface incomplete or missing")
-		}
-		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client preface", err)
-	}
+	c.log.Debug("ServerHandshake: Entered", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
-	if string(prefaceBuffer) != ClientPreface {
-		c.log.Error("Invalid client connection preface received", logger.LogFields{"received_preface": string(prefaceBuffer), "remote_addr": c.remoteAddrStr})
+	// 1. Read and validate client connection preface
+	//    RFC 7540, Section 3.5: "The client connection preface ... MUST be sent by the client and a server MUST receive it."
+	//    This applies to H2C with prior knowledge as well (RFC 9113, Sec 3.2.1).
+	c.log.Debug("ServerHandshake: Attempting to read client connection preface.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	prefaceBytes := make([]byte, len(ClientPreface))
+	n, err := io.ReadFull(c.netConn, prefaceBytes) // Store bytes read in n
+	if err != nil {
+		// This error means the client disconnected before sending the full preface,
+		// or some other network error occurred.
+		c.log.Error("Failed to read client connection preface", logger.LogFields{"remote_addr": c.remoteAddrStr, "bytes_read": n, "error": err}) // Log n and err
+		// Return a ConnectionError that will trigger a GOAWAY with PROTOCOL_ERROR
+		// The lastStreamID is 0 because no streams could have been processed yet.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return NewConnectionErrorWithCause(ErrCodeProtocolError, "client disconnected before sending full preface", err)
+		}
+		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client connection preface", err)
+	}
+	c.log.Debug("ServerHandshake: Client connection preface read.", logger.LogFields{"remote_addr": c.remoteAddrStr, "bytes_read": n, "preface_hex": hex.EncodeToString(prefaceBytes)})
+
+	if !bytes.Equal(prefaceBytes, []byte(ClientPreface)) {
+		c.log.Error("Invalid client connection preface received", logger.LogFields{
+			"remote_addr":          c.remoteAddrStr,
+			"bytes_read":           n, // Log n here as well
+			"received_preface_hex": hex.EncodeToString(prefaceBytes),
+			"expected_preface_str": ClientPreface,
+		})
 		return NewConnectionError(ErrCodeProtocolError, "invalid client connection preface")
 	}
-	c.log.Debug("Client connection preface validated.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	c.log.Debug("Client connection preface received and validated.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
 	// 2. Send server's initial SETTINGS frame.
-	// c.sendInitialSettings() queues the frame and starts the ACK timer.
+	//    RFC 7540, Section 3.5: "The server connection preface consists of a potentially empty SETTINGS frame ...
+	//    that MUST be the first frame sent by the server."
+	c.log.Debug("ServerHandshake: Attempting to send initial server SETTINGS frame.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if err := c.sendInitialSettings(); err != nil {
-		c.log.Error("Failed to send initial server SETTINGS frame during handshake",
+		c.log.Error("Failed to queue initial server SETTINGS frame during handshake",
 			logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
 		return err // sendInitialSettings already returns a ConnectionError or nil
 	}
-	c.log.Debug("Initial server SETTINGS frame queued for sending.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	c.log.Debug("Initial server SETTINGS frame queued. Waiting for writerLoop to send it.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	// The initial SETTINGS frame is queued. The writerLoop will send it.
+	// Wait for the initial server SETTINGS frame to be written by the writerLoop
+	// or for a timeout. This helps ensure curl sees server settings before proceeding.
+	select {
+	case <-c.initialSettingsWritten:
+		c.log.Debug("ServerHandshake: Confirmed initial server SETTINGS frame processed by writer.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	case <-time.After(ServerHandshakeSettingsWriteTimeout): // Use a defined timeout
+		c.log.Error("ServerHandshake: Timeout waiting for initial server SETTINGS frame to be written.",
+			logger.LogFields{"remote_addr": c.remoteAddrStr, "timeout": ServerHandshakeSettingsWriteTimeout.String()})
+		return NewConnectionError(ErrCodeInternalError, "timeout waiting for initial server SETTINGS write")
+	case <-c.shutdownChan:
+		c.log.Warn("ServerHandshake: Connection shutting down while waiting for initial SETTINGS write.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeConnectError, "connection shutdown during handshake")
+	}
 
 	// 3. Read and process client's initial SETTINGS frame.
-	// This MUST be the first frame from the client after their preface.
-	// TODO: Set a reasonable read deadline for this first frame.
+	//    RFC 7540, Section 3.5: The client sends its preface, then a SETTINGS frame.
+	//    This SETTINGS frame MUST be the first HTTP/2 frame sent by the client.
+	c.log.Debug("ServerHandshake: Attempting to read client's initial SETTINGS frame (post-preface).", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	frame, err := c.readFrame()
 	if err != nil {
-		c.log.Error("Failed to read client's initial SETTINGS frame", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
-		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client's initial SETTINGS frame", err)
+		c.log.Error("Failed to read client's initial SETTINGS frame (post-preface)", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return NewConnectionErrorWithCause(ErrCodeProtocolError, "client disconnected after preface, before sending initial SETTINGS frame", err)
+		}
+		return NewConnectionErrorWithCause(ErrCodeProtocolError, "error reading client's initial SETTINGS frame (post-preface)", err)
 	}
+	c.log.Debug("ServerHandshake: Frame read for client's initial SETTINGS.", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String()})
 
 	settingsFrame, ok := frame.(*SettingsFrame)
 	if !ok {
-		errMsg := fmt.Sprintf("expected client's initial frame to be SETTINGS, got %s", frame.Header().Type.String())
-		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
+		var frameHexDump string
+		// Attempt to serialize the received frame to hex for logging, if possible.
+		// This requires the frame to have a method like WriteTo or similar, then encode its bytes.
+		// For simplicity, let's just log its type and basic header info for now.
+		// A more robust way would be to have a utility to dump any frame to hex.
+		// buf := new(bytes.Buffer)
+		// if WriteFrame(buf, frame) == nil { // Assuming WriteFrame can write any frame type to a buffer
+		// 	frameHexDump = hex.EncodeToString(buf.Bytes())
+		// } else {
+		// 	frameHexDump = "cannot serialize frame to hex"
+		// }
+		// Simplified for now:
+		if fh := frame.Header(); fh != nil {
+			frameHexDump = fmt.Sprintf("Type: %s, Length: %d, Flags: %d, StreamID: %d", fh.Type, fh.Length, fh.Flags, fh.StreamID)
+		} else {
+			frameHexDump = "cannot get frame header"
+		}
+
+		errMsg := fmt.Sprintf("expected client's first frame (post-preface) to be SETTINGS, got %s", frame.Header().Type.String())
+		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr, "received_frame_type": frame.Header().Type.String(), "received_frame_info": frameHexDump})
 		return NewConnectionError(ErrCodeProtocolError, errMsg)
 	}
 
 	if settingsFrame.Header().Flags&FlagSettingsAck != 0 {
-		errMsg := "client's initial SETTINGS frame must not have ACK flag set"
+		errMsg := "client's initial SETTINGS frame (post-preface) must not have ACK flag set"
 		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
 		return NewConnectionError(ErrCodeProtocolError, errMsg)
 	}
 
 	// Process the client's SETTINGS frame. This will apply their settings and queue an ACK from us.
+	c.log.Debug("ServerHandshake: Processing client's initial SETTINGS frame.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if err := c.handleSettingsFrame(settingsFrame); err != nil {
-		c.log.Error("Error processing client's initial SETTINGS frame",
+		c.log.Error("Error processing client's initial SETTINGS frame (post-preface)",
 			logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
 		return err // handleSettingsFrame should return a ConnectionError if issues occur
 	}
+	c.log.Debug("ServerHandshake: Client's initial SETTINGS frame processed and ACK queued.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
 	c.log.Info("Server handshake completed successfully.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	c.log.Debug("ServerHandshake: Exiting successfully", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	return nil
 }
 
@@ -2190,21 +2427,48 @@ func (c *Connection) ServerHandshake() error {
 
 // serve is the main goroutine for reading frames from the connection.
 // It runs after the handshake is complete (or immediately for server if no handshake needed beyond preface).
-func (c *Connection) serve() {
-	var err error
-	// Ensure that Close is called eventually to clean up resources and signal other goroutines.
-	// The actual error passed to Close will be the first fatal error encountered.
+func (c *Connection) Serve(ctx context.Context) (err error) {
+	// ServerHandshake is now called by the server package's handleTCPConnection
+	// before calling Serve. Client-side connections would handle their handshake
+	// similarly before starting their equivalent of Serve.
+	c.log.Debug("Serve: Reader loop initiated", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	// ServerHandshake is now called by the server package's handleTCPConnection
+	// before calling Serve. Client-side connections would handle their handshake
+	// similarly before starting their equivalent of Serve.
+	c.log.Debug("Serve: Reader loop initiated", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+	// Add runtime/debug import for stack trace in panic recovery
+	// This is a bit of a hack to ensure the import is present when this function body is used.
+	// Ideally, imports are managed at the top of the file.
+	_ = debug.Stack // Use debug to satisfy import
+
 	defer func() {
-		// If connError was set by dispatchFrame or another source, use that.
-		// Otherwise, the 'err' from readFrame loop termination is the cause.
-		finalErr := err
-		c.streamsMu.RLock() // Safely read c.connError
-		if c.connError != nil {
-			finalErr = c.connError
+		// This defer function now correctly uses the named return variable 'err'
+		// of the 'Serve' method.
+		// It also captures panics.
+		if r := recover(); r != nil {
+			// Log the panic.
+			c.log.Error("Panic in Serve (reader loop)", logger.LogFields{"error": r, "remote_addr": c.remoteAddrStr, "stack": string(debug.Stack())})
+			// Ensure a generic internal error is propagated if a panic occurred and connError isn't already set.
+			c.streamsMu.Lock()
+			if c.connError == nil {
+				c.connError = NewConnectionError(ErrCodeInternalError, "internal server panic in reader loop")
+			}
+			c.streamsMu.Unlock()
 		}
+
+		// Prioritize c.connError if it was set by a connection-fatal event.
+		c.streamsMu.RLock()
+		currentConnError := c.connError
 		c.streamsMu.RUnlock()
 
-		c.log.Debug("Serve (reader) loop exiting.", logger.LogFields{"final_error_for_close": finalErr, "original_loop_term_error": err})
+		if currentConnError != nil {
+			err = currentConnError
+		}
+		// If err is still nil at this point (e.g. graceful shutdownChan close without prior error),
+		// and currentConnError was also nil, then Serve will return nil.
+
+		c.log.Debug("Serve (reader) loop exiting.", logger.LogFields{"final_error_for_close": err, "remote_addr": c.remoteAddrStr})
 
 		// Ensure readerDone is closed to signal that this goroutine has finished.
 		if c.readerDone != nil {
@@ -2215,39 +2479,14 @@ func (c *Connection) serve() {
 			}
 		}
 
-		// c.Close will be called with the 'finalErr' that caused the loop to terminate or was set elsewhere.
-		c.Close(finalErr)
+		// c.Close will be called with the 'err' that caused the loop to terminate or was set elsewhere.
+		c.Close(err) // Pass the final determined error to Close.
 	}()
 
-	c.log.Info("HTTP/2 connection (reader loop) serving started.", logger.LogFields{"remote_addr": c.remoteAddrStr, "is_client": c.isClient})
-
-	// Start the writer goroutine.
-
-	go c.writerLoop()
-
-	// Handle connection preface and initial SETTINGS exchange.
-	if !c.isClient { // Server-side
-		handshakeErr := c.ServerHandshake()
-		if handshakeErr != nil {
-			c.log.Error("Server handshake failed, closing connection.",
-				logger.LogFields{"error": handshakeErr, "remote_addr": c.remoteAddrStr})
-			err = handshakeErr // This error will be used by the defer c.Close(err)
-
-			// Store the error if it's the first one for this connection
-			c.streamsMu.Lock()
-			if c.connError == nil {
-				c.connError = err
-			}
-			c.streamsMu.Unlock()
-			return
-		}
-		c.log.Debug("Server-side handshake successful.", logger.LogFields{"remote_addr": c.remoteAddrStr})
-	} else { // Client-side
-		// TODO: Client-side preface logic:
-		// 1. Send client magic (PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n).
-		// 2. Send client's initial SETTINGS frame.
-		// 3. Then proceed to read server's SETTINGS (first frame from server) and other frames.
-		c.log.Debug("Client-side: TODO: Implement client preface sending and initial SETTINGS processing.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	// If this is a server-side connection, Serve is called *after* ServerHandshake has succeeded.
+	// So, we can log that the main serving loop is starting.
+	if !c.isClient {
+		c.log.Info("HTTP/2 connection main reader loop started (post-handshake).", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	}
 
 	// Main frame reading loop
@@ -2255,14 +2494,16 @@ func (c *Connection) serve() {
 		// Check for shutdown signal before attempting to read.
 		select {
 		case <-c.shutdownChan:
-			c.log.Info("Serve (reader) loop: shutdown signal received, terminating.", logger.LogFields{})
+			c.log.Info("Serve (reader) loop: shutdown signal received, terminating.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 			c.streamsMu.RLock()
-			err = c.connError // Use error that triggered shutdown if available
-			c.streamsMu.RUnlock()
-			if err == nil {
+			// Use error that triggered shutdown if available
+			if c.connError != nil {
+				err = c.connError
+			} else {
 				err = errors.New("connection shutdown initiated") // Generic if no specific error
 			}
-			return
+			c.streamsMu.RUnlock()
+			return err // Return the determined error
 		default:
 			// Continue to read frame.
 		}
@@ -2281,20 +2522,20 @@ func (c *Connection) serve() {
 			} else {
 				c.log.Error("Serve (reader) loop: error reading frame.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
 			}
-			return // Exit loop, defer will handle Close with this 'err'.
+			return err // Exit loop, defer will handle Close with this 'err'.
 		}
 
 		dispatchErr := c.dispatchFrame(frame)
 		if dispatchErr != nil {
 			c.log.Error("Serve (reader) loop: error dispatching frame, terminating connection.",
 				logger.LogFields{"error": dispatchErr.Error(), "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+
 			c.streamsMu.Lock()
 			if c.connError == nil {
 				c.connError = dispatchErr
 			}
 			c.streamsMu.Unlock()
-			err = dispatchErr
-			return
+			return dispatchErr // Return the dispatchError
 		}
 	}
 }
@@ -2302,6 +2543,7 @@ func (c *Connection) serve() {
 // writerLoop is the main goroutine for writing frames to the connection.
 // It serializes access to the underlying net.Conn for writes.
 func (c *Connection) writerLoop() {
+	c.log.Debug("Writer loop starting.", logger.LogFields{"remote_addr": c.remoteAddrStr}) // Added log
 	defer func() {
 		if c.writerDone != nil {
 			// Ensure writerDone is closed only once, even if panicking.
@@ -2374,6 +2616,23 @@ func (c *Connection) writerLoop() {
 				// to being called from its own worker goroutines. However, goroutine is safer.
 				go c.Close(err)
 				return // Exit writer loop as the connection is now considered failed.
+			} else { // writeFrame succeeded
+				// Signal if this was the initial server settings frame being written.
+				if !c.isClient {
+					// Use a non-blocking select to check if initialSettingsWritten is closed
+					// and if this is the correct frame to signal its closure.
+					select {
+					case <-c.initialSettingsWritten:
+						// Channel is already closed. Do nothing.
+					default:
+						// Channel is not closed yet. Check if this frame is the initial server SETTINGS.
+						if sf, ok := frame.(*SettingsFrame); ok && (sf.Header().Flags&FlagSettingsAck == 0) {
+							// This is indeed the initial, non-ACK, server SETTINGS frame.
+							close(c.initialSettingsWritten)
+							c.log.Debug("Writer loop: Signalled initialSettingsWritten channel closed.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+						}
+					}
+				}
 			}
 		}
 	}
@@ -2388,55 +2647,49 @@ func (c *Connection) sendInitialSettings() error {
 	}
 
 	c.settingsMu.Lock() // Protects c.ourSettings and c.settingsAckTimeoutTimer
-	defer c.settingsMu.Unlock()
-
-	if c.settingsAckTimeoutTimer != nil {
-		// This implies sendInitialSettings might have been called before, which is a logic error.
-		c.log.Error("sendInitialSettings called, but settingsAckTimeoutTimer already exists.", logger.LogFields{})
-		return errors.New("initial SETTINGS frame likely already sent or being sent")
-	}
 
 	var settingsPayload []Setting
 	for id, val := range c.ourSettings {
 		settingsPayload = append(settingsPayload, Setting{ID: id, Value: val})
 	}
-	// Sort settings by ID for deterministic frame content (optional, but good for testing/debugging)
-	// sort.Slice(settingsPayload, func(i, j int) bool { return settingsPayload[i].ID < settingsPayload[j].ID })
 
 	initialSettingsFrame := &SettingsFrame{
 		FrameHeader: FrameHeader{
 			Type:     FrameSettings,
 			Flags:    0, // Initial SETTINGS frame must not have ACK flag.
 			StreamID: 0, // SETTINGS frames are always on stream 0.
-			Length:   uint32(len(settingsPayload) * 6),
+			// Length will be set by WriteFrame based on payload.
 		},
 		Settings: settingsPayload,
 	}
 
-	c.log.Debug("Queuing initial server SETTINGS frame.", logger.LogFields{"num_settings": len(settingsPayload)})
-
-	// Queue the frame for sending.
+	// Queue the frame to the writer goroutine.
 	select {
 	case c.writerChan <- initialSettingsFrame:
-		// Successfully queued. Now start the ACK timeout timer.
-		c.settingsAckTimeoutTimer = time.AfterFunc(SettingsAckTimeoutDuration, func() {
-			errMsg := "timeout waiting for client's SETTINGS ACK"
-			c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr, "timeout_duration": SettingsAckTimeoutDuration.String()})
-			// Create a ConnectionError and close the connection.
-			// The Close method will handle sending GOAWAY.
-			connErr := NewConnectionError(ErrCodeSettingsTimeout, errMsg)
-			c.Close(connErr)
-		})
-		return nil
+		c.log.Debug("Initial server SETTINGS frame queued for sending.", logger.LogFields{"num_settings": len(settingsPayload), "remote_addr": c.remoteAddrStr})
 	case <-c.shutdownChan:
-		errMsg := "connection shutting down, cannot send initial SETTINGS frame"
-		c.log.Warn(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
-		return NewConnectionError(ErrCodeConnectError, errMsg) // Or a more specific shutdown error
+		c.settingsMu.Unlock()
+		c.log.Error("Failed to queue initial server SETTINGS: connection shutting down.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send initial SETTINGS")
 	default:
-		// writerChan is full. This is a critical problem, indicating the writerLoop is blocked or dead.
-		errMsg := "failed to queue initial SETTINGS frame: writer channel full or blocked"
-		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr})
-		// This situation likely means the connection is already unusable.
-		return NewConnectionError(ErrCodeInternalError, errMsg)
+		// writerChan is full. This is a critical state.
+		c.settingsMu.Unlock()
+		c.log.Error("Failed to queue initial server SETTINGS: writer channel full or blocked.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return NewConnectionError(ErrCodeInternalError, "failed to send initial SETTINGS: writer channel congested")
 	}
+
+	// Start the ACK timeout timer after successfully queuing the frame.
+	if c.settingsAckTimeoutTimer != nil {
+		// This should ideally not happen if sendInitialSettings is called only once.
+		c.settingsAckTimeoutTimer.Stop()
+	}
+	c.settingsAckTimeoutTimer = time.AfterFunc(SettingsAckTimeoutDuration, func() {
+		errMsg := "timeout waiting for client's SETTINGS ACK"
+		c.log.Error(errMsg, logger.LogFields{"remote_addr": c.remoteAddrStr, "timeout_duration": SettingsAckTimeoutDuration.String()})
+		connErr := NewConnectionError(ErrCodeSettingsTimeout, errMsg)
+		go c.Close(connErr)
+	})
+
+	c.settingsMu.Unlock()
+	return nil
 }

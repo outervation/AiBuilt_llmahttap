@@ -2,18 +2,20 @@ package http2
 
 import (
 	"context"
-	"encoding/json"
+
 	"io"
-	"net/http" // For http.Header, http.Request, http.URL
-	"net/url"  // For http.URL specifically if http above is not enough
-	"strings"  // For strings.Index and strings.HasPrefix
+	"net/http" // For http.Header, http.Request
+	"net/url"  // For url.URL
+	"os"       // Added for os.Stdout.Sync()
+
+	"runtime/debug" // For stack traces in panic recovery
+	"strings"       // For strings.Index and strings.HasPrefix
 
 	"fmt" // For error formatting, Sprintf
 	// "net/url" // For url.URL (REMOVED as potentially unused or only in stubs)
 	"sync"
 
 	"example.com/llmahttap/v2/internal/logger" // For logging within stream operations
-	"example.com/llmahttap/v2/internal/server" // For server.RouterInterface
 	"golang.org/x/net/http2/hpack"             // For hpack.HeaderField
 )
 
@@ -92,22 +94,6 @@ func (s StreamState) String() string {
 
 // ResponseWriter defines the interface for handlers to write HTTP/2 responses.
 // The Stream itself will likely implement this.
-type http2StreamWriter interface {
-	// SendHeaders sends response headers.
-	// If endStream is true, this also signals the end of the response body (e.g., for HEAD requests or empty bodies).
-	SendHeaders(headers []hpack.HeaderField, endStream bool) error
-
-	// WriteData sends a chunk of the response body.
-	// If endStream is true, this is the final chunk of the response body.
-	// It returns the number of bytes written from p.
-	WriteData(p []byte, endStream bool) (n int, err error)
-
-	// WriteTrailers sends trailing headers after the response body.
-	// This implicitly ends the stream.
-	WriteTrailers(trailers []hpack.HeaderField) error
-
-	// TODO: Consider adding a Flush() method if explicit control over sending buffered data is needed.
-}
 
 // Handler is the interface that processes requests for a given route.
 // Feature Spec 1.4.2: "Each handler implementation MUST conform to a server-defined internal interface
@@ -118,7 +104,7 @@ type Handler interface {
 	// ServeHTTP2 processes the request on the given stream.
 	// The stream provides methods to get request details and to write the response.
 	// The handlerConfig is passed to the handler when it's instantiated.
-	ServeHTTP2(s server.ResponseWriterStream, req *http.Request)
+	ServeHTTP2(s StreamWriter, req *http.Request)
 }
 
 // Compile-time check to ensure *Stream implements ResponseWriter.
@@ -144,8 +130,6 @@ type Stream struct {
 	requestTrailers   []hpack.HeaderField // For storing received trailer headers
 	requestBodyReader *io.PipeReader      // For handler to read incoming DATA frames
 	requestBodyWriter *io.PipeWriter      // For stream to write incoming DATA frames into
-	handler           server.Handler      // Changed from http2.Handler to server.Handler
-	handlerConfig     json.RawMessage     // Configuration for the handler
 
 	// Response handling (Stream implements ResponseWriter or provides one)
 	responseHeadersSent bool                // True if response HEADERS frame has been sent
@@ -186,8 +170,6 @@ func newStream(
 	initialOurWindowSize uint32,
 
 	initialPeerWindowSize uint32,
-	handler server.Handler, // Changed from http2.Handler to server.Handler
-	handlerCfg json.RawMessage,
 	prioWeight uint8,
 	prioParentID uint32,
 	prioExclusive bool,
@@ -207,8 +189,6 @@ func newStream(
 		priorityExclusive:           prioExclusive,
 		requestBodyReader:           pr,
 		requestBodyWriter:           pw,
-		handler:                     handler,
-		handlerConfig:               handlerCfg,
 		ctx:                         ctx,
 		cancelCtx:                   cancel,
 		endStreamReceivedFromClient: false,
@@ -238,7 +218,7 @@ func newStream(
 // Note: These methods will need to interact with the connection to send frames.
 
 // SendHeaders sends response headers.
-func (s *Stream) SendHeaders(headers []server.HeaderField, endStream bool) error {
+func (s *Stream) SendHeaders(headers []HeaderField, endStream bool) error {
 	s.mu.Lock()
 	// defer s.mu.Unlock() // Unlock must be carefully managed due to calls to conn
 
@@ -257,8 +237,9 @@ func (s *Stream) SendHeaders(headers []server.HeaderField, endStream bool) error
 	}
 	s.mu.Unlock() // Unlock before calling conn method which might also lock
 
-	hpackHeaders := serverToServerHpackHeaders(headers)
-	err := s.conn.sendHeadersFrame(s, hpackHeaders, endStream) // This method in conn must handle its own locking.
+	hpackHeaders := http2HeaderFieldsToHpackHeaderFields(headers)
+	s.conn.log.Debug("Stream: PRE-CALL conn.sendHeadersFrame", logger.LogFields{"stream_id": s.id, "s_conn_nil": s.conn == nil, "s_conn_log_nil": s.conn != nil && s.conn.log == nil, "num_headers": len(hpackHeaders), "end_stream": endStream})
+	err := s.conn.sendHeadersFrame(s, hpackHeaders, endStream)
 
 	s.mu.Lock() // Re-lock to update stream state
 	defer s.mu.Unlock()
@@ -380,6 +361,7 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 		s.mu.Unlock() // Unlock for the sendDataFrame call
 
 		// The stub sendDataFrame returns (int, error). We expect 0 bytes for an empty frame.
+		s.conn.log.Debug("Stream: PRE-CALL conn.sendDataFrame (empty)", logger.LogFields{"stream_id": s.id, "s_conn_nil": s.conn == nil, "s_conn_log_nil": s.conn != nil && s.conn.log == nil, "data_len": 0, "end_stream": true})
 		_, sendErr := s.conn.sendDataFrame(s, nil, true)
 
 		s.mu.Lock() // Re-lock for state update
@@ -457,6 +439,7 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 		isLastChunk := (dataOffset + chunkLen) == totalBytesToWrite
 		frameEndStream := isLastChunk && endStream
 
+		s.conn.log.Debug("Stream: PRE-CALL conn.sendDataFrame (chunk)", logger.LogFields{"stream_id": s.id, "s_conn_nil": s.conn == nil, "s_conn_log_nil": s.conn != nil && s.conn.log == nil, "chunk_len": len(chunkData), "end_stream": frameEndStream})
 		bytesSentThisChunk, sendErr := s.conn.sendDataFrame(s, chunkData, frameEndStream)
 
 		if sendErr != nil {
@@ -533,7 +516,7 @@ func (s *Stream) sendRSTStream(errorCode ErrorCode) error {
 }
 
 // WriteTrailers sends trailing headers after the response body.
-func (s *Stream) WriteTrailers(trailers []server.HeaderField) error {
+func (s *Stream) WriteTrailers(trailers []HeaderField) error {
 	s.mu.Lock() // Initial lock for checks
 	if !s.responseHeadersSent {
 		s.mu.Unlock()
@@ -550,7 +533,7 @@ func (s *Stream) WriteTrailers(trailers []server.HeaderField) error {
 
 	s.mu.Unlock() // Unlock before calling conn method
 
-	hpackTrailers := serverToServerHpackHeaders(trailers)
+	hpackTrailers := http2HeaderFieldsToHpackHeaderFields(trailers)
 	// The trailers frame itself will have END_STREAM set.
 	// The connection's sendHeadersFrame method must ensure END_STREAM is true for the frame carrying trailers.
 	err := s.conn.sendHeadersFrame(s, hpackTrailers, true)
@@ -604,9 +587,15 @@ func (s *Stream) transitionStateOnSendEndStream() {
 
 func (s *Stream) _setState(newState StreamState) {
 	if s.state == newState {
+		fmt.Printf("STREAM_DEBUG: _setState ENTERED for stream ID: %d, current state: %s, new state: %s, s.conn nil: %t, s.conn.log nil: %t\n", s.id, s.state.String(), newState.String(), s.conn == nil, s.conn != nil && s.conn.log == nil)
+		os.Stdout.Sync() // Force flush
 		return
 	}
+	fmt.Printf("STREAM_DEBUG: _setState BEFORE s.conn.log.Debug for stream ID: %d\n", s.id)
+	os.Stdout.Sync() // Force flush
 	oldState := s.state
+	fmt.Printf("STREAM_DEBUG: _setState BEFORE s.conn.log.Debug for stream ID: %d\n", s.id)
+	os.Stdout.Sync() // Force flush
 	s.state = newState
 	s.conn.log.Debug("Stream state changed", logger.LogFields{"stream_id": s.id, "old_state": oldState.String(), "new_state": newState.String()})
 
@@ -765,158 +754,102 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // processRequestHeadersAndDispatch is called on the server side when a complete
 // set of request headers is received for this stream. It constructs an http.Request
 // and dispatches it via the provided router.
-func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher server.RouterInterface) error {
-	s.mu.Lock()
-	if s.state != StreamStateOpen && s.state != StreamStateHalfClosedRemote {
-		// Headers should only be processed if the stream is in a state to receive them.
-		// createStream logic already sets state to Open or HalfClosedRemote.
-		s.mu.Unlock()
-		s.conn.log.Error("processRequestHeadersAndDispatch called on stream in invalid state",
-			logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		// This implies a logic error elsewhere or a race. The stream might already be closing.
-		// Attempt to RST, but the primary issue is the unexpected call.
+
+func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
+	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{
+		"stream_id":         s.id,
+		"num_headers_arg":   len(headers),
+		"end_stream_arg":    endStream,
+		"dispatcher_is_nil": dispatcher == nil,
+	})
+
+	if dispatcher == nil {
+		s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Dispatcher is nil, cannot proceed.", logger.LogFields{"stream_id": s.id})
+		// This is an internal server error. The stream should be reset.
 		_ = s.sendRSTStream(ErrCodeInternalError)
-		return NewStreamError(s.id, ErrCodeInternalError, "stream in invalid state for header processing")
+		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil")
 	}
-	s.requestHeaders = headers // Store raw headers on stream
+
+	// Store received headers (for potential handler access, though http.Request will be primary)
+	// Store received headers (for potential handler access, though http.Request will be primary)
+	// The state transitions (Idle -> Open/HalfClosedRemote) are now fully handled by the caller (conn.handleIncomingCompleteHeaders)
+	// before this method is invoked. This method can trust the state it's called in.
+	s.mu.Lock()
+	s.requestHeaders = headers // These are hpack.HeaderField
 	s.mu.Unlock()
 
-	method, path, scheme, authority, pseudoErr := s.conn.extractPseudoHeaders(headers)
+	// Construct http.Request from headers
+	// This is a simplified construction. A full one would handle cookies, content-length, etc.
+	// and more robust pseudo-header validation (though conn.extractPseudoHeaders does a lot).
+	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
 	if pseudoErr != nil {
-		s.conn.log.Error("Error extracting pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
-		_ = s.sendRSTStream(ErrCodeProtocolError) // Send RST for malformed request
-		return pseudoErr                          // Propagate if it's a ConnectionError
+		s.conn.log.Error("Failed to extract pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
+		_ = s.sendRSTStream(ErrCodeProtocolError) // This is a protocol error
+		return pseudoErr
 	}
 
-	// Construct URL
-	// Path might contain query string. e.g. /path?query=value
-	// http.Request.URL should have Path and RawQuery separated.
-	requestURL := &url.URL{}
-	if qIdx := strings.Index(path, "?"); qIdx != -1 {
-		requestURL.Path = path[:qIdx]
-		requestURL.RawQuery = path[qIdx+1:]
-	} else {
-		requestURL.Path = path
+	reqURL := &url.URL{
+		Scheme: pseudoScheme,
+		Host:   pseudoAuthority, // :authority or Host header
+		Path:   pseudoPath,      // Includes query string
+	}
+	// Query string is part of pseudoPath, http.Request.URL.RawQuery will be parsed from it by net/http if needed
+	// or we can parse it here:
+	if idx := strings.Index(pseudoPath, "?"); idx != -1 {
+		reqURL.Path = pseudoPath[:idx]
+		reqURL.RawQuery = pseudoPath[idx+1:]
 	}
 
-	requestURL.Scheme = scheme
-	if requestURL.Scheme == "" {
-		requestURL.Scheme = "https" // Default to https for HTTP/2 if not specified
+	httpHeaders := make(http.Header)
+	for _, hf := range headers {
+		if !strings.HasPrefix(hf.Name, ":") { // Don't include pseudo-headers in http.Header
+			httpHeaders.Add(hf.Name, hf.Value)
+		}
 	}
-	requestURL.Host = authority // :authority typically populates this
 
+	// Create the http.Request object
 	req := &http.Request{
-		Method:     method,
-		URL:        requestURL,
-		Proto:      "HTTP/2.0",
+		Method:     pseudoMethod,
+		URL:        reqURL,
+		Proto:      "HTTP/2.0", // Or ProtoMajor/ProtoMinor if needed
 		ProtoMajor: 2,
 		ProtoMinor: 0,
-		Header:     make(http.Header),
-		Body:       s.requestBodyReader, // This is an io.ReadCloser (specifically *io.PipeReader)
-		Host:       authority,           // Also set Host field
-		RequestURI: path,                // Original full :path value
+		Header:     httpHeaders,
+		Body:       s.requestBodyReader, // Pipe reader for DATA frames
+		Host:       pseudoAuthority,     // :authority or Host
 		RemoteAddr: s.conn.remoteAddrStr,
-		TLS:        nil, // TODO: Populate TLS connection state if available, s.conn.isTLS() only gives bool
+		RequestURI: pseudoPath, // Original :path value
+		// TLS, TransferEncoding, ContentLength would be set if applicable
+		// For ContentLength, it's derived from DATA frames or absence of END_STREAM on HEADERS.
+		// The http.Request.Body (our s.requestBodyReader) will handle this.
+		// If endStream was true on HEADERS and no DATA frames, Body will yield EOF immediately.
 	}
-	if s.conn.isTLS() {
-		// This is a placeholder. A real http.Request.TLS would be *tls.ConnectionState.
-		// For now, this structure isn't readily available to populate.
-		// Most handlers check req.URL.Scheme == "https" or rely on proxy headers.
-	}
+	req = req.WithContext(s.ctx) // Associate stream's context with the request
 
-	// Populate http.Header from hpack.HeaderField, skipping pseudo-headers.
-	// HTTP/2 allows multiple values for the same header field name. http.Header handles this with []string.
-	for _, hf := range headers {
-		if strings.HasPrefix(hf.Name, ":") {
-			continue // Skip pseudo-headers
-		}
-		// HTTP/1.1 header field names are case-insensitive. Go's http.Header canonicalizes keys.
-		// HTTP/2 header field names are lowercase.
-		req.Header.Add(hf.Name, hf.Value)
-	}
+	// Dispatch to the handler. The handler is responsible for calling s.SendHeaders, s.WriteData, etc.
+	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
 
-	// Cookie handling (optional, standard library http.Server does this)
-	// if cookies := req.Header["Cookie"]; len(cookies) > 0 {
-	// // Parse cookies, make them available via req.Cookies()
-	// // For simplicity, we are not implementing this here; handlers can parse if needed.
-	// }
-
-	// Dispatch the request
-	// The router's ServeHTTP expects an http.ResponseWriter and *http.Request.
-	// Our Stream `s` implements server.ResponseWriterStream, which satisfies the http.ResponseWriter part.
-	// The server.ResponseWriterStream is a superset and includes Stream specific methods like ID() etc.
-	s.conn.log.Debug("Dispatching request to router", logger.LogFields{"stream_id": s.id, "method": req.Method, "path": req.URL.Path})
-
-	// Set the handler on the stream *before* calling ServeHTTP on the router,
-	// so that if the router looks up the handler and then wants to associate it with the stream,
-	// it's not strictly necessary, but helps if the stream needs to know its handler later.
-	// However, the handler itself is usually opaque to the stream object after this point.
-	// The HandlerConfig is specific to the *route*, not the stream itself directly after creation.
-	// The dispatcher will find the handler and its config.
-
-	// The handler is executed synchronously here. If handlers are long-running,
-	// they should manage their own goroutines or the server needs a worker pool model.
-	// For now, assume handlers are reasonably fast or manage their own concurrency.
-	dispatcher.ServeHTTP(s, req)
-
-	// After ServeHTTP returns, the handler has finished processing the request for this stream.
-	// If endStream was not received with headers and the handler hasn't read the body fully,
-	// the requestBodyReader might still be open.
-	// If the handler didn't send a response or an error occurred leading to no response,
-	// the stream might be left in an awkward state. Http.Server has logic to ensure
-	// a response is always sent. Here, it's the handler's responsibility.
-	// If ServeHTTP panics, it should be recovered by a higher layer (e.g., in the per-stream goroutine).
+	// The dispatcher function is expected to be non-blocking itself (i.e., it should
+	// spawn goroutines for long-running handler logic).
+	// The stream remains active for the handler to write response.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.conn.log.Error("Panic in request handler goroutine", logger.LogFields{"stream_id": s.id, "panic": r, "stack": string(debug.Stack())})
+				// Ensure stream is closed if handler panics
+				_ = s.sendRSTStream(ErrCodeInternalError)
+			}
+			// Ensure the stream is properly closed if the handler finishes but doesn't explicitly end the stream response.
+			// This is complex: if handler returns, and server hasn't sent END_STREAM, what should happen?
+			// Usually, handler is responsible for completing the response. If it returns without error
+			// AND without closing the stream from server-side, it's ambiguous.
+			// For now, assume handler completes the stream or errors.
+			s.conn.streamHandlerDone(s) // Notify connection that this stream's handler work is done.
+		}()
+		dispatcher(s, req)
+	}()
 
 	return nil
-}
-
-// processResponseHeaders is called on the client side when a complete
-// set of response headers is received for this stream.
-func (s *Stream) processResponseHeaders(headers []hpack.HeaderField, endStream bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.conn.isClient {
-		s.conn.log.Error("processResponseHeaders called on server-side stream", logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeInternalError, "server-side stream cannot process response headers")
-	}
-
-	// TODO: Implement client-side response header processing.
-	// This would involve:
-	// 1. Validating pseudo-headers (e.g., :status is mandatory).
-	// 2. Storing headers for the client application to access.
-	// 3. If endStream is true, and no data is expected, transition stream state appropriately.
-	// 4. If data is expected, prepare requestBodyReader (which is for incoming data).
-	//    For client responses, this would be responseBodyReader.
-	s.conn.log.Debug("Client-side processResponseHeaders (stub)", logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
-
-	s.responseHeadersSent = true // From stream's perspective, "response" means headers from peer.
-	if endStream {
-		s.endStreamReceivedFromClient = true // Peer sent END_STREAM
-		if s.requestBodyWriter != nil {      // If this stream was expecting data from peer
-			_ = s.requestBodyWriter.Close() // Signal EOF
-		}
-		// Update stream state based on receiving END_STREAM
-		switch s.state {
-		case StreamStateOpen:
-			s._setState(StreamStateHalfClosedRemote)
-		case StreamStateHalfClosedLocal: // We (client) already sent END_STREAM
-			s._setState(StreamStateClosed)
-		default:
-			s.conn.log.Warn("Client received END_STREAM in unexpected stream state",
-				logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-			// This could be a protocol error if state was, e.g., Idle or Reserved.
-		}
-	} else {
-		// If not endStream, but stream was Idle (e.g. pushed stream HEADERS)
-		if s.state == StreamStateReservedRemote { // For a pushed stream
-			s._setState(StreamStateOpen)
-		}
-		// If it was Open already (response to client request), it remains Open.
-	}
-
-	return nil
-
 }
 
 // ID returns the stream's identifier.
@@ -927,16 +860,36 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
-// serverToServerHpackHeaders converts []server.HeaderField to []hpack.HeaderField.
-func serverToServerHpackHeaders(serverHeaders []server.HeaderField) []hpack.HeaderField {
-	if serverHeaders == nil {
+// http2HeaderFieldsToHpackHeaderFields converts []http2.HeaderField to []hpack.HeaderField.
+func http2HeaderFieldsToHpackHeaderFields(http2Headers []HeaderField) []hpack.HeaderField {
+	if http2Headers == nil {
 		return nil
 	}
-	hpackHeaders := make([]hpack.HeaderField, len(serverHeaders))
-	for i, sh := range serverHeaders {
-		// server.HeaderField has Name, Value. hpack.HeaderField has Name, Value, Sensitive.
+	hpackHeaders := make([]hpack.HeaderField, len(http2Headers))
+	for i, hf := range http2Headers {
+		hpackHeaders[i] = hpack.HeaderField{Name: hf.Name, Value: hf.Value /* Sensitive not mapped */}
+	}
+	return hpackHeaders
+}
+
+// serverToServerHpackHeaders is a temporary placeholder for http2HeaderFieldsToHpackHeaderFields.
+// This ensures that if the old name is still lingering (e.g. due to search/replace error),
+// it still calls the correct function. Eventually, all calls should be to http2HeaderFieldsToHpackHeaderFields.
+// For now, let's make it a direct alias to avoid an intermediate step if the replacement above worked.
+// func serverToServerHpackHeaders(http2Headers []HeaderField) []hpack.HeaderField {
+// 	return http2HeaderFieldsToHpackHeaderFields(http2Headers)
+// }
+
+// http2ToHpackHeaders converts []HeaderField (from http2 package) to []hpack.HeaderField.
+func http2ToHpackHeaders(http2Headers []HeaderField) []hpack.HeaderField {
+	if http2Headers == nil {
+		return nil
+	}
+	hpackHeaders := make([]hpack.HeaderField, len(http2Headers))
+	for i, hf := range http2Headers {
+		// http2.HeaderField has Name, Value. hpack.HeaderField has Name, Value, Sensitive.
 		// Assuming Sensitive defaults to false or is not relevant for this conversion path.
-		hpackHeaders[i] = hpack.HeaderField{Name: sh.Name, Value: sh.Value}
+		hpackHeaders[i] = hpack.HeaderField{Name: hf.Name, Value: hf.Value}
 	}
 	return hpackHeaders
 }

@@ -582,7 +582,8 @@ func validateConfig(cfg *Config) error {
 	if cfg.Logging.AccessLog.Target == "" { // Should be caught by default
 		return fmt.Errorf("logging.access_log.target cannot be empty")
 	}
-	if isFilePath(cfg.Logging.AccessLog.Target) && !filepath.IsAbs(cfg.Logging.AccessLog.Target) {
+
+	if IsFilePath(cfg.Logging.AccessLog.Target) && !filepath.IsAbs(cfg.Logging.AccessLog.Target) {
 		return fmt.Errorf("logging.access_log.target path '%s' must be absolute", cfg.Logging.AccessLog.Target)
 	}
 	if cfg.Logging.AccessLog.Format != "json" { // Currently only "json" is supported
@@ -606,7 +607,8 @@ func validateConfig(cfg *Config) error {
 	if cfg.Logging.ErrorLog.Target == "" { // Should be caught by default
 		return fmt.Errorf("logging.error_log.target cannot be empty")
 	}
-	if isFilePath(cfg.Logging.ErrorLog.Target) && !filepath.IsAbs(cfg.Logging.ErrorLog.Target) {
+
+	if IsFilePath(cfg.Logging.ErrorLog.Target) && !filepath.IsAbs(cfg.Logging.ErrorLog.Target) {
 		return fmt.Errorf("logging.error_log.target path '%s' must be absolute", cfg.Logging.ErrorLog.Target)
 	}
 
@@ -614,7 +616,9 @@ func validateConfig(cfg *Config) error {
 }
 
 // isFilePath checks if a target string is likely a file path (not stdout/stderr).
-func isFilePath(target string) bool {
+
+// IsFilePath checks if a target string is likely a file path (not stdout/stderr).
+func IsFilePath(target string) bool {
 	return target != "stdout" && target != "stderr"
 }
 

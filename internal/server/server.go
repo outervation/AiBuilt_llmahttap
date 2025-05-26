@@ -272,6 +272,19 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 	remoteAddr := tcpConn.RemoteAddr().String()
 	s.log.Debug("Accepted new TCP connection", logger.LogFields{"remote_addr": remoteAddr})
 
+	// Set TCP_NODELAY to disable Nagle's algorithm for this connection.
+	// This helps ensure small frames (like SETTINGS) are sent promptly.
+	if tcpCon, ok := tcpConn.(*net.TCPConn); ok {
+		if err := tcpCon.SetNoDelay(true); err != nil {
+			s.log.Warn("Failed to set TCP_NODELAY on connection", logger.LogFields{"remote_addr": remoteAddr, "error": err.Error()})
+			// Continue anyway, but this might impact handshake timing.
+		} else {
+			s.log.Debug("Successfully set TCP_NODELAY on connection", logger.LogFields{"remote_addr": remoteAddr})
+		}
+	} else {
+		s.log.Warn("Underlying connection is not *net.TCPConn, cannot set TCP_NODELAY.", logger.LogFields{"remote_addr": remoteAddr, "type": fmt.Sprintf("%T", tcpConn)})
+	}
+
 	var srvSettingsOverride map[http2.SettingID]uint32
 	if s.cfg != nil && s.cfg.Server != nil {
 		// Example: srvSettingsOverride = s.cfg.Server.Http2Settings (if defined)

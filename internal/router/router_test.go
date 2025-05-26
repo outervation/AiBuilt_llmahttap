@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context" // Added for mockResponseWriter.Context()
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"example.com/llmahttap/v2/internal/config"
+
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/server"
@@ -27,7 +29,7 @@ type mockHandler struct {
 	config      json.RawMessage
 }
 
-func (mh *mockHandler) ServeHTTP2(s *http2.Stream, req *http.Request) {
+func (mh *mockHandler) ServeHTTP2(resp http2.StreamWriter, req *http.Request) {
 	// No-op for most router tests, or can be used to signal it was called.
 }
 
@@ -202,7 +204,7 @@ func TestRouter_Match(t *testing.T) {
 	lg := newTestLogger(t)
 
 	mockHandlerFactory := func(handlerType string) server.HandlerFactory {
-		return func(cfg json.RawMessage, l *logger.Logger) (http2.Handler, error) {
+		return func(cfg json.RawMessage, l *logger.Logger) (server.Handler, error) { // Changed http2.Handler to server.Handler
 			return &mockHandler{id: "handler_for_" + handlerType, handlerType: handlerType, config: cfg}, nil
 		}
 	}
@@ -212,7 +214,8 @@ func TestRouter_Match(t *testing.T) {
 	registry.Register("root_exact_handler", mockHandlerFactory("root_exact_handler"))
 	registry.Register("root_prefix_handler", mockHandlerFactory("root_prefix_handler"))
 	registry.Register("case_sensitive_handler", mockHandlerFactory("case_sensitive_handler"))
-	registry.Register("handler_that_fails", func(cfg json.RawMessage, l *logger.Logger) (http2.Handler, error) {
+
+	registry.Register("handler_that_fails", func(cfg json.RawMessage, l *logger.Logger) (server.Handler, error) { // Changed http2.Handler to server.Handler
 		return nil, errors.New("handler creation failed")
 	})
 
@@ -344,12 +347,37 @@ type testOkHandlerForServeHTTP struct {
 	pathTracker *string
 }
 
-func (h *testOkHandlerForServeHTTP) ServeHTTP2(s *http2.Stream, req *http.Request) {
+func (h *testOkHandlerForServeHTTP) ServeHTTP2(resp http2.StreamWriter, req *http.Request) {
 	if h.pathTracker != nil {
 		*(h.pathTracker) = req.URL.Path
 	}
-	// s is *http2.Stream which implements http2.ResponseWriter
-	s.SendHeaders([]hpack.HeaderField{{Name: ":status", Value: "200"}}, true)
+	// resp is server.ResponseWriterStream, which implements server.ResponseWriter
+	// We need to convert server.HeaderField to hpack.HeaderField if SendHeaders takes hpack.HeaderField.
+	// server.ResponseWriter expects server.HeaderField. Our mockResponseWriter and testableStream use hpack.HeaderField.
+	// This needs to be consistent. Let's assume mockResponseWriter/testableStream should use server.HeaderField.
+	// For now, the error is about the factory signature.
+
+	// The mock handler needs to use the methods of server.ResponseWriterStream
+	// to send a response.
+	// The testableStream currently implements http2.ResponseWriter using hpack.HeaderField
+	// Let's assume `resp` can handle server.HeaderField or we will adapt testableStream later.
+	// For now, to compile, just call `resp.SendHeaders`.
+	// resp.SendHeaders([]server.HeaderField{{Name: ":status", Value: "200"}}, true)
+	// However, the actual stream used in tests is `testableStream` which uses mockResponseWriter,
+	// and mockResponseWriter uses hpack.HeaderField.
+	// This test (TestRouter_ServeHTTP) has a note: "Skipping direct call to r.ServeHTTP due to http2.Stream mocking complexity."
+	// So this ServeHTTP2 method might not be fully exercised if the handler is not directly called.
+	// But its signature must be correct.
+	// If it *is* called, and `resp` is `testableStream`, it expects hpack fields.
+	// Let's assume for now that the mock should send *something* minimal that fits the interface.
+	// The error is in the factory, not here directly yet.
+
+	// The call in original code:
+	// s.SendHeaders([]hpack.HeaderField{{Name: ":status", Value: "200"}}, true)
+	// Our `resp` is server.ResponseWriterStream, which should take server.HeaderField
+	// Let's assume the mock in TestRouter_ServeHTTP will be fixed to use server.HeaderField.
+	// For now, this is what a real handler would do.
+	resp.SendHeaders([]http2.HeaderField{{Name: ":status", Value: "200"}}, true)
 }
 
 func TestRouter_ServeHTTP(t *testing.T) {
@@ -357,10 +385,12 @@ func TestRouter_ServeHTTP(t *testing.T) {
 
 	handlerReg := server.NewHandlerRegistry()
 	var handlerServedPath string
-	handlerReg.Register("ok_handler", func(cfg json.RawMessage, l *logger.Logger) (http2.Handler, error) {
+
+	handlerReg.Register("ok_handler", func(cfg json.RawMessage, l *logger.Logger) (server.Handler, error) { // Changed http2.Handler to server.Handler
 		return &testOkHandlerForServeHTTP{pathTracker: &handlerServedPath}, nil
 	})
-	handlerReg.Register("fail_creation_handler", func(cfg json.RawMessage, l *logger.Logger) (http2.Handler, error) {
+
+	handlerReg.Register("fail_creation_handler", func(cfg json.RawMessage, l *logger.Logger) (server.Handler, error) { // Changed http2.Handler to server.Handler
 		return nil, fmt.Errorf("handler creation failed")
 	})
 
@@ -503,4 +533,8 @@ func TestRouteSorting(t *testing.T) {
 			t.Errorf("Route sorting failed. Expected '%s' at index %d, got '%s'", expectedOrder[i], i, r.PathPattern)
 		}
 	}
+}
+
+func (mrw *mockResponseWriter) Context() context.Context {
+	return context.Background() // Basic implementation for mock
 }

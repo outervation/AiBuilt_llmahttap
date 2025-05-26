@@ -189,6 +189,12 @@ func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 // If a handler is found but fails to be created, it sends a 500 Internal Server Error response.
 // This method would be called by the HTTP/2 connection/server layer for each request stream.
 func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
+	r.mainLogger.Debug("Router.ServeHTTP: ENTERED", logger.LogFields{
+		"method":   req.Method,
+		"uri":      req.RequestURI,
+		"path":     req.URL.Path,
+		"streamID": s.ID(),
+	})
 	// Path is extracted from :path pseudo-header, typically available in req.URL.Path
 	// For HTTP/2, the :path pseudo-header includes the query string.
 	// The routing is based on the path component only.
@@ -212,7 +218,7 @@ func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
 		}
 		// This uses the server's default error response mechanism.
 		// Ensure the logger is not nil, though it should be guaranteed by NewRouter.
-		server.WriteErrorResponse(s, http.StatusInternalServerError, headers, "Failed to initialize request handler.")
+		server.WriteErrorResponse(s, http.StatusInternalServerError, headers, "Failed to initialize request handler.", r.mainLogger)
 		return
 	}
 
@@ -227,7 +233,7 @@ func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
 				headers = append(headers, http2.HeaderField{Name: strings.ToLower(k), Value: v})
 			}
 		}
-		server.WriteErrorResponse(s, http.StatusNotFound, headers, "The requested resource was not found.")
+		server.WriteErrorResponse(s, http.StatusNotFound, headers, "The requested resource was not found.", r.mainLogger)
 		return
 	}
 

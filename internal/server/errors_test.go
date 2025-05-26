@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors" // Standard errors package
+	"example.com/llmahttap/v2/internal/http2"
 	"fmt"
 
 	"context"
@@ -102,7 +103,7 @@ type mockResponseWriter struct {
 	t *testing.T
 
 	headersSent   bool
-	sentHeaders   []isserver.HeaderField
+	sentHeaders   []http2.HeaderField
 	sentData      bytes.Buffer
 	endStreamData bool // Was endStream true on the WriteData call
 	endStreamHead bool // Was endStream true on the SendHeaders call
@@ -116,7 +117,7 @@ func newMockResponseWriter(t *testing.T) *mockResponseWriter {
 	return &mockResponseWriter{t: t}
 }
 
-func (m *mockResponseWriter) SendHeaders(headers []isserver.HeaderField, endStream bool) error {
+func (m *mockResponseWriter) SendHeaders(headers []http2.HeaderField, endStream bool) error {
 	if m.sendHeadersErr != nil {
 		return m.sendHeadersErr
 	}
@@ -125,7 +126,7 @@ func (m *mockResponseWriter) SendHeaders(headers []isserver.HeaderField, endStre
 		m.t.Fatal("SendHeaders called more than once")
 	}
 	m.headersSent = true
-	m.sentHeaders = make([]isserver.HeaderField, len(headers)) // Changed type here
+	m.sentHeaders = make([]http2.HeaderField, len(headers))
 	copy(m.sentHeaders, headers)
 	m.endStreamHead = endStream
 	return nil
@@ -157,13 +158,13 @@ func (m *mockResponseWriter) WriteData(p []byte, endStream bool) (n int, err err
 	return len(p), nil
 }
 
-func (m *mockResponseWriter) WriteTrailers(trailers []isserver.HeaderField) error {
+func (m *mockResponseWriter) WriteTrailers(trailers []http2.HeaderField) error {
 	m.t.Helper()
 	m.t.Fatal("WriteTrailers should not be called by WriteErrorResponse")
 	return nil
 }
 
-func findHeaderValue(headers []isserver.HeaderField, name string) (string, bool) {
+func findHeaderValue(headers []http2.HeaderField, name string) (string, bool) {
 	for _, h := range headers {
 		if h.Name == name {
 			return h.Value, true
@@ -375,12 +376,12 @@ func TestWriteErrorResponse(t *testing.T) {
 			mockRW.sendHeadersErr = tt.mockSendHeadersError
 			mockRW.writeDataErr = tt.mockWriteDataError
 
-			reqHeaders := []isserver.HeaderField{}
+			reqHeaders := []http2.HeaderField{}
 			if tt.acceptHeader != "" {
-				reqHeaders = append(reqHeaders, isserver.HeaderField{Name: "accept", Value: tt.acceptHeader})
+				reqHeaders = append(reqHeaders, http2.HeaderField{Name: "accept", Value: tt.acceptHeader})
 			}
 
-			err := isserver.WriteErrorResponse(mockRW, tt.statusCode, reqHeaders, tt.detailMessage)
+			err := isserver.WriteErrorResponse(mockRW, tt.statusCode, reqHeaders, tt.detailMessage, nil)
 
 			if tt.expectOverallError {
 				if err == nil {
