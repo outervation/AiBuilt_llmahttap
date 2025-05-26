@@ -2,6 +2,8 @@ package http2_test
 
 import (
 	"bytes"
+	"errors"
+	"strings"
 	// "encoding/binary" // Removed as not used
 	"fmt"
 	"io" // Needed for io.EOF, io.ErrUnexpectedEOF
@@ -163,7 +165,10 @@ func deepCopyFramePayload(f http2.Frame) interface{} {
 	case *http2.SettingsFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
-		if ft.Settings != nil {
+
+		if ft.Settings == nil {
+			cp.Settings = []http2.Setting{} // Normalize nil to empty non-nil for comparison
+		} else {
 			cp.Settings = make([]http2.Setting, len(ft.Settings))
 			copy(cp.Settings, ft.Settings)
 		}
@@ -2729,6 +2734,332 @@ func TestSettingID_String(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.sid.String(); got != tt.expected {
 				t.Errorf("SettingID.String() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReadFrame_ValidFrames(t *testing.T) {
+	tests := []struct {
+		name          string
+		originalFrame http2.Frame
+	}{
+		{
+			name: "DataFrame basic",
+			originalFrame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FrameData, StreamID: 1},
+				Data:        []byte("hello data"),
+			},
+		},
+		{
+			name: "DataFrame with padding and END_STREAM",
+			originalFrame: &http2.DataFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FrameData, Flags: http2.FlagDataPadded | http2.FlagDataEndStream, StreamID: 3},
+				PadLength:   4,
+				Data:        []byte("padded end data"),
+				Padding:     make([]byte, 4),
+			},
+		},
+		{
+			name: "HeadersFrame basic with END_HEADERS",
+			originalFrame: &http2.HeadersFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FrameHeaders, Flags: http2.FlagHeadersEndHeaders, StreamID: 5},
+				HeaderBlockFragment: []byte("header data"),
+			},
+		},
+		{
+			name: "HeadersFrame with all flags",
+			originalFrame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type: http2.FrameHeaders,
+					Flags: http2.FlagHeadersEndStream | http2.FlagHeadersEndHeaders |
+						http2.FlagHeadersPadded | http2.FlagHeadersPriority,
+					StreamID: 7,
+				},
+				PadLength:           3,
+				Exclusive:           true,
+				StreamDependency:    1,
+				Weight:              100,
+				HeaderBlockFragment: []byte("full headers"),
+				Padding:             make([]byte, 3),
+			},
+		},
+		{
+			name: "PriorityFrame basic",
+			originalFrame: &http2.PriorityFrame{
+				FrameHeader:      http2.FrameHeader{Type: http2.FramePriority, StreamID: 9},
+				Exclusive:        false,
+				StreamDependency: 7,
+				Weight:           200,
+			},
+		},
+		{
+			name: "RSTStreamFrame basic",
+			originalFrame: &http2.RSTStreamFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 11},
+				ErrorCode:   http2.ErrCodeCancel,
+			},
+		},
+		{
+			name: "SettingsFrame with settings",
+			originalFrame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0},
+				Settings: []http2.Setting{
+					{ID: http2.SettingMaxFrameSize, Value: 16384},
+					{ID: http2.SettingEnablePush, Value: 0},
+				},
+			},
+		},
+		{
+			name: "SettingsFrame ACK",
+			originalFrame: &http2.SettingsFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Flags: http2.FlagSettingsAck, StreamID: 0},
+				Settings:    nil, // Or []http2.Setting{}
+			},
+		},
+		{
+			name: "PushPromiseFrame basic with END_HEADERS",
+			originalFrame: &http2.PushPromiseFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FramePushPromise, Flags: http2.FlagPushPromiseEndHeaders, StreamID: 13},
+				PromisedStreamID:    14,
+				HeaderBlockFragment: []byte("promised stuff"),
+			},
+		},
+		{
+			name: "PushPromiseFrame with padding and END_HEADERS",
+			originalFrame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
+					StreamID: 15,
+				},
+				PadLength:           2,
+				PromisedStreamID:    16,
+				HeaderBlockFragment: []byte("padded promise"),
+				Padding:             make([]byte, 2),
+			},
+		},
+		{
+			name: "PingFrame basic",
+			originalFrame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FramePing, StreamID: 0},
+				OpaqueData:  [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			},
+		},
+		{
+			name: "PingFrame ACK",
+			originalFrame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{Type: http2.FramePing, Flags: http2.FlagPingAck, StreamID: 0},
+				OpaqueData:  [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+			},
+		},
+		{
+			name: "GoAwayFrame with debug data",
+			originalFrame: &http2.GoAwayFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
+				LastStreamID:        20,
+				ErrorCode:           http2.ErrCodeNoError,
+				AdditionalDebugData: []byte("going away"),
+			},
+		},
+		{
+			name: "GoAwayFrame no debug data",
+			originalFrame: &http2.GoAwayFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
+				LastStreamID:        22,
+				ErrorCode:           http2.ErrCodeInternalError,
+				AdditionalDebugData: []byte{},
+			},
+		},
+		{
+			name: "WindowUpdateFrame basic",
+			originalFrame: &http2.WindowUpdateFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FrameWindowUpdate, StreamID: 24},
+				WindowSizeIncrement: 1024,
+			},
+		},
+		{
+			name: "ContinuationFrame basic with END_HEADERS",
+			originalFrame: &http2.ContinuationFrame{
+				FrameHeader:         http2.FrameHeader{Type: http2.FrameContinuation, Flags: http2.FlagContinuationEndHeaders, StreamID: 26},
+				HeaderBlockFragment: []byte("continued headers"),
+			},
+		},
+		// UnknownFrame is tested in TestReadFrame_UnknownFrameType
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Ensure the original frame's header length is set correctly based on its payload.
+			// This is crucial because WriteFrame uses FrameHeader.Length.
+			tt.originalFrame.Header().Length = tt.originalFrame.PayloadLen()
+
+			var writeBuf bytes.Buffer
+			err := http2.WriteFrame(&writeBuf, tt.originalFrame)
+			if err != nil {
+				t.Fatalf("WriteFrame() failed to serialize original frame: %v", err)
+			}
+
+			// Create a new buffer for reading, as ReadFrame consumes the buffer.
+			readBuf := bytes.NewBuffer(writeBuf.Bytes())
+			parsedFrame, err := http2.ReadFrame(readBuf)
+
+			if err != nil {
+				t.Fatalf("ReadFrame() failed: %v. Serialized bytes: %x", err, writeBuf.Bytes())
+			}
+			if parsedFrame == nil {
+				t.Fatal("ReadFrame() returned nil frame without error")
+			}
+			if readBuf.Len() != 0 {
+				t.Errorf("ReadFrame() did not consume entire buffer, remaining: %d bytes", readBuf.Len())
+			}
+
+			// Compare headers
+			assertFrameHeaderEquals(t, *tt.originalFrame.Header(), *parsedFrame.Header())
+
+			// Compare payload parts (struct fields other than FrameHeader)
+			originalPayloadComparable := deepCopyFramePayload(tt.originalFrame)
+			parsedPayloadComparable := deepCopyFramePayload(parsedFrame)
+
+			if !reflect.DeepEqual(originalPayloadComparable, parsedPayloadComparable) {
+				t.Errorf("Frame payload parts not equal after ReadFrame.\nOriginal: %#v\nParsed:   %#v",
+					originalPayloadComparable, parsedPayloadComparable)
+			}
+		})
+	}
+}
+
+func TestReadFrame_ErrorConditions(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputBytes     []byte
+		expectedError  error  // For sentinel errors like io.EOF, checked with errors.Is
+		expectedErrStr string // For substring matching of error messages
+	}{
+		// --- Errors during Header Reading (delegated to ReadFrameHeader) ---
+		{
+			name:          "EOF reading header - empty buffer",
+			inputBytes:    []byte{},
+			expectedError: io.EOF,
+		},
+		{
+			name:          "EOF reading header - partial header (4 bytes)",
+			inputBytes:    []byte{0x00, 0x00, 0x01, 0x00}, // Length, Type
+			expectedError: io.ErrUnexpectedEOF,
+		},
+		// --- Errors during Payload Parsing (after successful header read) ---
+		{
+			name: "Valid header, EOF reading payload for DATA frame",
+			inputBytes: []byte{
+				0x00, 0x00, 0x05, // Length = 5
+				byte(http2.FrameData), 0x00, // Type=DATA, Flags=0
+				0x00, 0x00, 0x00, 0x01, // StreamID=1
+				'd', 'a', 't', // Payload: "dat" (3 bytes, expecting 5)
+			},
+			expectedErrStr: "parsing DATA payload: reading data: unexpected EOF",
+		},
+		{
+			name: "PRIORITY frame, Header.Length != 5 (is 3)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x03, // Length = 3
+				byte(http2.FramePriority), 0x00, // Type=PRIORITY, Flags=0
+				0x00, 0x00, 0x00, 0x01, // StreamID=1
+				0x01, 0x02, 0x03, // Dummy payload
+			},
+			expectedErrStr: "parsing PRIORITY payload: PRIORITY frame payload must be 5 bytes, got 3",
+		},
+		{
+			name: "RST_STREAM frame, Header.Length != 4 (is 2)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x02, // Length = 2
+				byte(http2.FrameRSTStream), 0x00, // Type=RST_STREAM, Flags=0
+				0x00, 0x00, 0x00, 0x01, // StreamID=1
+				0x00, 0x00, // Dummy payload
+			},
+			expectedErrStr: "parsing RST_STREAM payload: RST_STREAM frame payload must be 4 bytes, got 2",
+		},
+		{
+			name: "SETTINGS ACK frame, Header.Length != 0 (is 1)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x01, // Length = 1
+				byte(http2.FrameSettings), byte(http2.FlagSettingsAck), // Type=SETTINGS, Flags=ACK
+				0x00, 0x00, 0x00, 0x00, // StreamID=0
+				0xAA, // Dummy payload byte
+			},
+			expectedErrStr: "parsing SETTINGS payload: SETTINGS ACK frame must have a payload length of 0, got 1",
+		},
+		{
+			name: "SETTINGS frame, Header.Length not multiple of 6 (is 5)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x05, // Length = 5
+				byte(http2.FrameSettings), 0x00, // Type=SETTINGS, Flags=0
+				0x00, 0x00, 0x00, 0x00, // StreamID=0
+				0x01, 0x02, 0x03, 0x04, 0x05, // Dummy payload
+			},
+			expectedErrStr: "parsing SETTINGS payload: SETTINGS frame payload length 5 is not a multiple of 6",
+		},
+		{
+			name: "PING frame, Header.Length != 8 (is 7)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x07, // Length = 7
+				byte(http2.FramePing), 0x00, // Type=PING, Flags=0
+				0x00, 0x00, 0x00, 0x00, // StreamID=0
+				1, 2, 3, 4, 5, 6, 7, // Dummy payload
+			},
+			expectedErrStr: "parsing PING payload: PING frame payload must be 8 bytes, got 7",
+		},
+		{
+			name: "WINDOW_UPDATE frame, Header.Length != 4 (is 3)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x03, // Length = 3
+				byte(http2.FrameWindowUpdate), 0x00, // Type=WINDOW_UPDATE, Flags=0
+				0x00, 0x00, 0x00, 0x01, // StreamID=1
+				1, 2, 3, // Dummy payload
+			},
+			expectedErrStr: "parsing WINDOW_UPDATE payload: WINDOW_UPDATE frame payload must be 4 bytes, got 3",
+		},
+		{
+			name: "GOAWAY frame, Header.Length < 8 (is 7)",
+			inputBytes: []byte{
+				0x00, 0x00, 0x07, // Length = 7
+				byte(http2.FrameGoAway), 0x00, // Type=GOAWAY, Flags=0
+				0x00, 0x00, 0x00, 0x00, // StreamID=0
+				1, 2, 3, 4, 5, 6, 7, // Dummy payload
+			},
+			expectedErrStr: "parsing GOAWAY payload: GOAWAY frame payload must be at least 8 bytes, got 7",
+		},
+		{
+			name: "DataFrame PADDED, PadLength exceeds payload",
+			inputBytes: []byte{
+				0x00, 0x00, 0x01, // Length = 1 (for PadLength byte only)
+				byte(http2.FrameData), byte(http2.FlagDataPadded), // Type=DATA, Flags=PADDED
+				0x00, 0x00, 0x00, 0x01, // StreamID=1
+				0x05, // PadLength = 5, but payload is only this byte
+			},
+			expectedErrStr: "parsing DATA payload: pad length 5 exceeds payload length 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := bytes.NewBuffer(tt.inputBytes)
+			_, err := http2.ReadFrame(buf)
+
+			if err == nil {
+				t.Fatalf("ReadFrame() expected an error, got nil. Input: %x", tt.inputBytes)
+			}
+
+			if tt.expectedError != nil { // Check for sentinel errors like io.EOF
+				if !errors.Is(err, tt.expectedError) {
+					t.Errorf("ReadFrame() error mismatch.\nExpected (to be one of): %v\nGot:      %v (type %T)", tt.expectedError, err, err)
+				}
+			} else if tt.expectedErrStr != "" { // Check for specific error messages
+				if !strings.Contains(err.Error(), tt.expectedErrStr) {
+					t.Errorf("ReadFrame() error string mismatch.\nExpected to contain: '%s'\nGot:      '%v'", tt.expectedErrStr, err)
+				}
+			} else {
+				// This state implies the test case is misconfigured.
+				t.Fatal("Test case misconfiguration: an error was returned, but no expectedError or expectedErrStr was set.")
 			}
 		})
 	}
