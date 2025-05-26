@@ -365,7 +365,7 @@ func TestGenerateGoAwayFrame(t *testing.T) {
 			errArg:               &ConnectionError{LastStreamID: 20, Code: ErrCodeSettingsTimeout, Msg: "settings timeout msg"},
 			expectedLastStreamID: 20,
 			expectedErrorCode:    ErrCodeSettingsTimeout,
-			expectedDebugDataStr: "settings timeout msg", // Was "explicit debug string", changed due to new prio: ce.Msg > debugStrArg
+			expectedDebugDataStr: "settings timeout msg",
 		},
 	}
 
