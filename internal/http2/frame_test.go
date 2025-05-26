@@ -2002,6 +2002,17 @@ func TestPingFrame(t *testing.T) {
 			},
 		},
 		{
+			name: "PING frame with ACK flag and different opaque data",
+			frame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePing,
+					Flags:    http2.FlagPingAck,
+					StreamID: 0,
+				},
+				OpaqueData: [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+			},
+		},
+		{
 			name: "PING frame with all zeros OpaqueData",
 			frame: &http2.PingFrame{
 				FrameHeader: http2.FrameHeader{
