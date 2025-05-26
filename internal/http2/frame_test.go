@@ -4,7 +4,7 @@ import (
 	"bytes"
 	// "encoding/binary" // Removed as not used
 	"fmt"
-	// "io" // Removed as not directly used in this file
+	"io" // Needed for io.EOF, io.ErrUnexpectedEOF
 	"reflect"
 	"testing"
 
@@ -220,4 +220,121 @@ func TestFrameHeaderSerialization(t *testing.T) {
 		t.Errorf("Re-serialized parsedFH bytes mismatch original written bytes.\nOriginal: %x\nParsedThenSerialized: %x",
 			originalWrittenBytes, reSerializedBuf.Bytes())
 	}
+}
+
+func TestReadFrameHeader_Errors(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       []byte
+		expectedErr error
+	}{
+		{
+			name:        "EOF immediately",
+			input:       []byte{},
+			expectedErr: io.EOF,
+		},
+		{
+			name:        "short read (1 byte)",
+			input:       []byte{0x00},
+			expectedErr: io.ErrUnexpectedEOF,
+		},
+		{
+			name:        "short read (FrameHeaderLen - 1 bytes)",
+			input:       make([]byte, http2.FrameHeaderLen-1),
+			expectedErr: io.ErrUnexpectedEOF,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.input)
+			_, err := http2.ReadFrameHeader(r)
+			if err == nil {
+				t.Fatalf("ReadFrameHeader() expected error %v, got nil", tt.expectedErr)
+			}
+			// Using errors.Is for future-proofing, though direct comparison works for io.EOF/ErrUnexpectedEOF
+			if !isSpecificError(err, tt.expectedErr) {
+				t.Errorf("ReadFrameHeader() error mismatch: expected %v, got %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+// isSpecificError checks if err is equivalent to target.
+// This is a simple helper; for more complex scenarios, errors.Is or errors.As might be better.
+func isSpecificError(err, target error) bool {
+	if err == nil && target == nil {
+		return true
+	}
+	if err == nil || target == nil {
+		return false
+	}
+	return err.Error() == target.Error() || err == target // Handle sentinel errors like io.EOF
+}
+
+type failingWriter struct {
+	failAfterNBytes int
+	writtenBytes    int
+	errToReturn     error
+}
+
+func (fw *failingWriter) Write(p []byte) (n int, err error) {
+	if fw.errToReturn == nil {
+		fw.errToReturn = fmt.Errorf("simulated writer error") // Default error
+	}
+	if fw.writtenBytes >= fw.failAfterNBytes {
+		return 0, fw.errToReturn
+	}
+
+	canWrite := fw.failAfterNBytes - fw.writtenBytes
+	if canWrite <= 0 { // Should not happen if writtenBytes < failAfterNBytes, but as safeguard
+		return 0, fw.errToReturn
+	}
+
+	if len(p) > canWrite {
+		fw.writtenBytes += canWrite
+		return canWrite, fw.errToReturn
+	}
+
+	fw.writtenBytes += len(p)
+	return len(p), nil
+}
+
+func TestFrameHeader_WriteTo_Error(t *testing.T) {
+	fh := http2.FrameHeader{
+		Length:   123,
+		Type:     http2.FrameData,
+		Flags:    0,
+		StreamID: 1,
+	}
+
+	expectedErr := fmt.Errorf("custom writer error")
+
+	t.Run("fail immediately", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 0, errToReturn: expectedErr}
+		n, err := fh.WriteTo(fw)
+		if err == nil {
+			t.Fatal("fh.WriteTo() expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("fh.WriteTo() error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		if n != 0 {
+			t.Errorf("fh.WriteTo() expected 0 bytes written on immediate error, got %d", n)
+		}
+	})
+
+	t.Run("fail after partial write", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 4, errToReturn: expectedErr}
+		n, err := fh.WriteTo(fw)
+		if err == nil {
+			t.Fatal("fh.WriteTo() with partial write expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("fh.WriteTo() with partial write error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		if n != 4 {
+			t.Errorf("fh.WriteTo() with partial write expected 4 bytes written, got %d", n)
+		}
+	})
 }
