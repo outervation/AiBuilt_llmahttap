@@ -1329,6 +1329,17 @@ func TestRSTStreamFrame(t *testing.T) {
 				ErrorCode: http2.ErrCodeProtocolError,
 			},
 		},
+		{
+			name: "RST_STREAM frame with StreamClosed error code",
+			frame: &http2.RSTStreamFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameRSTStream,
+					Flags:    0,
+					StreamID: 789,
+				},
+				ErrorCode: http2.ErrCodeStreamClosed,
+			},
+		},
 	}
 
 	for _, tt := range tests {
