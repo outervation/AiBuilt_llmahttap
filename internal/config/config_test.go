@@ -1152,3 +1152,104 @@ func TestIsFilePath(t *testing.T) {
 		})
 	}
 }
+
+func TestParseAndValidateStaticFileServerConfig_MimeTypesMap(t *testing.T) {
+	docRoot, err := ioutil.TempDir("", "docroot-maptest-")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir for docRoot: %v", err)
+	}
+	defer os.RemoveAll(docRoot)
+
+	tests := []struct {
+		name                   string
+		handlerConfigFields    map[string]interface{}
+		expectedErrorSubstring string
+		expectedMimeCount      int
+		expectedResolved       map[string]string
+	}{
+		{
+			name: "valid_mime_types_map",
+			handlerConfigFields: map[string]interface{}{
+				"document_root": docRoot,
+				"mime_types_map": map[string]string{
+					".html": "text/html; charset=utf-8",
+					".css":  "text/css",
+				},
+			},
+			expectedMimeCount: 2,
+			expectedResolved: map[string]string{
+				".html": "text/html; charset=utf-8",
+				".css":  "text/css",
+			},
+		},
+		{
+			name: "mime_types_map_with_empty_value",
+			handlerConfigFields: map[string]interface{}{
+				"document_root": docRoot,
+				"mime_types_map": map[string]string{
+					".js": "",
+				},
+			},
+			expectedErrorSubstring: `mime_types_map value for key ".js" cannot be empty`,
+		},
+		{
+			name: "mime_types_map_with_key_not_starting_with_dot",
+			handlerConfigFields: map[string]interface{}{
+				"document_root": docRoot,
+				"mime_types_map": map[string]string{
+					"png": "image/png",
+				},
+			},
+			expectedErrorSubstring: `mime_types_map key "png" must start with a '.'`,
+		},
+		{
+			name: "no_custom_mime_types_provided_results_in_nil_or_empty_resolved",
+			handlerConfigFields: map[string]interface{}{
+				"document_root": docRoot,
+			},
+			expectedMimeCount: 0,
+			expectedResolved:  nil, // or map[string]string{}
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rawHandlerConfig, err := json.Marshal(tc.handlerConfigFields)
+			if err != nil {
+				t.Fatalf("Failed to marshal handlerConfigFields: %v", err)
+			}
+
+			// Using a dummy main config path as it's not strictly needed for MimeTypesMap
+			// but the function signature requires it.
+			sfsCfg, err := ParseAndValidateStaticFileServerConfig(rawHandlerConfig, "dummy_main_config.json")
+
+			if tc.expectedErrorSubstring != "" {
+				checkErrorContains(t, err, tc.expectedErrorSubstring)
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+				if sfsCfg == nil {
+					t.Fatal("Expected non-nil sfsCfg on success")
+				}
+				if len(sfsCfg.ResolvedMimeTypes) != tc.expectedMimeCount {
+					t.Errorf("Expected %d resolved mime types, got %d (%v)", tc.expectedMimeCount, len(sfsCfg.ResolvedMimeTypes), sfsCfg.ResolvedMimeTypes)
+				}
+				if tc.expectedMimeCount > 0 {
+					if sfsCfg.ResolvedMimeTypes == nil {
+						t.Fatalf("Expected ResolvedMimeTypes to be non-nil when expectedMimeCount > 0")
+					}
+					for k, v := range tc.expectedResolved {
+						if sfsCfg.ResolvedMimeTypes[k] != v {
+							t.Errorf("For key %s, expected mime type %s, got %s", k, v, sfsCfg.ResolvedMimeTypes[k])
+						}
+					}
+				} else { // tc.expectedMimeCount == 0
+					if sfsCfg.ResolvedMimeTypes != nil && len(sfsCfg.ResolvedMimeTypes) != 0 {
+						t.Errorf("Expected ResolvedMimeTypes to be nil or empty, got %v", sfsCfg.ResolvedMimeTypes)
+					}
+				}
+			}
+		})
+	}
+}
