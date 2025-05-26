@@ -71,6 +71,14 @@ func TestStreamError(t *testing.T) {
 			msg:       "stream already closed",
 			wantError: "stream error on stream 0: stream already closed (code STREAM_CLOSED, 5)",
 		},
+		{
+			name:      "stream error with empty message",
+			streamID:  5,
+			code:      ErrCodeCancel,
+			msg:       "", // Empty message
+			wantError: "stream error on stream 5:  (code CANCEL, 8)",
+			// cause is nil, checkCause defaults to false
+		},
 	}
 
 	for _, tt := range tests {
