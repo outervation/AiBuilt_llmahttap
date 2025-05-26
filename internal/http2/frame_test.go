@@ -1649,3 +1649,295 @@ func TestSettingsFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestPushPromiseFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.PushPromiseFrame
+	}{
+		{
+			name: "basic push_promise frame, END_HEADERS",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromiseEndHeaders, // Required for a single PUSH_PROMISE to be valid
+					StreamID: 1,                               // PUSH_PROMISE is sent on the stream it's associated with
+				},
+				PromisedStreamID:    2,
+				HeaderBlockFragment: []byte("promised headers"),
+			},
+		},
+		{
+			name: "push_promise frame with PADDED and END_HEADERS",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
+					StreamID: 3,
+				},
+				PadLength:           4,
+				PromisedStreamID:    4,
+				HeaderBlockFragment: []byte("padded promised headers"),
+				Padding:             make([]byte, 4),
+			},
+		},
+		{
+			name: "push_promise frame with empty fragment and END_HEADERS",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromiseEndHeaders,
+					StreamID: 5,
+				},
+				PromisedStreamID:    6,
+				HeaderBlockFragment: []byte{},
+			},
+		},
+		{
+			name: "push_promise frame with PADDED, empty fragment, and END_HEADERS",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
+					StreamID: 7,
+				},
+				PadLength:           2,
+				PromisedStreamID:    8,
+				HeaderBlockFragment: []byte{},
+				Padding:             make([]byte, 2),
+			},
+		},
+		{
+			name: "push_promise frame with PADDED flag, PadLength 0, and END_HEADERS",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePushPromise,
+					Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
+					StreamID: 9,
+				},
+				PadLength:           0,
+				PromisedStreamID:    10,
+				HeaderBlockFragment: []byte("zero padlength field"),
+				Padding:             []byte{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "PushPromiseFrame")
+		})
+	}
+}
+
+func TestPushPromiseFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FramePushPromise, StreamID: 1}
+	validPromisedIDBytes := []byte{0x00, 0x00, 0x00, 0x02} // PromisedStreamID = 2
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "PADDED flag, PadLength octet missing",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				h.Length = 0 // Not enough for PadLength byte
+				return h
+			}(),
+			payload:     []byte{},
+			expectedErr: "reading pad length: EOF",
+		},
+		{
+			name: "PADDED flag, PadLength exceeds remaining payload (no PromisedID yet)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				h.Length = 1 // Only PadLength byte itself
+				return h
+			}(),
+			payload:     []byte{10}, // PadLength 10, but no room for PromisedID, fragment, or padding
+			expectedErr: "pad length 10 exceeds remaining payload length 0",
+		},
+		{
+			name: "PromisedStreamID missing (no padding)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromiseEndHeaders
+				h.Length = 3 // Not enough for 4-byte PromisedStreamID
+				return h
+			}(),
+			payload:     make([]byte, 3),
+			expectedErr: "payload too short for PromisedStreamID: 3",
+		},
+		{
+			name: "PromisedStreamID missing (with PADDED)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				h.Length = 1 + 2 // PadLength(1) + 2 bytes for PromisedID (not enough)
+				return h
+			}(),
+			payload:     []byte{0, 0x00, 0x00}, // PadLength=0, then 2 bytes for PromisedID
+			expectedErr: "payload too short for PromisedStreamID: 2",
+		},
+		{
+			name: "error reading PromisedStreamID",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromiseEndHeaders
+				h.Length = 4 // Length for PromisedStreamID
+				return h
+			}(),
+			payload:     make([]byte, 2), // Provide only 2 of 4 bytes
+			expectedErr: "reading promised stream ID: unexpected EOF",
+		},
+		{
+			name: "PADDED, PadLength too large after PromisedID",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				h.Length = 1 + 4 // PadLength(1) + PromisedID(4)
+				return h
+			}(),
+			payload:     append([]byte{20}, validPromisedIDBytes...), // PadL=20, PromisedID=4. pad length 20 exceeds remaining payload length 4
+			expectedErr: "pad length 20 exceeds remaining payload length 4",
+		},
+		{
+			name: "error reading header block fragment (no padding)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromiseEndHeaders
+				h.Length = 4 + 10 // PromisedID(4) + Fragment(10)
+				return h
+			}(),
+			payload:     append(validPromisedIDBytes, make([]byte, 5)...), // PromisedID + 5 bytes of fragment
+			expectedErr: "reading header block fragment: unexpected EOF",
+		},
+		{
+			name: "error reading padding",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				h.Length = 1 + 4 + 5 + 10 // PadL(1) + PromisedID(4) + Frag(5) + Padding(10)
+				return h
+			}(),
+			payload:     append(append(append([]byte{10}, validPromisedIDBytes...), make([]byte, 5)...), make([]byte, 3)...),
+			expectedErr: "reading padding: unexpected EOF",
+		},
+		{
+			name: "mismatch in parsed length (Length > accounted for)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders
+				// PadL byte (1) + PromisedID (4) + Fragment (5) + Padding (actual 2) = 12 bytes
+				// But claim total length is 15.
+				h.Length = 15
+				return h
+			}(),
+			// PadLength=2, PromisedID="idid", Frag="hello", Padding="pp"
+			// Payload: PadL(1) + PromisedID(4) + Frag(5) + Padding(2) = 12 bytes actual
+			// currentPos = 1(PadL byte) + 4(PromisedID) + 5(Frag) + 2(Padding) = 12
+			payload:     []byte{2, 0, 0, 0, 2, 'h', 'e', 'l', 'l', 'o', 0, 0}, // PadL=2, PromisedID=2, Frag="hello", Padding=2bytes. Total actual payload=12
+			expectedErr: "reading header block fragment: unexpected EOF",      // Corrected: EOF on fragment read
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.PushPromiseFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestPushPromiseFrame_WritePayload_Error(t *testing.T) {
+	expectedErr := fmt.Errorf("custom writer error for push_promise")
+
+	tests := []struct {
+		name      string
+		frame     *http2.PushPromiseFrame
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{
+			name: "fail writing PadLength",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders},
+				PadLength:   2, PromisedStreamID: 1, HeaderBlockFragment: []byte("test"), Padding: make([]byte, 2),
+			},
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name: "fail writing PromisedStreamID (no padding)",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader:      http2.FrameHeader{Flags: http2.FlagPushPromiseEndHeaders},
+				PromisedStreamID: 1, HeaderBlockFragment: []byte("test"),
+			},
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name: "fail writing PromisedStreamID (after PadLength)",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders},
+				PadLength:   1, PromisedStreamID: 1, HeaderBlockFragment: []byte("test"), Padding: make([]byte, 1),
+			},
+			failAfter: 1, expectedN: 1, // Wrote PadLength
+		},
+		{
+			name: "fail writing HeaderBlockFragment (no padding)",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader:      http2.FrameHeader{Flags: http2.FlagPushPromiseEndHeaders},
+				PromisedStreamID: 1, HeaderBlockFragment: []byte("fragment data"),
+			},
+			failAfter: 4 + 2, expectedN: 4 + 2, // Wrote PromisedID + 2 bytes of fragment
+		},
+		{
+			name: "fail writing HeaderBlockFragment (with padding)",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders},
+				PadLength:   1, PromisedStreamID: 1, HeaderBlockFragment: []byte("fragment data"), Padding: make([]byte, 1),
+			},
+			failAfter: 1 + 4 + 2, expectedN: 1 + 4 + 2, // Wrote PadLength + PromisedID + 2 bytes of fragment
+		},
+		{
+			name: "fail writing Padding",
+			frame: &http2.PushPromiseFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders},
+				PadLength:   3, PromisedStreamID: 1, HeaderBlockFragment: []byte("frag"), Padding: make([]byte, 3),
+			},
+			// PadL(1 byte field) + PromisedID(4) + Frag(4) = 9. Fail after this.
+			failAfter: 1 + 4 + 4, expectedN: 1 + 4 + 4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := tt.frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatalf("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
