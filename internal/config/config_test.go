@@ -150,6 +150,57 @@ func TestLoadConfig_AutoDetectFailure(t *testing.T) {
 	checkErrorContains(t, err, "TOML error")
 }
 
+func TestLoadConfig_EmptyFile(t *testing.T) {
+	tests := []struct {
+		name        string
+		ext         string
+		expectError string
+		// expectJsonError and expectTomlError are for auto-detect cases
+		expectJsonError string
+		expectTomlError string
+	}{
+		{
+			name:        "empty .json file",
+			ext:         ".json",
+			expectError: "failed to parse JSON config",
+			// More specific check for the actual JSON error
+			// json.Unmarshal of empty byte slice gives "unexpected end of JSON input"
+			expectJsonError: "unexpected end of JSON input",
+		},
+		{
+			name:        "empty .toml file",
+			ext:         ".toml",
+			expectError: "failed to parse TOML config",
+			// toml.Unmarshal of empty byte slice gives "toml: unmarshal: empty input" or similar
+			expectTomlError: "empty input", // toml library specific error message part
+		},
+		{
+			name:            "empty file auto-detect",
+			ext:             ".empty", // unknown extension for auto-detect
+			expectError:     "failed to auto-detect and parse config",
+			expectJsonError: "unexpected end of JSON input",
+			expectTomlError: "empty input",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path, cleanup := writeTempFile(t, "", tc.ext) // Empty content
+			defer cleanup()
+
+			_, err := LoadConfig(path)
+			checkErrorContains(t, err, tc.expectError)
+
+			if tc.expectJsonError != "" {
+				checkErrorContains(t, err, tc.expectJsonError)
+			}
+			if tc.expectTomlError != "" {
+				checkErrorContains(t, err, tc.expectTomlError)
+			}
+		})
+	}
+}
+
 func TestLoadConfig_InvalidJSONSyntax(t *testing.T) {
 	content := `{"server": {"address": ":8080",}}` // Trailing comma
 	path, cleanup := writeTempFile(t, content, ".json")
@@ -1017,4 +1068,30 @@ func TestDuration_DirectUnmarshalMethods(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestIsFilePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		target   string
+		expected bool
+	}{
+		{"stdout", "stdout", false},
+		{"stderr", "stderr", false},
+		{"absolute path unix", "/var/log/app.log", true},
+		{"absolute path windows", "C:\\logs\\app.log", true},
+		{"relative path", "logs/app.log", true},
+		{"simple file name", "app.log", true},
+		{"empty string", "", true}, // IsFilePath considers empty string a path (though validation would reject it)
+		{"path with spaces", "/my logs/app.log", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := IsFilePath(tc.target)
+			if actual != tc.expected {
+				t.Errorf("IsFilePath(%q) = %v; want %v", tc.target, actual, tc.expected)
+			}
+		})
+	}
 }
