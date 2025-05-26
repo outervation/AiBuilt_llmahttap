@@ -1391,3 +1391,58 @@ func TestHpackAdapter_DynamicTableSizeManagement(t *testing.T) {
 		}
 	})
 }
+
+// TestHpackAdapter_EncodingErrorHandling tests error conditions for HpackAdapter.EncodeHeaderFields.
+func TestHpackAdapter_EncodingErrorHandling(t *testing.T) {
+	testCases := []struct {
+		name        string
+		setup       func(adapter *HpackAdapter) // Setup function to modify the adapter for the test case
+		headers     []hpack.HeaderField
+		wantErr     bool
+		errContains string // Substring expected in the error message if wantErr is true
+	}{
+		{
+			name: "Nil internal encoder",
+			setup: func(adapter *HpackAdapter) {
+				adapter.encoder = nil // Simulate a state where the encoder wasn't initialized
+			},
+			headers:     []hpack.HeaderField{{Name: "header", Value: "value"}},
+			wantErr:     true,
+			errContains: "HpackAdapter.encoder not initialized",
+		},
+		// Note: Testing errors from hpack.Encoder.WriteField itself is difficult
+		// because it primarily errors on its internal buffer failing to write.
+		// The default bytes.Buffer used by hpack.NewEncoder has a Write method
+		// that "never returns an error". Thus, this path is not easily testable
+		// without more complex mockups or specific (unlikely) system conditions.
+		// The HpackAdapter correctly propagates such errors if they were to occur.
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t) // Get a fresh, valid adapter
+
+			if tc.setup != nil {
+				tc.setup(adapter) // Apply test-specific modifications
+			}
+
+			_, err := adapter.EncodeHeaderFields(tc.headers)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("EncodeHeaderFields() expected an error, but got nil")
+				} else {
+					if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+						t.Errorf("EncodeHeaderFields() error = %q, expected to contain %q", err.Error(), tc.errContains)
+					}
+					// If errContains is empty, just checking for any error is sufficient.
+					t.Logf("EncodeHeaderFields() correctly returned error: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("EncodeHeaderFields() returned an unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
