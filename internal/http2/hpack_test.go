@@ -598,3 +598,141 @@ func TestHpackAdapter_Encode_ReturnsCopy(t *testing.T) {
 		t.Log("Encode does NOT return a slice pointing to the internal buffer's memory, as expected (it's a copy).")
 	}
 }
+
+// TestHpackAdapter_DecoderStateManagement tests ResetDecoderState and GetAndClearDecodedFields.
+func TestHpackAdapter_DecoderStateManagement(t *testing.T) {
+	t.Run("ResetDecoderState", func(t *testing.T) {
+		adapter := newTestHpackAdapter(t)
+		headers1 := []hpack.HeaderField{
+			{Name: "field1", Value: "value1-for-reset"},
+			{Name: "field2", Value: "value2-for-reset"},
+		}
+		encoded1, err := adapter.EncodeHeaderFields(headers1)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (headers1) failed: %v", err)
+		}
+
+		// Decode the first set of headers
+		err = adapter.DecodeFragment(encoded1)
+		if err != nil {
+			t.Fatalf("DecodeFragment (encoded1) failed: %v", err)
+		}
+		// At this point, adapter.decodedFields should contain headers1.
+
+		// Call ResetDecoderState
+		adapter.ResetDecoderState()
+
+		// Verify that decodedFields is now nil (cleared)
+		if adapter.decodedFields != nil {
+			t.Errorf("adapter.decodedFields should be nil after ResetDecoderState, got %+v", adapter.decodedFields)
+		}
+
+		// FinishDecoding should now yield no headers because we reset the adapter's field buffer.
+		// The underlying hpack.Decoder's Close() should not error if encoded1 was a valid complete block.
+		clearedHeaders, finishErr := adapter.FinishDecoding()
+		if finishErr != nil {
+			// If the original block was incomplete or malformed in a way that only Close() detects,
+			// this error is from the underlying decoder, not ResetDecoderState itself.
+			// For this test's purpose, we assume encoded1 is a valid, complete block.
+			t.Logf("FinishDecoding after ResetDecoderState errored: %v. This might indicate an issue with the original encoded block or the hpack.Decoder's Close() behavior on an empty buffer post-reset.", finishErr)
+		}
+		if len(clearedHeaders) != 0 {
+			t.Errorf("FinishDecoding after ResetDecoderState should return no headers, got %+v", clearedHeaders)
+		}
+
+		// Ensure the adapter is in a good state for decoding a new header block
+		headers2 := []hpack.HeaderField{{Name: "newfield", Value: "newvalue-after-reset"}}
+		encoded2, err := adapter.EncodeHeaderFields(headers2)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (headers2) failed: %v", err)
+		}
+
+		err = adapter.DecodeFragment(encoded2)
+		if err != nil {
+			t.Fatalf("DecodeFragment (encoded2) after ResetDecoderState failed: %v", err)
+		}
+		finalHeaders2, err := adapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (headers2) after ResetDecoderState failed: %v", err)
+		}
+		if !compareHeaderFields(headers2, finalHeaders2) {
+			t.Errorf("Decoded headers2 after ResetDecoderState do not match.\nWant: %+v\nGot:  %+v", headers2, finalHeaders2)
+		}
+	})
+
+	t.Run("GetAndClearDecodedFields_ClearsStateAndAllowsNext", func(t *testing.T) {
+		adapter := newTestHpackAdapter(t)
+		headers1 := []hpack.HeaderField{{Name: "fieldA", Value: "valueA-for-getclear"}}
+		encoded1, err := adapter.EncodeHeaderFields(headers1)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (headers1) failed: %v", err)
+		}
+
+		// Decode the first fragment
+		err = adapter.DecodeFragment(encoded1)
+		if err != nil {
+			t.Fatalf("DecodeFragment (encoded1) failed: %v", err)
+		}
+		// Important: For GetAndClearDecodedFields to work as expected with the underlying
+		// hpack.Decoder, the hpack.Decoder should ideally see a complete block
+		// before its state is considered "final" for that block. However,
+		// GetAndClearDecodedFields on our adapter is designed to pull whatever
+		// h.decodedFields has accumulated so far, without calling h.decoder.Close().
+		// This means it might get partial results if used mid-fragment sequence.
+		// This test ensures it clears *our adapter's* list.
+
+		// First call to GetAndClearDecodedFields
+		decoded1 := adapter.GetAndClearDecodedFields()
+		if !compareHeaderFields(headers1, decoded1) {
+			t.Errorf("GetAndClearDecodedFields (1) mismatch.\nWant: %+v\nGot:  %+v", headers1, decoded1)
+		}
+		// Verify internal state is cleared
+		if adapter.decodedFields != nil {
+			t.Errorf("adapter.decodedFields not nil after first GetAndClearDecodedFields call, got %+v", adapter.decodedFields)
+		}
+
+		// Second immediate call to GetAndClearDecodedFields should return nil/empty
+		decoded1Again := adapter.GetAndClearDecodedFields()
+		if decoded1Again != nil {
+			t.Errorf("Second immediate GetAndClearDecodedFields call should return nil, got %+v", decoded1Again)
+		}
+
+		// Decode a new, different set of headers.
+		// The underlying hpack.Decoder's state persists across calls to our adapter's GetAndClearDecodedFields
+		// because GetAndClearDecodedFields does not call decoder.Close().
+		// If encoded1 was a full, valid header block, the decoder expects the *next* Write
+		// to be the start of a new block.
+		headers2 := []hpack.HeaderField{{Name: "fieldB", Value: "valueB-for-getclear"}}
+		encoded2, err := adapter.EncodeHeaderFields(headers2)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (headers2) failed: %v", err)
+		}
+		err = adapter.DecodeFragment(encoded2)
+		if err != nil {
+			t.Fatalf("DecodeFragment (encoded2) failed: %v", err)
+		}
+
+		// GetAndClear for the second set of headers
+		decoded2 := adapter.GetAndClearDecodedFields()
+		if !compareHeaderFields(headers2, decoded2) {
+			t.Errorf("GetAndClearDecodedFields (2) mismatch.\nWant: %+v\nGot:  %+v", headers2, decoded2)
+		}
+		if adapter.decodedFields != nil {
+			t.Errorf("adapter.decodedFields not nil after second GetAndClearDecodedFields (for headers2), got %+v", adapter.decodedFields)
+		}
+
+		// To properly test the decoder's overall state, we should FinishDecoding the last block
+		// even after GetAndClear. Since GetAndClear returned headers2, h.decodedFields is now nil.
+		// But the hpack.Decoder itself still has 'encoded2' processed.
+		// If we call FinishDecoding now, it will call decoder.Close() on the (already processed) 'encoded2'.
+		// It should return nil (or the same fields again if decoder.Close re-emits, which it doesn't) and no error
+		// if 'encoded2' was a complete block.
+		finalFieldsAfterGetClear, finalErr := adapter.FinishDecoding()
+		if finalErr != nil {
+			t.Fatalf("FinishDecoding after GetAndClear and new fragment failed unexpectedly: %v", finalErr)
+		}
+		if len(finalFieldsAfterGetClear) != 0 {
+			t.Errorf("FinishDecoding after GetAndClear (which cleared adapter.decodedFields) should yield no new fields from adapter, got: %+v", finalFieldsAfterGetClear)
+		}
+	})
+}
