@@ -541,6 +541,63 @@ func TestAccessLogFormatAndContent(t *testing.T) {
 			realIPHeaderName:   stringPtr("X-Forwarded-For"),
 			expectedRemoteAddr: "192.168.1.50",
 		},
+		// New test cases for RemoteAddr and RemotePort parsing specifics
+		{
+			name:               "IPv4 without port",
+			reqMethod:          "GET",
+			reqURI:             "/ipv4-no-port",
+			reqRemoteAddr:      "77.88.99.1", // No port
+			reqHeaders:         nil,
+			streamID:           101,
+			status:             http.StatusOK,
+			responseBytes:      10,
+			duration:           5 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "77.88.99.1",
+		},
+		{
+			name:               "IPv6 without port",
+			reqMethod:          "GET",
+			reqURI:             "/ipv6-no-port",
+			reqRemoteAddr:      "2001:db8:1234::abcd", // No port
+			reqHeaders:         nil,
+			streamID:           103,
+			status:             http.StatusOK,
+			responseBytes:      20,
+			duration:           6 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "2001:db8:1234::abcd",
+		},
+		{
+			name:               "Hostname without port",
+			reqMethod:          "GET",
+			reqURI:             "/host-no-port",
+			reqRemoteAddr:      "someserver.example.com", // No port
+			reqHeaders:         nil,
+			streamID:           105,
+			status:             http.StatusOK,
+			responseBytes:      30,
+			duration:           7 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "someserver.example.com",
+		},
+		{
+			name:               "IPv4 with XFF, but XFF is empty, no port on remoteAddr",
+			reqMethod:          "GET",
+			reqURI:             "/ipv4-no-port-empty-xff",
+			reqRemoteAddr:      "77.88.99.2",                         // No port
+			reqHeaders:         http.Header{"X-Forwarded-For": {""}}, // Empty XFF
+			streamID:           107,
+			status:             http.StatusOK,
+			responseBytes:      40,
+			duration:           8 * time.Millisecond,
+			trustedProxies:     nil,                          // No trusted proxies
+			realIPHeaderName:   stringPtr("X-Forwarded-For"), // RealIPHeader is XFF
+			expectedRemoteAddr: "77.88.99.2",                 // Fallback to direct peer, as XFF is empty
+		},
 	}
 
 	for _, tt := range tests {
