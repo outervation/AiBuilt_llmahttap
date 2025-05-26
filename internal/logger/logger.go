@@ -104,20 +104,20 @@ func NewLogger(cfg *config.LoggingConfig) (*Logger, error) {
 	// Setup Error Logger
 	if cfg.ErrorLog != nil {
 		var errorOutput io.WriteCloser = os.Stderr // Default
-		if cfg.ErrorLog.Target != "stderr" {
-			if cfg.ErrorLog.Target == "stdout" {
+		if *cfg.ErrorLog.Target != "stderr" {
+			if *cfg.ErrorLog.Target == "stdout" {
 				errorOutput = os.Stdout
-			} else if config.IsFilePath(cfg.ErrorLog.Target) {
+			} else if config.IsFilePath(*cfg.ErrorLog.Target) {
 				// Ensure path is absolute (validated in config)
 				// TODO: Add file opening logic, SIGHUP handling will need this path
-				file, errOpen := os.OpenFile(cfg.ErrorLog.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				file, errOpen := os.OpenFile(*cfg.ErrorLog.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 				if errOpen != nil {
-					return nil, fmt.Errorf("failed to open error log file %s: %w", cfg.ErrorLog.Target, errOpen)
+					return nil, fmt.Errorf("failed to open error log file %s: %w", *cfg.ErrorLog.Target, errOpen)
 				}
 				errorOutput = file
 			} else {
 				// Should not happen if config validation is correct
-				return nil, fmt.Errorf("invalid error log target: %s", cfg.ErrorLog.Target)
+				return nil, fmt.Errorf("invalid error log target: %s", *cfg.ErrorLog.Target)
 			}
 		}
 		l.errorLog = &ErrorLogger{
@@ -130,10 +130,11 @@ func NewLogger(cfg *config.LoggingConfig) (*Logger, error) {
 		// This case should ideally be prevented by config defaulting.
 		// If ErrorLog is nil, we might default to a stderr logger with default LogLevel.
 		// For now, let's assume config ensures ErrorLog is non-nil.
+		defaultStdErrTarget := "stderr"
 		l.errorLog = &ErrorLogger{ // Default to stderr if not configured
 			logger:         log.New(os.Stderr, "", 0),
-			config:         config.ErrorLogConfig{Target: "stderr"}, // Minimal default
-			globalLogLevel: config.LogLevelInfo,                     // Default log level
+			config:         config.ErrorLogConfig{Target: &defaultStdErrTarget}, // Minimal default
+			globalLogLevel: config.LogLevelInfo,                                 // Default log level
 			output:         os.Stderr,
 		}
 	}
@@ -141,20 +142,20 @@ func NewLogger(cfg *config.LoggingConfig) (*Logger, error) {
 	// Setup Access Logger
 	if cfg.AccessLog != nil && (cfg.AccessLog.Enabled == nil || *cfg.AccessLog.Enabled) {
 		var accessOutput io.WriteCloser = os.Stdout // Default
-		if cfg.AccessLog.Target != "stdout" {
-			if cfg.AccessLog.Target == "stderr" {
+		if *cfg.AccessLog.Target != "stdout" {
+			if *cfg.AccessLog.Target == "stderr" {
 				accessOutput = os.Stderr
-			} else if config.IsFilePath(cfg.AccessLog.Target) {
+			} else if config.IsFilePath(*cfg.AccessLog.Target) {
 				// Ensure path is absolute (validated in config)
 				// TODO: Add file opening logic, SIGHUP handling will need this path
-				file, errOpen := os.OpenFile(cfg.AccessLog.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				file, errOpen := os.OpenFile(*cfg.AccessLog.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 				if errOpen != nil {
-					return nil, fmt.Errorf("failed to open access log file %s: %w", cfg.AccessLog.Target, errOpen)
+					return nil, fmt.Errorf("failed to open access log file %s: %w", *cfg.AccessLog.Target, errOpen)
 				}
 				accessOutput = file
 			} else {
 				// Should not happen if config validation is correct
-				return nil, fmt.Errorf("invalid access log target: %s", cfg.AccessLog.Target)
+				return nil, fmt.Errorf("invalid access log target: %s", *cfg.AccessLog.Target)
 			}
 		}
 
@@ -323,8 +324,21 @@ func (al *AccessLogger) LogAccess(
 	responseBytes int64,
 	duration time.Duration,
 ) {
-	if al == nil || al.logger == nil {
-		return // Access logging is disabled or not configured
+
+	if al == nil {
+		return
+	}
+	// Check the Enabled flag from its own config
+	// If Enabled is nil, it defaults to true (logging proceeds).
+	// If Enabled is true, logging proceeds.
+	// If Enabled is false, return.
+	if al.config.Enabled != nil && !*al.config.Enabled {
+		return
+	}
+	// If logger is nil (e.g., not fully initialized, or if config.Enabled was false
+	// during NewLogger and this method is somehow called directly), also return.
+	if al.logger == nil {
+		return
 	}
 
 	// Determine remote_addr and remote_port
@@ -390,7 +404,7 @@ func (al *AccessLogger) Reopen() error {
 	al.mu.Lock()
 	defer al.mu.Unlock()
 
-	if !config.IsFilePath(al.config.Target) {
+	if !config.IsFilePath(*al.config.Target) {
 		return nil // Not a file target
 	}
 
@@ -407,7 +421,7 @@ func (al *AccessLogger) Reopen() error {
 	}
 
 	// Use the configured target path for reopening
-	filePathToOpen := al.config.Target
+	filePathToOpen := *al.config.Target
 	newFile, errOpen := os.OpenFile(filePathToOpen, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if errOpen != nil {
 		log.Printf("Failed to reopen access log file %s: %v. Access logging may be impaired and will fall back to stdout.", filePathToOpen, errOpen)
@@ -479,7 +493,7 @@ func (el *ErrorLogger) Reopen() error {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 
-	if !config.IsFilePath(el.config.Target) {
+	if !config.IsFilePath(*el.config.Target) {
 		return nil // Not a file target
 	}
 
@@ -496,7 +510,7 @@ func (el *ErrorLogger) Reopen() error {
 	}
 
 	// Use the configured target path for reopening
-	filePathToOpen := el.config.Target
+	filePathToOpen := *el.config.Target
 	newFile, errOpen := os.OpenFile(filePathToOpen, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if errOpen != nil {
 		log.Printf("Failed to reopen error log file %s: %v. Error logging may be impaired and will fall back to stderr.", filePathToOpen, errOpen)
@@ -699,22 +713,22 @@ func (l *Logger) Access(req *http.Request, streamID uint32, status int, response
 func (l *Logger) CloseLogFiles() error {
 	var firstErr error
 	if l.accessLog != nil && l.accessLog.output != nil {
-		if config.IsFilePath(l.accessLog.config.Target) { // Only close if it's a file
+		if config.IsFilePath(*l.accessLog.config.Target) { // Only close if it's a file
 			if err := l.accessLog.output.Close(); err != nil {
-				l.Error("Failed to close access log file", LogFields{"target": l.accessLog.config.Target, "error": err.Error()})
+				l.Error("Failed to close access log file", LogFields{"target": *l.accessLog.config.Target, "error": err.Error()})
 				if firstErr == nil {
-					firstErr = fmt.Errorf("closing access log '%s': %w", l.accessLog.config.Target, err)
+					firstErr = fmt.Errorf("closing access log '%s': %w", *l.accessLog.config.Target, err)
 				}
 			}
 		}
 	}
 	if l.errorLog != nil && l.errorLog.output != nil {
-		if config.IsFilePath(l.errorLog.config.Target) { // Only close if it's a file
+		if config.IsFilePath(*l.errorLog.config.Target) { // Only close if it's a file
 			if err := l.errorLog.output.Close(); err != nil {
 				// Use a more primitive logger here if the main one is compromised
-				fmt.Fprintf(os.Stderr, "[ERRORLOGGER] Failed to close error log file %s: %v\n", l.errorLog.config.Target, err)
+				fmt.Fprintf(os.Stderr, "[ERRORLOGGER] Failed to close error log file %s: %v\n", *l.errorLog.config.Target, err)
 				if firstErr == nil {
-					firstErr = fmt.Errorf("closing error log '%s': %w", l.errorLog.config.Target, err)
+					firstErr = fmt.Errorf("closing error log '%s': %w", *l.errorLog.config.Target, err)
 				}
 			}
 		}
@@ -727,7 +741,7 @@ func (l *Logger) CloseLogFiles() error {
 func (l *Logger) ReopenLogFiles() error {
 	l.errorLog.mu.Lock()
 	defer l.errorLog.mu.Unlock()
-	if l.errorLog != nil && config.IsFilePath(l.errorLog.config.Target) {
+	if l.errorLog != nil && config.IsFilePath(*l.errorLog.config.Target) {
 		if f, ok := l.errorLog.output.(*os.File); ok {
 			if f != os.Stdout && f != os.Stderr { // Don't try to reopen stdio
 				filePath := f.Name() // Get path from existing file
@@ -754,7 +768,7 @@ func (l *Logger) ReopenLogFiles() error {
 
 	l.accessLog.mu.Lock()
 	defer l.accessLog.mu.Unlock()
-	if l.accessLog != nil && config.IsFilePath(l.accessLog.config.Target) {
+	if l.accessLog != nil && config.IsFilePath(*l.accessLog.config.Target) {
 		if f, ok := l.accessLog.output.(*os.File); ok {
 			if f != os.Stdout && f != os.Stderr {
 				filePath := f.Name()
