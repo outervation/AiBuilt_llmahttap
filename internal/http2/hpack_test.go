@@ -109,7 +109,128 @@ func TestHpackAdapter_EncodeDecode_Simple(t *testing.T) {
 	}
 }
 
-// TestHpackAdapter_EncodeDecode_MultipleFragments tests decoding across multiple fragments.
+// TestHpackAdapter_EncodeDecode_RoundTrip performs comprehensive round-trip tests.
+func TestHpackAdapter_EncodeDecode_RoundTrip(t *testing.T) {
+	commonHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/"},
+		{Name: ":scheme", Value: "https"},
+		{Name: "accept", Value: "application/json, text/html;q=0.9, */*;q=0.8"},
+		{Name: "user-agent", Value: "Go-http-client/2.0 test suite"},
+	}
+	longHeaderValue := strings.Repeat("a", 200) // A value long enough to likely not fit in small tables or avoid simple indexing
+
+	testCases := []struct {
+		name      string
+		headersIn []hpack.HeaderField
+	}{
+		{
+			name:      "Empty headers",
+			headersIn: []hpack.HeaderField{},
+		},
+		{
+			name: "Simple GET request",
+			headersIn: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":path", Value: "/index.html"},
+				{Name: ":scheme", Value: "http"},
+				{Name: "host", Value: "example.com"},
+			},
+		},
+		{
+			name: "Common headers with user-agent",
+			headersIn: append(commonHeaders, hpack.HeaderField{
+				Name: "x-custom-id", Value: "abcdef123456",
+			}),
+		},
+		{
+			name: "Headers with potentially sensitive data",
+			headersIn: []hpack.HeaderField{
+				{Name: ":method", Value: "POST"},
+				{Name: ":path", Value: "/submit_form"},
+				{Name: "authorization", Value: "Bearer sometokenvalue", Sensitive: true},
+				{Name: "cookie", Value: "sessionID=secret123; other=data", Sensitive: true},
+			},
+		},
+		{
+			name: "Headers with long values",
+			headersIn: []hpack.HeaderField{
+				{Name: "x-long-value", Value: longHeaderValue},
+				{Name: "another-header", Value: "short"},
+				{Name: "x-another-long", Value: strings.Repeat("b", 250)},
+			},
+		},
+		{
+			name: "Mix of indexed and new headers",
+			headersIn: []hpack.HeaderField{
+				// Likely to be indexed after first few uses by hpack library
+				{Name: ":method", Value: "PUT"},
+				{Name: ":status", Value: "200"}, // Response header in request context for testing
+				{Name: "content-type", Value: "application/xml"},
+				// New headers
+				{Name: "x-unique-request-id", Value: "uuid-goes-here-normally-but-static-for-test"},
+				{Name: "cache-control", Value: "no-cache, no-store, must-revalidate"},
+			},
+		},
+		{
+			name: "Headers requiring Huffman encoding (potentially)",
+			// The hpack library decides on Huffman, we just provide strings
+			headersIn: []hpack.HeaderField{
+				{Name: "custom-header-with-varied-chars", Value: "Value with spaces, and !@#$%^&*()_+ "},
+				{Name: "plain-ascii", Value: "abcdefghijklmnopqrstuvwxyz"},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t) // Fresh adapter for each test case ensures clean table state
+
+			// 1. Encode the headers
+			encodedBytes, err := adapter.EncodeHeaderFields(tc.headersIn)
+			if err != nil {
+				t.Fatalf("EncodeHeaderFields failed: %v", err)
+			}
+
+			// For non-empty headers, expect non-empty output.
+			// For empty headers, hpack encoder produces empty output.
+			if len(tc.headersIn) > 0 && len(encodedBytes) == 0 {
+				t.Fatal("EncodeHeaderFields returned empty byte slice for non-empty headers")
+			}
+			if len(tc.headersIn) == 0 && len(encodedBytes) != 0 {
+				t.Fatalf("EncodeHeaderFields returned non-empty byte slice (%x) for empty headers", encodedBytes)
+			}
+
+			// 2. Decode the headers
+			// Reset decoder state explicitly, though FinishDecoding from a previous run
+			// (if adapter was reused, which it isn't here) should also do it.
+			// More importantly, this clears adapter.decodedFields.
+			adapter.ResetDecoderState()
+
+			err = adapter.DecodeFragment(encodedBytes)
+			if err != nil {
+				t.Fatalf("DecodeFragment failed: %v", err)
+			}
+
+			decodedHeaders, err := adapter.FinishDecoding()
+			if err != nil {
+				t.Fatalf("FinishDecoding failed: %v", err)
+			}
+
+			// 3. Verify
+			if !compareHeaderFields(tc.headersIn, decodedHeaders) {
+				t.Errorf("Decoded headers do not match original input.\nOriginal: %+v\nDecoded:  %+v", tc.headersIn, decodedHeaders)
+			}
+
+			// Sanity check: ensure decodedFields is cleared after FinishDecoding
+			if adapter.decodedFields != nil {
+				t.Error("adapter.decodedFields was not cleared after FinishDecoding")
+			}
+		})
+	}
+}
+
+// TestHpackAdapter_EncodeDecode_MultipleFragments
 func TestHpackAdapter_EncodeDecode_MultipleFragments(t *testing.T) {
 	adapter := newTestHpackAdapter(t)
 	headers := []hpack.HeaderField{
