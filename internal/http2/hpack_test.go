@@ -1070,3 +1070,235 @@ func TestHpackAdapter_DecodingErrorHandling(t *testing.T) {
 		})
 	}
 }
+
+// TestHpackAdapter_DynamicTableSizeManagement tests the behavior of HpackAdapter
+// when dynamic table sizes for encoder and decoder are changed.
+func TestHpackAdapter_DynamicTableSizeManagement(t *testing.T) {
+	headersToTest := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/some/path/to/resource"},
+		{Name: "accept-encoding", Value: "gzip, deflate"},
+		{Name: "user-agent", Value: "my-custom-test-client/1.0"},
+		{Name: "x-custom-long-header", Value: strings.Repeat("a", 100)}, // Long enough to encourage indexing
+	}
+
+	// --- Part 1: Encoder Behavior with Size Changes ---
+	t.Run("EncoderTableSizeChanges", func(t *testing.T) {
+		adapter := newTestHpackAdapter(t) // Initial table size: defaultMaxTableSize (4096)
+
+		// Encode with initial (large) table size
+		encodedBytesInitial, err := adapter.EncodeHeaderFields(headersToTest)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (initial) failed: %v", err)
+		}
+		if len(encodedBytesInitial) == 0 {
+			t.Fatal("EncodeHeaderFields (initial) produced empty output for non-empty headers")
+		}
+
+		// Change encoder table size to a very small value
+		smallTableSize := uint32(64) // Small enough to force different encoding
+		adapter.SetMaxEncoderDynamicTableSize(smallTableSize)
+
+		encodedBytesSmallTable, err := adapter.EncodeHeaderFields(headersToTest)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (small table) failed: %v", err)
+		}
+		if len(encodedBytesSmallTable) == 0 {
+			t.Fatal("EncodeHeaderFields (small table) produced empty output for non-empty headers")
+		}
+
+		// Expect different encodings due to table size change
+		if bytes.Equal(encodedBytesInitial, encodedBytesSmallTable) {
+			// This could happen if headers are all static or too short to be affected significantly
+			// by dynamic table changes with these specific sizes.
+			// Consider using headers more sensitive to dynamic table for a stronger assertion here.
+			// For now, a log message if they are equal.
+			t.Logf("Warning: Encoded bytes with initial table (%d bytes) and small table (%d bytes) are identical. Headers might not be exercising dynamic table differences effectively.", len(encodedBytesInitial), len(encodedBytesSmallTable))
+		}
+
+		// Verify both encodings can be decoded correctly (using a decoder with sufficient capacity)
+		decoderAdapter := newTestHpackAdapter(t) // Fresh adapter with default (large) table
+
+		decoderAdapter.ResetDecoderState()
+		err = decoderAdapter.DecodeFragment(encodedBytesInitial)
+		if err != nil {
+			t.Fatalf("DecodeFragment (initial encoding) failed: %v", err)
+		}
+		decodedInitial, err := decoderAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (initial encoding) failed: %v", err)
+		}
+		if !compareHeaderFields(headersToTest, decodedInitial) {
+			t.Errorf("Decoded headers (initial encoding) mismatch.\nWant: %+v\nGot:  %+v", headersToTest, decodedInitial)
+		}
+
+		decoderAdapter.ResetDecoderState()
+		err = decoderAdapter.DecodeFragment(encodedBytesSmallTable)
+		if err != nil {
+			t.Fatalf("DecodeFragment (small table encoding) failed: %v", err)
+		}
+		decodedSmallTable, err := decoderAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (small table encoding) failed: %v", err)
+		}
+		if !compareHeaderFields(headersToTest, decodedSmallTable) {
+			t.Errorf("Decoded headers (small table encoding) mismatch.\nWant: %+v\nGot:  %+v", headersToTest, decodedSmallTable)
+		}
+
+		// Change encoder table size to a larger value again
+		largerTableSize := uint32(8192)
+		adapter.SetMaxEncoderDynamicTableSize(largerTableSize)
+		encodedBytesLargerTable, err := adapter.EncodeHeaderFields(headersToTest)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (larger table) failed: %v", err)
+		}
+		if len(encodedBytesLargerTable) == 0 {
+			t.Fatal("EncodeHeaderFields (larger table) produced empty output")
+		}
+		// encodedBytesLargerTable might be same as encodedBytesInitial if defaultMaxTableSize was optimal
+		// or different if headersToTest could benefit from even larger table.
+
+		decoderAdapter.ResetDecoderState()
+		err = decoderAdapter.DecodeFragment(encodedBytesLargerTable)
+		if err != nil {
+			t.Fatalf("DecodeFragment (larger table encoding) failed: %v", err)
+		}
+		decodedLargerTable, err := decoderAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (larger table encoding) failed: %v", err)
+		}
+		if !compareHeaderFields(headersToTest, decodedLargerTable) {
+			t.Errorf("Decoded headers (larger table encoding) mismatch.\nWant: %+v\nGot:  %+v", headersToTest, decodedLargerTable)
+		}
+	})
+
+	// --- Part 2: Decoder Behavior with Size Changes (and peer encoder compliance/non-compliance) ---
+	t.Run("DecoderTableSizeChanges", func(t *testing.T) {
+		serverAdapter := newTestHpackAdapter(t) // Our server's HPACK adapter
+		clientAdapter := newTestHpackAdapter(t) // Simulates a peer client's HPACK adapter
+
+		headersSet1 := []hpack.HeaderField{
+			{Name: "content-type", Value: "application/json"},
+			{Name: "x-request-id", Value: "uuid-abc-123"},
+		}
+
+		// Scenario 2.1: Client respects server's initial (default) decoder table size
+		// serverAdapter.maxTableSize is defaultMaxTableSize (4096)
+		// clientAdapter's encoder should respect this.
+		clientAdapter.SetMaxEncoderDynamicTableSize(serverAdapter.maxTableSize)
+		encodedS1, err := clientAdapter.EncodeHeaderFields(headersSet1)
+		if err != nil {
+			t.Fatalf("Client encode (S1) failed: %v", err)
+		}
+
+		serverAdapter.ResetDecoderState()
+		err = serverAdapter.DecodeFragment(encodedS1)
+		if err != nil {
+			t.Fatalf("Server DecodeFragment (S1) failed: %v", err)
+		}
+		decodedS1, err := serverAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("Server FinishDecoding (S1) failed: %v", err)
+		}
+		if !compareHeaderFields(headersSet1, decodedS1) {
+			t.Errorf("Decoded S1 mismatch. Want %+v, Got %+v", headersSet1, decodedS1)
+		}
+
+		// Scenario 2.2: Server reduces its decoder table size, client complies
+		serverReducedDecoderSize := uint32(128)
+		err = serverAdapter.SetMaxDecoderDynamicTableSize(serverReducedDecoderSize)
+		if err != nil {
+			t.Fatalf("serverAdapter.SetMaxDecoderDynamicTableSize failed: %v", err)
+		}
+
+		clientAdapter.SetMaxEncoderDynamicTableSize(serverReducedDecoderSize) // Client respects new, smaller size
+
+		encodedS2, err := clientAdapter.EncodeHeaderFields(headersSet1) // Encode same headers
+		if err != nil {
+			t.Fatalf("Client encode (S2) failed: %v", err)
+		}
+
+		serverAdapter.ResetDecoderState()
+		err = serverAdapter.DecodeFragment(encodedS2)
+		if err != nil {
+			t.Fatalf("Server DecodeFragment (S2) failed: %v", err)
+		}
+		decodedS2, err := serverAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("Server FinishDecoding (S2) failed: %v", err)
+		}
+		if !compareHeaderFields(headersSet1, decodedS2) {
+			t.Errorf("Decoded S2 mismatch. Want %+v, Got %+v", headersSet1, decodedS2)
+		}
+
+		// Scenario 2.3: Server reduces decoder table size, client DOES NOT comply (attempts to use entries beyond server's new limit)
+		// To make this reliable, we want the client to encode a header that refers to an index
+		// that would be valid for its (larger) table, but invalid for the server's (smaller) table.
+
+		// Setup:
+		// Server decoder table size is set to 0 (only static table allowed).
+		serverOnlyStaticTableSize := uint32(0)
+		err = serverAdapter.SetMaxDecoderDynamicTableSize(serverOnlyStaticTableSize)
+		if err != nil {
+			t.Fatalf("serverAdapter.SetMaxDecoderDynamicTableSize to 0 failed: %v", err)
+		}
+		if serverAdapter.maxTableSize != serverOnlyStaticTableSize { // Verify our tracking
+			t.Fatalf("serverAdapter.maxTableSize mismatch after setting to 0. Got %d", serverAdapter.maxTableSize)
+		}
+
+		// Client encoder believes it can use a larger dynamic table.
+		clientLargeTableSize := defaultMaxTableSize // e.g., 4096
+		clientAdapter.SetMaxEncoderDynamicTableSize(uint32(clientLargeTableSize))
+
+		// Client encodes a header that will be added to its dynamic table.
+		// The first dynamic table entry is at index 62 (static table has 61 entries).
+		headerForDynamicTable := []hpack.HeaderField{{Name: "new-dynamic-header", Value: "this-will-be-indexed-by-client"}}
+
+		// First encoding: to add to client's dynamic table (actual bytes not used for server decoding yet)
+		_, err = clientAdapter.EncodeHeaderFields(headerForDynamicTable)
+		if err != nil {
+			t.Fatalf("Client encode (populate dynamic table) failed: %v", err)
+		}
+
+		// Second encoding: client attempts to use the dynamic table entry it just created.
+		// This should produce an HPACK output that uses index 62 (0x80 | 62 = 0xBE).
+		encodedS3InvalidForServer, err := clientAdapter.EncodeHeaderFields(headerForDynamicTable)
+		if err != nil {
+			t.Fatalf("Client encode (S3 - using dynamic entry) failed: %v", err)
+		}
+
+		// Server (with dynamic table size 0) attempts to decode this.
+		// It should fail because index 62 is not in its static table and its dynamic table is size 0.
+		serverAdapter.ResetDecoderState()
+		decodeFragErr := serverAdapter.DecodeFragment(encodedS3InvalidForServer)
+		decodedFieldsS3, finishErr := serverAdapter.FinishDecoding()
+
+		effectiveError := decodeFragErr
+		if effectiveError == nil {
+			effectiveError = finishErr
+		}
+
+		if effectiveError == nil {
+			t.Errorf("Server decoding (S3) expected an error due to invalid index for small table, but got none. Decoded: %+v", decodedFieldsS3)
+		} else {
+			// Check for specific hpack error if possible, e.g., "invalid index"
+			// The exact error message comes from golang.org/x/net/http2/hpack
+			// Common error: "hpack: invalid indexed representation index 62" (or similar)
+			// Or "hpack: HpackAdapter.decoder.Close failed: hpack: invalid indexed representation index 62"
+			expectedErrSubstrings := []string{"invalid indexed representation", "index 62"}
+			foundAllSubstrings := true
+			for _, sub := range expectedErrSubstrings {
+				if !strings.Contains(effectiveError.Error(), sub) {
+					foundAllSubstrings = false
+					break
+				}
+			}
+			if !foundAllSubstrings {
+				t.Errorf("Server decoding (S3) error %q does not contain all expected substrings %+v", effectiveError, expectedErrSubstrings)
+			} else {
+				t.Logf("Server decoding (S3) correctly failed with error: %v", effectiveError)
+			}
+		}
+	})
+}
