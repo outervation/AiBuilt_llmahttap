@@ -221,6 +221,11 @@ func TestLoadConfig_DefaultsApplied(t *testing.T) {
 	if cfg.Logging.AccessLog.RealIPHeader == nil || *cfg.Logging.AccessLog.RealIPHeader != defaultAccessLogRealIPHeader {
 		t.Errorf("Expected default access log real_ip_header %s, got %v", defaultAccessLogRealIPHeader, cfg.Logging.AccessLog.RealIPHeader)
 	}
+	if cfg.Logging.AccessLog.TrustedProxies == nil {
+		t.Errorf("Expected default access log TrustedProxies to be an empty slice, got nil")
+	} else if len(cfg.Logging.AccessLog.TrustedProxies) != 0 {
+		t.Errorf("Expected default access log TrustedProxies to be an empty slice, got %v", cfg.Logging.AccessLog.TrustedProxies)
+	}
 	if cfg.Logging.ErrorLog == nil {
 		t.Fatal("cfg.Logging.ErrorLog is nil after defaults")
 	}
