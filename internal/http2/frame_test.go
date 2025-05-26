@@ -1151,3 +1151,150 @@ func TestHeadersFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestPriorityFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.PriorityFrame
+	}{
+		{
+			name: "basic priority frame",
+			frame: &http2.PriorityFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePriority,
+					Flags:    0,
+					StreamID: 1, // PRIORITY frames MUST be associated with a stream.
+				},
+				Exclusive:        false,
+				StreamDependency: 123,
+				Weight:           15, // Effective weight 16
+			},
+		},
+		{
+			name: "priority frame with E flag set",
+			frame: &http2.PriorityFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePriority,
+					Flags:    0,
+					StreamID: 2,
+				},
+				Exclusive:        true,
+				StreamDependency: 456,
+				Weight:           255, // Effective weight 256
+			},
+		},
+		{
+			name: "priority frame with stream dependency 0",
+			frame: &http2.PriorityFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePriority,
+					Flags:    0,
+					StreamID: 3,
+				},
+				Exclusive:        false,
+				StreamDependency: 0, // Depends on the root
+				Weight:           0, // Effective weight 1
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "PriorityFrame")
+		})
+	}
+}
+
+func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FramePriority, StreamID: 1}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "payload too short",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 4 // PRIORITY payload must be 5 bytes
+				return h
+			}(),
+			payload:     make([]byte, 4),
+			expectedErr: "PRIORITY frame payload must be 5 bytes, got 4",
+		},
+		{
+			name: "payload too long",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 6 // PRIORITY payload must be 5 bytes
+				return h
+			}(),
+			payload:     make([]byte, 6),
+			expectedErr: "PRIORITY frame payload must be 5 bytes, got 6",
+		},
+		{
+			name: "error reading payload (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 5
+				return h
+			}(),
+			payload:     make([]byte, 3), // Provide only 3 of 5 bytes
+			expectedErr: "reading PRIORITY payload: unexpected EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.PriorityFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestPriorityFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.PriorityFrame{
+		FrameHeader:      http2.FrameHeader{Type: http2.FramePriority, StreamID: 1, Length: 5},
+		Exclusive:        false,
+		StreamDependency: 10,
+		Weight:           100,
+	}
+	expectedErr := fmt.Errorf("custom writer error for priority")
+
+	tests := []struct {
+		name      string
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{name: "fail immediately", failAfter: 0, expectedN: 0},
+		{name: "fail after partial write", failAfter: 2, expectedN: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
