@@ -25,6 +25,27 @@ func compareHeaderFields(a, b []hpack.HeaderField) bool {
 	return true
 }
 
+// newTestHpackAdapter creates a HpackAdapter with defaultMaxTableSize for testing.
+// It calls t.Fatal if adapter creation fails or if the adapter is not properly initialized.
+func newTestHpackAdapter(t *testing.T) *HpackAdapter {
+	t.Helper()
+	adapter := NewHpackAdapter(defaultMaxTableSize)
+	if adapter == nil {
+		t.Fatalf("newTestHpackAdapter: NewHpackAdapter(%d) returned nil", defaultMaxTableSize)
+	}
+	// Basic check for internal fields initialization, more detailed checks are in TestNewHpackAdapter
+	if adapter.encoder == nil {
+		t.Fatalf("newTestHpackAdapter: adapter.encoder is nil")
+	}
+	if adapter.decoder == nil {
+		t.Fatalf("newTestHpackAdapter: adapter.decoder is nil")
+	}
+	if adapter.encodeBuf == nil {
+		t.Fatalf("newTestHpackAdapter: adapter.encodeBuf is nil")
+	}
+	return adapter
+}
+
 // TestNewHpackAdapter checks the initialization of HpackAdapter.
 func TestNewHpackAdapter(t *testing.T) {
 	adapter := NewHpackAdapter(defaultMaxTableSize)
@@ -51,7 +72,7 @@ func TestNewHpackAdapter(t *testing.T) {
 
 // TestHpackAdapter_EncodeDecode_Simple tests a simple encode-decode round trip.
 func TestHpackAdapter_EncodeDecode_Simple(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	headers := []hpack.HeaderField{
 		{Name: ":method", Value: "GET"},
 		{Name: ":path", Value: "/"},
@@ -87,7 +108,7 @@ func TestHpackAdapter_EncodeDecode_Simple(t *testing.T) {
 
 // TestHpackAdapter_EncodeDecode_MultipleFragments tests decoding across multiple fragments.
 func TestHpackAdapter_EncodeDecode_MultipleFragments(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	headers := []hpack.HeaderField{
 		{Name: "header1", Value: "value1"},
 		{Name: "header2", Value: "value2-loooooooooooooooooooooooooooooooooooooong"},
@@ -132,7 +153,7 @@ func TestHpackAdapter_EncodeDecode_MultipleFragments(t *testing.T) {
 
 // TestHpackAdapter_SetMaxDynamicTableSize tests setting the dynamic table sizes.
 func TestHpackAdapter_SetMaxDynamicTableSize(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	newEncoderSize := uint32(2048)
 	newDecoderSize := uint32(1024)
 
@@ -168,7 +189,7 @@ func TestHpackAdapter_SetMaxDynamicTableSize(t *testing.T) {
 
 // TestHpackAdapter_GetAndClearDecodedFields tests GetAndClearDecodedFields behavior.
 func TestHpackAdapter_GetAndClearDecodedFields(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	headers1 := []hpack.HeaderField{{Name: "field1", Value: "value1"}}
 	headers2 := []hpack.HeaderField{{Name: "field2", Value: "value2"}}
 
@@ -211,7 +232,7 @@ func TestHpackAdapter_GetAndClearDecodedFields(t *testing.T) {
 }
 
 func TestHpackAdapter_EncodeHeaderFields_Error(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	// The golang.org/x/net/http2/hpack.Encoder.WriteField only returns an error
 	// if its internal buffer write fails, which is hard to trigger without
 	// extreme memory pressure or a custom writer that fails.
@@ -224,7 +245,7 @@ func TestHpackAdapter_EncodeHeaderFields_Error(t *testing.T) {
 }
 
 func TestHpackAdapter_DecodeFragment_Error(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	// Test nil decoder case
 	originalDecoder := adapter.decoder
 	adapter.decoder = nil
@@ -251,7 +272,7 @@ func TestHpackAdapter_DecodeFragment_Error(t *testing.T) {
 }
 
 func TestHpackAdapter_FinishDecoding_Error(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	// Test nil decoder case
 	originalDecoder := adapter.decoder
 	adapter.decoder = nil
@@ -394,7 +415,7 @@ func TestEncoder_Encode_DstReuse(t *testing.T) {
 // The current HpackAdapter.EncodeHeaderFields returns h.encodeBuf.Bytes(), which is a slice to the internal buffer.
 // The original HpackAdapter.Encode method returns a copy. This test is for EncodeHeaderFields.
 func TestHpackAdapter_EncodeHeaderFields_ReturnsSliceOfInternalBuffer(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	headers1 := []hpack.HeaderField{{Name: "h1", Value: "v1"}}
 	headers2 := []hpack.HeaderField{{Name: "h2", Value: "v2"}}
 
@@ -434,7 +455,7 @@ func TestHpackAdapter_EncodeHeaderFields_ReturnsSliceOfInternalBuffer(t *testing
 		// This means it *does* return a slice of the internal buffer.
 		// If encoded1 == encoded1Copy, it could be that the second encoding was identical or didn't clobber.
 		// Let's try making header2 produce a *different* and *shorter* encoding.
-		adapterShort := NewHpackAdapter(defaultMaxTableSize)
+		adapterShort := newTestHpackAdapter(t)
 		hShort1 := []hpack.HeaderField{{Name: "long-name-header", Value: "long-value-to-make-it-big"}}
 		hShort2 := []hpack.HeaderField{{Name: "s", Value: "v"}} // very short
 
@@ -462,7 +483,7 @@ func TestHpackAdapter_EncodeHeaderFields_ReturnsSliceOfInternalBuffer(t *testing
 // TestHpackAdapter_Encode_ReturnsCopy tests if the original Encode method
 // returns a copy, as expected from its implementation.
 func TestHpackAdapter_Encode_ReturnsCopy(t *testing.T) {
-	adapter := NewHpackAdapter(defaultMaxTableSize)
+	adapter := newTestHpackAdapter(t)
 	headers1 := []hpack.HeaderField{{Name: "h1", Value: "v1"}}
 	headers2 := []hpack.HeaderField{{Name: "h2", Value: "v2"}}
 
