@@ -338,3 +338,125 @@ func TestFrameHeader_WriteTo_Error(t *testing.T) {
 		}
 	})
 }
+
+func TestContinuationFrame(t *testing.T) {
+	tests := []struct {
+		name          string
+		frame         *http2.ContinuationFrame
+		expectedError bool // For specific parse/write errors not covered by generic loop
+	}{
+		{
+			name: "basic continuation frame",
+			frame: &http2.ContinuationFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameContinuation,
+					Flags:    0,
+					StreamID: 123,
+					// Length will be set by PayloadLen
+				},
+				HeaderBlockFragment: []byte("some header data"),
+			},
+		},
+		{
+			name: "continuation frame with END_HEADERS flag",
+			frame: &http2.ContinuationFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameContinuation,
+					Flags:    http2.FlagContinuationEndHeaders,
+					StreamID: 456,
+				},
+				HeaderBlockFragment: []byte("more header data"),
+			},
+		},
+		{
+			name: "continuation frame with empty header block fragment",
+			frame: &http2.ContinuationFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameContinuation,
+					Flags:    0,
+					StreamID: 789,
+				},
+				HeaderBlockFragment: []byte{},
+			},
+		},
+		{
+			name: "continuation frame with END_HEADERS and empty fragment",
+			frame: &http2.ContinuationFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameContinuation,
+					Flags:    http2.FlagContinuationEndHeaders,
+					StreamID: 1,
+				},
+				HeaderBlockFragment: []byte{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set length based on payload, WriteFrame will use this
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "ContinuationFrame")
+		})
+	}
+}
+
+func TestContinuationFrame_ParsePayload_Errors(t *testing.T) {
+	t.Run("payload too short error during read", func(t *testing.T) {
+		header := http2.FrameHeader{
+			Type:     http2.FrameContinuation,
+			Length:   10, // Expect 10 bytes
+			StreamID: 1,
+		}
+		// Provide only 5 bytes, ReadFull should cause ErrUnexpectedEOF
+		payload := bytes.NewBuffer(make([]byte, 5))
+		frame := &http2.ContinuationFrame{}
+
+		err := frame.ParsePayload(payload, header)
+		if err == nil {
+			t.Fatal("ParsePayload expected an error for short payload, got nil")
+		}
+		// The error from ReadFull inside ParsePayload will be io.ErrUnexpectedEOF
+		if !isSpecificError(err, io.ErrUnexpectedEOF) && err.Error() != "reading CONTINUATION header block fragment: unexpected EOF" {
+			// The error message check is because fmt.Errorf wraps it
+			t.Errorf("ParsePayload error mismatch: expected %v or wrapped version, got %v", io.ErrUnexpectedEOF, err)
+		}
+	})
+}
+
+func TestContinuationFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.ContinuationFrame{
+		FrameHeader:         http2.FrameHeader{Type: http2.FrameContinuation, StreamID: 1, Length: 5},
+		HeaderBlockFragment: []byte("hello"),
+	}
+	expectedErr := fmt.Errorf("custom writer error for continuation")
+
+	t.Run("fail immediately", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 0, errToReturn: expectedErr}
+		n, err := frame.WritePayload(fw)
+		if err == nil {
+			t.Fatal("WritePayload expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		if n != 0 {
+			t.Errorf("WritePayload expected 0 bytes written on immediate error, got %d", n)
+		}
+	})
+
+	t.Run("fail after partial write", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 2, errToReturn: expectedErr}
+		n, err := frame.WritePayload(fw)
+		if err == nil {
+			t.Fatal("WritePayload with partial write expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("WritePayload with partial write error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		// The failingWriter will return what it could write before erroring
+		if n != 2 {
+			t.Errorf("WritePayload with partial write expected 2 bytes written, got %d", n)
+		}
+	})
+}
