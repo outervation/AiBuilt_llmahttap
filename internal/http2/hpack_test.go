@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/http2/hpack"
+	"strings"
 )
 
 const (
@@ -735,4 +736,136 @@ func TestHpackAdapter_DecoderStateManagement(t *testing.T) {
 			t.Errorf("FinishDecoding after GetAndClear (which cleared adapter.decodedFields) should yield no new fields from adapter, got: %+v", finalFieldsAfterGetClear)
 		}
 	})
+}
+
+// TestHpackAdapter_DecodingErrorHandling tests various error scenarios during HPACK decoding.
+func TestHpackAdapter_DecodingErrorHandling(t *testing.T) {
+	testCases := []struct {
+		name                    string
+		setupAdapter            func(adapter *HpackAdapter) // Optional setup, e.g., making decoder nil
+		fragment                []byte
+		expectDecodeFragmentErr bool
+		expectFinishDecodingErr bool
+		errSubstring            string // Expected substring in the effective error message
+	}{
+		{
+			name:                    "Valid empty fragment",
+			fragment:                []byte{},
+			expectDecodeFragmentErr: false,
+			expectFinishDecodingErr: false,
+			errSubstring:            "", // No error
+		},
+		{
+			name:                    "Invalid indexed header field (index 0)",
+			fragment:                []byte{0x80}, // Index 0 is invalid in HPACK
+			expectDecodeFragmentErr: true,         // hpack.Decoder.Write should error
+			expectFinishDecodingErr: false,        // hpack.Decoder.Close might not error further, or its error is secondary
+			errSubstring:            "invalid indexed representation index 0",
+		},
+		{
+			name:     "Incomplete string literal in header value",
+			fragment: []byte{0x44, 0x03, '/', 'a'}, // :path (from static table, index 4), value claims len 3, but only provides "/a" (len 2)
+			// hpack.Decoder.Write will likely consume this partial data.
+			// hpack.Decoder.Close will detect the string is shorter than declared.
+			expectDecodeFragmentErr: false,
+			expectFinishDecodingErr: true,
+			errSubstring:            "truncated headers",
+		},
+		{
+			name: "Adapter methods with nil internal decoder",
+			setupAdapter: func(adapter *HpackAdapter) {
+				adapter.decoder = nil // Manually set decoder to nil to test adapter's internal checks
+			},
+			fragment:                []byte{0x00},                           // Dummy data, DecodeFragment will be called
+			expectDecodeFragmentErr: true,                                   // adapter.DecodeFragment should check for nil decoder
+			expectFinishDecodingErr: true,                                   // adapter.FinishDecoding should also check for nil decoder
+			errSubstring:            "HpackAdapter.decoder not initialized", // This error comes from the adapter's nil check
+		},
+		{
+			name: "Decoder close error due to incomplete Huffman coded string",
+			// Header: Name "foo" (literal, len 3), Value Huffman encoded, claims len 9, but data is truncated.
+			// Actual Huffman for "custom-val" (10 chars) is shorter. Let's use one from an example:
+			// Example from hpack spec C.4.1: "www.example.com" (Huffman, 12 bytes). Take a prefix.
+			// 0x40: Literal Header Field with Incremental Indexing -- New Name
+			// 0x03: Name Length 3, Name "foo"
+			// 0x8C: Value Huffman encoded, length 12. (Using 12 from example, for "www.example.com")
+			// Data for "www.example.com": 9D 29 AD 17 18 63 C7 8F 0B 97 C8 AE 90 (13 bytes, but example shows 12 for the actual example?)
+			// Let's use the example from TestHpackAdapter_FinishDecoding_Error: "huffman data incomplete"
+			// This was: 0x40 | 0x03 | 'f' | 'o' | 'o' | 0x89 (huffman, len 9) | F1 E3 C2 E5 F2 3A 6A 0F (8 bytes provided, 1 missing)
+			fragment:                []byte{0x40, 0x03, 'f', 'o', 'o', 0x89, 0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6A, 0x0F},
+			expectDecodeFragmentErr: false, // hpack.Decoder.Write likely consumes the partial Huffman data
+			expectFinishDecodingErr: true,  // hpack.Decoder.Close detects incomplete Huffman sequence
+			errSubstring:            "truncated headers",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t)
+			if tc.setupAdapter != nil {
+				tc.setupAdapter(adapter)
+			}
+
+			adapter.ResetDecoderState() // Ensure HpackAdapter's decodedFields buffer is clean
+
+			// --- Test execution ---
+			dfError := adapter.DecodeFragment(tc.fragment)
+			// Note: decodedHeaders from FinishDecoding might be non-nil even if an error occurs,
+			// representing partially decoded headers. The HpackAdapter.FinishDecoding clears its
+			// internal list *after* retrieving it.
+			decodedHeaders, fdError := adapter.FinishDecoding()
+
+			// --- Assertion ---
+			actualDfErrorOccurred := (dfError != nil)
+			actualFdErrorOccurred := (fdError != nil)
+
+			// 1. Check DecodeFragment error status
+			if actualDfErrorOccurred != tc.expectDecodeFragmentErr {
+				t.Errorf("DecodeFragment: expected_error_status=%v, got=%v (error: %q)",
+					tc.expectDecodeFragmentErr, actualDfErrorOccurred, dfError)
+			}
+
+			// 2. Check FinishDecoding error status
+			if actualFdErrorOccurred != tc.expectFinishDecodingErr {
+				// This check is nuanced. If DecodeFragment errored as expected,
+				// FinishDecoding's error status is secondary for this test's pass/fail criteria
+				// but still interesting to observe.
+				if tc.expectDecodeFragmentErr && actualDfErrorOccurred {
+					// DecodeFragment errored as expected. Log if FinishDecoding's behavior diverges from its specific expectation.
+					// This is not a test failure for the primary expectation of DecodeFragment erroring.
+					t.Logf("Note: DecodeFragment errored as expected. FinishDecoding: expected_error_status=%v, got=%v (error: %q)",
+						tc.expectFinishDecodingErr, actualFdErrorOccurred, fdError)
+				} else {
+					// DecodeFragment did NOT error as expected (or was not expected to error).
+					// In this case, FinishDecoding's error status is critical.
+					t.Errorf("FinishDecoding: expected_error_status=%v, got=%v (error: %q)",
+						tc.expectFinishDecodingErr, actualFdErrorOccurred, fdError)
+				}
+			}
+
+			// 3. Check overall error condition and message content
+			effectiveError := dfError
+			if effectiveError == nil {
+				effectiveError = fdError
+			}
+
+			expectedAnErrorOverall := tc.expectDecodeFragmentErr || tc.expectFinishDecodingErr
+
+			if expectedAnErrorOverall {
+				if effectiveError == nil {
+					t.Errorf("Overall: Expected an error, but got none. (dfError: %v, fdError: %v)", dfError, fdError)
+				} else if tc.errSubstring != "" && !strings.Contains(effectiveError.Error(), tc.errSubstring) {
+					t.Errorf("Overall: Effective error %q does not contain substring %q", effectiveError.Error(), tc.errSubstring)
+				}
+			} else { // Not expecting any error overall
+				if effectiveError != nil {
+					t.Errorf("Overall: Expected no error, but got: %q. (dfError: %v, fdError: %v)", effectiveError, dfError, fdError)
+				}
+			}
+
+			if t.Failed() && len(decodedHeaders) > 0 {
+				t.Logf("Partially decoded headers (if any upon failure): %+v", decodedHeaders)
+			}
+		})
+	}
 }
