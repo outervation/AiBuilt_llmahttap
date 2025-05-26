@@ -798,10 +798,12 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 		context        LogFields
 		globalLogLevel config.LogLevel // Logger's configured minimum level
 		expectLog      bool
-		expectedSource string // If auto-populated or from context
+		expectedSource string // If explicitly set, otherwise auto-populated if name contains "auto source"
+		// No need for expectedRequestMethod, expectedRequestURI, expectedH2StreamID here,
+		// as these will be derived from context or checked implicitly.
 	}{
 		{
-			name:           "Debug message, Debug level, logged",
+			name:           "Debug message, Debug level, logged (auto source)",
 			level:          config.LogLevelDebug,
 			msg:            "This is a debug message.",
 			context:        LogFields{"user_id": 123, "request_id": "abc"},
@@ -809,7 +811,7 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 			expectLog:      true,
 		},
 		{
-			name:           "Info message, Debug level, logged",
+			name:           "Info message, Debug level, logged (auto source)",
 			level:          config.LogLevelInfo,
 			msg:            "This is an info message.",
 			context:        nil,
@@ -817,7 +819,7 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 			expectLog:      true,
 		},
 		{
-			name:           "Warning message, Info level, logged",
+			name:           "Warning message, Info level, logged with custom source",
 			level:          config.LogLevelWarning,
 			msg:            "This is a warning.",
 			context:        LogFields{"source": "custom_module.go:42"},
@@ -826,7 +828,7 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 			expectedSource: "custom_module.go:42",
 		},
 		{
-			name:           "Error message, Warning level, logged",
+			name:           "Error message, Warning level, logged with request context (auto source)",
 			level:          config.LogLevelError,
 			msg:            "This is an error!",
 			context:        LogFields{"method": "GET", "uri": "/test", "h2_stream_id": uint32(5)},
@@ -850,13 +852,44 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 			expectLog:      false,
 		},
 		{
-			name:           "Error message, Error level, logged with auto source",
+			name:           "Error message, Error level, logged (auto source basic)",
 			level:          config.LogLevelError,
 			msg:            "Critical failure.",
 			context:        nil, // Source will be auto-populated by logger.Error()
 			globalLogLevel: config.LogLevelError,
 			expectLog:      true,
-			// expectedSource will be checked for presence, not exact match due to line number variance
+		},
+		{
+			name:           "Error with h2_stream_id as int (auto source)",
+			level:          config.LogLevelError,
+			msg:            "Stream ID as int",
+			context:        LogFields{"h2_stream_id": int(12345)},
+			globalLogLevel: config.LogLevelDebug,
+			expectLog:      true,
+		},
+		{
+			name:           "Error with h2_stream_id as int32 (auto source)",
+			level:          config.LogLevelError,
+			msg:            "Stream ID as int32",
+			context:        LogFields{"h2_stream_id": int32(54321)},
+			globalLogLevel: config.LogLevelDebug,
+			expectLog:      true,
+		},
+		{
+			name:           "Error with h2_stream_id as float64 (auto source)",
+			level:          config.LogLevelError,
+			msg:            "Stream ID as float64",
+			context:        LogFields{"h2_stream_id": float64(987.0)}, // Should be truncated to uint32(987)
+			globalLogLevel: config.LogLevelDebug,
+			expectLog:      true,
+		},
+		{
+			name:           "Error with h2_stream_id as incompatible string (auto source, in details)",
+			level:          config.LogLevelError,
+			msg:            "Stream ID as string",
+			context:        LogFields{"h2_stream_id": "not_a_stream_id"},
+			globalLogLevel: config.LogLevelDebug,
+			expectLog:      true,
 		},
 	}
 
@@ -869,8 +902,6 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 			el := newTestErrorLogger(errorLogCfg, tt.globalLogLevel, &buf)
 
 			// Call the appropriate log method based on tt.level
-			// This also tests the wrapper methods like el.Debug(), el.Info() etc.
-			// which populate source if not provided.
 			switch tt.level {
 			case config.LogLevelDebug:
 				el.Debug(tt.msg, tt.context)
@@ -904,106 +935,152 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 				}
 
 				// Check source
-				if tt.expectedSource != "" {
+				if tt.expectedSource != "" { // Explicit source provided in test case
 					if entry.Source != tt.expectedSource {
 						t.Errorf("Expected Source %q, got %q", tt.expectedSource, entry.Source)
 					}
-				} else if tt.name == "Error message, Error level, logged with auto source" { // Special case for auto-populated source
+				} else if strings.Contains(tt.name, "auto source") { // Check for auto-populated source
 					if entry.Source == "" {
 						t.Errorf("Expected auto-populated Source, but it was empty")
-					} else if !strings.HasSuffix(entry.Source, "logger_test.go:"+strconv.Itoa(getExpectedLineNumberForErrorLog(tt.level))) {
-						// This is tricky because the line number can change.
-						// We check if it ends with "logger_test.go:<number>"
-						// For more robust checks, one might inspect the stack or use a mock runtime.Caller
-						t.Logf("Auto-populated source: %s. Verification of exact line number is fragile.", entry.Source)
-						if !strings.HasPrefix(entry.Source, "logger_test.go:") {
-							t.Errorf("Expected auto-populated Source to start with 'logger_test.go:', got %q", entry.Source)
+					} else {
+						// Verify it's from the correct file and has a line number part.
+						// Example: "logger_test.go:123"
+						parts := strings.Split(entry.Source, ":")
+						if len(parts) < 2 || parts[0] != "logger_test.go" {
+							t.Errorf("Expected auto-populated Source to be in format 'logger_test.go:LINE_NO', got %q", entry.Source)
+						} else {
+							if _, err := strconv.Atoi(parts[len(parts)-1]); err != nil {
+								t.Errorf("Expected auto-populated Source to end with a line number, got %q (error parsing line number: %v)", entry.Source, err)
+							}
 						}
+						t.Logf("Auto-populated source: %s. Verified format 'logger_test.go:LINE_NO'.", entry.Source)
 					}
+				} else if entry.Source != "" && !strings.Contains(tt.name, "custom source") { // No explicit source, not auto-source test, should be empty
+					t.Errorf("Expected empty Source, got %q for test case name %q", entry.Source, tt.name)
 				}
 
 				// Check context fields mapped to specific entry fields
+				expectedRequestMethodInEntry := ""
 				if httpMethod, ok := tt.context["method"].(string); ok {
-					if entry.RequestMethod != httpMethod {
-						t.Errorf("Expected RequestMethod %q, got %q", httpMethod, entry.RequestMethod)
-					}
+					expectedRequestMethodInEntry = httpMethod
 				}
+				if entry.RequestMethod != expectedRequestMethodInEntry {
+					t.Errorf("Expected RequestMethod %q, got %q", expectedRequestMethodInEntry, entry.RequestMethod)
+				}
+
+				expectedRequestURIInEntry := ""
 				if uri, ok := tt.context["uri"].(string); ok {
-					if entry.RequestURI != uri {
-						t.Errorf("Expected RequestURI %q, got %q", uri, entry.RequestURI)
+					expectedRequestURIInEntry = uri
+				}
+				if entry.RequestURI != expectedRequestURIInEntry {
+					t.Errorf("Expected RequestURI %q, got %q", expectedRequestURIInEntry, entry.RequestURI)
+				}
+
+				// Check RequestH2StreamID
+				var expectedH2StreamIDValInEntry uint32
+				originalH2StreamIDVal, presentInH2StreamIDContext := tt.context["h2_stream_id"]
+				isH2StreamIDSuccessfullyProcessedType := false
+				if presentInH2StreamIDContext {
+					switch v := originalH2StreamIDVal.(type) {
+					case uint32:
+						expectedH2StreamIDValInEntry = v
+						isH2StreamIDSuccessfullyProcessedType = true
+					case int:
+						expectedH2StreamIDValInEntry = uint32(v)
+						isH2StreamIDSuccessfullyProcessedType = true
+					case int32:
+						expectedH2StreamIDValInEntry = uint32(v)
+						isH2StreamIDSuccessfullyProcessedType = true
+					case float64:
+						expectedH2StreamIDValInEntry = uint32(v)
+						isH2StreamIDSuccessfullyProcessedType = true
 					}
 				}
-				if h2id, ok := tt.context["h2_stream_id"].(uint32); ok {
-					if entry.RequestH2StreamID != h2id {
-						t.Errorf("Expected RequestH2StreamID %d, got %d", h2id, entry.RequestH2StreamID)
-					}
+				if entry.RequestH2StreamID != expectedH2StreamIDValInEntry {
+					t.Errorf("Expected RequestH2StreamID %d, got %d. Original context value: %v",
+						expectedH2StreamIDValInEntry, entry.RequestH2StreamID, originalH2StreamIDVal)
 				}
 
 				// Check remaining context fields in Details
+				// expectedDetails are fields from context that were *not* mapped to specific entry fields.
 				expectedDetails := make(LogFields)
 				if tt.context != nil {
 					for k, v := range tt.context {
-						if k != "source" && k != "method" && k != "uri" && k != "h2_stream_id" {
+						isProcessedField := false
+						switch k {
+						case "source":
+							if _, ok := v.(string); ok {
+								isProcessedField = true
+							}
+						case "method":
+							if _, ok := v.(string); ok {
+								isProcessedField = true
+							}
+						case "uri":
+							if _, ok := v.(string); ok {
+								isProcessedField = true
+							}
+						case "h2_stream_id":
+							if isH2StreamIDSuccessfullyProcessedType { // Use the flag determined above
+								isProcessedField = true
+							}
+						}
+						if !isProcessedField {
 							expectedDetails[k] = v
 						}
 					}
 				}
+
 				if len(expectedDetails) > 0 {
 					if entry.Details == nil {
-						t.Errorf("Expected Details map, got nil. Expected: %v", expectedDetails)
+						t.Errorf("Expected Details map with keys %v, got nil. Original context: %v", getKeys(expectedDetails), tt.context)
 					} else {
 						for k, expectedV := range expectedDetails {
 							actualV, ok := entry.Details[k]
 							if !ok {
-								t.Errorf("Expected key %q in Details, but not found. Entry Details: %v", k, entry.Details)
+								t.Errorf("Expected key %q in Details, but not found. Entry Details: %v. Original context: %v", k, entry.Details, tt.context)
 								continue
 							}
-							// JSON unmarshals numbers as float64 by default
-							if fExpected, okF := expectedV.(float64); okF {
-								if fActual, okA := actualV.(float64); okA {
-									if fExpected != fActual {
-										t.Errorf("Details mismatch for key %q. Expected %v (float64), got %v (float64)", k, fExpected, fActual)
+							// JSON unmarshals numbers as float64 by default into interface{}
+							// Compare string representations for simplicity or handle types carefully
+							if fmt.Sprintf("%v", actualV) != fmt.Sprintf("%v", expectedV) {
+								// More specific type checks if needed, like in the original test
+								isMatch := false
+								if fExpected, okF := expectedV.(float64); okF {
+									if fActual, okA := actualV.(float64); okA && fExpected == fActual {
+										isMatch = true
 									}
-								} else {
-									t.Errorf("Details type mismatch for key %q. Expected float64, got %T", k, actualV)
-								}
-							} else if iExpected, okI := expectedV.(int); okI { // Handle int if original context had int
-								if fActual, okA := actualV.(float64); okA { // JSON turns it into float64
-									if float64(iExpected) != fActual {
-										t.Errorf("Details mismatch for key %q. Expected %v (int, becomes float64), got %v (float64)", k, iExpected, fActual)
+								} else if iExpected, okI := expectedV.(int); okI {
+									if fActual, okA := actualV.(float64); okA && float64(iExpected) == fActual {
+										isMatch = true
 									}
-								} else {
-									t.Errorf("Details type mismatch for key %q. Expected float64 (from int), got %T", k, actualV)
-								}
-							} else if sExpected, okS := expectedV.(string); okS {
-								if sActual, okSA := actualV.(string); okSA {
-									if sExpected != sActual {
-										t.Errorf("Details mismatch for key %q. Expected %q (string), got %q (string)", k, sExpected, sActual)
+								} else if sExpected, okS := expectedV.(string); okS {
+									if sActual, okSA := actualV.(string); okSA && sExpected == sActual {
+										isMatch = true
 									}
-								} else {
-									t.Errorf("Details type mismatch for key %q. Expected string, got %T", k, actualV)
 								}
-							} else {
-								// For other types, direct comparison or more specific checks might be needed
-								if fmt.Sprintf("%v", expectedV) != fmt.Sprintf("%v", actualV) {
-									t.Errorf("Details mismatch for key %q. Expected %v, got %v", k, expectedV, actualV)
+								// Add more types if necessary
+
+								if !isMatch {
+									t.Errorf("Details mismatch for key %q. Expected %v (type %T), got %v (type %T). Original context: %v",
+										k, expectedV, expectedV, actualV, actualV, tt.context)
 								}
 							}
 						}
 						// Check for unexpected keys in actual details
 						for k := range entry.Details {
 							if _, ok := expectedDetails[k]; !ok {
-								t.Errorf("Unexpected key %q found in Details: %v", k, entry.Details[k])
+								t.Errorf("Unexpected key %q found in Details: %v. Original context: %v", k, entry.Details[k], tt.context)
 							}
 						}
 					}
-				} else {
-					if entry.Details != nil {
-						t.Errorf("Expected nil Details, got %v", entry.Details)
+				} else { // No details expected
+					if entry.Details != nil && len(entry.Details) > 0 { // Allow empty map, but not map with items
+						t.Errorf("Expected nil or empty Details, got %v. Original context: %v", entry.Details, tt.context)
 					}
 				}
 
-			} else {
+			} else { // Not expecting log
 				if len(logLines) != 0 {
 					t.Errorf("Expected 0 log lines, got %d. Lines: %v", len(logLines), logLines)
 				}
@@ -1012,36 +1089,13 @@ func TestErrorLogFormatAndContent(t *testing.T) {
 	}
 }
 
-// getExpectedLineNumberForErrorLog is a helper to estimate line number for source.
-// THIS IS FRAGILE and only for basic validation.
-// It assumes the call to el.Error/Warn/Info/Debug is on a specific line within the test.
-
-func getExpectedLineNumberForErrorLog(level config.LogLevel) int {
-	// This helper returns the expected line number of the el.XXX call
-	// within TestErrorLogFormatAndContent for the specific test case:
-	// "Error message, Error level, logged with auto source"
-	// This test case calls el.Error(...).
-	// The line numbers are relative to the start of the file and can change if the file is edited.
-	// Current call sites in TestErrorLogFormatAndContent:
-	// el.Debug(...) -> line 873 approx.
-	// el.Info(...)  -> line 875 approx.
-	// el.Warn(...)  -> line 877 approx.
-	// el.Error(...) -> line 879 approx.
-
-	// The test "Error message, Error level, logged with auto source" specifically uses config.LogLevelError.
-	if level == config.LogLevelError {
-		return 879 // This is the line number of `el.Error(tt.msg, tt.context)` for that test case.
+// getKeys is a helper to get keys from a map for logging.
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-
-	// Fallback for other levels if their auto-source line numbers were to be checked precisely.
-	// For now, only the LogLevelError case for "Error message, Error level, logged with auto source" uses this.
-	// If this helper is used for other levels in similar auto-source checks, their line numbers
-	// would need to be returned here.
-	// Defaulting to the Error line as it's the primary one checked.
-	// A panic or t.Fatalf might be better if an unexpected level is passed and needs precise checking.
-	t := &testing.T{} // Temporary testing.T for Fatalf if needed, though not ideal in a helper like this.
-	t.Logf("Warning: getExpectedLineNumberForErrorLog called with level %s, but precise line number check is primarily set up for LogLevelError.", level)
-	return 879 // Default or placeholder
+	return keys
 }
 
 func TestGetRealClientIP(t *testing.T) {
