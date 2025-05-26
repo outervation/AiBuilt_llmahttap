@@ -153,6 +153,94 @@ func TestHpackAdapter_EncodeDecode_MultipleFragments(t *testing.T) {
 	}
 }
 
+// TestHpackAdapter_Decode_Simple tests decoding of simple, valid HPACK byte streams.
+func TestHpackAdapter_Decode_Simple(t *testing.T) {
+	// Expected headers (same as a case in TestHpackAdapter_EncodeDecode_Simple)
+	expectedHeadersSimple := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":path", Value: "/"},
+		{Name: ":scheme", Value: "http"},
+		{Name: "user-agent", Value: "my-test-client/1.0"},
+	}
+
+	// Generate the HPACK bytes for these headers using a temporary adapter
+	tempAdapter := newTestHpackAdapter(t)
+	hpackBytesSimple, err := tempAdapter.EncodeHeaderFields(expectedHeadersSimple)
+	if err != nil {
+		t.Fatalf("Failed to generate test HPACK bytes for simple case: %v", err)
+	}
+	if len(hpackBytesSimple) == 0 && len(expectedHeadersSimple) > 0 {
+		t.Fatal("Generated test HPACK bytes for simple case are empty but expected headers")
+	}
+
+	// For empty header list, hpackBytes would be empty.
+	// The golang hpack encoder produces empty bytes for an empty list of fields.
+	hpackBytesEmpty, err := tempAdapter.EncodeHeaderFields([]hpack.HeaderField{})
+	if err != nil {
+		t.Fatalf("Failed to generate test HPACK bytes for empty case: %v", err)
+	}
+	if len(hpackBytesEmpty) != 0 {
+		t.Fatalf("Generated test HPACK bytes for empty case are not empty: got %x", hpackBytesEmpty)
+	}
+
+	testCases := []struct {
+		name        string
+		hpackInput  []byte
+		wantHeaders []hpack.HeaderField
+		wantErr     bool
+	}{
+		{
+			name:        "Simple GET request headers",
+			hpackInput:  hpackBytesSimple,
+			wantHeaders: expectedHeadersSimple,
+			wantErr:     false,
+		},
+		{
+			name:        "Empty header list",
+			hpackInput:  hpackBytesEmpty, // Should be []byte{}
+			wantHeaders: []hpack.HeaderField{},
+			wantErr:     false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t) // Fresh adapter for each test case
+
+			adapter.ResetDecoderState() // Ensure clean state
+
+			// First, try to decode the fragment
+			decodeErr := adapter.DecodeFragment(tc.hpackInput)
+
+			// Then, finalize decoding
+			decodedHeaders, finishErr := adapter.FinishDecoding()
+
+			// Determine the effective error
+			var effectiveErr error
+			if decodeErr != nil {
+				effectiveErr = decodeErr            // Prioritize DecodeFragment error if it occurs
+				if finishErr != nil && tc.wantErr { // Log secondary error only if an error was expected anyway
+					t.Logf("FinishDecoding also errored after DecodeFragment errored: %v (secondary to DecodeFragment error: %v)", finishErr, decodeErr)
+				}
+			} else {
+				effectiveErr = finishErr // If DecodeFragment was fine, use FinishDecoding's error
+			}
+
+			if (effectiveErr != nil) != tc.wantErr {
+				t.Fatalf("Effective decoding error = %v, wantErr %v. (DecodeFragment err: %v, FinishDecoding err: %v)", effectiveErr, tc.wantErr, decodeErr, finishErr)
+			}
+
+			if tc.wantErr { // If an error was expected and occurred, don't check headers.
+				return
+			}
+			// No error expected, and none occurred. Check headers.
+			if !compareHeaderFields(tc.wantHeaders, decodedHeaders) {
+				t.Errorf("Decoded headers do not match expected.\nWant: %+v\nGot:  %+v", tc.wantHeaders, decodedHeaders)
+			}
+		})
+	}
+}
+
 // TestHpackAdapter_SetMaxDynamicTableSize tests setting the dynamic table sizes.
 func TestHpackAdapter_SetMaxDynamicTableSize(t *testing.T) {
 	adapter := newTestHpackAdapter(t)
