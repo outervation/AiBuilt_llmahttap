@@ -21,6 +21,11 @@ import (
 	"example.com/llmahttap/v2/internal/config"
 )
 
+// parseJSONLog is a helper to unmarshal a JSON log line into the provided out interface.
+func parseJSONLog(logLine []byte, out interface{}) error {
+	return json.Unmarshal(logLine, out)
+}
+
 // nopWriteCloser is a helper to wrap an io.Writer into an io.WriteCloser
 // with a no-op Close method.
 type nopWriteCloser struct {
@@ -179,14 +184,17 @@ func newMockHTTPRequest(t *testing.T, method, path, remoteAddr string, headers h
 		req.RemoteAddr = remoteAddr
 	}
 	if headers != nil {
-		req.Header = headers
+		for k, headerValues := range headers {
+			if len(headerValues) > 0 {
+				req.Header.Set(k, headerValues[0]) // Use Set for the first value
+				// Add remaining values if a header has multiple values
+				for i := 1; i < len(headerValues); i++ {
+					req.Header.Add(k, headerValues[i])
+				}
+			}
+		}
 	}
 	return req
-}
-
-// parseJSONLog attempts to unmarshal a single log line (as bytes) into the target struct.
-func parseJSONLog(line []byte, targetStruct interface{}) error {
-	return json.Unmarshal(line, targetStruct)
 }
 
 // readLogOutput reads all lines from an io.Reader (e.g., bytes.Buffer or os.File).
@@ -398,33 +406,39 @@ func TestAccessLogEnabledFlag(t *testing.T) {
 
 func TestAccessLogFormatAndContent(t *testing.T) {
 	tests := []struct {
-		name            string
-		reqMethod       string
-		reqURI          string
-		reqRemoteAddr   string
-		reqHeaders      http.Header
-		streamID        uint32
-		status          int
-		responseBytes   int64
-		duration        time.Duration
-		expectedProto   string // HTTP/1.1 for httptest.NewRequest
+		name          string
+		reqMethod     string
+		reqURI        string
+		reqRemoteAddr string // Direct peer, e.g., "192.168.0.1:12345"
+		reqHeaders    http.Header
+		streamID      uint32
+		status        int
+		responseBytes int64
+		duration      time.Duration
+		// Fields for RealIPHeader testing
+		trustedProxies     []string
+		realIPHeaderName   *string
+		expectedRemoteAddr string // The final IP expected in the log
+		// Other expected fields
 		expectUserAgent string
 		expectReferer   string
 	}{
 		{
-			name:          "Basic request",
-			reqMethod:     "GET",
-			reqURI:        "/test/path?query=1",
-			reqRemoteAddr: "192.168.0.1:12345",
-			reqHeaders:    nil,
-			streamID:      1,
-			status:        http.StatusOK,
-			responseBytes: 1024,
-			duration:      100 * time.Millisecond,
-			expectedProto: "HTTP/1.1",
+			name:               "Basic request, no proxy",
+			reqMethod:          "GET",
+			reqURI:             "/test/path?query=1",
+			reqRemoteAddr:      "192.168.0.1:12345",
+			reqHeaders:         nil,
+			streamID:           1,
+			status:             http.StatusOK,
+			responseBytes:      1024,
+			duration:           100 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "192.168.0.1",
 		},
 		{
-			name:          "Request with User-Agent and Referer",
+			name:          "Request with User-Agent and Referer, no proxy",
 			reqMethod:     "POST",
 			reqURI:        "/submit",
 			reqRemoteAddr: "10.0.0.5:54321",
@@ -432,25 +446,100 @@ func TestAccessLogFormatAndContent(t *testing.T) {
 				"User-Agent": {"TestAgent/1.0"},
 				"Referer":    {"http://example.com/previous"},
 			},
-			streamID:        3,
-			status:          http.StatusCreated,
-			responseBytes:   50,
-			duration:        25 * time.Millisecond,
-			expectedProto:   "HTTP/1.1",
-			expectUserAgent: "TestAgent/1.0",
-			expectReferer:   "http://example.com/previous",
+			streamID:           3,
+			status:             http.StatusCreated,
+			responseBytes:      50,
+			duration:           25 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "10.0.0.5",
+			expectUserAgent:    "TestAgent/1.0",
+			expectReferer:      "http://example.com/previous",
 		},
 		{
-			name:          "Request without optional headers, IPv6",
-			reqMethod:     "HEAD",
-			reqURI:        "/check",
-			reqRemoteAddr: "[2001:db8::1]:8080",
-			reqHeaders:    nil,
-			streamID:      5,
-			status:        http.StatusNoContent,
-			responseBytes: 0,
-			duration:      10 * time.Millisecond,
-			expectedProto: "HTTP/1.1",
+			name:               "Request without optional headers, IPv6, no proxy",
+			reqMethod:          "HEAD",
+			reqURI:             "/check",
+			reqRemoteAddr:      "[2001:db8::1]:8080",
+			reqHeaders:         nil,
+			streamID:           5,
+			status:             http.StatusNoContent,
+			responseBytes:      0,
+			duration:           10 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   nil,
+			expectedRemoteAddr: "2001:db8::1",
+		},
+		// New test cases for RealIPHeader and TrustedProxies logic
+		{
+			name:               "XFF exists, default RealIPHeader, no trusted proxies",
+			reqMethod:          "GET",
+			reqURI:             "/xff-no-trust",
+			reqRemoteAddr:      "172.16.0.100:12345", // a supposed proxy
+			reqHeaders:         http.Header{"X-Forwarded-For": {"10.1.2.3"}},
+			streamID:           7,
+			status:             http.StatusOK,
+			responseBytes:      100,
+			duration:           30 * time.Millisecond,
+			trustedProxies:     nil,
+			realIPHeaderName:   stringPtr("X-Forwarded-For"),
+			expectedRemoteAddr: "10.1.2.3", // From XFF, as direct peer isn't trusted for XFF chain.
+		},
+		{
+			name:               "XFF with one trusted proxy",
+			reqMethod:          "GET",
+			reqURI:             "/xff-one-trusted",
+			reqRemoteAddr:      "192.168.1.50:12345",                                       // This is the trusted proxy
+			reqHeaders:         http.Header{"X-Forwarded-For": {"10.1.2.3, 192.168.1.50"}}, // client, proxy
+			streamID:           9,
+			status:             http.StatusOK,
+			responseBytes:      150,
+			duration:           40 * time.Millisecond,
+			trustedProxies:     []string{"192.168.1.0/24"},
+			realIPHeaderName:   stringPtr("X-Forwarded-For"),
+			expectedRemoteAddr: "10.1.2.3",
+		},
+		{
+			name:               "XFF all trusted, use direct peer",
+			reqMethod:          "GET",
+			reqURI:             "/xff-all-trusted",
+			reqRemoteAddr:      "8.8.8.8:12345",                                            // The actual connecting IP (not in trustedProxies list itself)
+			reqHeaders:         http.Header{"X-Forwarded-For": {"192.168.1.50, 10.0.0.1"}}, // Both trusted
+			streamID:           11,
+			status:             http.StatusOK,
+			responseBytes:      200,
+			duration:           50 * time.Millisecond,
+			trustedProxies:     []string{"192.168.1.0/24", "10.0.0.0/8"},
+			realIPHeaderName:   stringPtr("X-Forwarded-For"),
+			expectedRemoteAddr: "8.8.8.8",
+		},
+		{
+			name:               "Custom RealIPHeader used",
+			reqMethod:          "GET",
+			reqURI:             "/custom-header-simplified",
+			reqRemoteAddr:      "172.20.0.1:12345", // Arbitrary non-trusted direct peer
+			reqHeaders:         http.Header{"CF-Connecting-IP": {"10.1.2.3"}},
+			streamID:           13,
+			status:             http.StatusOK,
+			responseBytes:      250,
+			duration:           60 * time.Millisecond,
+			trustedProxies:     nil, // No trusted proxies for this simplified case
+			realIPHeaderName:   stringPtr("CF-Connecting-IP"),
+			expectedRemoteAddr: "10.1.2.3",
+		},
+		{
+			name:               "XFF with malformed IP, fallback to direct peer",
+			reqMethod:          "GET",
+			reqURI:             "/xff-malformed",
+			reqRemoteAddr:      "192.168.1.50:12345", // Trusted
+			reqHeaders:         http.Header{"X-Forwarded-For": {"not-an-ip, 10.1.2.3"}},
+			streamID:           15,
+			status:             http.StatusOK,
+			responseBytes:      300,
+			duration:           70 * time.Millisecond,
+			trustedProxies:     []string{"192.168.1.0/24"},
+			realIPHeaderName:   stringPtr("X-Forwarded-For"),
+			expectedRemoteAddr: "192.168.1.50",
 		},
 	}
 
@@ -459,9 +548,11 @@ func TestAccessLogFormatAndContent(t *testing.T) {
 			var buf bytes.Buffer
 			enabled := true
 			accessLogCfg := &config.AccessLogConfig{
-				Enabled: &enabled,
-				Format:  "json",
-				Target:  stringPtr("buffer"), // Use buffer for easy capture
+				Enabled:        &enabled,
+				Format:         "json",
+				Target:         stringPtr("buffer"), // Use buffer for easy capture
+				TrustedProxies: tt.trustedProxies,
+				RealIPHeader:   tt.realIPHeaderName,
 			}
 
 			al, err := newTestAccessLogger(accessLogCfg, &buf)
@@ -474,6 +565,81 @@ func TestAccessLogFormatAndContent(t *testing.T) {
 			// The logger uses req.Proto directly.
 			req.Proto = "HTTP/2.0" // Simulate HTTP/2 request for protocol field testing
 
+			if tt.name == "Custom RealIPHeader used" {
+				t.Logf("--- DIAGNOSTICS for Custom_RealIPHeader_used ---")
+				t.Logf("Direct Peer (clientHost for getRealClientIP): %s", req.RemoteAddr) // req.RemoteAddr is used to derive clientHost
+				if tt.realIPHeaderName != nil {
+					t.Logf("RealIPHeaderName for getRealClientIP: %s", *tt.realIPHeaderName)
+				} else {
+					t.Logf("RealIPHeaderName for getRealClientIP: <nil>")
+				}
+				t.Logf("Headers for getRealClientIP: %v", req.Header)
+				if al != nil {
+					t.Logf("Trusted Proxies for getRealClientIP (al.parsedProxies):")
+					if al.parsedProxies.cidrs == nil && al.parsedProxies.ips == nil {
+						t.Logf("  al.parsedProxies is empty (both cidrs and ips are nil)")
+					} else {
+						if al.parsedProxies.cidrs != nil {
+							for _, cidr := range al.parsedProxies.cidrs {
+								t.Logf("  CIDR: %s", cidr.String())
+							}
+						} else {
+							t.Logf("  al.parsedProxies.cidrs is nil")
+						}
+						if al.parsedProxies.ips != nil {
+							for _, ip := range al.parsedProxies.ips {
+								t.Logf("  IP: %s", ip.String())
+							}
+						} else {
+							t.Logf("  al.parsedProxies.ips is nil")
+						}
+					}
+
+					// Simulate check for IP "10.1.2.3"
+					ipToCheck := net.ParseIP("10.1.2.3")
+					isConsideredTrusted := false
+					if ipToCheck != nil {
+						if al.parsedProxies.cidrs != nil {
+							for _, trustedCIDR := range al.parsedProxies.cidrs {
+								if trustedCIDR.Contains(ipToCheck) {
+									isConsideredTrusted = true
+									t.Logf("  MANUAL CHECK: '10.1.2.3' IS TRUSTED by CIDR %s", trustedCIDR.String())
+									break
+								}
+							}
+						}
+						if !isConsideredTrusted && al.parsedProxies.ips != nil {
+							for _, trustedIP := range al.parsedProxies.ips {
+								if trustedIP.Equal(ipToCheck) {
+									isConsideredTrusted = true
+									t.Logf("  MANUAL CHECK: '10.1.2.3' IS TRUSTED by IP %s", trustedIP.String())
+									break
+								}
+							}
+						}
+					} else {
+						t.Logf("  MANUAL CHECK: '10.1.2.3' failed to parse.")
+					}
+
+					if !isConsideredTrusted {
+						t.Logf("  MANUAL CHECK: '10.1.2.3' IS NOT TRUSTED by any entry in al.parsedProxies.")
+					}
+				} else {
+					t.Logf("al is nil, cannot perform detailed diagnostics on al.parsedProxies")
+				}
+
+				// Add direct call to isIPTrusted for 10.1.2.3
+				if al != nil {
+					ipToReallyCheck := net.ParseIP("10.1.2.3")
+					if ipToReallyCheck != nil {
+						isTrustedResult := isIPTrusted(ipToReallyCheck, al.parsedProxies)
+						t.Logf("  DIRECT isIPTrusted('10.1.2.3', al.parsedProxies) RESULT: %v", isTrustedResult)
+					} else {
+						t.Logf("  DIRECT isIPTrusted: Failed to parse '10.1.2.3' for direct check.")
+					}
+				}
+				t.Logf("--- END DIAGNOSTICS ---")
+			}
 			al.LogAccess(req, tt.streamID, tt.status, tt.responseBytes, tt.duration)
 
 			logLines := readLogBuffer(&buf)
@@ -489,15 +655,20 @@ func TestAccessLogFormatAndContent(t *testing.T) {
 			// Check timestamp format
 			checkTimeFormat(t, entry.Timestamp)
 
-			// Check RemoteAddr and RemotePort
-			expectedHost, expectedPortStr, _ := net.SplitHostPort(tt.reqRemoteAddr)
-			expectedPort, _ := strconv.Atoi(expectedPortStr)
-
-			if entry.RemoteAddr != expectedHost {
-				t.Errorf("Expected RemoteAddr %q, got %q", expectedHost, entry.RemoteAddr)
+			// Check RemoteAddr (resolved client IP)
+			if entry.RemoteAddr != tt.expectedRemoteAddr {
+				t.Errorf("Expected RemoteAddr %q, got %q", tt.expectedRemoteAddr, entry.RemoteAddr)
 			}
+
+			// Check RemotePort (direct peer's port)
+			_, expectedPortStr, err := net.SplitHostPort(tt.reqRemoteAddr)
+			if err != nil { // Handle cases where reqRemoteAddr might not have a port (e.g. "localhost")
+				expectedPortStr = "0" // Default if not parsable, consistent with logger's behavior
+			}
+			expectedPort, _ := strconv.Atoi(expectedPortStr) // Atoi returns 0 on error, also consistent.
+
 			if entry.RemotePort != expectedPort {
-				t.Errorf("Expected RemotePort %d, got %d", expectedPort, entry.RemotePort)
+				t.Errorf("Expected RemotePort %d (from direct peer %s), got %d", expectedPort, tt.reqRemoteAddr, entry.RemotePort)
 			}
 
 			// Check Protocol
@@ -1142,21 +1313,22 @@ func TestNewLoggerFileCreationAndReopen(t *testing.T) {
 
 	// Close initial log files (as NewLogger opens them)
 	// The ReopenLogFiles method within logger should handle its own internal file descriptors.
-	// We'll close them here to simulate an external log rotation scenario more cleanly.
-	if logger.accessLog != nil && logger.accessLog.output != nil {
-		if f, ok := logger.accessLog.output.(*os.File); ok {
-			if f.Name() == accessLogPath { // Ensure it's the file we think it is
-				f.Close()
-			}
-		}
-	}
-	if logger.errorLog != nil && logger.errorLog.output != nil {
-		if f, ok := logger.errorLog.output.(*os.File); ok {
-			if f.Name() == errorLogPath {
-				f.Close()
-			}
-		}
-	}
+	// We will NOT close them here to avoid "file already closed" errors during reopen,
+	// as ReopenLogFiles will attempt to close them.
+	// if logger.accessLog != nil && logger.accessLog.output != nil {
+	// 	if f, ok := logger.accessLog.output.(*os.File); ok {
+	// 		if f.Name() == accessLogPath { // Ensure it's the file we think it is
+	// 			f.Close()
+	// 		}
+	// 	}
+	// }
+	// if logger.errorLog != nil && logger.errorLog.output != nil {
+	// 	if f, ok := logger.errorLog.output.(*os.File); ok {
+	// 		if f.Name() == errorLogPath {
+	// 			f.Close()
+	// 		}
+	// 	}
+	// }
 
 	// Simulate log rotation: move the old files (optional, but good for testing reopen creates new FD)
 	// For simplicity, we'll just let ReopenLogFiles open the same path again.
