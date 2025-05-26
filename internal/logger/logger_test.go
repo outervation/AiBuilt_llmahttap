@@ -1906,3 +1906,77 @@ func TestAtomicLogWrites(t *testing.T) {
 		}
 	})
 }
+
+func TestErrorLogLevelFiltering(t *testing.T) {
+	allLevels := []config.LogLevel{
+		config.LogLevelDebug,
+		config.LogLevelInfo,
+		config.LogLevelWarning,
+		config.LogLevelError,
+	}
+
+	for _, globalLogLevel := range allLevels {
+		t.Run(fmt.Sprintf("GlobalLevel_%s", globalLogLevel), func(t *testing.T) {
+			for _, messageLogLevel := range allLevels {
+				t.Run(fmt.Sprintf("MessageLevel_%s", messageLogLevel), func(t *testing.T) {
+					var buf bytes.Buffer
+					errorLogCfg := &config.ErrorLogConfig{
+						Target: stringPtr("buffer"), // Target isn't strictly used if 'out' is given
+					}
+					el := newTestErrorLogger(errorLogCfg, globalLogLevel, &buf)
+
+					message := fmt.Sprintf("Test message with level %s, global level %s", messageLogLevel, globalLogLevel)
+					context := LogFields{"test_field": "test_value"}
+
+					switch messageLogLevel {
+					case config.LogLevelDebug:
+						el.Debug(message, context)
+					case config.LogLevelInfo:
+						el.Info(message, context)
+					case config.LogLevelWarning:
+						el.Warn(message, context)
+					case config.LogLevelError:
+						el.Error(message, context)
+					}
+
+					logLines := readLogBuffer(&buf)
+
+					// Determine if log should be expected
+					// A message is logged if messageSeverity >= configuredSeverity
+					messageSeverity := getLogLevelSeverity(messageLogLevel)
+					configuredSeverity := getLogLevelSeverity(globalLogLevel)
+					expectLog := messageSeverity >= configuredSeverity
+
+					if expectLog {
+						if len(logLines) != 1 {
+							t.Fatalf("Expected 1 log line, got %d. Global: %s, Message: %s", len(logLines), globalLogLevel, messageLogLevel)
+						}
+						var entry ErrorLogEntry
+						if err := parseJSONLog([]byte(logLines[0]), &entry); err != nil {
+							t.Fatalf("Failed to parse error log entry: %v. Line: %s", err, logLines[0])
+						}
+
+						if entry.Level != string(messageLogLevel) {
+							t.Errorf("Expected logged Level %q, got %q", messageLogLevel, entry.Level)
+						}
+						if entry.Message != message {
+							t.Errorf("Expected logged Message %q, got %q", message, entry.Message)
+						}
+						if entry.Details == nil || entry.Details["test_field"] != "test_value" {
+							t.Errorf("Expected 'test_field' in Details with value 'test_value', got %v", entry.Details)
+						}
+						// Source is auto-populated, check it's not empty
+						if entry.Source == "" {
+							t.Errorf("Expected auto-populated source, but it was empty")
+						}
+
+					} else { // Not expecting log
+						if len(logLines) != 0 {
+							t.Errorf("Expected 0 log lines, got %d. Global: %s, Message: %s. Lines: %v", len(logLines), globalLogLevel, messageLogLevel, logLines)
+						}
+					}
+				})
+			}
+		})
+	}
+}
