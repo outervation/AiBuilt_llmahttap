@@ -2,6 +2,7 @@ package http2
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -1442,6 +1443,117 @@ func TestHpackAdapter_EncodingErrorHandling(t *testing.T) {
 				if err != nil {
 					t.Errorf("EncodeHeaderFields() returned an unexpected error: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestHpackAdapter_HeaderBlockFragmentation tests decoding of header blocks
+// that are split across multiple fragments, simulating HEADERS + CONTINUATION frames.
+func TestHpackAdapter_HeaderBlockFragmentation(t *testing.T) {
+	headersToTest := []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/submit/data/here"},
+		{Name: "content-type", Value: "application/x-www-form-urlencoded"},
+		{Name: "user-agent", Value: "fragmented-test-client/0.1"},
+		{Name: "x-custom-long-header-for-fragmentation", Value: strings.Repeat("xyz", 50)}, // Make it reasonably long
+		{Name: "another-header", Value: "short and sweet"},
+	}
+
+	adapter := newTestHpackAdapter(t)
+
+	// 1. Encode the headers into a single block
+	encodedBytes, err := adapter.EncodeHeaderFields(headersToTest)
+	if err != nil {
+		t.Fatalf("EncodeHeaderFields failed: %v", err)
+	}
+	if len(encodedBytes) == 0 && len(headersToTest) > 0 {
+		t.Fatal("EncodeHeaderFields produced empty output for non-empty headers")
+	}
+
+	// 2. Split the encoded block into multiple fragments
+	// Ensure there's enough data to split; for very short encodings this might need adjustment.
+	if len(encodedBytes) < 3 {
+		t.Logf("Encoded byte stream too short (%d bytes) to split into 3 meaningful fragments for this test. Using 1 or 2 fragments if possible.", len(encodedBytes))
+		if len(encodedBytes) == 0 && len(headersToTest) > 0 {
+			// This case implies encoding of non-empty headers resulted in empty bytes, which is an issue itself.
+			t.Fatalf("Encoding non-empty headers resulted in zero bytes. Cannot test fragmentation.")
+		}
+		if len(encodedBytes) == 0 && len(headersToTest) == 0 {
+			// Encoding empty headers results in empty bytes, fragmentation test is not applicable.
+			t.Log("Encoding empty headers resulted in zero bytes. Fragmentation test not applicable.")
+			return
+		}
+		// If we can't split into 3, don't fail, just proceed with fewer fragments or skip if not possible.
+	}
+
+	// Test with varying number of fragments
+	for numFrags := 1; numFrags <= 3; numFrags++ {
+		if len(encodedBytes) < numFrags && len(encodedBytes) > 0 { // if encodedBytes is 0, numFrags=1 is still fine
+			t.Logf("Skipping %d-fragment test as encoded data (%d bytes) is too short.", numFrags, len(encodedBytes))
+			continue
+		}
+		if len(encodedBytes) == 0 && numFrags > 1 { // if encodedBytes is 0, only 1 "fragment" (empty) makes sense
+			continue
+		}
+
+		t.Run(fmt.Sprintf("%d_Fragments", numFrags), func(t *testing.T) {
+			adapter.ResetDecoderState() // Ensure clean state for each sub-test run
+
+			fragments := make([][]byte, numFrags)
+			baseLen := 0
+			if len(encodedBytes) > 0 { // Avoid division by zero if encodedBytes is empty
+				baseLen = len(encodedBytes) / numFrags
+			}
+
+			currentPos := 0
+			for i := 0; i < numFrags; i++ {
+				if currentPos >= len(encodedBytes) { // Should not happen if len(encodedBytes) >= numFrags or len=0,numFrags=1
+					if i == 0 && len(encodedBytes) == 0 { // Special case: 0 bytes, 1 fragment -> fragment is empty
+						fragments[i] = []byte{}
+						break
+					}
+					// This implies an issue with fragment calculation or trying to make too many fragments from too little data
+					// For safety, assign empty if we run out of bounds, though the outer checks should prevent this.
+					fragments[i] = []byte{}
+					continue
+				}
+				endPos := currentPos + baseLen
+				if i == numFrags-1 { // Last fragment takes all the rest
+					endPos = len(encodedBytes)
+				}
+				if endPos > len(encodedBytes) { // Ensure we don't slice out of bounds
+					endPos = len(encodedBytes)
+				}
+				if currentPos > endPos { // Can happen if baseLen is 0 and we are not in the last fragment
+					fragments[i] = []byte{}
+				} else {
+					fragments[i] = encodedBytes[currentPos:endPos]
+				}
+				currentPos = endPos
+			}
+
+			t.Logf("Total encoded length: %d. Test with %d fragments. Fragment lengths:", len(encodedBytes), numFrags)
+			for i, frag := range fragments {
+				t.Logf("  Frag %d: %d bytes", i+1, len(frag))
+				decodeErr := adapter.DecodeFragment(frag)
+				if decodeErr != nil {
+					t.Fatalf("DecodeFragment (frag %d of %d) failed: %v", i+1, numFrags, decodeErr)
+				}
+			}
+
+			decodedHeaders, finishErr := adapter.FinishDecoding()
+			if finishErr != nil {
+				t.Fatalf("FinishDecoding failed: %v", finishErr)
+			}
+
+			if !compareHeaderFields(headersToTest, decodedHeaders) {
+				t.Errorf("Decoded headers do not match original input after %d-fragmentation.\nOriginal: %+v\nDecoded:  %+v", numFrags, headersToTest, decodedHeaders)
+			}
+
+			if adapter.decodedFields != nil {
+				t.Error("adapter.decodedFields was not cleared after FinishDecoding")
 			}
 		})
 	}
