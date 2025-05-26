@@ -157,6 +157,8 @@ func TestLoadConfig_InvalidJSONSyntax(t *testing.T) {
 
 	_, err := LoadConfig(path)
 	checkErrorContains(t, err, "failed to parse JSON config")
+	// More specific check for the actual JSON error
+	checkErrorContains(t, err, "invalid character '}' looking for beginning of object key string") // This is a common error for trailing commas
 }
 
 func TestLoadConfig_InvalidTOMLSyntax(t *testing.T) {
@@ -169,6 +171,8 @@ address = ":8080"
 
 	_, err := LoadConfig(path)
 	checkErrorContains(t, err, "failed to parse TOML config")
+	// More specific check for TOML error
+	checkErrorContains(t, err, "expected '.' or ']' to end table name") // Adjusted based on actual error
 }
 
 func TestLoadConfig_DefaultsApplied(t *testing.T) {
