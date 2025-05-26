@@ -253,24 +253,28 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 
 func (f *DataFrame) WritePayload(w io.Writer) (int64, error) {
 	var totalN int64
+	var nWrite int // Use int for Write return, then cast to int64
+	var err error
+
 	if f.Flags&FlagDataPadded != 0 {
-		n, err := w.Write([]byte{f.PadLength})
+		nWrite, err = w.Write([]byte{f.PadLength})
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
-	n, err := w.Write(f.Data)
+	nWrite, err = w.Write(f.Data)
+	totalN += int64(nWrite)
 	if err != nil {
 		return totalN, err
 	}
-	totalN += int64(n)
+
 	if f.Flags&FlagDataPadded != 0 {
-		n, err := w.Write(f.Padding)
+		nWrite, err = w.Write(f.Padding)
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	return totalN, nil
 }
@@ -364,12 +368,15 @@ func (f *HeadersFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 
 func (f *HeadersFrame) WritePayload(w io.Writer) (int64, error) {
 	var totalN int64
+	var nWrite int
+	var err error
+
 	if f.Flags&FlagHeadersPadded != 0 {
-		n, err := w.Write([]byte{f.PadLength})
+		nWrite, err = w.Write([]byte{f.PadLength})
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	if f.Flags&FlagHeadersPriority != 0 {
 		var prioBuf [5]byte
@@ -379,23 +386,23 @@ func (f *HeadersFrame) WritePayload(w io.Writer) (int64, error) {
 		}
 		binary.BigEndian.PutUint32(prioBuf[0:4], streamDepAndE)
 		prioBuf[4] = f.Weight
-		n, err := w.Write(prioBuf[:])
+		nWrite, err = w.Write(prioBuf[:])
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
-	n, err := w.Write(f.HeaderBlockFragment)
+	nWrite, err = w.Write(f.HeaderBlockFragment)
+	totalN += int64(nWrite)
 	if err != nil {
 		return totalN, err
 	}
-	totalN += int64(n)
 	if f.Flags&FlagHeadersPadded != 0 {
-		n, err := w.Write(f.Padding)
+		nWrite, err = w.Write(f.Padding)
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	return totalN, nil
 }
@@ -541,15 +548,18 @@ func (f *SettingsFrame) WritePayload(w io.Writer) (int64, error) {
 		return 0, nil // No payload for ACK
 	}
 	var totalN int64
+	var nWrite int
+	var err error
 	buf := make([]byte, settingEntrySize)
+
 	for _, setting := range f.Settings {
 		binary.BigEndian.PutUint16(buf[0:2], uint16(setting.ID))
 		binary.BigEndian.PutUint32(buf[2:6], setting.Value)
-		n, err := w.Write(buf)
+		nWrite, err = w.Write(buf)
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	return totalN, nil
 }
@@ -629,34 +639,37 @@ func (f *PushPromiseFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 
 func (f *PushPromiseFrame) WritePayload(w io.Writer) (int64, error) {
 	var totalN int64
+	var nWrite int
+	var err error
+
 	if f.Flags&FlagPushPromisePadded != 0 {
-		n, err := w.Write([]byte{f.PadLength})
+		nWrite, err = w.Write([]byte{f.PadLength})
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 
 	var streamIDBuf [4]byte
 	binary.BigEndian.PutUint32(streamIDBuf[:], f.PromisedStreamID&0x7FFFFFFF) // Ensure R bit is 0
-	n, err := w.Write(streamIDBuf[:])
+	nWrite, err = w.Write(streamIDBuf[:])
+	totalN += int64(nWrite)
 	if err != nil {
 		return totalN, err
 	}
-	totalN += int64(n)
 
-	n, err = w.Write(f.HeaderBlockFragment)
+	nWrite, err = w.Write(f.HeaderBlockFragment)
+	totalN += int64(nWrite)
 	if err != nil {
 		return totalN, err
 	}
-	totalN += int64(n)
 
 	if f.Flags&FlagPushPromisePadded != 0 {
-		n, err := w.Write(f.Padding)
+		nWrite, err = w.Write(f.Padding)
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	return totalN, nil
 }
@@ -730,28 +743,35 @@ func (f *GoAwayFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		if _, err := io.ReadFull(r, f.AdditionalDebugData); err != nil {
 			return fmt.Errorf("reading GOAWAY additional debug data: %w", err)
 		}
+	} else {
+		// Ensure AdditionalDebugData is an empty non-nil slice if no debug data is present,
+		// for consistency in comparisons (e.g. reflect.DeepEqual).
+		f.AdditionalDebugData = []byte{}
 	}
 	return nil
 }
 
 func (f *GoAwayFrame) WritePayload(w io.Writer) (int64, error) {
 	var totalN int64
+	var nWrite int
+	var err error
 	var fixedPart [8]byte
+
 	binary.BigEndian.PutUint32(fixedPart[0:4], f.LastStreamID&0x7FFFFFFF) // Ensure R bit is 0
 	binary.BigEndian.PutUint32(fixedPart[4:8], uint32(f.ErrorCode))
 
-	n, err := w.Write(fixedPart[:])
+	nWrite, err = w.Write(fixedPart[:])
+	totalN += int64(nWrite)
 	if err != nil {
 		return totalN, err
 	}
-	totalN += int64(n)
 
 	if len(f.AdditionalDebugData) > 0 {
-		n, err := w.Write(f.AdditionalDebugData)
+		nWrite, err = w.Write(f.AdditionalDebugData)
+		totalN += int64(nWrite)
 		if err != nil {
 			return totalN, err
 		}
-		totalN += int64(n)
 	}
 	return totalN, nil
 }
