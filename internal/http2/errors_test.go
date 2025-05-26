@@ -347,6 +347,17 @@ func TestGenerateGoAwayFrame(t *testing.T) {
 			expectedErrorCode:    ErrCodeEnhanceYourCalm,
 			expectedDebugDataStr: "calm down",
 		},
+
+		{
+			name:                 "ConnectionError with empty DebugData and Msg, uses debugStrArg",
+			lastStreamIDArg:      400,            // Will be overridden by ce.LastStreamID
+			errCodeArg:           ErrCodeNoError, // Will be overridden by ce.Code
+			debugStrArg:          "fallback debug from arg",
+			errArg:               &ConnectionError{LastStreamID: 450, Code: ErrCodeRefusedStream, Msg: "", DebugData: nil},
+			expectedLastStreamID: 450,
+			expectedErrorCode:    ErrCodeRefusedStream,
+			expectedDebugDataStr: "fallback debug from arg",
+		},
 		{
 			name:                 "Non-ConnectionError error, uses args",
 			lastStreamIDArg:      50,
