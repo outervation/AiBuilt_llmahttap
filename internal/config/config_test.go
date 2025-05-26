@@ -2,11 +2,9 @@ package config
 
 import (
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -597,163 +595,222 @@ func TestLoadConfig_Validation_LoggingConfig(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_Validation_StaticFileServerHandlerConfig_MimeTypesFile(t *testing.T) {
-	// Setup a dummy absolute path for document_root
-	docRootBase, err := ioutil.TempDir("", "docrootbasetest-")
+func TestParseAndValidateStaticFileServerConfig_MimeTypesFileInteraction(t *testing.T) {
+	// Base directory for temporary files (main config, mime files)
+	baseTempDir, err := ioutil.TempDir("", "configtest-main-")
 	if err != nil {
-		t.Fatalf("Failed to create temp dir for docRoot: %v", err)
+		t.Fatalf("Failed to create base temp dir: %v", err)
 	}
-	defer os.RemoveAll(docRootBase)
-	// Ensure forward slashes for JSON, then quote for JSON string
-	jsonSafeAbsDocRoot := strconv.Quote(filepath.ToSlash(docRootBase))
+	defer os.RemoveAll(baseTempDir)
 
-	// Create a valid mime types JSON file content (used by some tests below if they need to create it)
+	// Create a dummy main config file path within baseTempDir. Its content doesn't matter, only its path for relative resolution.
+	dummyMainConfigPath := filepath.Join(baseTempDir, "main_config.json")
+	if err := ioutil.WriteFile(dummyMainConfigPath, []byte("{}"), 0644); err != nil {
+		t.Fatalf("Failed to write dummy main config file: %v", err)
+	}
+
+	// Dummy absolute document root needed for SFS config.
+	absDocRoot, err := ioutil.TempDir("", "sfs-docroot-")
+	if err != nil {
+		t.Fatalf("Failed to create temp docroot for SFS config: %v", err)
+	}
+	defer os.RemoveAll(absDocRoot)
+	// Convert to forward slashes and quote for JSON embedding.
+	// jsonSafeAbsDocRoot := strconv.Quote(filepath.ToSlash(absDocRoot)) // Not needed if using json.Marshal on map
+
 	validMimeContent := ` { ".txt": "text/plain", ".custom": "application/x-custom" }`
+	malformedMimeContent := `{not json`
+	invalidKeyMimeContent := `{"txt": "text/plain"}` // Key "txt" should be ".txt"
+	emptyValueMimeContent := `{".txt": ""}`
 
 	tests := []struct {
 		name                   string
-		handlerConfigSnippet   string  // Just the content of "handler_config"
-		mimeFileName           string  // Name of the mime file (relative to main config). Empty if no specific file interaction.
-		mimeFileContent        *string // Content for the mime file. If nil, don't create. "DO_NOT_CREATE" to ensure absence.
+		handlerConfigFields    map[string]interface{} // Fields to build handler_config JSON
+		mimeFileName           string                 // Relative to baseTempDir (if relative path used in handlerConfig) or absolute.
+		mimeFileIsAbsolute     bool                   // True if mimeFileName is an absolute path
+		mimeFileContent        *string                // Content for the mime file. If nil, don't create. "DO_NOT_CREATE" to ensure absence.
+		mainConfigPathForCall  string                 // Path to pass as mainConfigFilePath to ParseAndValidate...
 		expectedErrorSubstring string
+		expectedMimeCount      int
 	}{
 		{
-			name:                   "sfs_valid_mime_types_path_absolute",
-			handlerConfigSnippet:   fmt.Sprintf(`{"document_root": %s, "mime_types_path": %s}`, jsonSafeAbsDocRoot, strconv.Quote(filepath.Join(docRootBase, "valid_mime.json"))),
-			mimeFileName:           "valid_mime.json", // Will be created in docRootBase
-			mimeFileContent:        &validMimeContent,
-			expectedErrorSubstring: "", // No error
+			name: "valid_relative_mime_path",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot, // Will be quoted correctly by json.Marshal
+				"mime_types_path": "rel_valid_mime.json",
+			},
+			mimeFileName:          "rel_valid_mime.json", // Relative to baseTempDir
+			mimeFileContent:       &validMimeContent,
+			mainConfigPathForCall: dummyMainConfigPath,
+			expectedMimeCount:     2,
 		},
 		{
-			name:                 "sfs_mime_types_path_file_not_found",
-			handlerConfigSnippet: fmt.Sprintf(`{"document_root": %s, "mime_types_path": "nonexistent_mime.json"}`, jsonSafeAbsDocRoot),
-			mimeFileName:         "nonexistent_mime.json", // Specify the name so os.Remove can target it
-			mimeFileContent:      strPtr("DO_NOT_CREATE"),
-			// TODO: Restore "failed to read mime_types_path file" once error propagation in config.go is fixed.
-			expectedErrorSubstring: "",
+			name: "valid_absolute_mime_path",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": filepath.Join(baseTempDir, "abs_valid_mime.json"), // Make it absolute
+			},
+			mimeFileName:          filepath.Join(baseTempDir, "abs_valid_mime.json"), // Actual absolute path for file creation
+			mimeFileIsAbsolute:    true,
+			mimeFileContent:       &validMimeContent,
+			mainConfigPathForCall: dummyMainConfigPath, // mainConfigPath still needed even if mime path is abs
+			expectedMimeCount:     2,
 		},
 		{
-			name:                 "sfs_mime_types_path_file_malformed_JSON",
-			handlerConfigSnippet: fmt.Sprintf(`{"document_root": %s, "mime_types_path": "malformed_mime.json"}`, jsonSafeAbsDocRoot),
-			mimeFileName:         "malformed_mime.json",
-			mimeFileContent:      strPtr("{not json"),
-			// TODO: Restore "failed to parse JSON from mime_types_path file" once error propagation in config.go is fixed.
-			expectedErrorSubstring: "",
+			name: "mime_path_file_not_found_relative",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "nonexistent_mime.json",
+			},
+			mimeFileName:           "nonexistent_mime.json",
+			mimeFileContent:        strPtr("DO_NOT_CREATE"),
+			mainConfigPathForCall:  dummyMainConfigPath,
+			expectedErrorSubstring: "failed to read mime_types_path file",
 		},
 		{
-			name:                 "sfs_mime_types_path_file_with_invalid_key",
-			handlerConfigSnippet: fmt.Sprintf(`{"document_root": %s, "mime_types_path": "invalidkey_mime.json"}`, jsonSafeAbsDocRoot),
-			mimeFileName:         "invalidkey_mime.json",
-			mimeFileContent:      strPtr(`{"txt": "text/plain"}`), // Key "txt" should be ".txt"
-			// TODO: Restore `key "txt" must start with a '.'` once error propagation in config.go is fixed.
-			expectedErrorSubstring: "",
+			name: "mime_path_file_malformed_json_relative",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "malformed_mime.json",
+			},
+			mimeFileName:           "malformed_mime.json",
+			mimeFileContent:        &malformedMimeContent,
+			mainConfigPathForCall:  dummyMainConfigPath,
+			expectedErrorSubstring: "failed to parse JSON from mime_types_path file",
 		},
 		{
-			name:                 "sfs_mime_types_path_file_with_empty_value",
-			handlerConfigSnippet: fmt.Sprintf(`{"document_root": %s, "mime_types_path": "emptyval_mime.json"}`, jsonSafeAbsDocRoot),
-			mimeFileName:         "emptyval_mime.json",
-			mimeFileContent:      strPtr(`{".txt": ""}`),
-			// TODO: Restore `value for key ".txt" cannot be empty` once error propagation in config.go is fixed.
-			expectedErrorSubstring: "",
+			name: "mime_path_file_invalid_key_relative",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "invalidkey_mime.json",
+			},
+			mimeFileName:           "invalidkey_mime.json",
+			mimeFileContent:        &invalidKeyMimeContent,
+			mainConfigPathForCall:  dummyMainConfigPath,
+			expectedErrorSubstring: "must start with a '.'",
 		},
 		{
-			name:                 "sfs_mime_types_path_empty_string_in_config",
-			handlerConfigSnippet: fmt.Sprintf(`{"document_root": %s, "mime_types_path": ""}`, jsonSafeAbsDocRoot),
-			mimeFileName:         "", // No specific file to manage for this test case's error
-			// TODO: Restore "handler_config.mime_types_path cannot be empty if specified" once error propagation in config.go is fixed.
-			expectedErrorSubstring: "",
+			name: "mime_path_file_empty_value_relative",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "emptyval_mime.json",
+			},
+			mimeFileName:           "emptyval_mime.json",
+			mimeFileContent:        &emptyValueMimeContent,
+			mainConfigPathForCall:  dummyMainConfigPath,
+			expectedErrorSubstring: "value for key \".txt\" cannot be empty",
+		},
+		{
+			name: "mime_types_path_is_empty_string",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "",
+			},
+			mainConfigPathForCall:  dummyMainConfigPath,
+			expectedErrorSubstring: "handler_config.mime_types_path cannot be empty if specified",
+		},
+		{
+			name: "relative_mime_path_with_empty_mainConfigPath",
+			handlerConfigFields: map[string]interface{}{
+				"document_root":   absDocRoot,
+				"mime_types_path": "some_rel_mime.json",
+			},
+			mimeFileName:           "some_rel_mime.json", // Won't be created as error is earlier
+			mimeFileContent:        nil,                  // or DO_NOT_CREATE
+			mainConfigPathForCall:  "",                   // Key part of this test
+			expectedErrorSubstring: "cannot resolve relative mime_types_path \"some_rel_mime.json\": main configuration file path is not available",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Construct the full config JSON
-			fullConfigJSON := fmt.Sprintf(`{
-				"routing": {
-					"routes": [{
-						"path_pattern": "/static/", 
-						"match_type": "Prefix", 
-						"handler_type": "StaticFileServer",
-						"handler_config": %s
-					}]
+			// Ensure DocumentRoot is in the map with the correct quoted path for JSON
+			// Note: json.Marshal will handle quoting string values like absDocRoot,
+			// so no need for jsonSafeAbsDocRoot directly in tc.handlerConfigFields map values.
+			if _, ok := tc.handlerConfigFields["document_root"]; !ok {
+				t.Fatal("Test case misconfiguration: document_root must be in handlerConfigFields")
+			}
+
+			rawHandlerConfig, err := json.Marshal(tc.handlerConfigFields)
+			if err != nil {
+				t.Fatalf("Failed to marshal handlerConfigFields to JSON: %v", err)
+			}
+
+			// Determine actual mime file path for creation/cleanup
+			var actualMimeFilePath string
+			if tc.mimeFileName != "" {
+				if tc.mimeFileIsAbsolute {
+					actualMimeFilePath = tc.mimeFileName // Already absolute
+				} else {
+					actualMimeFilePath = filepath.Join(baseTempDir, tc.mimeFileName)
 				}
-			}`, tc.handlerConfigSnippet)
+			}
 
-			mainConfigFile, cleanupMainConfig := writeTempFile(t, fullConfigJSON, ".json")
-			defer cleanupMainConfig()
-
-			// Handle creation/deletion of the referenced mime file
-			var mimeFilePath string
-			if tc.mimeFileName != "" { // Only if a mimeFileName is specified
-				// Ensure mainConfigFile has a directory component for Join.
-				// If mainConfigFile is just "file.json", Dir will be ".".
-				mainConfigDir := filepath.Dir(mainConfigFile)
-				if mainConfigDir == "." || mainConfigDir == "" { // TempFile in current dir might give just filename
-					wd, err := os.Getwd()
-					if err != nil {
-						t.Fatalf("Failed to get working directory: %v", err)
-					}
-					mainConfigDir = wd
-					t.Logf("[%s] Resolved mainConfigDir to current working directory: %s", tc.name, mainConfigDir)
-				}
-
-				mimeFilePath = filepath.Join(mainConfigDir, tc.mimeFileName)
-				t.Logf("[%s] Mime file path for test operations: %s", tc.name, mimeFilePath)
+			// Create or ensure absence of the mime file
+			if actualMimeFilePath != "" {
+				// Clean up any pre-existing file from previous sub-test run if names collide (unlikely with TempDir)
+				_ = os.Remove(actualMimeFilePath)
 
 				if tc.mimeFileContent != nil {
 					if *tc.mimeFileContent == "DO_NOT_CREATE" {
-						removed := false
-						if mimeFilePath != "" {
-							for i := 0; i < 5; i++ {
-								_ = os.Remove(mimeFilePath)
-								_, statErr := os.Stat(mimeFilePath)
-								if os.IsNotExist(statErr) {
-									removed = true
-									t.Logf("[%s] Confirmed mime file %s does not exist.", tc.name, mimeFilePath)
-									break
-								}
-								time.Sleep(10 * time.Millisecond)
-							}
-							if !removed {
-								t.Fatalf("[%s] CRITICAL TEST SETUP FAILURE: Mime file %s was NOT successfully removed. Path: %s", tc.name, tc.mimeFileName, mimeFilePath)
-							}
-						} else {
-							t.Logf("[%s] Skipping removal/stat for DO_NOT_CREATE as mimeFilePath is empty.", tc.name)
+						// Ensure it's gone
+						_, statErr := os.Stat(actualMimeFilePath)
+						if !os.IsNotExist(statErr) {
+							t.Logf("File %s existed unexpectedly, removing.", actualMimeFilePath)
+							_ = os.Remove(actualMimeFilePath)
 						}
 					} else {
-						t.Logf("[%s] Writing mime file %s with content: %s", tc.name, mimeFilePath, *tc.mimeFileContent)
-						err := ioutil.WriteFile(mimeFilePath, []byte(*tc.mimeFileContent), 0644)
+						err := ioutil.WriteFile(actualMimeFilePath, []byte(*tc.mimeFileContent), 0644)
 						if err != nil {
-							t.Fatalf("[%s] Failed to write temp mime file %s: %v", tc.name, mimeFilePath, err)
+							t.Fatalf("Failed to write mime file %s: %v", actualMimeFilePath, err)
 						}
-						defer func() {
-							t.Logf("[%s] Cleaning up mime file %s", tc.name, mimeFilePath)
-							os.Remove(mimeFilePath)
-						}()
-					}
-				} else {
-					if mimeFilePath != "" {
-						t.Logf("[%s] MimeFileContent is nil, ensuring %s does not exist.", tc.name, mimeFilePath)
-						_ = os.Remove(mimeFilePath)
-					} else {
-						t.Logf("[%s] MimeFileContent is nil and mimeFilePath is empty, nothing to remove.", tc.name)
+						// No defer here, cleanup happens via baseTempDir or explicitly below if needed.
 					}
 				}
-			} else {
-				t.Logf("[%s] No mimeFileName specified, no mime file operations.", tc.name)
 			}
 
-			if tc.expectedErrorSubstring == "" {
-				if err != nil {
-					t.Errorf("Expected no error, but got: %v", err)
-				}
+			// DEBUG: Check if file exists immediately after writing
+			_, statErr := os.Stat(actualMimeFilePath)
+			if statErr == nil {
+				t.Logf("Test %s: DEBUG - os.Stat check PASSED for %s immediately after write.", tc.name, actualMimeFilePath)
 			} else {
+				t.Logf("Test %s: DEBUG - os.Stat check FAILED for %s immediately after write: %v", tc.name, actualMimeFilePath, statErr)
+			}
+			sfsCfg, err := ParseAndValidateStaticFileServerConfig(rawHandlerConfig, tc.mainConfigPathForCall)
+
+			if tc.expectedErrorSubstring != "" {
 				checkErrorContains(t, err, tc.expectedErrorSubstring)
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+				if sfsCfg == nil {
+					t.Fatal("Expected non-nil sfsCfg on success")
+				}
+				if sfsCfg.ResolvedMimeTypes == nil && tc.expectedMimeCount > 0 {
+					t.Errorf("Expected ResolvedMimeTypes to be non-nil, got nil")
+				}
+				if len(sfsCfg.ResolvedMimeTypes) != tc.expectedMimeCount {
+					t.Errorf("Expected %d resolved mime types, got %d (%v)", tc.expectedMimeCount, len(sfsCfg.ResolvedMimeTypes), sfsCfg.ResolvedMimeTypes)
+				}
+				if tc.expectedMimeCount > 0 { // Check specific entries if expected
+					if tc.mimeFileContent != nil && *tc.mimeFileContent == validMimeContent {
+						if sfsCfg.ResolvedMimeTypes[".txt"] != "text/plain" {
+							t.Errorf("Expected .txt -> text/plain, got %s", sfsCfg.ResolvedMimeTypes[".txt"])
+						}
+						if sfsCfg.ResolvedMimeTypes[".custom"] != "application/x-custom" {
+							t.Errorf("Expected .custom -> application/x-custom, got %s", sfsCfg.ResolvedMimeTypes[".custom"])
+						}
+					}
+				}
+			}
+
+			// Clean up the specific mime file if it was created
+			if actualMimeFilePath != "" && tc.mimeFileContent != nil && *tc.mimeFileContent != "DO_NOT_CREATE" {
+				os.Remove(actualMimeFilePath)
 			}
 		})
 	}
-	// NOTE: The final '}' for the TestLoadConfig_Validation_StaticFileServerHandlerConfig_MimeTypesFile function is intentionally OMITTED here.
-	// The EditFileByMatch should replace the original closing brace.
 }
 func TestParseAndValidateStaticFileServerConfig_Defaults(t *testing.T) {
 	docRoot, _ := ioutil.TempDir("", "docroot")
