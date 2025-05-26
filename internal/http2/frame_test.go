@@ -783,3 +783,371 @@ func TestDataFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestHeadersFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.HeadersFrame
+	}{
+		{
+			name: "basic headers frame, no flags, END_HEADERS implicitly true for testFrameType",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersEndHeaders, // Required for a single HEADERS to be valid
+					StreamID: 1,
+				},
+				HeaderBlockFragment: []byte("header data"),
+			},
+		},
+		{
+			name: "headers frame with END_STREAM and END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersEndStream | http2.FlagHeadersEndHeaders,
+					StreamID: 3,
+				},
+				HeaderBlockFragment: []byte("final headers"),
+			},
+		},
+		{
+			name: "headers frame with PADDED and END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders,
+					StreamID: 7,
+				},
+				PadLength:           4,
+				HeaderBlockFragment: []byte("padded headers"),
+				Padding:             make([]byte, 4),
+			},
+		},
+		{
+			name: "headers frame with PRIORITY and END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders,
+					StreamID: 9,
+				},
+				Exclusive:           true,
+				StreamDependency:    123,
+				Weight:              200,
+				HeaderBlockFragment: []byte("priority headers"),
+			},
+		},
+		{
+			name: "headers frame with PADDED, PRIORITY, and END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersPadded | http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders,
+					StreamID: 11,
+				},
+				PadLength:           3,
+				Exclusive:           false,
+				StreamDependency:    456,
+				Weight:              100,
+				HeaderBlockFragment: []byte("padded priority headers"),
+				Padding:             make([]byte, 3),
+			},
+		},
+		{
+			name: "headers frame with all common flags (END_STREAM, END_HEADERS, PADDED, PRIORITY)",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type: http2.FrameHeaders,
+					Flags: http2.FlagHeadersEndStream | http2.FlagHeadersEndHeaders |
+						http2.FlagHeadersPadded | http2.FlagHeadersPriority,
+					StreamID: 13,
+				},
+				PadLength:           5,
+				Exclusive:           true,
+				StreamDependency:    789,
+				Weight:              50,
+				HeaderBlockFragment: []byte("all flags headers"),
+				Padding:             make([]byte, 5),
+			},
+		},
+		{
+			name: "headers frame with empty fragment, END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersEndHeaders,
+					StreamID: 15,
+				},
+				HeaderBlockFragment: []byte{},
+			},
+		},
+		{
+			name: "headers frame with empty fragment, with padding, priority, END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersPadded | http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders,
+					StreamID: 17,
+				},
+				PadLength:           2,
+				Exclusive:           false,
+				StreamDependency:    10,
+				Weight:              1, // Weight in frame is actual weight, not weight-1
+				HeaderBlockFragment: []byte{},
+				Padding:             make([]byte, 2),
+			},
+		},
+		{
+			name: "headers frame with PADDED flag, PadLength 0, and END_HEADERS",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameHeaders,
+					Flags:    http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders,
+					StreamID: 19,
+				},
+				PadLength:           0,
+				HeaderBlockFragment: []byte("zero padlength field"),
+				Padding:             []byte{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "HeadersFrame")
+		})
+	}
+}
+
+func TestHeadersFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameHeaders, StreamID: 1}
+	// Valid non-zero priority stream dependency, E=0, Weight=15 (for 16 effective)
+	validPriorityBytes := []byte{0x00, 0x00, 0x00, 0x01, 15}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "PADDED flag, PadLength octet missing",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
+				h.Length = 0 // Not enough for PadLength byte
+				return h
+			}(),
+			payload:     []byte{},
+			expectedErr: "reading pad length: EOF",
+		},
+		{
+			name: "PADDED flag, PadLength exceeds remaining payload",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
+				h.Length = 1 // Only PadLength byte itself
+				return h
+			}(),
+			payload:     []byte{10}, // PadLength 10, but no more bytes for fragment or padding
+			expectedErr: "pad length 10 exceeds remaining payload length 0",
+		},
+		{
+			name: "PRIORITY flag, priority fields missing",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders
+				h.Length = 4 // Not enough for 5 priority bytes
+				return h
+			}(),
+			payload:     make([]byte, 4),
+			expectedErr: "payload too short for priority fields: 4",
+		},
+		{
+			name: "PRIORITY flag, error reading priority fields",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders
+				h.Length = 5
+				return h
+			}(),
+			payload:     make([]byte, 3), // Provide only 3 of 5 priority bytes
+			expectedErr: "reading priority fields: unexpected EOF",
+		},
+		{
+			name: "PADDED and PRIORITY, PadLength too large",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders
+				h.Length = 1 + 5 // PadLength + PriorityFields
+				return h
+			}(),
+			payload:     append([]byte{20}, validPriorityBytes...), // PadLength 20, Pri=5 bytes, no room for fragment/padding
+			expectedErr: "pad length 20 exceeds remaining payload length 5",
+		},
+		{
+			name: "error reading header block fragment (no padding/priority)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersEndHeaders
+				h.Length = 10 // Expect 10 bytes of fragment
+				return h
+			}(),
+			payload:     make([]byte, 5), // Provide only 5
+			expectedErr: "reading header block fragment: unexpected EOF",
+		},
+		{
+			name: "error reading header block fragment (with PADDED)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
+				h.Length = 1 + 10 + 2 // PadL(1) + Frag(10) + Padding(2)
+				return h
+			}(),
+			payload:     append([]byte{2}, make([]byte, 5)...), // PadLength=2, Fragment should be 10, provide 5
+			expectedErr: "reading header block fragment: unexpected EOF",
+		},
+		{
+			name: "error reading header block fragment (with PRIORITY)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders
+				h.Length = 5 + 10 // Priority(5) + Frag(10)
+				return h
+			}(),
+			payload:     append(validPriorityBytes, make([]byte, 5)...), // Priority=5, Fragment should be 10, provide 5
+			expectedErr: "reading header block fragment: unexpected EOF",
+		},
+		{
+			name: "error reading padding",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
+				h.Length = 1 + 5 + 10 // PadL(1) + Frag(5) + Padding(10)
+				return h
+			}(),
+			payload:     append(append([]byte{10}, make([]byte, 5)...), make([]byte, 3)...), // PadL=10, Frag=5, Padding should be 10, provide 3
+			expectedErr: "reading padding: unexpected EOF",
+		},
+		{
+			name: "mismatch in parsed length (Length > accounted for)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
+				// PadL byte (1) + Fragment (5) + Padding (actual 2) = 8 bytes
+				// But claim total length is 10.
+				h.Length = 10
+				return h
+			}(),
+			// PadLength=2, Data = 5 bytes. So currentPos = 1(PadL) + 5(Frag) + 2(Pad) = 8
+			payload:     []byte{2, 'h', 'e', 'l', 'l', 'o', 0, 0}, // PadLength 2, Frag "hello", Padding 0,0. Total 8 bytes.
+			expectedErr: "reading padding: EOF",                   // Changed from "mismatch..." as EOF occurs first
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.HeadersFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestHeadersFrame_WritePayload_Error(t *testing.T) {
+	expectedErr := fmt.Errorf("custom writer error for headers")
+
+	tests := []struct {
+		name      string
+		frame     *http2.HeadersFrame
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{
+			name: "fail writing PadLength",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders},
+				PadLength:   2, HeaderBlockFragment: []byte("test"), Padding: make([]byte, 2),
+			},
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name: "fail writing Priority",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders},
+				Exclusive:   true, StreamDependency: 1, Weight: 16, HeaderBlockFragment: []byte("test"),
+			},
+			failAfter: 0, expectedN: 0, // Priority is written first if PADDED is not set
+		},
+		{
+			name: "fail writing Priority (after PadLength)",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPadded | http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders},
+				PadLength:   1, Exclusive: true, StreamDependency: 1, Weight: 16, HeaderBlockFragment: []byte("test"), Padding: make([]byte, 1),
+			},
+			failAfter: 1, expectedN: 1, // Wrote PadLength
+		},
+		{
+			name: "fail writing HeaderBlockFragment (no Pad/Prio)",
+			frame: &http2.HeadersFrame{
+				FrameHeader:         http2.FrameHeader{Flags: http2.FlagHeadersEndHeaders},
+				HeaderBlockFragment: []byte("fragment data"),
+			},
+			failAfter: 2, expectedN: 2,
+		},
+		{
+			name: "fail writing HeaderBlockFragment (after PadLength)",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders},
+				PadLength:   1, HeaderBlockFragment: []byte("fragment data"), Padding: make([]byte, 1),
+			},
+			failAfter: 1 + 2, expectedN: 1 + 2, // Wrote PadLength + 2 bytes of fragment
+		},
+		{
+			name: "fail writing HeaderBlockFragment (after Priority)",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders},
+				Exclusive:   true, StreamDependency: 1, Weight: 16, HeaderBlockFragment: []byte("fragment data"),
+			},
+			failAfter: 5 + 2, expectedN: 5 + 2, // Wrote Priority + 2 bytes of fragment
+		},
+		{
+			name: "fail writing Padding",
+			frame: &http2.HeadersFrame{
+				FrameHeader: http2.FrameHeader{Flags: http2.FlagHeadersPadded | http2.FlagHeadersPriority | http2.FlagHeadersEndHeaders},
+				PadLength:   3, Exclusive: true, StreamDependency: 1, Weight: 16,
+				HeaderBlockFragment: []byte("frag"), Padding: make([]byte, 3),
+			},
+			// PadL(1 byte for PadLength field) + Prio(5) + Frag(4) = 10. Fail after this.
+			failAfter: 1 + 5 + 4, expectedN: 1 + 5 + 4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Ensure header length is consistent for WritePayload logic
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := tt.frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatalf("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
