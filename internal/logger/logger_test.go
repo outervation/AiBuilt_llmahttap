@@ -1980,3 +1980,125 @@ func TestErrorLogLevelFiltering(t *testing.T) {
 		})
 	}
 }
+
+func TestErrorLoggingToDifferentTargets(t *testing.T) {
+	// baseErrorLogCfg and baseAccessLogCfg are simplified for focus.
+	// Real NewLogger uses more complex defaulting logic from config.applyDefaults.
+	// Here, we ensure necessary fields are set for NewLogger to succeed.
+	createDefaultErrorLogCfg := func(target string) *config.ErrorLogConfig {
+		return &config.ErrorLogConfig{Target: stringPtr(target)}
+	}
+	createDefaultAccessLogCfg := func(target string, enabled bool) *config.AccessLogConfig {
+		return &config.AccessLogConfig{
+			Enabled:      boolPtr(enabled),
+			Target:       stringPtr(target),
+			Format:       "json",                       // Default and only supported format for now
+			RealIPHeader: stringPtr("X-Forwarded-For"), // Default
+		}
+	}
+
+	// --- Test Case 1: Error Log to File ---
+	t.Run("ErrorLogToFile", func(t *testing.T) {
+		tempFilePath, cleanup := createTempLogFile(t, "error-target-*.log")
+		defer cleanup()
+
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,                       // Global level set to Debug to ensure all test messages are logged
+			AccessLog: createDefaultAccessLogCfg("stderr", false), // Access log to stderr and disabled to not interfere
+			ErrorLog:  createDefaultErrorLogCfg(tempFilePath),
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for file target: %v", err)
+		}
+
+		testMsg := "Error message to file target"
+		testLevel := config.LogLevelError
+		testContext := LogFields{"detail_key": "detail_value", "h2_stream_id": uint32(123)}
+
+		// Use logger's Error method which internally calls ErrorLogger's Error
+		logger.Error(testMsg, testContext)
+
+		// Ensure logs are flushed by closing the logger's file handles
+		if err := logger.CloseLogFiles(); err != nil {
+			t.Fatalf("CloseLogFiles failed: %v", err)
+		}
+
+		content, err := ioutil.ReadFile(tempFilePath)
+		if err != nil {
+			t.Fatalf("Failed to read error log file %s: %v", tempFilePath, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("Expected 1 log line in file, got %d. Content:\n%s", len(lines), string(content))
+		}
+
+		var entry ErrorLogEntry
+		if err := parseJSONLog([]byte(lines[0]), &entry); err != nil {
+			t.Fatalf("Failed to parse error log entry from file: %v. Line: %s", err, lines[0])
+		}
+
+		// Verify key fields
+		if entry.Message != testMsg {
+			t.Errorf("Expected Message %q, got '%s'", testMsg, entry.Message)
+		}
+		if entry.Level != string(testLevel) {
+			t.Errorf("Expected Level %q, got '%s'", testLevel, entry.Level)
+		}
+		if entry.RequestH2StreamID != uint32(123) {
+			t.Errorf("Expected H2StreamID %d, got %d", uint32(123), entry.RequestH2StreamID)
+		}
+		if entry.Details == nil || entry.Details["detail_key"] != "detail_value" {
+			t.Errorf("Expected 'detail_key' in Details with value 'detail_value', got %v", entry.Details)
+		}
+		if entry.Source == "" { // Source should be auto-populated
+			t.Error("Expected auto-populated source, but it was empty")
+		}
+	})
+
+	// --- Test Case 2: Error Log to stdout ---
+	t.Run("ErrorLogToStdout", func(t *testing.T) {
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: createDefaultAccessLogCfg("stderr", false), // Access log to different stream & disabled
+			ErrorLog:  createDefaultErrorLogCfg("stdout"),
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for stdout target: %v", err)
+		}
+
+		logger.Warn("Warning message to stdout", LogFields{"stdout_warn": true})
+
+		if err := logger.CloseLogFiles(); err != nil { // Should be no-op for stdout
+			t.Errorf("CloseLogFiles for stdout target errored: %v", err)
+		}
+		// Direct verification of stdout content is not done in unit tests.
+		// Test ensures no panics or errors during configuration and logging.
+		t.Log("Error log to stdout test completed. Manual output verification if running with -v.")
+	})
+
+	// --- Test Case 3: Error Log to stderr ---
+	t.Run("ErrorLogToStderr", func(t *testing.T) {
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: createDefaultAccessLogCfg("stdout", false), // Access log to different stream & disabled
+			ErrorLog:  createDefaultErrorLogCfg("stderr"),
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for stderr target: %v", err)
+		}
+
+		logger.Info("Info message to stderr", LogFields{"stderr_info": true})
+
+		if err := logger.CloseLogFiles(); err != nil { // Should be no-op for stderr
+			t.Errorf("CloseLogFiles for stderr target errored: %v", err)
+		}
+		// Direct verification of stderr content is not done in unit tests.
+		t.Log("Error log to stderr test completed. Manual output verification if running with -v.")
+	})
+}
