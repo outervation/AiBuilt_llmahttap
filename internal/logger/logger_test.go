@@ -1630,3 +1630,129 @@ func TestAccessLogMarshallingError(t *testing.T) {
 		t.Errorf("Expected error fallback msg, got %s", errFallbackEntry.Msg)
 	}
 }
+
+func TestAccessLoggingToDifferentTargets(t *testing.T) {
+	// baseAccessLogCfg and baseErrorLogCfg are simplified for focus.
+	// Real NewLogger uses more complex defaulting logic from config.applyDefaults.
+	// Here, we ensure necessary fields are set for NewLogger to succeed.
+	createDefaultErrorLogCfg := func(target string) *config.ErrorLogConfig {
+		return &config.ErrorLogConfig{Target: stringPtr(target)}
+	}
+	createDefaultAccessLogCfg := func(target string, enabled bool) *config.AccessLogConfig {
+		return &config.AccessLogConfig{
+			Enabled:      boolPtr(enabled),
+			Target:       stringPtr(target),
+			Format:       "json",                       // Default and only supported format for now
+			RealIPHeader: stringPtr("X-Forwarded-For"), // Default
+		}
+	}
+
+	// --- Test Case 1: Access Log to File ---
+	t.Run("AccessLogToFile", func(t *testing.T) {
+		tempFilePath, cleanup := createTempLogFile(t, "access-target-*.log")
+		defer cleanup()
+
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: createDefaultAccessLogCfg(tempFilePath, true),
+			ErrorLog:  createDefaultErrorLogCfg("stderr"), // Error log to stderr to not interfere
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for file target: %v", err)
+		}
+
+		req := newMockHTTPRequest(t, "GET", "/file-target", "10.0.0.1:1234", nil)
+		req.Proto = "HTTP/2.0" // Ensure protocol is as expected in logs
+		streamID := uint32(77)
+		status := http.StatusAccepted
+		respBytes := int64(123)
+		duration := 75 * time.Millisecond
+
+		logger.Access(req, streamID, status, respBytes, duration)
+
+		// Ensure logs are flushed by closing the logger's file handles
+		if err := logger.CloseLogFiles(); err != nil {
+			t.Fatalf("CloseLogFiles failed: %v", err)
+		}
+
+		content, err := ioutil.ReadFile(tempFilePath)
+		if err != nil {
+			t.Fatalf("Failed to read access log file %s: %v", tempFilePath, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("Expected 1 log line in file, got %d. Content:\n%s", len(lines), string(content))
+		}
+
+		var entry AccessLogEntry
+		if err := parseJSONLog([]byte(lines[0]), &entry); err != nil {
+			t.Fatalf("Failed to parse access log entry from file: %v. Line: %s", err, lines[0])
+		}
+
+		// Verify some key fields to ensure correct entry was written
+		if entry.URI != "/file-target" {
+			t.Errorf("Expected URI '/file-target', got '%s'", entry.URI)
+		}
+		if entry.Status != status {
+			t.Errorf("Expected status %d, got %d", status, entry.Status)
+		}
+		if entry.H2StreamID != streamID {
+			t.Errorf("Expected stream ID %d, got %d", streamID, entry.H2StreamID)
+		}
+		if entry.RemoteAddr != "10.0.0.1" { // Simple case, no proxying involved in this mock
+			t.Errorf("Expected remote addr '10.0.0.1', got '%s'", entry.RemoteAddr)
+		}
+		if entry.Protocol != "HTTP/2.0" {
+			t.Errorf("Expected protocol 'HTTP/2.0', got '%s'", entry.Protocol)
+		}
+	})
+
+	// --- Test Case 2: Access Log to stdout ---
+	t.Run("AccessLogToStdout", func(t *testing.T) {
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: createDefaultAccessLogCfg("stdout", true),
+			ErrorLog:  createDefaultErrorLogCfg("stderr"), // Error log to different stream
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for stdout target: %v", err)
+		}
+
+		req := newMockHTTPRequest(t, "GET", "/stdout-target", "10.0.0.2:1234", nil)
+		logger.Access(req, 88, http.StatusOK, 0, 10*time.Millisecond)
+
+		if err := logger.CloseLogFiles(); err != nil { // Should be no-op for stdout
+			t.Errorf("CloseLogFiles for stdout target errored: %v", err)
+		}
+		// Direct verification of stdout content is not done in unit tests.
+		// Test ensures no panics or errors during configuration and logging.
+		t.Log("Access log to stdout test completed. Manual output verification if running with -v.")
+	})
+
+	// --- Test Case 3: Access Log to stderr ---
+	t.Run("AccessLogToStderr", func(t *testing.T) {
+		cfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: createDefaultAccessLogCfg("stderr", true),
+			ErrorLog:  createDefaultErrorLogCfg("stdout"), // Error log to different stream
+		}
+
+		logger, err := NewLogger(cfg)
+		if err != nil {
+			t.Fatalf("NewLogger failed for stderr target: %v", err)
+		}
+
+		req := newMockHTTPRequest(t, "GET", "/stderr-target", "10.0.0.3:1234", nil)
+		logger.Access(req, 99, http.StatusNotFound, 0, 15*time.Millisecond)
+
+		if err := logger.CloseLogFiles(); err != nil { // Should be no-op for stderr
+			t.Errorf("CloseLogFiles for stderr target errored: %v", err)
+		}
+		// Direct verification of stderr content is not done in unit tests.
+		t.Log("Access log to stderr test completed. Manual output verification if running with -v.")
+	})
+}
