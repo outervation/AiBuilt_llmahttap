@@ -1032,18 +1032,21 @@ func TestHeadersFrame_ParsePayload_Errors(t *testing.T) {
 			expectedErr: "reading padding: unexpected EOF",
 		},
 		{
-			name: "mismatch in parsed length (Length > accounted for)",
+			name: "mismatch in parsed length (Header.Length > available payload, EOF on padding read)",
 			header: func() http2.FrameHeader {
 				h := baseHeader
 				h.Flags = http2.FlagHeadersPadded | http2.FlagHeadersEndHeaders
-				// PadL byte (1) + Fragment (5) + Padding (actual 2) = 8 bytes
-				// But claim total length is 10.
+				// Frame claims length 10.
+				// Payload provides PadLength byte (value 2) + 7 bytes of data = 8 bytes total.
+				// Parse: PadLength byte (1st byte of payload) = 2.
+				//        Fragment Length = (Frame.Length - 1 (for PadLength byte) - PadLength_value) = (10 - 1 - 2) = 7.
+				//        Reads 7 bytes fragment (next 7 bytes of payload). Total 1+7=8 bytes read from payload.
+				//        Tries to read Padding of 2 bytes, but payload buffer is exhausted.
 				h.Length = 10
 				return h
 			}(),
-			// PadLength=2, Data = 5 bytes. So currentPos = 1(PadL) + 5(Frag) + 2(Pad) = 8
-			payload:     []byte{2, 'h', 'e', 'l', 'l', 'o', 0, 0}, // PadLength 2, Frag "hello", Padding 0,0. Total 8 bytes.
-			expectedErr: "reading padding: EOF",                   // Changed from "mismatch..." as EOF occurs first
+			payload:     []byte{2, 'f', 'r', 'a', 'g', 'm', 'e', 'n'}, // 8 bytes: PadLength=2, Fragment="fragmen"
+			expectedErr: "reading padding: EOF",
 		},
 	}
 
