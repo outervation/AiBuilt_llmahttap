@@ -546,6 +546,12 @@ func TestLoadConfig_Validation_RoutingConfig(t *testing.T) {
 			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static/", "match_type": "Prefix", "handler_type": "StaticFileServer", "handler_config": {"document_root":"` + absPath + `", "a_field": "a_value",}}]}}`,
 			expectError: "invalid character '}' looking for beginning of object key string",
 		},
+
+		{
+			name:        "sfs index_files entry empty string",
+			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static/", "match_type": "Prefix", "handler_type": "StaticFileServer", "handler_config": {"document_root": "` + absPath + `", "index_files": ["index.html", ""]}}]}}`,
+			expectError: "routing.routes[0].handler_config.index_files[1] cannot be an empty string",
+		},
 	}
 
 	for _, tc := range tests {
@@ -937,7 +943,7 @@ func TestStaticFileServer_DefaultAppliedInGlobalConfig(t *testing.T) {
 	// is responsible for parsing and validating specific handler configs.
 	// This test ensures that if we *do* parse it using the correct function, defaults are applied.
 
-	parsedSfsCfg, err := ParseAndValidateStaticFileServerConfig(route.HandlerConfig, cfg.OriginalFilePath())
+	parsedSfsCfg, err := ParseAndValidateStaticFileServerConfig(route.HandlerConfig.Bytes(), cfg.OriginalFilePath())
 	if err != nil {
 		t.Fatalf("ParseAndValidateStaticFileServerConfig failed: %v", err)
 	}
@@ -1287,5 +1293,228 @@ func TestParseAndValidateStaticFileServerConfig_MimeTypesMap(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLoadConfig_ComprehensiveJSON_ByExtension(t *testing.T) {
+	content := `{
+    "server": {
+        "address": "127.0.0.1:8443",
+        "executable_path": "/usr/local/bin/myserver_v2",
+        "child_readiness_timeout": "15s",
+        "graceful_shutdown_timeout": "45s"
+    },
+    "logging": {
+        "log_level": "DEBUG",
+        "access_log": {
+            "enabled": true,
+            "target": "/var/log/myserver_access.log",
+            "format": "json",
+            "trusted_proxies": ["192.168.1.0/24", "10.0.0.1"],
+            "real_ip_header": "X-Real-IP"
+        },
+        "error_log": {
+            "target": "/var/log/myserver_error.log"
+        }
+    },
+    "routing": {
+        "routes": [
+            {
+                "path_pattern": "/api/v1/",
+                "match_type": "Prefix",
+                "handler_type": "APIHandler",
+                "handler_config": {
+                    "version": "v1",
+                    "timeout": "5s"
+                }
+            },
+            {
+                "path_pattern": "/login",
+                "match_type": "Exact",
+                "handler_type": "LoginHandler"
+            }
+        ]
+    }
+}`
+	path, cleanup := writeTempFile(t, content, ".json")
+	defer cleanup()
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed for comprehensive JSON: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Expected config to be non-nil for comprehensive JSON")
+	}
+
+	// Perform checks on the loaded comprehensive configuration
+	if *cfg.Server.Address != "127.0.0.1:8443" {
+		t.Errorf("Expected server address '127.0.0.1:8443', got '%s'", *cfg.Server.Address)
+	}
+	if *cfg.Server.ExecutablePath != "/usr/local/bin/myserver_v2" {
+		t.Errorf("Expected executable_path '/usr/local/bin/myserver_v2', got '%s'", *cfg.Server.ExecutablePath)
+	}
+	if cfg.Logging.LogLevel != LogLevelDebug {
+		t.Errorf("Expected log_level 'DEBUG', got '%s'", cfg.Logging.LogLevel)
+	}
+	if len(cfg.Logging.AccessLog.TrustedProxies) != 2 || cfg.Logging.AccessLog.TrustedProxies[0] != "192.168.1.0/24" {
+		t.Errorf("Unexpected trusted_proxies: %v", cfg.Logging.AccessLog.TrustedProxies)
+	}
+	if len(cfg.Routing.Routes) != 2 {
+		t.Fatalf("Expected 2 routes, got %d", len(cfg.Routing.Routes))
+	}
+	if cfg.Routing.Routes[0].PathPattern != "/api/v1/" {
+		t.Errorf("Expected first route path_pattern '/api/v1/', got '%s'", cfg.Routing.Routes[0].PathPattern)
+	}
+	// Check handler_config (it's json.RawMessage, so compare its string form after unmarshalling)
+	expectedHandlerConfig := `{"version":"v1","timeout":"5s"}`
+	var actualHandlerCfgObj map[string]interface{}
+	var expectedHandlerCfgObj map[string]interface{}
+	if err := json.Unmarshal(cfg.Routing.Routes[0].HandlerConfig, &actualHandlerCfgObj); err != nil {
+		t.Fatalf("Failed to unmarshal actual handler_config: %v", err)
+	}
+	if err := json.Unmarshal([]byte(expectedHandlerConfig), &expectedHandlerCfgObj); err != nil {
+		t.Fatalf("Failed to unmarshal expected handler_config string: %v", err)
+	}
+
+	// Simple check for a key-value pair from handler_config
+	if actualHandlerCfgObj["version"] != expectedHandlerCfgObj["version"] {
+		t.Errorf("HandlerConfig version mismatch. Expected %v, got %v. Raw: %s", expectedHandlerCfgObj["version"], actualHandlerCfgObj["version"], string(cfg.Routing.Routes[0].HandlerConfig))
+	}
+
+	if cfg.Routing.Routes[1].HandlerConfig != nil {
+		t.Errorf("Expected second route HandlerConfig to be nil, got %s", string(cfg.Routing.Routes[1].HandlerConfig))
+	}
+}
+
+func TestLoadConfig_ComprehensiveTOML_ByExtension(t *testing.T) {
+	content := `
+[server]
+address = "127.0.0.1:8443"
+executable_path = "/usr/local/bin/myserver_v2"
+child_readiness_timeout = "15s"
+graceful_shutdown_timeout = "45s"
+
+[logging]
+log_level = "DEBUG"
+
+  [logging.access_log]
+  enabled = true
+  target = "/var/log/myserver_access.log"
+  format = "json"
+  trusted_proxies = ["192.168.1.0/24", "10.0.0.1"]
+  real_ip_header = "X-Real-IP"
+
+  [logging.error_log]
+  target = "/var/log/myserver_error.log"
+
+[[routing.routes]]
+path_pattern = "/api/v1/"
+match_type = "Prefix"
+handler_type = "APIHandler"
+handler_config = '''
+{
+    "version": "v1",
+    "timeout": "5s"
+}
+'''
+`
+	path, cleanup := writeTempFile(t, content, ".toml")
+	defer cleanup()
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed for comprehensive TOML: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Expected config to be non-nil for comprehensive TOML")
+	}
+
+	// Perform checks on the loaded comprehensive configuration
+	if *cfg.Server.Address != "127.0.0.1:8443" {
+		t.Errorf("Expected server address '127.0.0.1:8443', got '%s'", *cfg.Server.Address)
+	}
+	if cfg.Logging.LogLevel != LogLevelDebug {
+		t.Errorf("Expected log_level 'DEBUG', got '%s'", cfg.Logging.LogLevel)
+	}
+	if len(cfg.Routing.Routes) != 1 { // Adjusted for single route
+		t.Fatalf("Expected 1 route, got %d", len(cfg.Routing.Routes))
+	}
+	// Check handler_config
+	expectedHandlerConfigStr := `{
+    "version": "v1",
+    "timeout": "5s"
+}`
+	var actualHandlerCfgObj map[string]interface{}
+	var expectedHandlerCfgObj map[string]interface{}
+
+	if err := json.Unmarshal(cfg.Routing.Routes[0].HandlerConfig, &actualHandlerCfgObj); err != nil {
+		t.Fatalf("Failed to unmarshal actual handler_config from TOML route: %v. Raw: %s", err, string(cfg.Routing.Routes[0].HandlerConfig))
+	}
+	if err := json.Unmarshal([]byte(expectedHandlerConfigStr), &expectedHandlerCfgObj); err != nil {
+		t.Fatalf("Failed to unmarshal expected handler_config string for comparison: %v", err)
+	}
+
+	if actualHandlerCfgObj["version"] != expectedHandlerCfgObj["version"] {
+		t.Errorf("HandlerConfig version mismatch. Expected %v, got %v. Raw: %s", expectedHandlerCfgObj["version"], actualHandlerCfgObj["version"], string(cfg.Routing.Routes[0].HandlerConfig))
+	}
+	if actualHandlerCfgObj["timeout"] != expectedHandlerCfgObj["timeout"] {
+		t.Errorf("HandlerConfig timeout mismatch. Expected %v, got %v. Raw: %s", expectedHandlerCfgObj["timeout"], actualHandlerCfgObj["timeout"], string(cfg.Routing.Routes[0].HandlerConfig))
+	}
+}
+
+func TestLoadConfig_ComprehensiveJSON_AutoDetectByContent(t *testing.T) {
+	content := `{
+    "server": {"address": "auto.json:8553"},
+    "logging": {"log_level": "INFO"},
+    "routing": {"routes": [{"path_pattern": "/auto_json", "match_type": "Exact", "handler_type": "AutoTest"}]}
+}`
+	path, cleanup := writeTempFile(t, content, ".cfg") // Use a generic extension
+	defer cleanup()
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed for auto-detect comprehensive JSON: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Expected config to be non-nil for auto-detect comprehensive JSON")
+	}
+	if *cfg.Server.Address != "auto.json:8553" {
+		t.Errorf("Expected server address 'auto.json:8553', got '%s'", *cfg.Server.Address)
+	}
+	if len(cfg.Routing.Routes) != 1 || cfg.Routing.Routes[0].PathPattern != "/auto_json" {
+		t.Errorf("Unexpected routing config for auto-detect JSON")
+	}
+}
+
+func TestLoadConfig_ComprehensiveTOML_AutoDetectByContent(t *testing.T) {
+	content := `
+[server]
+address = "auto.toml:8554"
+[logging]
+log_level = "WARNING"
+[[routing.routes]]
+path_pattern = "/auto_toml/"
+match_type = "Prefix"
+handler_type = "AutoTestToml"
+`
+	path, cleanup := writeTempFile(t, content, ".data") // Use another generic extension
+	defer cleanup()
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed for auto-detect comprehensive TOML: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Expected config to be non-nil for auto-detect comprehensive TOML")
+	}
+	if *cfg.Server.Address != "auto.toml:8554" {
+		t.Errorf("Expected server address 'auto.toml:8554', got '%s'", *cfg.Server.Address)
+	}
+	if cfg.Logging.LogLevel != LogLevelWarning {
+		t.Errorf("Expected log_level 'WARNING', got '%s'", cfg.Logging.LogLevel)
+	}
+	if len(cfg.Routing.Routes) != 1 || cfg.Routing.Routes[0].PathPattern != "/auto_toml/" {
+		t.Errorf("Unexpected routing config for auto-detect TOML")
 	}
 }
