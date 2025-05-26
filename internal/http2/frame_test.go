@@ -1941,3 +1941,142 @@ func TestPushPromiseFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestPingFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.PingFrame
+	}{
+		{
+			name: "basic PING frame (not ACK)",
+			frame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePing,
+					Flags:    0,
+					StreamID: 0, // PING frames must be on stream 0
+				},
+				OpaqueData: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			},
+		},
+		{
+			name: "PING frame with ACK flag",
+			frame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePing,
+					Flags:    http2.FlagPingAck,
+					StreamID: 0,
+				},
+				OpaqueData: [8]byte{0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x0, 0x1},
+			},
+		},
+		{
+			name: "PING frame with all zeros OpaqueData",
+			frame: &http2.PingFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FramePing,
+					Flags:    0,
+					StreamID: 0,
+				},
+				OpaqueData: [8]byte{0, 0, 0, 0, 0, 0, 0, 0},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "PingFrame")
+		})
+	}
+}
+
+func TestPingFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FramePing, StreamID: 0}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "payload too short",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 7 // PING payload must be 8 bytes
+				return h
+			}(),
+			payload:     make([]byte, 7),
+			expectedErr: "PING frame payload must be 8 bytes, got 7",
+		},
+		{
+			name: "payload too long",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 9 // PING payload must be 8 bytes
+				return h
+			}(),
+			payload:     make([]byte, 9),
+			expectedErr: "PING frame payload must be 8 bytes, got 9",
+		},
+		{
+			name: "error reading payload (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 8
+				return h
+			}(),
+			payload:     make([]byte, 5), // Provide only 5 of 8 bytes
+			expectedErr: "reading PING opaque data: unexpected EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.PingFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestPingFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.PingFrame{
+		FrameHeader: http2.FrameHeader{Type: http2.FramePing, StreamID: 0, Length: 8},
+		OpaqueData:  [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}
+	expectedErr := fmt.Errorf("custom writer error for ping")
+
+	tests := []struct {
+		name      string
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{name: "fail immediately", failAfter: 0, expectedN: 0},
+		{name: "fail after partial write", failAfter: 4, expectedN: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
