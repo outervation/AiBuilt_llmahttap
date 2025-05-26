@@ -1558,3 +1558,156 @@ func TestHpackAdapter_HeaderBlockFragmentation(t *testing.T) {
 		})
 	}
 }
+
+// TestHpackAdapter_IndexingAndCompression verifies HPACK dynamic table indexing and compression.
+func TestHpackAdapter_IndexingAndCompression(t *testing.T) {
+	t.Run("SameHeaderSetRepeated", func(t *testing.T) {
+		adapter := newTestHpackAdapter(t)
+		headers := []hpack.HeaderField{
+			{Name: ":method", Value: "POST"}, // Static table
+			{Name: "x-custom-header", Value: "value-for-dynamic-table-test-1"},
+			{Name: "another-custom-header", Value: "another-value-for-dynamic-table-test-2"},
+			{Name: "content-type", Value: "application/x-test-custom"},
+		}
+
+		// First encoding: should add custom headers to dynamic table
+		encodedBytes1, err := adapter.EncodeHeaderFields(headers)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (1st time) failed: %v", err)
+		}
+		if len(encodedBytes1) == 0 {
+			t.Fatal("EncodeHeaderFields (1st time) produced empty output for non-empty headers")
+		}
+		size1 := len(encodedBytes1)
+
+		// Decode first encoding to ensure correctness
+		adapter.ResetDecoderState()
+		if err := adapter.DecodeFragment(encodedBytes1); err != nil {
+			t.Fatalf("DecodeFragment (1st time) failed: %v", err)
+		}
+		decodedHeaders1, err := adapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (1st time) failed: %v", err)
+		}
+		if !compareHeaderFields(headers, decodedHeaders1) {
+			t.Errorf("Decoded headers (1st time) do not match original.\nOriginal: %+v\nDecoded:  %+v", headers, decodedHeaders1)
+		}
+
+		// Second encoding of the same headers: should use indexed representations from dynamic table
+		encodedBytes2, err := adapter.EncodeHeaderFields(headers)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (2nd time) failed: %v", err)
+		}
+		if len(encodedBytes2) == 0 {
+			t.Fatal("EncodeHeaderFields (2nd time) produced empty output for non-empty headers")
+		}
+		size2 := len(encodedBytes2)
+
+		// Decode second encoding
+		adapter.ResetDecoderState()
+		if err := adapter.DecodeFragment(encodedBytes2); err != nil {
+			t.Fatalf("DecodeFragment (2nd time) failed: %v", err)
+		}
+		decodedHeaders2, err := adapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (2nd time) failed: %v", err)
+		}
+		if !compareHeaderFields(headers, decodedHeaders2) {
+			t.Errorf("Decoded headers (2nd time) do not match original.\nOriginal: %+v\nDecoded:  %+v", headers, decodedHeaders2)
+		}
+
+		// Assert that the second encoding is smaller due to dynamic table usage
+		if size2 >= size1 {
+			t.Errorf("Expected second encoding size (%d) to be smaller than first encoding size (%d) due to dynamic table indexing. Output1: %x, Output2: %x", size2, size1, encodedBytes1, encodedBytes2)
+		} else {
+			t.Logf("Compression observed: size1=%d, size2=%d (smaller as expected)", size1, size2)
+		}
+	})
+
+	t.Run("DifferentHeaderSetsWithOverlap", func(t *testing.T) {
+		commonHeaders := []hpack.HeaderField{
+			{Name: "x-common-field", Value: "this-is-a-common-value-across-requests"},
+			{Name: "user-agent", Value: "compression-test-client/1.1"},
+			{Name: ":authority", Value: "example.com"},
+		}
+		uniqueHeaders1 := []hpack.HeaderField{
+			{Name: "x-set1-unique", Value: "unique-value-for-set1-only"},
+		}
+		uniqueHeaders2 := []hpack.HeaderField{
+			{Name: "x-set2-unique", Value: "unique-value-for-set2-only-longer"},
+			{Name: "another-for-set2", Value: "another"},
+		}
+
+		headersSet1 := append([]hpack.HeaderField{}, commonHeaders...)
+		headersSet1 = append(headersSet1, uniqueHeaders1...)
+
+		headersSet2 := append([]hpack.HeaderField{}, commonHeaders...)
+		headersSet2 = append(headersSet2, uniqueHeaders2...)
+
+		// Adapter with state (simulates ongoing connection)
+		statefulAdapter := newTestHpackAdapter(t)
+
+		// Encode Set1: commonHeaders should be added to dynamic table
+		encodedSet1, err := statefulAdapter.EncodeHeaderFields(headersSet1)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (Set1) failed: %v", err)
+		}
+		if len(encodedSet1) == 0 {
+			t.Fatal("EncodeHeaderFields (Set1) produced empty output")
+		}
+
+		// Decode Set1 for verification
+		statefulAdapter.ResetDecoderState()
+		if err := statefulAdapter.DecodeFragment(encodedSet1); err != nil {
+			t.Fatalf("DecodeFragment (Set1) failed: %v", err)
+		}
+		decodedSet1, err := statefulAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (Set1) failed: %v", err)
+		}
+		if !compareHeaderFields(headersSet1, decodedSet1) {
+			t.Errorf("Decoded Set1 headers do not match original.\nOriginal: %+v\nDecoded:  %+v", headersSet1, decodedSet1)
+		}
+
+		// Encode Set2 with the same statefulAdapter: commonHeaders should be compressed
+		encodedSet2_stateful, err := statefulAdapter.EncodeHeaderFields(headersSet2)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (Set2, stateful) failed: %v", err)
+		}
+		if len(encodedSet2_stateful) == 0 {
+			t.Fatal("EncodeHeaderFields (Set2, stateful) produced empty output")
+		}
+		sizeSet2_stateful := len(encodedSet2_stateful)
+
+		// Decode Set2 (stateful) for verification
+		statefulAdapter.ResetDecoderState()
+		if err := statefulAdapter.DecodeFragment(encodedSet2_stateful); err != nil {
+			t.Fatalf("DecodeFragment (Set2, stateful) failed: %v", err)
+		}
+		decodedSet2_stateful, err := statefulAdapter.FinishDecoding()
+		if err != nil {
+			t.Fatalf("FinishDecoding (Set2, stateful) failed: %v", err)
+		}
+		if !compareHeaderFields(headersSet2, decodedSet2_stateful) {
+			t.Errorf("Decoded Set2 (stateful) headers do not match original.\nOriginal: %+v\nDecoded:  %+v", headersSet2, decodedSet2_stateful)
+		}
+
+		// Now, encode Set2 with a fresh adapter (no prior state)
+		freshAdapter := newTestHpackAdapter(t)
+		encodedSet2_fresh, err := freshAdapter.EncodeHeaderFields(headersSet2)
+		if err != nil {
+			t.Fatalf("EncodeHeaderFields (Set2, fresh) failed: %v", err)
+		}
+		if len(encodedSet2_fresh) == 0 {
+			t.Fatal("EncodeHeaderFields (Set2, fresh) produced empty output")
+		}
+		sizeSet2_fresh := len(encodedSet2_fresh)
+
+		// Assert that encoding Set2 with state (common headers indexed) is smaller than fresh encoding
+		if sizeSet2_stateful >= sizeSet2_fresh {
+			t.Errorf("Expected Set2 encoding with stateful adapter (size %d) to be smaller than with fresh adapter (size %d) due to dynamic table indexing of common headers. Stateful: %x, Fresh: %x", sizeSet2_stateful, sizeSet2_fresh, encodedSet2_stateful, encodedSet2_fresh)
+		} else {
+			t.Logf("Compression observed for common headers: stateful Set2 size=%d, fresh Set2 size=%d (smaller as expected)", sizeSet2_stateful, sizeSet2_fresh)
+		}
+	})
+}
