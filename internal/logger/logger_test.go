@@ -2102,3 +2102,122 @@ func TestErrorLoggingToDifferentTargets(t *testing.T) {
 		t.Log("Error log to stderr test completed. Manual output verification if running with -v.")
 	})
 }
+
+// TestLogger_ReopenLogFiles_OpenFileFailure tests the behavior of Logger.ReopenLogFiles
+// when os.OpenFile fails for one of the log files during the reopen process.
+func TestLogger_ReopenLogFiles_OpenFileFailure(t *testing.T) {
+	// --- Setup: Capture standard log output (for log.Printf messages from logger.go) ---
+	var stdLogBuf bytes.Buffer
+	originalStdLogOutput := log.Writer()
+	log.SetOutput(&stdLogBuf)
+	defer func() {
+		log.SetOutput(originalStdLogOutput)
+	}()
+
+	// --- Setup: Create temporary file for access log initially ---
+	accessLogTempFile, err := ioutil.TempFile("", "access-reopen-fail-*.log")
+	if err != nil {
+		t.Fatalf("Failed to create temp file for access log: %v", err)
+	}
+	accessLogPath := accessLogTempFile.Name()
+	// Close it immediately, NewLogger will open it.
+	if err := accessLogTempFile.Close(); err != nil {
+		t.Fatalf("Failed to close initial temp access log: %v", err)
+	}
+	// Defer cleanup of the path (which might be a file or dir by end of test)
+	defer os.RemoveAll(accessLogPath) // Use RemoveAll in case it becomes a dir
+
+	// Error log to stderr to keep it out of the file manipulation logic for this test
+	errorLogTarget := "stderr"
+
+	cfg := &config.LoggingConfig{
+		LogLevel: config.LogLevelDebug,
+		AccessLog: &config.AccessLogConfig{
+			Enabled:      boolPtr(true),
+			Target:       stringPtr(accessLogPath),
+			Format:       "json",
+			RealIPHeader: stringPtr("X-Forwarded-For"),
+		},
+		ErrorLog: &config.ErrorLogConfig{
+			Target: stringPtr(errorLogTarget),
+		},
+	}
+
+	logger, err := NewLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewLogger() failed: %v", err)
+	}
+
+	// --- Log something to ensure the access log file is used ---
+	req := newMockHTTPRequest(t, "GET", "/initial-log", "1.2.3.4:1234", nil)
+	logger.Access(req, 1, http.StatusOK, 100, 10*time.Millisecond)
+
+	// --- Critical step: Manipulate the filesystem to cause os.OpenFile to fail on reopen ---
+	// Close the file descriptor held by the logger for the access log.
+	if accessFile, ok := logger.accessLog.output.(*os.File); ok {
+		if err := accessFile.Close(); err != nil {
+			t.Fatalf("Failed to close current access log file before manipulation: %v", err)
+		}
+	} else {
+		t.Fatalf("Access log output was not an *os.File as expected.")
+	}
+
+	// Remove the original access log file
+	if err := os.Remove(accessLogPath); err != nil {
+		t.Fatalf("Failed to remove original access log file: %v", err)
+	}
+	// Create a directory at the same path. os.OpenFile with O_WRONLY/O_APPEND will fail on a directory.
+	if err := os.Mkdir(accessLogPath, 0755); err != nil {
+		t.Fatalf("Failed to create directory at access log path: %v", err)
+	}
+
+	// --- Call ReopenLogFiles ---
+	reopenErr := logger.ReopenLogFiles()
+
+	// --- Assertions ---
+	if reopenErr == nil {
+		t.Errorf("Expected ReopenLogFiles to return an error, but it was nil")
+	} else {
+		expectedErrorMsgPart := fmt.Sprintf("failed to reopen access log file %s", accessLogPath)
+		if !strings.Contains(reopenErr.Error(), expectedErrorMsgPart) {
+			t.Errorf("Expected error message to contain %q, got %q", expectedErrorMsgPart, reopenErr.Error())
+		}
+	}
+
+	// Check standard log output for the diagnostic message
+	stdLogOutput := stdLogBuf.String()
+	expectedStdLogMsgPart := fmt.Sprintf("Failed to reopen access log file %s", accessLogPath)
+	expectedStdLogFallbackPart := "Logging may be impaired." // Or "Access logging may be impaired and will fall back to stdout."
+	if !strings.Contains(stdLogOutput, expectedStdLogMsgPart) {
+		t.Errorf("Expected standard log output to contain diagnostic about failing to reopen %q. Got:\n%s", accessLogPath, stdLogOutput)
+	}
+	if !strings.Contains(stdLogOutput, expectedStdLogFallbackPart) {
+		t.Errorf("Expected standard log output to mention fallback/impairment. Got:\n%s", stdLogOutput)
+	}
+
+	// Check if access logger's output fell back to os.Stdout
+	if logger.accessLog.output != os.Stdout {
+		t.Errorf("Expected accessLog.output to be os.Stdout after reopen failure, got %T", logger.accessLog.output)
+	}
+	// Check if the internal log.Logger for accessLog also writes to os.Stdout
+	// This requires inspecting the logger, which is not directly possible without reflection or specific getters.
+	// However, logger.accessLog.output being os.Stdout implies the internal logger was also updated by SetOutput.
+
+	// Error logger should be unaffected (it was stderr)
+	if logger.errorLog.config.Target == nil || *logger.errorLog.config.Target != errorLogTarget {
+		t.Errorf("Error log target was unexpectedly changed from %s", errorLogTarget)
+	}
+	if logger.errorLog.output != os.Stderr { // NewLogger sets it to os.Stderr if target is "stderr"
+		t.Errorf("Error log output was unexpectedly changed from os.Stderr")
+	}
+
+	// --- Attempt to log again to access log; it should not panic and effectively go to stdout ---
+	// (Directly verifying it went to actual process stdout is out of scope for this unit test)
+	logger.Access(req, 2, http.StatusAccepted, 200, 20*time.Millisecond)
+	t.Logf("Access log attempt after reopen failure completed. Output should have gone to stdout.")
+
+	// Final close of any remaining open files (error log in this case, which is stderr, so no-op)
+	if err := logger.CloseLogFiles(); err != nil {
+		t.Errorf("CloseLogFiles after failed reopen errored: %v", err)
+	}
+}
