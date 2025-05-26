@@ -13,6 +13,164 @@ import (
 	"example.com/llmahttap/v2/internal/http2"
 )
 
+var validFramesTestCases = []struct {
+	name          string
+	originalFrame http2.Frame
+}{
+	{
+		name: "DataFrame basic",
+		originalFrame: &http2.DataFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FrameData, StreamID: 1},
+			Data:        []byte("hello data"),
+		},
+	},
+	{
+		name: "DataFrame with padding and END_STREAM",
+		originalFrame: &http2.DataFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FrameData, Flags: http2.FlagDataPadded | http2.FlagDataEndStream, StreamID: 3},
+			PadLength:   4,
+			Data:        []byte("padded end data"),
+			Padding:     make([]byte, 4),
+		},
+	},
+	{
+		name: "HeadersFrame basic with END_HEADERS",
+		originalFrame: &http2.HeadersFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FrameHeaders, Flags: http2.FlagHeadersEndHeaders, StreamID: 5},
+			HeaderBlockFragment: []byte("header data"),
+		},
+	},
+	{
+		name: "HeadersFrame with all flags",
+		originalFrame: &http2.HeadersFrame{
+			FrameHeader: http2.FrameHeader{
+				Type: http2.FrameHeaders,
+				Flags: http2.FlagHeadersEndStream | http2.FlagHeadersEndHeaders |
+					http2.FlagHeadersPadded | http2.FlagHeadersPriority,
+				StreamID: 7,
+			},
+			PadLength:           3,
+			Exclusive:           true,
+			StreamDependency:    1,
+			Weight:              100,
+			HeaderBlockFragment: []byte("full headers"),
+			Padding:             make([]byte, 3),
+		},
+	},
+	{
+		name: "PriorityFrame basic",
+		originalFrame: &http2.PriorityFrame{
+			FrameHeader:      http2.FrameHeader{Type: http2.FramePriority, StreamID: 9},
+			Exclusive:        false,
+			StreamDependency: 7,
+			Weight:           200,
+		},
+	},
+	{
+		name: "RSTStreamFrame basic",
+		originalFrame: &http2.RSTStreamFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 11},
+			ErrorCode:   http2.ErrCodeCancel,
+		},
+	},
+	{
+		name: "SettingsFrame with settings",
+		originalFrame: &http2.SettingsFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0},
+			Settings: []http2.Setting{
+				{ID: http2.SettingMaxFrameSize, Value: 16384},
+				{ID: http2.SettingEnablePush, Value: 0},
+			},
+		},
+	},
+	{
+		name: "SettingsFrame ACK",
+		originalFrame: &http2.SettingsFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Flags: http2.FlagSettingsAck, StreamID: 0},
+			Settings:    nil, // Or []http2.Setting{}
+		},
+	},
+	{
+		name: "PushPromiseFrame basic with END_HEADERS",
+		originalFrame: &http2.PushPromiseFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FramePushPromise, Flags: http2.FlagPushPromiseEndHeaders, StreamID: 13},
+			PromisedStreamID:    14,
+			HeaderBlockFragment: []byte("promised stuff"),
+		},
+	},
+	{
+		name: "PushPromiseFrame with padding and END_HEADERS",
+		originalFrame: &http2.PushPromiseFrame{
+			FrameHeader: http2.FrameHeader{
+				Type:     http2.FramePushPromise,
+				Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
+				StreamID: 15,
+			},
+			PadLength:           2,
+			PromisedStreamID:    16,
+			HeaderBlockFragment: []byte("padded promise"),
+			Padding:             make([]byte, 2),
+		},
+	},
+	{
+		name: "PingFrame basic",
+		originalFrame: &http2.PingFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FramePing, StreamID: 0},
+			OpaqueData:  [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		},
+	},
+	{
+		name: "PingFrame ACK",
+		originalFrame: &http2.PingFrame{
+			FrameHeader: http2.FrameHeader{Type: http2.FramePing, Flags: http2.FlagPingAck, StreamID: 0},
+			OpaqueData:  [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+		},
+	},
+	{
+		name: "GoAwayFrame with debug data",
+		originalFrame: &http2.GoAwayFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
+			LastStreamID:        20,
+			ErrorCode:           http2.ErrCodeNoError,
+			AdditionalDebugData: []byte("going away"),
+		},
+	},
+	{
+		name: "GoAwayFrame no debug data",
+		originalFrame: &http2.GoAwayFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
+			LastStreamID:        22,
+			ErrorCode:           http2.ErrCodeInternalError,
+			AdditionalDebugData: []byte{},
+		},
+	},
+	{
+		name: "WindowUpdateFrame basic",
+		originalFrame: &http2.WindowUpdateFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FrameWindowUpdate, StreamID: 24},
+			WindowSizeIncrement: 1024,
+		},
+	},
+	{
+		name: "ContinuationFrame basic with END_HEADERS",
+		originalFrame: &http2.ContinuationFrame{
+			FrameHeader:         http2.FrameHeader{Type: http2.FrameContinuation, Flags: http2.FlagContinuationEndHeaders, StreamID: 26},
+			HeaderBlockFragment: []byte("continued headers"),
+		},
+	},
+	// UnknownFrame is tested in TestReadFrame_UnknownFrameType separately for ReadFrame,
+	// For WriteFrame, we primarily test known frame types.
+	// Adding an UnknownFrame here would require WriteFrame to handle it gracefully,
+	// which it does by calling its PayloadLen and WritePayload.
+	{
+		name: "UnknownFrame from perspective of WriteFrame",
+		originalFrame: &http2.UnknownFrame{
+			FrameHeader: http2.FrameHeader{Type: 0xEE, StreamID: 28, Flags: 0xAA},
+			Payload:     []byte{1, 2, 3, 4},
+		},
+	},
+}
+
 // Helper function to compare two FrameHeader structs.
 // Useful because direct comparison of structs containing slices (like raw [9]byte) might not be ideal.
 func assertFrameHeaderEquals(t *testing.T, expected, actual http2.FrameHeader) {
@@ -2740,155 +2898,7 @@ func TestSettingID_String(t *testing.T) {
 }
 
 func TestReadFrame_ValidFrames(t *testing.T) {
-	tests := []struct {
-		name          string
-		originalFrame http2.Frame
-	}{
-		{
-			name: "DataFrame basic",
-			originalFrame: &http2.DataFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FrameData, StreamID: 1},
-				Data:        []byte("hello data"),
-			},
-		},
-		{
-			name: "DataFrame with padding and END_STREAM",
-			originalFrame: &http2.DataFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FrameData, Flags: http2.FlagDataPadded | http2.FlagDataEndStream, StreamID: 3},
-				PadLength:   4,
-				Data:        []byte("padded end data"),
-				Padding:     make([]byte, 4),
-			},
-		},
-		{
-			name: "HeadersFrame basic with END_HEADERS",
-			originalFrame: &http2.HeadersFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FrameHeaders, Flags: http2.FlagHeadersEndHeaders, StreamID: 5},
-				HeaderBlockFragment: []byte("header data"),
-			},
-		},
-		{
-			name: "HeadersFrame with all flags",
-			originalFrame: &http2.HeadersFrame{
-				FrameHeader: http2.FrameHeader{
-					Type: http2.FrameHeaders,
-					Flags: http2.FlagHeadersEndStream | http2.FlagHeadersEndHeaders |
-						http2.FlagHeadersPadded | http2.FlagHeadersPriority,
-					StreamID: 7,
-				},
-				PadLength:           3,
-				Exclusive:           true,
-				StreamDependency:    1,
-				Weight:              100,
-				HeaderBlockFragment: []byte("full headers"),
-				Padding:             make([]byte, 3),
-			},
-		},
-		{
-			name: "PriorityFrame basic",
-			originalFrame: &http2.PriorityFrame{
-				FrameHeader:      http2.FrameHeader{Type: http2.FramePriority, StreamID: 9},
-				Exclusive:        false,
-				StreamDependency: 7,
-				Weight:           200,
-			},
-		},
-		{
-			name: "RSTStreamFrame basic",
-			originalFrame: &http2.RSTStreamFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 11},
-				ErrorCode:   http2.ErrCodeCancel,
-			},
-		},
-		{
-			name: "SettingsFrame with settings",
-			originalFrame: &http2.SettingsFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, StreamID: 0},
-				Settings: []http2.Setting{
-					{ID: http2.SettingMaxFrameSize, Value: 16384},
-					{ID: http2.SettingEnablePush, Value: 0},
-				},
-			},
-		},
-		{
-			name: "SettingsFrame ACK",
-			originalFrame: &http2.SettingsFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Flags: http2.FlagSettingsAck, StreamID: 0},
-				Settings:    nil, // Or []http2.Setting{}
-			},
-		},
-		{
-			name: "PushPromiseFrame basic with END_HEADERS",
-			originalFrame: &http2.PushPromiseFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FramePushPromise, Flags: http2.FlagPushPromiseEndHeaders, StreamID: 13},
-				PromisedStreamID:    14,
-				HeaderBlockFragment: []byte("promised stuff"),
-			},
-		},
-		{
-			name: "PushPromiseFrame with padding and END_HEADERS",
-			originalFrame: &http2.PushPromiseFrame{
-				FrameHeader: http2.FrameHeader{
-					Type:     http2.FramePushPromise,
-					Flags:    http2.FlagPushPromisePadded | http2.FlagPushPromiseEndHeaders,
-					StreamID: 15,
-				},
-				PadLength:           2,
-				PromisedStreamID:    16,
-				HeaderBlockFragment: []byte("padded promise"),
-				Padding:             make([]byte, 2),
-			},
-		},
-		{
-			name: "PingFrame basic",
-			originalFrame: &http2.PingFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FramePing, StreamID: 0},
-				OpaqueData:  [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
-			},
-		},
-		{
-			name: "PingFrame ACK",
-			originalFrame: &http2.PingFrame{
-				FrameHeader: http2.FrameHeader{Type: http2.FramePing, Flags: http2.FlagPingAck, StreamID: 0},
-				OpaqueData:  [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
-			},
-		},
-		{
-			name: "GoAwayFrame with debug data",
-			originalFrame: &http2.GoAwayFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
-				LastStreamID:        20,
-				ErrorCode:           http2.ErrCodeNoError,
-				AdditionalDebugData: []byte("going away"),
-			},
-		},
-		{
-			name: "GoAwayFrame no debug data",
-			originalFrame: &http2.GoAwayFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0},
-				LastStreamID:        22,
-				ErrorCode:           http2.ErrCodeInternalError,
-				AdditionalDebugData: []byte{},
-			},
-		},
-		{
-			name: "WindowUpdateFrame basic",
-			originalFrame: &http2.WindowUpdateFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FrameWindowUpdate, StreamID: 24},
-				WindowSizeIncrement: 1024,
-			},
-		},
-		{
-			name: "ContinuationFrame basic with END_HEADERS",
-			originalFrame: &http2.ContinuationFrame{
-				FrameHeader:         http2.FrameHeader{Type: http2.FrameContinuation, Flags: http2.FlagContinuationEndHeaders, StreamID: 26},
-				HeaderBlockFragment: []byte("continued headers"),
-			},
-		},
-		// UnknownFrame is tested in TestReadFrame_UnknownFrameType
-	}
-
-	for _, tt := range tests {
+	for _, tt := range validFramesTestCases {
 		t.Run(tt.name, func(t *testing.T) {
 			// Ensure the original frame's header length is set correctly based on its payload.
 			// This is crucial because WriteFrame uses FrameHeader.Length.
@@ -3060,6 +3070,106 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 			} else {
 				// This state implies the test case is misconfigured.
 				t.Fatal("Test case misconfiguration: an error was returned, but no expectedError or expectedErrStr was set.")
+			}
+		})
+	}
+}
+
+// cloneFrame creates a deep copy of a frame instance, primarily by serializing and deserializing it.
+// This is useful for getting an independent copy for testing, especially since WriteFrame
+// modifies the Header.Length field of the frame it processes.
+func cloneFrame(original http2.Frame, t *testing.T) http2.Frame {
+	t.Helper()
+
+	// Before serializing the 'original' frame to clone it, ensure its
+	// FrameHeader.Length accurately reflects its PayloadLen().
+	// The `WriteFrame` function itself does this as its first step.
+	// If `original` comes from `validFramesTestCases` which are prepared for `TestReadFrame_ValidFrames`,
+	// its Length is already set to PayloadLen().
+	// If `original.Header().Length` was not already equal to `original.PayloadLen()`,
+	// `http2.WriteFrame` would correct it before writing the header.
+	// So, direct use of `http2.WriteFrame` is fine here.
+
+	var buf bytes.Buffer
+	err := http2.WriteFrame(&buf, original)
+	if err != nil {
+		// If the original frame itself is malformed in a way that WriteFrame rejects (e.g. inconsistent PayloadLen vs WritePayload)
+		// this would be caught by other tests. Here, we assume original is a valid frame definition.
+		t.Fatalf("cloneFrame: WriteFrame failed for original frame type %T: %v", original, err)
+	}
+
+	cloned, err := http2.ReadFrame(bytes.NewBuffer(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("cloneFrame: ReadFrame failed: %v. Serialized bytes: %x", err, buf.Bytes())
+	}
+	if cloned == nil {
+		t.Fatal("cloneFrame: ReadFrame returned nil frame without error")
+	}
+	return cloned
+}
+
+// TestWriteFrame_OutputVerification tests that http2.WriteFrame correctly serializes
+// various frame types into the expected byte sequences.
+func TestWriteFrame_OutputVerification(t *testing.T) {
+	for _, tt := range validFramesTestCases {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. Create a pristine copy of the frame from the test case.
+			// This ensures that any modifications by WriteFrame in previous iterations
+			// or parallel tests (if t.Parallel were used) do not interfere.
+			cleanFrameForExpectation := cloneFrame(tt.originalFrame, t)
+
+			// 2. Determine the expected payload length and actual payload bytes.
+			expectedPayloadLen := cleanFrameForExpectation.PayloadLen()
+			var expectedPayloadBuf bytes.Buffer
+			payloadBytesWritten, err := cleanFrameForExpectation.WritePayload(&expectedPayloadBuf)
+			if err != nil {
+				t.Fatalf("cleanFrameForExpectation.WritePayload() failed: %v", err)
+			}
+			// This check is crucial: WritePayload must write what PayloadLen reports.
+			// WriteFrame relies on this consistency.
+			if uint32(payloadBytesWritten) != expectedPayloadLen {
+				t.Fatalf("cleanFrameForExpectation.WritePayload() wrote %d bytes, but PayloadLen() is %d. Frame: %#v",
+					payloadBytesWritten, expectedPayloadLen, cleanFrameForExpectation)
+			}
+			expectedPayloadBytes := expectedPayloadBuf.Bytes()
+
+			// 3. Determine the expected header bytes.
+			// The header that WriteFrame *should* write will have its Length field
+			// set to expectedPayloadLen.
+			expectedHeaderToSerialize := *cleanFrameForExpectation.Header() // Get a copy of the header
+			expectedHeaderToSerialize.Length = expectedPayloadLen           // Set the correct length
+
+			var expectedHeaderBuf bytes.Buffer
+			if _, err := expectedHeaderToSerialize.WriteTo(&expectedHeaderBuf); err != nil {
+				t.Fatalf("expectedHeaderToSerialize.WriteTo() failed: %v", err)
+			}
+			expectedHeaderBytes := expectedHeaderBuf.Bytes()
+
+			// 4. Construct the total expected byte sequence for the full frame.
+			expectedTotalBytes := append(expectedHeaderBytes, expectedPayloadBytes...)
+
+			// 5. Call http2.WriteFrame on another clean copy of the frame.
+			// WriteFrame will modify frameToWrite.Header().Length in place.
+			frameToWrite := cloneFrame(tt.originalFrame, t)
+			var actualWriteBuf bytes.Buffer
+			err = http2.WriteFrame(&actualWriteBuf, frameToWrite)
+			if err != nil {
+				t.Fatalf("http2.WriteFrame() failed: %v. Frame input: %#v", err, frameToWrite)
+			}
+
+			// 6. Compare the actual written bytes with the expected total bytes.
+			if !bytes.Equal(expectedTotalBytes, actualWriteBuf.Bytes()) {
+				t.Errorf("http2.WriteFrame() output mismatch for %s (%T).\nExpected: %x (%d bytes: %dH + %dP)\nActual:   %x (%d bytes)\nInput Frame (for expectation): %#v\nFrame after WriteFrame: %#v",
+					tt.name, tt.originalFrame,
+					expectedTotalBytes, len(expectedTotalBytes), len(expectedHeaderBytes), len(expectedPayloadBytes),
+					actualWriteBuf.Bytes(), actualWriteBuf.Len(),
+					cleanFrameForExpectation, frameToWrite)
+			}
+
+			// 7. Verify that WriteFrame correctly set the Header().Length on the frame it processed.
+			if frameToWrite.Header().Length != expectedPayloadLen {
+				t.Errorf("frameToWrite.Header().Length after WriteFrame (%d) was not set to expectedPayloadLen (%d)",
+					frameToWrite.Header().Length, expectedPayloadLen)
 			}
 		})
 	}
