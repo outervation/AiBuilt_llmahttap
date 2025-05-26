@@ -322,6 +322,86 @@ func TestHpackAdapter_GetAndClearDecodedFields(t *testing.T) {
 	}
 }
 
+// TestHpackAdapter_EncodeHeaderFields_Simple tests basic scenarios for EncodeHeaderFields.
+func TestHpackAdapter_EncodeHeaderFields_Simple(t *testing.T) {
+	testCases := []struct {
+		name    string
+		headers []hpack.HeaderField
+		// We don't check exact encoded bytes as they can vary with table state,
+		// but we ensure it decodes back correctly and is non-empty for non-empty input.
+		expectEmptyOutput bool
+		expectError       bool
+	}{
+		{
+			name:              "Empty header list",
+			headers:           []hpack.HeaderField{},
+			expectEmptyOutput: true,
+			expectError:       false,
+		},
+		{
+			name: "Single header",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+			},
+			expectEmptyOutput: false,
+			expectError:       false,
+		},
+		{
+			name: "Multiple headers",
+			headers: []hpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/test"},
+				{Name: "accept", Value: "application/json"},
+			},
+			expectEmptyOutput: false,
+			expectError:       false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := newTestHpackAdapter(t)
+
+			encodedBytes, err := adapter.EncodeHeaderFields(tc.headers)
+
+			if tc.expectError {
+				if err == nil {
+					t.Errorf("EncodeHeaderFields expected an error, but got none")
+				}
+				return // Stop if error was expected
+			}
+			if err != nil {
+				t.Fatalf("EncodeHeaderFields failed unexpectedly: %v", err)
+			}
+
+			if tc.expectEmptyOutput {
+				if len(encodedBytes) != 0 {
+					t.Errorf("Expected empty output from EncodeHeaderFields, but got %d bytes: %x", len(encodedBytes), encodedBytes)
+				}
+			} else {
+				if len(encodedBytes) == 0 {
+					t.Errorf("Expected non-empty output from EncodeHeaderFields, but got empty")
+				}
+			}
+
+			// Verify by decoding back
+			adapter.ResetDecoderState()
+			decodeErr := adapter.DecodeFragment(encodedBytes)
+			if decodeErr != nil {
+				t.Fatalf("DecodeFragment failed while verifying encoded output: %v", decodeErr)
+			}
+			decodedHeaders, finishErr := adapter.FinishDecoding()
+			if finishErr != nil {
+				t.Fatalf("FinishDecoding failed while verifying encoded output: %v", finishErr)
+			}
+
+			if !compareHeaderFields(tc.headers, decodedHeaders) {
+				t.Errorf("Decoded headers do not match original input.\nOriginal: %+v\nDecoded:  %+v", tc.headers, decodedHeaders)
+			}
+		})
+	}
+}
+
 func TestHpackAdapter_EncodeHeaderFields_Error(t *testing.T) {
 	adapter := newTestHpackAdapter(t)
 	// The golang.org/x/net/http2/hpack.Encoder.WriteField only returns an error
