@@ -419,11 +419,15 @@ func TestLoadConfig_Validation_ServerConfig(t *testing.T) {
 
 func TestLoadConfig_Validation_RoutingConfig(t *testing.T) {
 	absPath := "/tmp" // Dummy absolute path for tests requiring it
+	// Attempt to create if not exists, for robustness in test environments
 	if _, err := os.Stat(absPath); os.IsNotExist(err) {
 		if err := os.Mkdir(absPath, 0755); err != nil {
-			t.Fatalf("Failed to create dummy dir %s: %v", absPath, err)
+			// If creation fails, log it but don't fatal if tests not needing it can still run.
+			// Tests specifically needing absPath for SFS will fail later if it's not usable.
+			t.Logf("Warning: Failed to create dummy dir %s: %v. SFS tests needing it might fail.", absPath, err)
 		}
-		defer os.RemoveAll(absPath)
+		// No defer os.RemoveAll(absPath) here as it might be shared or managed by test runner environment.
+		// If it's crucial, individual tests should manage their specific temp resources.
 	}
 
 	tests := []struct {
@@ -447,9 +451,19 @@ func TestLoadConfig_Validation_RoutingConfig(t *testing.T) {
 			expectError: "path_pattern '/admin/' with MatchType 'Exact' must not end with '/' unless it is the root path '/'",
 		},
 		{
+			name:        "valid root exact match",
+			configJSON:  `{"routing": {"routes": [{"path_pattern": "/", "match_type": "Exact", "handler_type": "RootHandler"}]}}`,
+			expectError: "", // Expect no error
+		},
+		{
 			name:        "prefix match does not end with /",
 			configJSON:  `{"routing": {"routes": [{"path_pattern": "/static", "match_type": "Prefix", "handler_type": "Test"}]}}`,
 			expectError: "path_pattern '/static' with MatchType 'Prefix' must end with '/'",
+		},
+		{
+			name:        "valid root prefix match",
+			configJSON:  `{"routing": {"routes": [{"path_pattern": "/", "match_type": "Prefix", "handler_type": "RootHandler"}]}}`,
+			expectError: "", // Expect no error
 		},
 		{
 			name:        "missing match_type",
@@ -524,8 +538,16 @@ func TestLoadConfig_Validation_RoutingConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path, cleanup := writeTempFile(t, tc.configJSON, ".json")
 			defer cleanup()
-			_, err := LoadConfig(path)
-			checkErrorContains(t, err, tc.expectError)
+			_, err := LoadConfig(path) // LoadConfig calls applyDefaults and then validateConfig
+
+			if tc.expectError != "" {
+				checkErrorContains(t, err, tc.expectError)
+			} else {
+				// This is a success case, err should be nil
+				if err != nil {
+					t.Fatalf("Expected no error for valid config, but got: %v", err)
+				}
+			}
 		})
 	}
 }
