@@ -188,7 +188,10 @@ func deepCopyFramePayload(f http2.Frame) interface{} {
 	case *http2.GoAwayFrame:
 		cp := *ft
 		cp.FrameHeader = http2.FrameHeader{}
-		if ft.AdditionalDebugData != nil {
+		// Normalize nil to empty slice for comparison, matching ParsePayload behavior
+		if ft.AdditionalDebugData == nil {
+			cp.AdditionalDebugData = []byte{}
+		} else {
 			cp.AdditionalDebugData = make([]byte, len(ft.AdditionalDebugData))
 			copy(cp.AdditionalDebugData, ft.AdditionalDebugData)
 		}
@@ -2166,8 +2169,21 @@ func TestGoAwayFrame(t *testing.T) {
 				LastStreamID:        0, // Can be 0 if no streams processed
 				ErrorCode:           http2.ErrCodeInternalError,
 				AdditionalDebugData: []byte("internal server issue"),
+			}, // Closes frame field for "specific error and debug data"
+		}, // Closes "specific error and debug data" test case struct literal, ADDED COMMA
+		{ // Starts "nil debug data" test case struct literal (sibling)
+			name: "GOAWAY frame with nil debug data", // Should be handled same as empty slice
+			frame: &http2.GoAwayFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameGoAway,
+					Flags:    0,
+					StreamID: 0,
+				},
+				LastStreamID:        999,
+				ErrorCode:           http2.ErrCodeSettingsTimeout,
+				AdditionalDebugData: nil, // Test nil explicitly
 			},
-		},
+		}, // Closes "nil debug data" test case struct literal, ADDED COMMA
 		{
 			name: "GOAWAY frame with max LastStreamID",
 			frame: &http2.GoAwayFrame{
