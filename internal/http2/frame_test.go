@@ -2080,3 +2080,542 @@ func TestPingFrame_WritePayload_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestGoAwayFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.GoAwayFrame
+	}{
+		{
+			name: "basic GOAWAY frame",
+			frame: &http2.GoAwayFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameGoAway,
+					Flags:    0,
+					StreamID: 0, // GOAWAY frames must be on stream 0
+				},
+				LastStreamID:        12345,
+				ErrorCode:           http2.ErrCodeNoError,
+				AdditionalDebugData: []byte("graceful shutdown"),
+			},
+		},
+		{
+			name: "GOAWAY frame with no debug data",
+			frame: &http2.GoAwayFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameGoAway,
+					Flags:    0,
+					StreamID: 0,
+				},
+				LastStreamID:        67890,
+				ErrorCode:           http2.ErrCodeProtocolError,
+				AdditionalDebugData: []byte{}, // Empty debug data
+			},
+		},
+		{
+			name: "GOAWAY frame with specific error and debug data",
+			frame: &http2.GoAwayFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameGoAway,
+					Flags:    0,
+					StreamID: 0,
+				},
+				LastStreamID:        0, // Can be 0 if no streams processed
+				ErrorCode:           http2.ErrCodeInternalError,
+				AdditionalDebugData: []byte("internal server issue"),
+			},
+		},
+		{
+			name: "GOAWAY frame with max LastStreamID",
+			frame: &http2.GoAwayFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameGoAway,
+					Flags:    0,
+					StreamID: 0,
+				},
+				LastStreamID:        0x7FFFFFFF, // Max 31-bit stream ID
+				ErrorCode:           http2.ErrCodeEnhanceYourCalm,
+				AdditionalDebugData: []byte("calm down"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "GoAwayFrame")
+		})
+	}
+}
+
+func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0}
+	validFixedPart := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00} // LastStreamID=1, ErrorCode=NoError
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "payload too short (less than 8 bytes for fixed part)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 7 // GOAWAY must be at least 8 bytes
+				return h
+			}(),
+			payload:     make([]byte, 7),
+			expectedErr: "GOAWAY frame payload must be at least 8 bytes, got 7",
+		},
+		{
+			name: "error reading fixed part (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 8 // Length for fixed part only
+				return h
+			}(),
+			payload:     make([]byte, 5), // Provide only 5 of 8 bytes for fixed part
+			expectedErr: "reading GOAWAY fixed part: unexpected EOF",
+		},
+		{
+			name: "error reading additional debug data (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 8 + 10 // Fixed part (8) + Debug data (10)
+				return h
+			}(),
+			payload:     append(validFixedPart, make([]byte, 5)...), // Fixed part + 5 bytes of debug data
+			expectedErr: "reading GOAWAY additional debug data: unexpected EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.GoAwayFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestGoAwayFrame_WritePayload_Error(t *testing.T) {
+	frameWithDebug := &http2.GoAwayFrame{
+		FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0, Length: 8 + 5},
+		LastStreamID:        10,
+		ErrorCode:           http2.ErrCodeConnectError,
+		AdditionalDebugData: []byte("debug"),
+	}
+	frameNoDebug := &http2.GoAwayFrame{
+		FrameHeader:         http2.FrameHeader{Type: http2.FrameGoAway, StreamID: 0, Length: 8},
+		LastStreamID:        20,
+		ErrorCode:           http2.ErrCodeNoError,
+		AdditionalDebugData: nil, // or []byte{}
+	}
+	expectedErr := fmt.Errorf("custom writer error for goaway")
+
+	tests := []struct {
+		name      string
+		frame     *http2.GoAwayFrame
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{
+			name:      "fail writing fixed part (no debug)",
+			frame:     frameNoDebug,
+			failAfter: 0, expectedN: 0,
+		},
+		{
+			name:      "fail writing fixed part (with debug)",
+			frame:     frameWithDebug,
+			failAfter: 4, expectedN: 4,
+		},
+		{
+			name:      "fail writing debug data",
+			frame:     frameWithDebug,
+			failAfter: 8 + 2, expectedN: 8 + 2, // Wrote fixed part (8) + 2 bytes of debug
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := tt.frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
+
+func TestWindowUpdateFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.WindowUpdateFrame
+	}{
+		{
+			name: "basic WINDOW_UPDATE frame",
+			frame: &http2.WindowUpdateFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameWindowUpdate,
+					Flags:    0,
+					StreamID: 1, // Can be stream 0 or a specific stream
+				},
+				WindowSizeIncrement: 1000,
+			},
+		},
+		{
+			name: "WINDOW_UPDATE frame with max increment",
+			frame: &http2.WindowUpdateFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameWindowUpdate,
+					Flags:    0,
+					StreamID: 0, // Connection-level update
+				},
+				WindowSizeIncrement: 0x7FFFFFFF, // Max 31-bit value
+			},
+		},
+		{
+			// Note: A WindowSizeIncrement of 0 is a PROTOCOL_ERROR for stream-specific updates,
+			// but allowed for connection-level updates (though usually indicative of an issue).
+			// The frame parsing/serialization itself should handle it.
+			name: "WINDOW_UPDATE frame with zero increment",
+			frame: &http2.WindowUpdateFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     http2.FrameWindowUpdate,
+					Flags:    0,
+					StreamID: 0,
+				},
+				WindowSizeIncrement: 0,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "WindowUpdateFrame")
+		})
+	}
+}
+
+func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
+	baseHeader := http2.FrameHeader{Type: http2.FrameWindowUpdate, StreamID: 1}
+
+	tests := []struct {
+		name        string
+		header      http2.FrameHeader
+		payload     []byte
+		expectedErr string
+	}{
+		{
+			name: "payload too short",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 3 // WINDOW_UPDATE payload must be 4 bytes
+				return h
+			}(),
+			payload:     make([]byte, 3),
+			expectedErr: "WINDOW_UPDATE frame payload must be 4 bytes, got 3",
+		},
+		{
+			name: "payload too long",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 5 // WINDOW_UPDATE payload must be 4 bytes
+				return h
+			}(),
+			payload:     make([]byte, 5),
+			expectedErr: "WINDOW_UPDATE frame payload must be 4 bytes, got 5",
+		},
+		{
+			name: "error reading payload (EOF)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Length = 4
+				return h
+			}(),
+			payload:     make([]byte, 2), // Provide only 2 of 4 bytes
+			expectedErr: "reading WINDOW_UPDATE increment: unexpected EOF",
+		},
+		// WindowSizeIncrement == 0 is not a parsing error, but a protocol error handled at a higher level.
+		// TestWindowUpdateFrame already covers the zero increment case for parsing.
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := bytes.NewBuffer(tt.payload)
+			frame := &http2.WindowUpdateFrame{}
+			err := frame.ParsePayload(r, tt.header)
+
+			if err == nil {
+				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+			}
+			if !matchErr(err, tt.expectedErr) {
+				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestWindowUpdateFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.WindowUpdateFrame{
+		FrameHeader:         http2.FrameHeader{Type: http2.FrameWindowUpdate, StreamID: 0, Length: 4},
+		WindowSizeIncrement: 100,
+	}
+	expectedErr := fmt.Errorf("custom writer error for window_update")
+
+	tests := []struct {
+		name      string
+		failAfter int // Bytes after which writer fails
+		expectedN int64
+	}{
+		{name: "fail immediately", failAfter: 0, expectedN: 0},
+		{name: "fail after partial write", failAfter: 2, expectedN: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &failingWriter{failAfterNBytes: tt.failAfter, errToReturn: expectedErr}
+			n, err := frame.WritePayload(fw)
+
+			if err == nil {
+				t.Fatal("WritePayload expected an error, got nil")
+			}
+			if !isSpecificError(err, expectedErr) {
+				t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+			}
+			if n != tt.expectedN {
+				t.Errorf("WritePayload expected %d bytes written, got %d", tt.expectedN, n)
+			}
+		})
+	}
+}
+
+func TestUnknownFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame *http2.UnknownFrame
+	}{
+		{
+			name: "unknown frame type with some payload",
+			frame: &http2.UnknownFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     0xFF, // An example of an unknown type
+					Flags:    0xAB,
+					StreamID: 12345,
+				},
+				Payload: []byte{0xDE, 0xAD, 0xBE, 0xEF},
+			},
+		},
+		{
+			name: "unknown frame type with empty payload",
+			frame: &http2.UnknownFrame{
+				FrameHeader: http2.FrameHeader{
+					Type:     0x42, // Another unknown type
+					Flags:    0,
+					StreamID: 0,
+				},
+				Payload: []byte{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.frame.FrameHeader.Length = tt.frame.PayloadLen()
+			testFrameType(t, tt.frame, "UnknownFrame")
+		})
+	}
+}
+
+func TestUnknownFrame_ParsePayload_Errors(t *testing.T) {
+	t.Run("payload too short error during read", func(t *testing.T) {
+		header := http2.FrameHeader{
+			Type:     0xFE, // Unknown type
+			Length:   10,   // Expect 10 bytes
+			StreamID: 1,
+		}
+		// Provide only 5 bytes, ReadFull should cause ErrUnexpectedEOF
+		payload := bytes.NewBuffer(make([]byte, 5))
+		frame := &http2.UnknownFrame{}
+
+		err := frame.ParsePayload(payload, header)
+		if err == nil {
+			t.Fatal("ParsePayload expected an error for short payload, got nil")
+		}
+		if !isSpecificError(err, io.ErrUnexpectedEOF) && err.Error() != "reading UnknownFrame payload: unexpected EOF" {
+			t.Errorf("ParsePayload error mismatch: expected %v or wrapped version, got %v", io.ErrUnexpectedEOF, err)
+		}
+	})
+}
+
+func TestUnknownFrame_WritePayload_Error(t *testing.T) {
+	frame := &http2.UnknownFrame{
+		FrameHeader: http2.FrameHeader{Type: 0xFD, StreamID: 1, Length: 5},
+		Payload:     []byte("hello"),
+	}
+	expectedErr := fmt.Errorf("custom writer error for unknown")
+
+	t.Run("fail immediately", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 0, errToReturn: expectedErr}
+		n, err := frame.WritePayload(fw)
+		if err == nil {
+			t.Fatal("WritePayload expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("WritePayload error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		if n != 0 {
+			t.Errorf("WritePayload expected 0 bytes written on immediate error, got %d", n)
+		}
+	})
+
+	t.Run("fail after partial write", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 2, errToReturn: expectedErr}
+		n, err := frame.WritePayload(fw)
+		if err == nil {
+			t.Fatal("WritePayload with partial write expected an error, got nil")
+		}
+		if !isSpecificError(err, expectedErr) {
+			t.Errorf("WritePayload with partial write error mismatch: expected %v, got %v", expectedErr, err)
+		}
+		if n != 2 {
+			t.Errorf("WritePayload with partial write expected 2 bytes written, got %d", n)
+		}
+	})
+}
+
+func TestReadFrame_UnknownFrameType(t *testing.T) {
+	// Construct raw bytes for an unknown frame type
+	// Header: Length=4, Type=0xFF (unknown), Flags=0, StreamID=1
+	// Payload: "test"
+	rawFrameBytes := []byte{
+		0x00, 0x00, 0x04, // Length = 4
+		0xFF,                   // Type = 255 (unknown)
+		0x00,                   // Flags = 0
+		0x00, 0x00, 0x00, 0x01, // StreamID = 1
+		't', 'e', 's', 't', // Payload
+	}
+	buf := bytes.NewBuffer(rawFrameBytes)
+
+	frame, err := http2.ReadFrame(buf)
+	if err != nil {
+		t.Fatalf("ReadFrame() unexpected error for unknown frame type: %v", err)
+	}
+
+	unknownFrame, ok := frame.(*http2.UnknownFrame)
+	if !ok {
+		t.Fatalf("ReadFrame() did not return *http2.UnknownFrame, got %T", frame)
+	}
+
+	expectedHeader := http2.FrameHeader{
+		Length:   4,
+		Type:     0xFF,
+		Flags:    0,
+		StreamID: 1,
+	}
+	// Can't use assertFrameHeaderEquals directly because unknownFrame.FrameHeader.raw won't be populated
+	// the same way as if it was read by ReadFrameHeader then written.
+	// Instead, compare the fields.
+	if unknownFrame.FrameHeader.Length != expectedHeader.Length ||
+		unknownFrame.FrameHeader.Type != expectedHeader.Type ||
+		unknownFrame.FrameHeader.Flags != expectedHeader.Flags ||
+		unknownFrame.FrameHeader.StreamID != expectedHeader.StreamID {
+		t.Errorf("UnknownFrame header mismatch.\nExpected: %+v\nGot:      %+v",
+			expectedHeader, unknownFrame.FrameHeader)
+	}
+
+	if !bytes.Equal(unknownFrame.Payload, []byte("test")) {
+		t.Errorf("UnknownFrame payload mismatch: expected %x, got %x", []byte("test"), unknownFrame.Payload)
+	}
+
+	if buf.Len() != 0 {
+		t.Errorf("Buffer not fully consumed after ReadFrame for unknown type, remaining %d bytes", buf.Len())
+	}
+}
+
+func TestWriteFrame_ErrorHandling(t *testing.T) {
+	// Use a simple frame type for this test, e.g., PingFrame
+	originalFrame := &http2.PingFrame{
+		FrameHeader: http2.FrameHeader{Type: http2.FramePing, StreamID: 0},
+		OpaqueData:  [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}
+	// Length will be set by WriteFrame based on PayloadLen()
+	// originalFrame.FrameHeader.Length = originalFrame.PayloadLen() // Not needed here
+
+	expectedErr := fmt.Errorf("simulated writer failure")
+
+	t.Run("error writing header", func(t *testing.T) {
+		fw := &failingWriter{failAfterNBytes: 0, errToReturn: expectedErr} // Fails immediately
+		err := http2.WriteFrame(fw, originalFrame)
+		if err == nil {
+			t.Fatal("WriteFrame expected error writing header, got nil")
+		}
+		if !matchErr(err, "writing frame header") || !matchErr(err, expectedErr.Error()) {
+			t.Errorf("WriteFrame error writing header mismatch. Expected to contain 'writing frame header' and '%s', got: %v", expectedErr.Error(), err)
+		}
+	})
+
+	t.Run("error writing payload", func(t *testing.T) {
+		// Fail after header (9 bytes) but before full payload
+		fw := &failingWriter{failAfterNBytes: int(http2.FrameHeaderLen) + 2, errToReturn: expectedErr}
+		err := http2.WriteFrame(fw, originalFrame)
+		if err == nil {
+			t.Fatal("WriteFrame expected error writing payload, got nil")
+		}
+		if !matchErr(err, "writing PING payload") || !matchErr(err, expectedErr.Error()) {
+			t.Errorf("WriteFrame error writing payload mismatch. Expected to contain 'writing PING payload' and '%s', got: %v", expectedErr.Error(), err)
+		}
+	})
+
+	t.Run("payload length mismatch error", func(t *testing.T) {
+		// Create a mock frame that misreports its payload length
+		mockFrame := &mockMisreportingFrame{
+			FrameHeader:        http2.FrameHeader{Type: 0xEE, StreamID: 1},
+			actualPayload:      []byte("actual"), // 6 bytes
+			reportedPayloadLen: 5,                // Reports 5 bytes
+		}
+
+		var buf bytes.Buffer // Use a successful writer
+		err := http2.WriteFrame(&buf, mockFrame)
+		if err == nil {
+			t.Fatal("WriteFrame expected error for payload length mismatch, got nil")
+		}
+		expectedErrMsgSubstr := "payload length mismatch: PayloadLen() declared 5, but WritePayload() wrote 6 bytes"
+		if !matchErr(err, expectedErrMsgSubstr) {
+			t.Errorf("WriteFrame error for payload length mismatch incorrect. Expected to contain '%s', got: %v", expectedErrMsgSubstr, err)
+		}
+	})
+}
+
+// mockMisreportingFrame is a helper for testing WriteFrame's internal consistency check.
+type mockMisreportingFrame struct {
+	http2.FrameHeader
+	actualPayload      []byte
+	reportedPayloadLen uint32
+}
+
+func (m *mockMisreportingFrame) Header() *http2.FrameHeader { return &m.FrameHeader }
+func (m *mockMisreportingFrame) ParsePayload(r io.Reader, header http2.FrameHeader) error {
+	return nil /* not used */
+}
+func (m *mockMisreportingFrame) WritePayload(w io.Writer) (int64, error) {
+	n, err := w.Write(m.actualPayload)
+	return int64(n), err
+}
+func (m *mockMisreportingFrame) PayloadLen() uint32 { return m.reportedPayloadLen }
