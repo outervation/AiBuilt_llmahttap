@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe" // Required for the newTestStream helper due to constraints
 
 	"example.com/llmahttap/v2/internal/config"
@@ -311,11 +315,10 @@ func (mrd *mockRequestDispatcher) Dispatch(sw StreamWriter, req *http.Request) {
 }
 
 // newTestStream is a helper function to initialize a http2.Stream for testing.
+
 func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8, prioParentID uint32, prioExclusive bool, isInitiatedByPeer bool) *Stream {
 	t.Helper()
 
-	// Initialize fields in mockConnection that need to be non-nil for Connection methods
-	// or for newStream's internal logic when accessing s.conn.FIELD.
 	if mc.ctx == nil {
 		mc.ctx, mc.cancelCtx = context.WithCancel(context.Background())
 	}
@@ -339,41 +342,23 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	if mc.connFCManager == nil {
 		mc.connFCManager = NewConnectionFlowControlManager()
 	}
-	// CRITICAL: Initialize the writerChan that Connection.sendRSTStreamFrame will use.
-	// This field must be at the correct memory offset in mockConnection.
-	// Ensure writerChan is initialized (it's done where mc is declared if needed, or here)
 	if mc.writerChan == nil {
-		mc.writerChan = make(chan Frame, 10) // Default buffer if not pre-set
+		mc.writerChan = make(chan Frame, 10)
 	}
 
-	// The writerChan is initialized. Tests that expect frames to be sent
-	// must read from mc.writerChan or ensure it's drained if not inspected.
-	// The previous automatic drainer is removed to allow tests to inspect frames.
-	// If a test doesn't inspect writerChan but causes writes, it should ensure
-	// writerChan is sufficiently buffered or start a local drainer.
-	// go func() {
-	// 	for {
-	// 		select {
-	// 		case _, ok := <-mc.writerChan:
-	// 			if !ok {
-	// 				return
-	// 			} // Channel closed
-	// 		case <-mc.ctx.Done(): // Connection context cancelled
-	// 			return
-	// 		}
-	// 	}
-	// }()
+	connAsRealConnType := (*Connection)(unsafe.Pointer(mc))
 
-	// Initialize other config values in mockConnection if they are used by stream.go via s.conn.FIELD.
-	// For example, if s.conn.maxFrameSize is used:
-	// (*Connection)(unsafe.Pointer(mc)).maxFrameSize = mc.cfgMaxFrameSize (this needs careful alignment)
-	// For now, we rely on the direct field `mc.maxFrameSize` being set if stream.go was modified to use it from mockConnection,
-	// or that the default (0) is handled by stream.go if it accesses s.conn.maxFrameSize.
-	// The real Connection.maxFrameSize is at the very end. If stream.go uses s.conn.maxFrameSize,
-	// then the mockConnection needs a field at that specific offset.
-	// The current stream.go uses DefaultMaxFrameSize if s.conn.maxFrameSize is 0.
+	// Initialize fields on the Connection memory layout that stream.go will access.
+	// These are set from the mockConnection's 'cfg' fields.
+	connAsRealConnType.remoteAddrStr = mc.cfgRemoteAddrStr
+	if mc.cfgMaxFrameSize > 0 {
+		connAsRealConnType.maxFrameSize = mc.cfgMaxFrameSize
+	} else {
+		connAsRealConnType.maxFrameSize = DefaultMaxFrameSize // Default if not specified
+	}
+	// Ensure mc.log is also set on the actual Connection memory layout part if s.conn.log is used
+	// (it's already done by setting mc.log and then casting mc)
 
-	// Values passed directly to newStream function call:
 	ourInitialWin := mc.cfgOurInitialWindowSize
 	if ourInitialWin == 0 {
 		ourInitialWin = DefaultInitialWindowSize
@@ -383,13 +368,11 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		peerInitialWin = DefaultInitialWindowSize
 	}
 
-	connAsRealConnType := (*Connection)(unsafe.Pointer(mc))
-
 	s, err := newStream(
 		connAsRealConnType,
 		id,
-		ourInitialWin,  // Pass configured or default
-		peerInitialWin, // Pass configured or default
+		ourInitialWin,
+		peerInitialWin,
 		prioWeight,
 		prioParentID,
 		prioExclusive,
@@ -404,7 +387,6 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		if mc.cancelCtx != nil {
 			mc.cancelCtx()
 		}
-		// No automatic writerChan close here; tests manage it or rely on context.
 	})
 
 	return s
@@ -1632,4 +1614,229 @@ func TestNewStream_PriorityAddFailure(t *testing.T) {
 	// The internal cleanup within newStream's error path is assumed to be tested by virtue of it being there.
 	// If we wanted to verify the pipes were closed, we'd need newStream to return them even on error,
 	// or have a more complex mock setup.
+}
+
+func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
+	const testStreamID = uint32(1)
+	defaultPrioWeight := uint8(16)
+
+	baseHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/test?query=1"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: "user-agent", Value: "test-agent"},
+		{Name: "accept", Value: "application/json"},
+	}
+
+	tests := []struct {
+		name                string
+		headers             []hpack.HeaderField
+		endStream           bool
+		dispatcher          func(sw StreamWriter, req *http.Request)
+		isDispatcherNilTest bool
+		expectErrorFromFunc bool      // True if processRequestHeadersAndDispatch itself should return an error
+		expectedRSTCode     ErrorCode // If an RST_STREAM is expected (due to error in func or panic)
+		expectRST           bool      // True if an RST frame should be sent
+		expectedReq         *http.Request
+		customValidation    func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, mc *mockConnection)
+	}{
+		{
+			name:      "valid headers, no endStream",
+			headers:   baseHeaders,
+			endStream: false,
+			dispatcher: func(sw StreamWriter, req *http.Request) {
+				if req.Method != "GET" {
+					t.Errorf("Dispatcher: req.Method = %s, want GET", req.Method)
+				}
+			},
+			expectedReq: &http.Request{
+				Method: "GET",
+				URL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/test", RawQuery: "query=1"},
+				Proto:  "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
+				Header:     http.Header{"User-Agent": []string{"test-agent"}, "Accept": []string{"application/json"}},
+				Host:       "example.com",
+				RequestURI: "/test?query=1",
+			},
+		},
+		{
+			name:       "valid headers, with endStream",
+			headers:    baseHeaders,
+			endStream:  true,
+			dispatcher: func(sw StreamWriter, req *http.Request) {},
+			expectedReq: &http.Request{
+				Method: "GET",
+				URL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/test", RawQuery: "query=1"},
+				Proto:  "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
+				Header:     http.Header{"User-Agent": []string{"test-agent"}, "Accept": []string{"application/json"}},
+				Host:       "example.com",
+				RequestURI: "/test?query=1",
+			},
+		},
+		{
+			name: "missing :method pseudo-header",
+			headers: []hpack.HeaderField{
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/test"},
+				{Name: ":authority", Value: "example.com"},
+			},
+			endStream:           false,
+			expectErrorFromFunc: true, // Error from pseudo header validation
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+		},
+		{
+			name: "missing :path pseudo-header",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":authority", Value: "example.com"},
+			},
+			endStream:           false,
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+		},
+		{
+			name: "missing :scheme pseudo-header",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":path", Value: "/test"},
+				{Name: ":authority", Value: "example.com"},
+			},
+			endStream:           false,
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+		},
+		{
+			name:                "nil dispatcher",
+			headers:             baseHeaders,
+			endStream:           false,
+			isDispatcherNilTest: true,
+			expectErrorFromFunc: true, // Error due to nil dispatcher
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeInternalError,
+		},
+		{
+			name:      "dispatcher panics",
+			headers:   baseHeaders,
+			endStream: false,
+			dispatcher: func(sw StreamWriter, req *http.Request) {
+				panic("test panic in dispatcher")
+			},
+			expectErrorFromFunc: false, // processRequestHeadersAndDispatch returns nil, panic handled in goroutine
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeInternalError, // RST from panic recovery
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var mc mockConnection
+			mc.writerChan = make(chan Frame, 1)
+			mc.cfgRemoteAddrStr = "127.0.0.1:12345"
+			mc.cfgMaxFrameSize = DefaultMaxFrameSize
+
+			stream := newTestStream(t, testStreamID, &mc, defaultPrioWeight, 0, false, true)
+			stream.mu.Lock()
+			stream.state = StreamStateOpen
+			stream.mu.Unlock()
+
+			mrd := &mockRequestDispatcher{}
+			var dispatcherToUse func(StreamWriter, *http.Request)
+			if !tc.isDispatcherNilTest {
+				if tc.dispatcher != nil {
+					mrd.fn = tc.dispatcher
+				} else {
+					mrd.fn = func(sw StreamWriter, req *http.Request) { /* default no-op */ }
+				}
+				dispatcherToUse = mrd.Dispatch
+			} else {
+				dispatcherToUse = nil
+			}
+
+			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
+
+			if tc.expectErrorFromFunc {
+				if err == nil {
+					t.Fatalf("Expected an error from processRequestHeadersAndDispatch, but got nil")
+				}
+				// Further error content checks can be added here if needed
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
+				}
+			}
+
+			if tc.expectRST {
+				select {
+				case frame := <-mc.writerChan:
+					rstFrame, ok := frame.(*RSTStreamFrame)
+					if !ok {
+						t.Fatalf("Expected RSTStreamFrame, got %T", frame)
+					}
+					if rstFrame.Header().StreamID != stream.id {
+						t.Errorf("RSTStreamFrame StreamID mismatch: got %d, want %d", rstFrame.Header().StreamID, stream.id)
+					}
+					if rstFrame.ErrorCode != tc.expectedRSTCode {
+						t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s", rstFrame.ErrorCode, tc.expectedRSTCode)
+					}
+				case <-time.After(150 * time.Millisecond): // Increased timeout slightly
+					t.Errorf("Expected RSTStreamFrame on writerChan, but none found (Test: %s)", tc.name)
+				}
+			} else { // No RST expected
+				select {
+				case frame := <-mc.writerChan:
+					t.Errorf("Did not expect RSTStreamFrame, but got one: %+v (Test: %s)", frame, tc.name)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			if !tc.expectErrorFromFunc && !tc.isDispatcherNilTest && tc.dispatcher != nil && !strings.Contains(tc.name, "panics") {
+				// Wait a bit for the dispatcher goroutine to run for non-error, non-panic, non-nil-dispatcher cases
+				time.Sleep(50 * time.Millisecond) // Give dispatcher goroutine a chance to run
+
+				mrd.mu.Lock()
+				called := mrd.called
+				lastReq := mrd.lastReq
+				mrd.mu.Unlock()
+
+				if !called {
+					t.Fatal("Dispatcher was not called")
+				}
+
+				if tc.expectedReq != nil && lastReq != nil {
+					if lastReq.Method != tc.expectedReq.Method {
+						t.Errorf("Request Method mismatch: got %s, want %s", lastReq.Method, tc.expectedReq.Method)
+					}
+					if lastReq.URL.String() != tc.expectedReq.URL.String() {
+						t.Errorf("Request URL mismatch: got %s, want %s", lastReq.URL.String(), tc.expectedReq.URL.String())
+					}
+					if !reflect.DeepEqual(lastReq.Header, tc.expectedReq.Header) {
+						t.Errorf("Request Headers mismatch: got %+v, want %+v", lastReq.Header, tc.expectedReq.Header)
+					}
+					if lastReq.Host != tc.expectedReq.Host {
+						t.Errorf("Request Host mismatch: got %s, want %s", lastReq.Host, tc.expectedReq.Host)
+					}
+					if lastReq.RequestURI != tc.expectedReq.RequestURI {
+						t.Errorf("RequestURI mismatch: got %s, want %s", lastReq.RequestURI, tc.expectedReq.RequestURI)
+					}
+					if lastReq.RemoteAddr != mc.cfgRemoteAddrStr {
+						t.Errorf("Request RemoteAddr: got %q, want %q", lastReq.RemoteAddr, mc.cfgRemoteAddrStr)
+					}
+					if lastReq.Body != stream.requestBodyReader {
+						t.Error("Request Body is not the stream's requestBodyReader")
+					}
+					if lastReq.Context() != stream.ctx {
+						t.Error("Request Context is not the stream's context")
+					}
+				}
+			}
+			if tc.customValidation != nil {
+				tc.customValidation(t, mrd, stream, &mc)
+			}
+		})
+	}
 }
