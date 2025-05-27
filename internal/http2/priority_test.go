@@ -1772,3 +1772,141 @@ func TestPriorityTree_UpdatePriority_ReparentExclusive_NewParentNoChildren(t *te
 		t.Errorf("Post-Update Root Children: expected %v, got %v", expectedRootChildrenPost, rootChildrenPost)
 	}
 }
+
+func TestPriorityTree_UpdatePriority_ReparentExclusive_NewParentHasChildren(t *testing.T) {
+	pt := NewPriorityTree()
+
+	newParentStreamID := uint32(1)
+	childOfNewParent1ID := uint32(2)
+	childOfNewParent2ID := uint32(3)
+
+	streamToReparentID := uint32(4)
+	childOfReparentedID := uint32(5)
+	originalParentOfReparentedID := uint32(7) // An arbitrary original parent for streamToReparentID
+
+	otherRootChildID := uint32(6) // Control stream
+
+	weightNewParent := uint8(15) // Default for stream 1
+	weightChildOfNewParent1 := uint8(10)
+	weightChildOfNewParent2 := uint8(20)
+	weightStreamToReparentInitial := uint8(30)
+	weightChildOfReparented := uint8(40)
+	newWeightForReparented := uint8(50)
+
+	// Setup:
+	// 0 -> newParentStreamID (1)
+	//      -> childOfNewParent1ID (2, w:10)
+	//      -> childOfNewParent2ID (3, w:20)
+	// 0 -> originalParentOfReparentedID (7)
+	//      -> streamToReparentID (4, w:30)
+	//           -> childOfReparentedID (5, w:40)
+	// 0 -> otherRootChildID (6)
+
+	_ = pt.AddStream(newParentStreamID, nil) // Will become the new parent for stream 4
+	_ = pt.AddStream(childOfNewParent1ID, &streamDependencyInfo{StreamDependency: newParentStreamID, Weight: weightChildOfNewParent1})
+	_ = pt.AddStream(childOfNewParent2ID, &streamDependencyInfo{StreamDependency: newParentStreamID, Weight: weightChildOfNewParent2})
+
+	_ = pt.AddStream(originalParentOfReparentedID, nil) // Original parent for stream 4
+	_ = pt.AddStream(streamToReparentID, &streamDependencyInfo{StreamDependency: originalParentOfReparentedID, Weight: weightStreamToReparentInitial})
+	_ = pt.AddStream(childOfReparentedID, &streamDependencyInfo{StreamDependency: streamToReparentID, Weight: weightChildOfReparented})
+
+	_ = pt.AddStream(otherRootChildID, nil) // Control stream
+
+	// Verify initial state for newParentStreamID (1)
+	p1Pre, c1Pre, w1Pre, _ := pt.GetDependencies(newParentStreamID)
+	if p1Pre != 0 || !reflect.DeepEqual(sortUint32Slice(c1Pre), []uint32{childOfNewParent1ID, childOfNewParent2ID}) || w1Pre != weightNewParent {
+		t.Fatalf("Pre-Update S1: P:%d C:%v W:%d. Expected P:0 C:[%d %d] W:%d", p1Pre, c1Pre, w1Pre, childOfNewParent1ID, childOfNewParent2ID, weightNewParent)
+	}
+
+	// Verify initial state for streamToReparentID (4)
+	p4Pre, c4Pre, w4Pre, _ := pt.GetDependencies(streamToReparentID)
+	if p4Pre != originalParentOfReparentedID || !reflect.DeepEqual(sortUint32Slice(c4Pre), []uint32{childOfReparentedID}) || w4Pre != weightStreamToReparentInitial {
+		t.Fatalf("Pre-Update S4: P:%d C:%v W:%d. Expected P:%d C:[%d] W:%d", p4Pre, c4Pre, w4Pre, originalParentOfReparentedID, childOfReparentedID, weightStreamToReparentInitial)
+	}
+
+	// Verify initial state for originalParentOfReparentedID (7)
+	p7Pre, c7Pre, _, _ := pt.GetDependencies(originalParentOfReparentedID)
+	if p7Pre != 0 || !contains(c7Pre, streamToReparentID) {
+		t.Fatalf("Pre-Update S7: P:%d C:%v. Expected P:0 C to contain %d", p7Pre, c7Pre, streamToReparentID)
+	}
+
+	// Operation: Re-parent streamToReparentID (4) to be an exclusive child of newParentStreamID (1)
+	pt.mu.Lock()
+	err := pt.UpdatePriority(streamToReparentID, newParentStreamID, newWeightForReparented, true)
+	pt.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("UpdatePriority failed: %v", err)
+	}
+
+	// --- Verifications ---
+
+	// Verify newParentStreamID (1)
+	p1Post, c1Post, w1Post, _ := pt.GetDependencies(newParentStreamID)
+	if p1Post != 0 {
+		t.Errorf("newParentStream (1) post-update: parent expected 0, got %d", p1Post)
+	}
+	if w1Post != weightNewParent { // Weight of parent itself should be unchanged
+		t.Errorf("newParentStream (1) post-update: weight expected %d, got %d", weightNewParent, w1Post)
+	}
+	expectedC1Post := []uint32{streamToReparentID} // Stream 4 is now sole child
+	if !reflect.DeepEqual(sortUint32Slice(c1Post), sortUint32Slice(expectedC1Post)) {
+		t.Errorf("newParentStream (1) post-update: children expected %v, got %v", expectedC1Post, c1Post)
+	}
+
+	// Verify streamToReparentID (4)
+	p4Post, c4Post, w4Post, _ := pt.GetDependencies(streamToReparentID)
+	if p4Post != newParentStreamID {
+		t.Errorf("streamToReparent (4) post-update: parent expected %d, got %d", newParentStreamID, p4Post)
+	}
+	if w4Post != newWeightForReparented {
+		t.Errorf("streamToReparent (4) post-update: weight expected %d, got %d", newWeightForReparented, w4Post)
+	}
+	// Children of 4 should be its original child (5) AND the adopted children from 1 (2, 3)
+	expectedC4Post := []uint32{childOfReparentedID, childOfNewParent1ID, childOfNewParent2ID}
+	if !reflect.DeepEqual(sortUint32Slice(c4Post), sortUint32Slice(expectedC4Post)) {
+		t.Errorf("streamToReparent (4) post-update: children expected sorted %v, got sorted %v (original: %v)", sortUint32Slice(expectedC4Post), sortUint32Slice(c4Post), c4Post)
+	}
+
+	// Verify childOfNewParent1ID (2) - now child of stream 4
+	p2Post, _, w2Post, _ := pt.GetDependencies(childOfNewParent1ID)
+	if p2Post != streamToReparentID {
+		t.Errorf("childOfNewParent1 (2) post-update: parent expected %d, got %d", streamToReparentID, p2Post)
+	}
+	if w2Post != weightChildOfNewParent1 { // Weight preserved
+		t.Errorf("childOfNewParent1 (2) post-update: weight expected %d, got %d", weightChildOfNewParent1, w2Post)
+	}
+
+	// Verify childOfNewParent2ID (3) - now child of stream 4
+	p3Post, _, w3Post, _ := pt.GetDependencies(childOfNewParent2ID)
+	if p3Post != streamToReparentID {
+		t.Errorf("childOfNewParent2 (3) post-update: parent expected %d, got %d", streamToReparentID, p3Post)
+	}
+	if w3Post != weightChildOfNewParent2 { // Weight preserved
+		t.Errorf("childOfNewParent2 (3) post-update: weight expected %d, got %d", weightChildOfNewParent2, w3Post)
+	}
+
+	// Verify childOfReparentedID (5) - still child of stream 4
+	p5Post, _, w5Post, _ := pt.GetDependencies(childOfReparentedID)
+	if p5Post != streamToReparentID {
+		t.Errorf("childOfReparented (5) post-update: parent expected %d, got %d", streamToReparentID, p5Post)
+	}
+	if w5Post != weightChildOfReparented { // Weight preserved
+		t.Errorf("childOfReparented (5) post-update: weight expected %d, got %d", weightChildOfReparented, w5Post)
+	}
+
+	// Verify originalParentOfReparentedID (7) no longer has streamToReparentID (4) as a child (assuming it was its only child initially for simplicity of this check part)
+	_, c7Post, _, _ := pt.GetDependencies(originalParentOfReparentedID)
+	if contains(c7Post, streamToReparentID) {
+		t.Errorf("originalParent (7) post-update: still has stream %d as child. Children: %v", streamToReparentID, c7Post)
+	}
+	if len(c7Post) != 0 { // If stream 4 was its only child
+		t.Logf("Note: originalParent (7) has children %v after stream 4 was moved. This is okay if it had other children.", c7Post)
+	}
+
+	// Verify otherRootChildID (6) is unaffected
+	p6Post, c6Post, w6Post, _ := pt.GetDependencies(otherRootChildID)
+	if p6Post != 0 || len(c6Post) != 0 || w6Post != 15 { // Assuming default weight 15
+		t.Errorf("otherRootChild (6) post-update: state changed. P:%d (exp 0), C:%v (exp:[]), W:%d (exp:15)", p6Post, c6Post, w6Post)
+	}
+}
