@@ -287,6 +287,15 @@ func (mc *mockConnection) streamHandlerDone(s *Stream) {
 	}
 }
 
+// removeClosedStream is a mock method to simulate Connection.removeClosedStream
+// It's called by tests to verify interaction after a stream is closed.
+func (mc *mockConnection) removeClosedStream(s *Stream) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.removeClosedStreamCallCount++
+	mc.lastStreamRemovedByClose = s
+}
+
 // mockRequestDispatcher is a mock for the RequestDispatcherFunc.
 type mockRequestDispatcher struct {
 	fn         func(sw StreamWriter, req *http.Request)
@@ -2109,6 +2118,28 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 				} else if streamErr.Code != tc.expectedFcAcquireError {
 					t.Errorf("Flow control acquire *StreamError code mismatch: got %s, want %s", streamErr.Code, tc.expectedFcAcquireError)
 				}
+			}
+			// 5. Verify interaction with conn.removeClosedStream (simulated)
+			// Simulate the connection manager calling removeClosedStream after observing the stream is closed.
+			// This would typically happen in the connection's main loop when it iterates over streams
+			// and finds one in the Closed state.
+			if stream.state == StreamStateClosed { // Only simulate if truly closed.
+				// The unsafe.Pointer cast is used to access the mockConnection through the
+				// stream.conn pointer, which is of type *Connection.
+				// This is safe here because we know stream.conn points to our mc.
+				mockConnFromStream := (*mockConnection)(unsafe.Pointer(stream.conn))
+				mockConnFromStream.removeClosedStream(stream)
+
+				mockConnFromStream.mu.Lock() // Lock the specific mock instance's mutex
+				if mockConnFromStream.removeClosedStreamCallCount != 1 {
+					t.Errorf("Expected mc.removeClosedStream to be called once, got %d", mockConnFromStream.removeClosedStreamCallCount)
+				}
+				if mockConnFromStream.lastStreamRemovedByClose != stream {
+					t.Errorf("mc.lastStreamRemovedByClose was not the expected stream instance (got %p, want %p)", mockConnFromStream.lastStreamRemovedByClose, stream)
+				}
+				mockConnFromStream.mu.Unlock()
+			} else {
+				t.Errorf("Stream was not in Closed state before simulating removeClosedStream call; state: %s", stream.state)
 			}
 			// newTestStream's t.Cleanup will Close stream, which will be idempotent.
 		})
