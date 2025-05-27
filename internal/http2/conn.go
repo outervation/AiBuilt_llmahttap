@@ -191,7 +191,6 @@ func NewConnection(
 	// Initialize our settings
 	conn.ourSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
 	conn.ourSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
-	conn.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
 
 	if isClientSide {
 		conn.ourSettings[SettingEnablePush] = DefaultClientEnablePush
