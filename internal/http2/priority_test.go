@@ -1442,3 +1442,92 @@ func TestPriorityTree_GetDependencies_NodeWithParentNoChildren(t *testing.T) {
 		t.Errorf("targetStreamID %d: expected no children (it's a leaf node), got %v (len %d)", targetStreamID, children, len(children))
 	}
 }
+
+func TestPriorityTree_RemoveStream_ChildOfRoot_WithChildrenReparenting(t *testing.T) {
+	pt := NewPriorityTree()
+	// Structure:
+	// 0 -> S1 (to be removed)
+	//      -> C1 (child of S1, w:10)
+	//      -> C2 (child of S1, w:20)
+	//   -> S_sibling (sibling of S1, w:15 default)
+
+	streamS1 := uint32(1)
+	streamC1 := uint32(2)
+	streamC2 := uint32(3)
+	streamSibling := uint32(4)
+
+	weightC1 := uint8(10)
+	weightC2 := uint8(20)
+
+	_ = pt.AddStream(streamS1, nil) // 0 -> S1 (default weight 15)
+	_ = pt.AddStream(streamC1, &streamDependencyInfo{StreamDependency: streamS1, Weight: weightC1})
+	_ = pt.AddStream(streamC2, &streamDependencyInfo{StreamDependency: streamS1, Weight: weightC2})
+	_ = pt.AddStream(streamSibling, nil) // 0 -> S_sibling (default weight 15)
+
+	// Verify initial state for S1
+	s1p, s1c, s1w, _ := pt.GetDependencies(streamS1)
+	if s1p != 0 || !reflect.DeepEqual(sortUint32Slice(s1c), []uint32{streamC1, streamC2}) || s1w != 15 {
+		t.Fatalf("Pre-Remove Stream S1: P:%d C:%v W:%d. Expected P:0 C:[%d %d] W:15", s1p, s1c, s1w, streamC1, streamC2)
+	}
+	// Verify initial state for C1
+	c1p, _, c1w, _ := pt.GetDependencies(streamC1)
+	if c1p != streamS1 || c1w != weightC1 {
+		t.Fatalf("Pre-Remove Stream C1: P:%d W:%d. Expected P:%d W:%d", c1p, c1w, streamS1, weightC1)
+	}
+	// Verify initial state for C2
+	c2p, _, c2w, _ := pt.GetDependencies(streamC2)
+	if c2p != streamS1 || c2w != weightC2 {
+		t.Fatalf("Pre-Remove Stream C2: P:%d W:%d. Expected P:%d W:%d", c2p, c2w, streamS1, weightC2)
+	}
+	// Verify initial state for S_sibling
+	sp, _, sw, _ := pt.GetDependencies(streamSibling)
+	if sp != 0 || sw != 15 {
+		t.Fatalf("Pre-Remove Stream S_sibling: P:%d W:%d. Expected P:0 W:15", sp, sw)
+	}
+
+	// Remove streamS1
+	err := pt.RemoveStream(streamS1)
+	if err != nil {
+		t.Fatalf("RemoveStream(%d) failed: %v", streamS1, err)
+	}
+
+	// Verify S1 is gone
+	_, _, _, errGetS1 := pt.GetDependencies(streamS1)
+	if errGetS1 == nil {
+		t.Errorf("Stream %d should not be found after removal", streamS1)
+	}
+
+	// Verify C1 is now child of 0, weight preserved
+	c1pPost, _, c1wPost, _ := pt.GetDependencies(streamC1)
+	if c1pPost != 0 {
+		t.Errorf("Stream C1 post-remove: expected parent 0, got %d", c1pPost)
+	}
+	if c1wPost != weightC1 {
+		t.Errorf("Stream C1 post-remove: expected weight %d, got %d", weightC1, c1wPost)
+	}
+
+	// Verify C2 is now child of 0, weight preserved
+	c2pPost, _, c2wPost, _ := pt.GetDependencies(streamC2)
+	if c2pPost != 0 {
+		t.Errorf("Stream C2 post-remove: expected parent 0, got %d", c2pPost)
+	}
+	if c2wPost != weightC2 {
+		t.Errorf("Stream C2 post-remove: expected weight %d, got %d", weightC2, c2wPost)
+	}
+
+	// Verify S_sibling is still child of 0, properties preserved
+	spPost, _, swPost, _ := pt.GetDependencies(streamSibling)
+	if spPost != 0 {
+		t.Errorf("Stream S_sibling post-remove: expected parent 0, got %d", spPost)
+	}
+	if swPost != 15 {
+		t.Errorf("Stream S_sibling post-remove: expected weight 15, got %d", swPost)
+	}
+
+	// Verify Stream 0 children
+	_, stream0Children, _, _ := pt.GetDependencies(0)
+	expectedStream0Children := []uint32{streamC1, streamC2, streamSibling}
+	if !reflect.DeepEqual(sortUint32Slice(stream0Children), sortUint32Slice(expectedStream0Children)) {
+		t.Errorf("Stream 0 children post-remove: expected %v, got %v", expectedStream0Children, stream0Children)
+	}
+}
