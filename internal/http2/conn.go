@@ -499,17 +499,22 @@ func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, en
 	c.log.Debug("sendHeadersFrame: Preparing to send HEADERS",
 		logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
 
-	// 1. Encode headers using HPACK
-	// For now, we assume the entire block fits into one HEADERS frame and does not exceed peerMaxFrameSize.
-	// A full implementation needs to handle fragmentation into CONTINUATION frames.
-	encodedBytes := c.hpackAdapter.Encode(headers)
-	// HPACK encoding errors are typically not returned directly by x/net/http2/hpack's Encode.
-	// If encoding fails in a way that the library detects (e.g., value too long for representation),
-	// it might panic or have other side effects. For now, assume Encode succeeds if it returns.
+	// Check 1: Is connection already known to be shutting down? (Non-blocking)
+	select {
+	case <-c.shutdownChan:
+		c.log.Warn("sendHeadersFrame: Connection already shutting down (pre-check), cannot send HEADERS frame.",
+			logger.LogFields{"stream_id": s.id})
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
+	default:
+		// Not shutting down yet, proceed.
+	}
 
-	// Check against peer's max frame size for the header block fragment.
-	// This is simplified; a full implementation would fragment if encodedBytes > c.peerMaxFrameSize.
-	// Here, we'll error if it's too large for a single frame for now.
+	encodedBytes, encodeErr := c.hpackAdapter.EncodeHeaderFields(headers)
+	if encodeErr != nil {
+		c.log.Error("sendHeadersFrame: HPACK encoding failed", logger.LogFields{"stream_id": s.id, "error": encodeErr.Error()})
+		return NewConnectionError(ErrCodeCompressionError, "HPACK encoding error: "+encodeErr.Error())
+	}
+
 	c.settingsMu.RLock()
 	peerFrameSizeLimit := c.peerMaxFrameSize
 	c.settingsMu.RUnlock()
@@ -517,47 +522,34 @@ func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, en
 	if uint32(len(encodedBytes)) > peerFrameSizeLimit {
 		errMsg := fmt.Sprintf("encoded header block size (%d) exceeds peer's MAX_FRAME_SIZE (%d)", len(encodedBytes), peerFrameSizeLimit)
 		c.log.Error("sendHeadersFrame: "+errMsg, logger.LogFields{"stream_id": s.id})
-		// This should probably lead to a connection error (INTERNAL_ERROR) as we failed to respect peer settings.
-		// Or, if we were to implement fragmentation, we would do so here.
-		// For now, treat as internal error on our side.
 		return NewConnectionError(ErrCodeInternalError, errMsg)
 	}
 
-	// 2. Construct HEADERS frame
-	var frameFlags Flags = FlagHeadersEndHeaders // Assume all headers fit in this one frame.
+	var frameFlags Flags = FlagHeadersEndHeaders
 	if endStream {
 		frameFlags |= FlagHeadersEndStream
 	}
-	// TODO: Add PRIORITY flag and fields if priority is being sent. For now, no priority.
 
 	headersFrame := &HeadersFrame{
 		FrameHeader: FrameHeader{
 			Type:     FrameHeaders,
 			Flags:    frameFlags,
 			StreamID: s.id,
-			Length:   uint32(len(encodedBytes)), // Length of the header block fragment
+			Length:   uint32(len(encodedBytes)),
 		},
-		// Priority fields (StreamDependency, Weight, Exclusive) are omitted if PRIORITY flag is not set.
 		HeaderBlockFragment: encodedBytes,
 	}
 
-	// 3. Send frame to writerChan
+	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
 	select {
 	case c.writerChan <- headersFrame:
 		c.log.Debug("sendHeadersFrame: HEADERS frame queued",
 			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(encodedBytes)})
 		return nil
 	case <-c.shutdownChan:
-		c.log.Warn("sendHeadersFrame: Connection shutting down, cannot send HEADERS frame.",
+		c.log.Warn("sendHeadersFrame: Connection shutting down (during send attempt), cannot send HEADERS frame.",
 			logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeConnectError, // Or a more specific stream error if applicable
-			fmt.Sprintf("connection shutting down, cannot send HEADERS for stream %d", s.id))
-	default:
-		// writerChan is full, indicates writer is blocked or not processing. Critical internal issue.
-		c.log.Error("sendHeadersFrame: Failed to queue HEADERS frame: writer channel full or blocked.",
-			logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeInternalError,
-			fmt.Sprintf("writer channel congested, cannot send HEADERS for stream %d", s.id))
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send HEADERS for stream %d", s.id))
 	}
 }
 
@@ -575,92 +567,90 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 		return 0, NewConnectionError(ErrCodeInternalError, errMsg)
 	}
 
+	// Check 1: Is connection already known to be shutting down? (Non-blocking)
+	select {
+	case <-c.shutdownChan:
+		c.log.Warn("sendDataFrame: Connection already shutting down (pre-check), cannot send DATA frame.",
+			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
+		return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send DATA for stream %d", s.id))
+	default:
+		// Not shutting down yet, proceed.
+	}
+
 	// Construct DATA frame
-	// Note: Padding is not implemented in this basic version.
-	// If padding were implemented, FrameHeader.Length would include padding length.
 	var frameFlags Flags = 0
 	if endStream {
 		frameFlags |= FlagDataEndStream
 	}
-	// If padding were implemented, frameFlags |= FlagDataPadded would be set if PadLength > 0.
 
 	dataFrame := &DataFrame{
 		FrameHeader: FrameHeader{
 			Type:     FrameData,
 			Flags:    frameFlags,
 			StreamID: s.id,
-			Length:   uint32(len(data)), // Length of the data payload only
+			Length:   uint32(len(data)),
 		},
-		// PadLength: 0, // If padding was implemented
 		Data: data,
 	}
 
-	// Send frame to writerChan
+	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
 	select {
 	case c.writerChan <- dataFrame:
 		c.log.Debug("sendDataFrame: DATA frame queued",
 			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(data)})
-		return len(data), nil // Return number of bytes from the input data slice that were queued
+		return len(data), nil
 	case <-c.shutdownChan:
-		c.log.Warn("sendDataFrame: Connection shutting down, cannot send DATA frame.",
+		c.log.Warn("sendDataFrame: Connection shutting down (during send attempt), cannot send DATA frame.",
 			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
-		return 0, NewConnectionError(ErrCodeConnectError,
-			fmt.Sprintf("connection shutting down, cannot send DATA for stream %d", s.id))
-	default:
-		// writerChan is full, indicates writer is blocked or not processing. Critical internal issue.
-		c.log.Error("sendDataFrame: Failed to queue DATA frame: writer channel full or blocked.",
-			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
-		return 0, NewConnectionError(ErrCodeInternalError,
-			fmt.Sprintf("writer channel congested, cannot send DATA for stream %d", s.id))
+		return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send DATA for stream %d", s.id))
+		// No default case here. If writerChan is full, we want this to block until
+		// either the frame is sent or shutdownChan is closed.
+		// The previous 'default' case that errored on full writerChan is removed.
+		// If writerChan is indefinitely full and no shutdown, it's a different kind of problem (writerLoop stuck).
 	}
 }
 
 // sendRSTStreamFrame sends an RST_STREAM frame.
 // This is a stub implementation.
+
 func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
 	c.log.Debug("Queuing RST_STREAM frame for sending", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
 
-	// Check if stream is 0, RST_STREAM is not allowed on stream 0.
-	// RFC 7540, Section 6.4: "RST_STREAM frames MUST be associated with a stream.
-	// If a RST_STREAM frame is received with a stream identifier of 0x0, the recipient MUST
-	// treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
-	// This check is for *sending*; our server should never try to send RST_STREAM on stream 0.
 	if streamID == 0 {
 		errMsg := "internal error: attempted to send RST_STREAM on stream 0"
 		c.log.Error(errMsg, logger.LogFields{"error_code": errorCode.String()})
-		// This is an internal server error if our code tries this.
 		return NewConnectionError(ErrCodeInternalError, errMsg)
+	}
+
+	// Check 1: Is connection already known to be shutting down? (Non-blocking)
+	select {
+	case <-c.shutdownChan:
+		c.log.Warn("sendRSTStreamFrame: Connection already shutting down (pre-check), cannot send RST_STREAM frame.",
+			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send RST_STREAM for stream %d", streamID))
+	default:
+		// Not shutting down yet, proceed.
 	}
 
 	rstFrame := &RSTStreamFrame{
 		FrameHeader: FrameHeader{
 			Type:     FrameRSTStream,
-			Flags:    0, // RST_STREAM frames do not define any flags.
+			Flags:    0,
 			StreamID: streamID,
-			Length:   4, // RST_STREAM payload is always 4 octets (ErrorCode)
+			Length:   4,
 		},
 		ErrorCode: errorCode,
 	}
 
-	// Send the frame to the writer goroutine.
+	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
 	select {
 	case c.writerChan <- rstFrame:
 		c.log.Debug("RST_STREAM frame queued", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
-		return nil // Successfully queued
+		return nil
 	case <-c.shutdownChan:
-		// Connection is shutting down, cannot send new frames.
-		c.log.Warn("Connection shutting down, cannot send RST_STREAM frame.",
+		c.log.Warn("sendRSTStreamFrame: Connection shutting down (during send attempt), cannot send RST_STREAM frame.",
 			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
-		// Return an error indicating the connection state.
-		return NewConnectionError(ErrCodeConnectError, // Using ConnectError as a general "connection unavailable"
-			fmt.Sprintf("connection shutting down, cannot send RST_STREAM for stream %d", streamID))
-	default:
-		// writerChan is full, indicates writer is blocked or not processing. This is a critical internal issue.
-		c.log.Error("Failed to queue RST_STREAM frame: writer channel full or blocked.",
-			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
-		// This implies the connection is unhealthy and likely needs to be terminated.
-		return NewConnectionError(ErrCodeInternalError,
-			fmt.Sprintf("writer channel congested, cannot send RST_STREAM for stream %d", streamID))
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send RST_STREAM for stream %d", streamID))
 	}
 }
 
@@ -1811,10 +1801,6 @@ func (c *Connection) sendGoAway(lastStreamID uint32, errorCode ErrorCode, debugD
 		c.log.Warn("Connection shutting down, cannot send GOAWAY frame.",
 			logger.LogFields{"last_stream_id": lastStreamID, "error_code": errorCode.String()})
 		return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send GOAWAY")
-	default:
-		c.log.Error("Failed to queue GOAWAY frame: writer channel full or blocked.",
-			logger.LogFields{"last_stream_id": lastStreamID, "error_code": errorCode.String()})
-		return NewConnectionError(ErrCodeInternalError, "failed to send GOAWAY: writer channel congested")
 	}
 }
 
@@ -1902,16 +1888,14 @@ func (c *Connection) isShuttingDownLocked() bool {
 // It sends GOAWAY, closes streams, closes the net.Conn, and cleans up resources.
 // This method should be called at most once, typically by Close().
 func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, debugData []byte, gracefulStreamTimeout time.Duration) {
-	c.streamsMu.Lock()
-	if c.isShuttingDownLocked() {
-		c.streamsMu.Unlock()
+	// Check if already shutting down (using shutdownChan directly is better here for first check)
+	select {
+	case <-c.shutdownChan:
+		c.log.Debug("initiateShutdown: Already shutting down (checked shutdownChan).", logger.LogFields{})
 		return // Already shutting down
+	default:
+		// Not yet shutting down, proceed.
 	}
-	// Mark that shutdown has started.
-	// This MUST be done before releasing streamsMu for the first time in this function,
-	// to prevent race conditions with multiple calls to initiateShutdown or Close.
-	close(c.shutdownChan)
-	c.streamsMu.Unlock()
 
 	c.log.Debug("Initiating connection shutdown sequence.",
 		logger.LogFields{
@@ -1920,15 +1904,55 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 			"graceful_stream_timeout":   gracefulStreamTimeout.String(),
 		})
 
-	// 1. Send GOAWAY frame if not already sent.
-	// sendGoAway method itself checks c.goAwaySent.
+	// 1. Send GOAWAY frame. This must happen BEFORE closing shutdownChan,
+	//    as sendGoAway itself checks shutdownChan.
+	//    sendGoAway handles its own goAwaySent idempotency.
 	if err := c.sendGoAway(lastStreamID, errCode, debugData); err != nil {
-		c.log.Error("Failed to send GOAWAY frame during shutdown.", logger.LogFields{"error": err})
-		// Continue shutdown regardless
+		c.log.Error("Failed to send GOAWAY frame during shutdown initiation.", logger.LogFields{"error": err})
+		// Potentially store this error, but continue shutdown.
+		c.streamsMu.Lock()
+		if c.connError == nil {
+			c.connError = err
+		}
+		c.streamsMu.Unlock()
 	}
 
-	// 2. Graceful stream handling
-	if gracefulStreamTimeout > 0 && !c.isClient { // Graceful only for server-side handling of existing streams for now
+	// 2. Now signal all other parts of the system that shutdown has started.
+	//    Protect the actual close(c.shutdownChan) with a mutex and re-check.
+	c.streamsMu.Lock()
+	select {
+	case <-c.shutdownChan: // Check again in case of race condition from another Close() call
+		c.log.Debug("initiateShutdown: shutdownChan found already closed before explicit close here.", logger.LogFields{})
+	default:
+		close(c.shutdownChan)
+		c.log.Debug("initiateShutdown: Explicitly closed shutdownChan.", logger.LogFields{})
+	}
+	c.streamsMu.Unlock()
+
+	// 3. Close writerChan to signal writerLoop to finish draining and exit.
+	//    This must happen BEFORE waiting on writerDone.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.log.Warn("Recovered from panic trying to close writerChan (possibly already closed).", logger.LogFields{"panic": r})
+			}
+		}()
+		if c.writerChan != nil {
+			c.log.Debug("initiateShutdown: Attempting to close writerChan.", logger.LogFields{})
+			close(c.writerChan)
+			c.log.Debug("initiateShutdown: writerChan closed.", logger.LogFields{})
+		}
+	}()
+
+	// 4. Wait for writerLoop to finish processing all queued frames.
+	if c.writerDone != nil {
+		c.log.Debug("initiateShutdown: Waiting for writerDone.", logger.LogFields{})
+		<-c.writerDone // Wait for writerLoop to fully exit
+		c.log.Debug("initiateShutdown: writerDone signal received.", logger.LogFields{})
+	}
+
+	// 5. Graceful stream handling (after writer has finished its attempts)
+	if gracefulStreamTimeout > 0 && !c.isClient {
 		c.log.Debug("Starting graceful stream shutdown period.", logger.LogFields{"timeout": gracefulStreamTimeout})
 		startTime := time.Now()
 		deadline := startTime.Add(gracefulStreamTimeout)
@@ -1937,10 +1961,6 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 			c.streamsMu.RLock()
 			activeStreamsBelowGoAwayID := 0
 			for streamIDIter, stream := range c.streams {
-				// Only consider streams the peer might expect to complete.
-				// If GOAWAY was from us due to error, lastStreamID is OUR last processed.
-				// If GOAWAY was from peer, their lastStreamID is relevant.
-				// For simplicity, our lastStreamID in the GOAWAY we send is the limit.
 				if streamIDIter <= lastStreamID {
 					stream.mu.RLock()
 					isStreamEffectivelyClosed := stream.state == StreamStateClosed ||
@@ -1959,8 +1979,6 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 				break
 			}
 			c.log.Debug("Waiting for streams to close gracefully.", logger.LogFields{"active_streams_below_goaway_id": activeStreamsBelowGoAwayID, "time_remaining": deadline.Sub(time.Now())})
-			// TODO: Replace time.Sleep with a more robust mechanism, e.g., a condition variable signaled by stream closures.
-			// For now, simple polling.
 			time.Sleep(100 * time.Millisecond) // Check interval
 		}
 		if time.Now().After(deadline) {
@@ -1968,7 +1986,7 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 		}
 	}
 
-	// 3. Forcefully close all remaining active streams
+	// 6. Forcefully close all remaining active streams
 	c.log.Debug("Forcefully closing any remaining active streams.", logger.LogFields{})
 	var streamsToClose []*Stream
 	c.streamsMu.RLock()
@@ -1979,20 +1997,15 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 
 	for _, stream := range streamsToClose {
 		streamErr := NewStreamError(stream.id, ErrCodeCancel, "connection shutting down")
-		// Stream.Close is idempotent and handles its own state.
-		// It might send RST_STREAM if appropriate.
 		if err := stream.Close(streamErr); err != nil {
 			c.log.Warn("Error closing stream during connection shutdown.", logger.LogFields{"stream_id": stream.id, "error": err.Error()})
 		}
 	}
-	// After this, removeClosedStream (called by stream.Close via state transition) should have cleaned them from c.streams.
 
-	// 4. Close the underlying network connection.
-	// This will unblock the reader goroutine if it's stuck in netConn.Read().
+	// 7. Close the underlying network connection. This happens AFTER writer is done.
 	c.log.Debug("Closing network connection.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if err := c.netConn.Close(); err != nil {
 		c.log.Warn("Error closing network connection.", logger.LogFields{"error": err.Error()})
-		// Store this error if it's the first network-related one, but don't overwrite existing primary error.
 		c.streamsMu.Lock()
 		if c.connError == nil {
 			c.connError = err
@@ -2000,49 +2013,25 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 		c.streamsMu.Unlock()
 	}
 
-	// 5. Signal writer goroutine to terminate and clean up.
-	// Closing writerChan signals the writerLoop to drain remaining frames and then exit.
-	if c.writerChan != nil {
-		// Ensure writerChan is closed only once. A select-based approach for sending to a
-		// possibly already closed channel could be used, or a sync.Once around close(c.writerChan).
-		// For now, assuming a single call path to here for the actual close.
-		// The writer goroutine itself should handle reading from a closed channel.
-		// One common pattern: use a dedicated signal channel for the writer to stop,
-		// then it closes writerChan after draining. Or, check if already closed.
-		// A simple way to check if a channel is closed is to try to send a non-blocking message or use recover.
-		// The safest is often for the producer (here, connection methods adding to writerChan) to stop producing
-		// and the consumer (writerLoop) to detect shutdown (e.g. via c.shutdownChan) and then drain and exit.
-		// Forcing close of writerChan from here is fine if writerLoop correctly handles reads from a closed channel.
-
-		// TODO: Refine writerChan closure to be safer with concurrent access if initiateShutdown could be called from writerLoop.
-		// For now, direct close assuming writerLoop handles it.
-		close(c.writerChan)
-		c.log.Debug("Writer channel closed.", logger.LogFields{})
-	}
-
-	// 6. Cancel the connection's context.
-	// This signals any operations using c.ctx to stop.
+	// 8. Cancel the connection's context.
 	if c.cancelCtx != nil {
 		c.cancelCtx()
 		c.log.Debug("Connection context cancelled.", logger.LogFields{})
 	}
 
-	// 7. Clean up other connection-level resources.
+	// 9. Clean up other connection-level resources.
 	c.log.Debug("Cleaning up connection resources.", logger.LogFields{})
 	if c.connFCManager != nil {
-		// Pass the primary shutdown error to flow control, so waiters can unblock with reason.
 		var fcCloseErr error
-		c.streamsMu.RLock() // Safely read connError
+		c.streamsMu.RLock()
 		fcCloseErr = c.connError
 		c.streamsMu.RUnlock()
 		if fcCloseErr == nil {
-			// If no primary error, use the error code from the GOAWAY frame.
 			fcCloseErr = NewConnectionError(errCode, "connection closed")
 		}
 		c.connFCManager.Close(fcCloseErr)
 	}
 
-	// Stop settings ACK timer
 	c.settingsMu.Lock()
 	if c.settingsAckTimeoutTimer != nil {
 		c.settingsAckTimeoutTimer.Stop()
@@ -2050,7 +2039,6 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	}
 	c.settingsMu.Unlock()
 
-	// Stop active PING timers
 	c.activePingsMu.Lock()
 	for data, timer := range c.activePings {
 		timer.Stop()
@@ -2058,14 +2046,51 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	}
 	c.activePingsMu.Unlock()
 
-	// HpackAdapter doesn't currently have explicit cleanup.
-	// PriorityTree also doesn't. If they did, call here.
+	// 7. Cancel the connection's context.
+	if c.cancelCtx != nil {
+		c.cancelCtx()
+		c.log.Debug("Connection context cancelled.", logger.LogFields{})
+	}
+
+	// 8. Clean up other connection-level resources.
+	c.log.Debug("Cleaning up connection resources.", logger.LogFields{})
+	if c.connFCManager != nil {
+		var fcCloseErr error
+		c.streamsMu.RLock()
+		fcCloseErr = c.connError
+		c.streamsMu.RUnlock()
+		if fcCloseErr == nil {
+			fcCloseErr = NewConnectionError(errCode, "connection closed")
+		}
+		c.connFCManager.Close(fcCloseErr)
+	}
+
+	c.settingsMu.Lock()
+	if c.settingsAckTimeoutTimer != nil {
+		c.settingsAckTimeoutTimer.Stop()
+		c.settingsAckTimeoutTimer = nil
+	}
+	c.settingsMu.Unlock()
+
+	c.activePingsMu.Lock()
+	for data, timer := range c.activePings {
+		timer.Stop()
+		delete(c.activePings, data)
+	}
+	c.activePingsMu.Unlock()
 
 	c.log.Info("Connection shutdown sequence complete.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
-	// Reader/writer goroutines will signal their exit by closing readerDone/writerDone.
-	// The Close() method waits for these.
-	// The Close() method waits for these.
+	if c.readerDone != nil {
+		select {
+		case <-c.readerDone:
+		default:
+			close(c.readerDone)
+			c.log.Debug("initiateShutdown: readerDone force-closed by shutdown logic.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		}
+	}
+	// writerDone is closed by the writerLoop's defer statement when it exits.
+	// Do not close it here to avoid "close of closed channel" panic.
 }
 
 // handleSettingsFrame processes an incoming SETTINGS frame.
@@ -2296,7 +2321,9 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 	// Initiate our own shutdown sequence in response to receiving GOAWAY.
 	// We send ErrCodeNoError in our GOAWAY as we are now gracefully closing in response to peer's signal.
 	// Debug data from peer's GOAWAY is not typically propagated to our GOAWAY.
-	go c.initiateShutdown(ourGoAwayLastStreamID, ErrCodeNoError, nil, gracefulTimeout)
+	// Making this synchronous for testing. In production, might remain async
+	// but ensure GOAWAY is sent before netConn closes.
+	c.initiateShutdown(ourGoAwayLastStreamID, ErrCodeNoError, nil, gracefulTimeout)
 
 	return nil
 }
@@ -2603,19 +2630,21 @@ func (c *Connection) writerLoop() {
 					logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
 
 				// A write error is fatal for the connection.
-				// Store the error and initiate connection closure.
+				// Store the error and ensure connection closure is initiated.
 				c.streamsMu.Lock()
 				if c.connError == nil {
 					c.connError = err
 				}
+				// Ensure shutdownChan is closed to signal other parts of the system.
+				// c.isShuttingDownLocked() is safe as streamsMu is held.
+				if !c.isShuttingDownLocked() {
+					close(c.shutdownChan)
+					// Since shutdownChan is now closed, the Serve() loop's defer c.Close()
+					// or an external Close() call will handle the full shutdown.
+					// We don't call c.Close() from writerLoop directly to avoid deadlocks.
+				}
 				c.streamsMu.Unlock()
-
-				// Use a goroutine for c.Close to avoid potential deadlock if Close()
-				// tries to interact with the writerLoop (e.g., by closing writerChan and waiting for writerDone).
-				// Since writerLoop is the one calling Close here, direct call should be fine if Close is robust
-				// to being called from its own worker goroutines. However, goroutine is safer.
-				go c.Close(err)
-				return // Exit writer loop as the connection is now considered failed.
+				return // Exit writer loop. Its defer will close c.writerDone.
 			} else { // writeFrame succeeded
 				// Signal if this was the initial server settings frame being written.
 				if !c.isClient {
