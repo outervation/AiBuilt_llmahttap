@@ -408,11 +408,12 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 				s.conn.log.Error("stream: failed to acquire connection flow control",
 					logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "requested": chunkLen, "conn_available": s.conn.connFCManager.GetConnectionSendAvailable(), "error": errFc.Error()})
 				// CRITICAL: Stream FC was acquired but conn FC failed.
-				// The current FlowControlWindow has no "release" or "rollback".
-				// The stream FC remains debited for this failed attempt.
-				// This is a limitation of the current FCW design and needs future improvement
-				// (e.g., try-acquire, or a mechanism to return acquired capacity).
-				// For now, the write fails, and stream FC is effectively "lost" for this operation.
+				// Release the previously acquired stream flow control.
+				if releaseErr := s.fcManager.sendWindow.Increase(uint32(chunkLen)); releaseErr != nil {
+					s.conn.log.Error("stream: failed to release stream flow control after conn FC failure",
+						logger.LogFields{"stream_id": s.id, "chunk_len": chunkLen, "release_error": releaseErr.Error()})
+					// This is a more complex error state; the connection might be unstable.
+				}
 				return dataOffset, errFc
 			}
 		}
