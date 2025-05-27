@@ -512,7 +512,7 @@ func (ts *testableStream) WriteTrailers(trailers []http2.HeaderField) error {
 
 // Implement other http2.Stream methods that might be called by a handler if necessary
 // For now, these are enough for router.ServeHTTP's own logic (error handling) and basic handler calls.
-func (ts *testableStream) Context()                            {}                              // No-op, adjust if handler uses it
+func (ts *testableStream) Context() context.Context            { return context.Background() } // No-op, adjust if handler uses it
 func (ts *testableStream) RequestBody() *bytes.Reader          { return bytes.NewReader(nil) } // No-op
 func (ts *testableStream) RequestHeaders() []hpack.HeaderField { return nil }
 func (ts *testableStream) GetHandlerConfig() json.RawMessage   { return nil }
