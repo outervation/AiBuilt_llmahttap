@@ -818,25 +818,52 @@ func TestPriorityTree_GetDependencies_StreamNotFound(t *testing.T) {
 }
 
 func TestPriorityTree_GetDependencies_Stream0(t *testing.T) {
-	pt := NewPriorityTree()
-	_ = pt.AddStream(1, nil) // Add a child to stream 0
+	t.Run("initial_state", func(t *testing.T) {
+		pt := NewPriorityTree()
+		parentID, children, weight, err := pt.GetDependencies(0)
+		if err != nil {
+			t.Fatalf("GetDependencies(0) initial state failed: %v", err)
+		}
+		if parentID != 0 {
+			t.Errorf("Stream 0 initial parent: expected 0, got %d", parentID)
+		}
+		if weight != 0 { // As per NewPriorityTree, stream 0 has weight 0
+			t.Errorf("Stream 0 initial weight: expected 0, got %d", weight)
+		}
+		if len(children) != 0 {
+			t.Errorf("Stream 0 initial children: expected empty, got %v", children)
+		}
+	})
 
-	parentID, children, weight, err := pt.GetDependencies(0)
-	if err != nil {
-		t.Fatalf("GetDependencies(0) failed: %v", err)
-	}
-	if parentID != 0 {
-		t.Errorf("Stream 0 parent: expected 0, got %d", parentID)
-	}
-	// Weight for stream 0 is not strictly defined in RFC as it's the root,
-	// our node stores 0 by default.
-	if weight != 0 {
-		t.Errorf("Stream 0 weight: expected 0 (or undefined), got %d", weight)
-	}
-	expectedChildren := []uint32{1}
-	if !reflect.DeepEqual(sortUint32Slice(children), sortUint32Slice(expectedChildren)) {
-		t.Errorf("Stream 0 children: expected %v, got %v", expectedChildren, children)
-	}
+	t.Run("with_children", func(t *testing.T) {
+		pt := NewPriorityTree()
+		// Add some children to stream 0
+		err := pt.AddStream(1, nil) // Default priority, becomes child of 0
+		if err != nil {
+			t.Fatalf("Failed to add stream 1: %v", err)
+		}
+		err = pt.AddStream(2, &streamDependencyInfo{StreamDependency: 0, Weight: 20, Exclusive: false}) // Explicitly child of 0
+		if err != nil {
+			t.Fatalf("Failed to add stream 2: %v", err)
+		}
+
+		parentID, children, weight, errGet := pt.GetDependencies(0)
+		if errGet != nil {
+			t.Fatalf("GetDependencies(0) with children failed: %v", errGet)
+		}
+		if parentID != 0 {
+			t.Errorf("Stream 0 parent with children: expected 0, got %d", parentID)
+		}
+		if weight != 0 { // As per NewPriorityTree, stream 0 has weight 0
+			t.Errorf("Stream 0 weight with children: expected 0, got %d", weight)
+		}
+		expectedChildren := []uint32{1, 2}
+		// GetDependencies returns a copy of children; sort for stable comparison.
+		if !reflect.DeepEqual(sortUint32Slice(children), sortUint32Slice(expectedChildren)) {
+			t.Errorf("Stream 0 children: expected sorted %v, got sorted %v (original: %v)",
+				sortUint32Slice(expectedChildren), sortUint32Slice(children), children)
+		}
+	})
 }
 
 func TestPriorityTree_GetDependencies_ComplexNode(t *testing.T) {
