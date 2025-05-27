@@ -220,9 +220,27 @@ func (h *HpackAdapter) EncodeHeaderFields(fields []hpack.HeaderField) ([]byte, e
 	}
 	h.encodeBuf.Reset() // Reset internal buffer for this encoding operation
 	for _, hf := range fields {
-		if err := h.encoder.WriteField(hf); err != nil {
+		// Validate header field name: must not be empty.
+		// HTTP/2 RFC 7540, Section 8.1.2: "Header field names MUST be valid HTTP header fields.
+		// Empty header field names MUST be treated as a malformed request or response."
+		// HPACK RFC 7541 doesn't explicitly forbid empty names at encoding time as strongly,
+		// but the HTTP/2 layer above it does.
+		if hf.Name == "" {
+			return nil, fmt.Errorf("hpack: invalid header field name: name is empty (value: %q)", hf.Value)
+		}
+		// TODO: Further validation for valid characters in hf.Name as per RFC 7230 and HTTP/2 spec.
+		// For now, just checking for empty.
+
+		// NEW LOGGING (can be removed after fix is confirmed)
+		// fmt.Printf("HpackAdapter.EncodeHeaderFields: Processing hf: %+v\n", hf)
+		errSingle := h.encoder.WriteField(hf)
+		// NEW LOGGING (can be removed after fix is confirmed)
+		// if hf.Name == "" { // This logging becomes less relevant if we error out above.
+		// 	fmt.Printf("HpackAdapter.EncodeHeaderFields: h.encoder.WriteField for empty name returned: %v\n", errSingle)
+		// }
+		if errSingle != nil {
 			// Return nil for bytes and the error if WriteField fails.
-			return nil, fmt.Errorf("hpack: HpackAdapter.encoder.WriteField failed for header field %q: %w", hf.Name, err)
+			return nil, fmt.Errorf("hpack: HpackAdapter.encoder.WriteField failed for header field %q: %w", hf.Name, errSingle)
 		}
 	}
 	// Return the bytes from the buffer. The caller should be aware that this slice

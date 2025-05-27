@@ -108,7 +108,7 @@ type mockConnection struct {
 	// This padding ensures that when mockConnection is cast to *Connection,
 	// assignments to fields like maxFrameSize (offset 232) and remoteAddrStr (offset 240)
 	// write into valid memory within this padded region.
-	_padd_after_writerChan [6]uintptr // CORRECTED PADDING (48 bytes to match total size of 408)
+	_padd_after_writerChan [7]uintptr // CORRECTED PADDING (56 bytes to match total size of 408)
 
 	// --- Fields used by newTestStream to pass values, NOT for layout of s.conn.FIELD ---
 	// These are distinct from the layout placeholders above.
@@ -300,24 +300,6 @@ func (mc *mockConnection) removeClosedStream(s *Stream) {
 }
 
 // mockRequestDispatcher is a mock for the RequestDispatcherFunc.
-type mockRequestDispatcher struct {
-	fn         func(sw StreamWriter, req *http.Request)
-	mu         sync.Mutex
-	called     bool
-	lastStream StreamWriter
-	lastReq    *http.Request
-}
-
-func (mrd *mockRequestDispatcher) Dispatch(sw StreamWriter, req *http.Request) {
-	mrd.mu.Lock()
-	mrd.called = true
-	mrd.lastStream = sw
-	mrd.lastReq = req
-	mrd.mu.Unlock()
-	if mrd.fn != nil {
-		mrd.fn(sw, req)
-	}
-}
 
 // newTestStream is a helper function to initialize a http2.Stream for testing.
 
@@ -328,7 +310,7 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		mc.ctx, mc.cancelCtx = context.WithCancel(context.Background())
 	}
 	if mc.log == nil {
-		logTarget := os.DevNull
+		logTarget := "stdout"
 		enabled := false
 		logCfg := &config.LoggingConfig{
 			LogLevel:  config.LogLevelDebug,
@@ -379,25 +361,27 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	connAsRealConnType.writerChan = mc.writerChan
 
 	// Initialize fields on the Connection memory layout that stream.go will access.
-	connAsRealConnType.remoteAddrStr = mc.cfgRemoteAddrStr
+	// connAsRealConnType.remoteAddrStr = mc.cfgRemoteAddrStr
 
-	if mc.cfgOurCurrentMaxFrameSize > 0 {
-		connAsRealConnType.ourCurrentMaxFrameSize = mc.cfgOurCurrentMaxFrameSize
-	} else {
-		connAsRealConnType.ourCurrentMaxFrameSize = DefaultSettingsMaxFrameSize // Default
-	}
+	// if mc.cfgOurCurrentMaxFrameSize > 0 {
+	// 	connAsRealConnType.ourCurrentMaxFrameSize = mc.cfgOurCurrentMaxFrameSize
+	// } else {
+	// 	connAsRealConnType.ourCurrentMaxFrameSize = DefaultSettingsMaxFrameSize // Default
+	// }
 
 	if mc.cfgPeerMaxFrameSize > 0 {
 		connAsRealConnType.peerMaxFrameSize = mc.cfgPeerMaxFrameSize
 	} else {
 		connAsRealConnType.peerMaxFrameSize = DefaultSettingsMaxFrameSize // Default
 	}
+	// 	connAsRealConnType.peerMaxFrameSize = DefaultSettingsMaxFrameSize // Default
+	// }
 
-	if mc.cfgMaxFrameSize > 0 {
-		connAsRealConnType.maxFrameSize = mc.cfgMaxFrameSize
-	} else {
-		connAsRealConnType.maxFrameSize = DefaultSettingsMaxFrameSize // Default if not specified
-	}
+	// if mc.cfgMaxFrameSize > 0 {
+	// 	connAsRealConnType.maxFrameSize = mc.cfgMaxFrameSize
+	// } else {
+	// 	connAsRealConnType.maxFrameSize = DefaultSettingsMaxFrameSize // Default if not specified
+	// }
 	peerInitialWin := mc.cfgPeerInitialWindowSize
 	// If cfgPeerInitialWindowSize is 0, it means the test case explicitly wants
 	// to test a scenario with a 0 initial window size from the peer.
@@ -409,6 +393,7 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	if ourInitialWin == 0 {
 		ourInitialWin = DefaultInitialWindowSize
 	}
+	t.Logf("newTestStream: ourInitialWin = %d, peerInitialWin = %d (mc.cfgOurInitialWindowSize = %d, mc.cfgPeerInitialWindowSize = %d)", ourInitialWin, peerInitialWin, mc.cfgOurInitialWindowSize, mc.cfgPeerInitialWindowSize)
 
 	s, err := newStream(
 		connAsRealConnType,
@@ -2638,7 +2623,7 @@ func TestStream_WriteData(t *testing.T) {
 			expectedConnSendWindowAfter:   200,
 		},
 		{
-			name:                       "Success: send data larger than maxFrameSize (chunking)",
+			name:                       "Success: send data larger than maxFrameSize, chunking",
 			initialState:               StreamStateOpen,
 			initialResponseHeadersSent: true,
 			initialStreamSendWindow:    100,

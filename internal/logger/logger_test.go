@@ -30,11 +30,6 @@ func parseJSONLog(logLine []byte, out interface{}) error {
 
 // nopWriteCloser is a helper to wrap an io.Writer into an io.WriteCloser
 // with a no-op Close method.
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nopWriteCloser) Close() error { return nil }
 
 // defaultTestLogLevel is used when a specific level isn't provided in helpers.
 const defaultTestLogLevel = config.LogLevelDebug

@@ -850,3 +850,69 @@ func (l *Logger) ReopenLogFiles() error {
 // Ensure config.IsFilePath is available or reimplement logic if not directly accessible
 // For now, assuming config.IsFilePath is exported from the config package.
 // If not, it's: func isFilePath(target string) bool { return target != "stdout" && target != "stderr" }
+
+// NewDiscardLogger returns a logger that discards all output.
+// Useful for tests where log output is not desired.
+func NewDiscardLogger() *Logger {
+	logTarget := os.DevNull // Use os.DevNull for discarding logs
+	logCfg := &config.LoggingConfig{
+		LogLevel: config.LogLevelError, // Minimal logging for tests
+		AccessLog: &config.AccessLogConfig{
+			Enabled: BoolPtr(false),
+			Target:  &logTarget,
+		},
+		ErrorLog: &config.ErrorLogConfig{
+			Target: &logTarget,
+		},
+	}
+	lg, err := NewLogger(logCfg)
+	if err != nil {
+		// Panic during test setup is acceptable if logger can't be created.
+		panic("Failed to create discard logger for tests: " + err.Error())
+	}
+	return lg
+}
+
+// BoolPtr is a helper to get a pointer to a boolean value.
+func BoolPtr(b bool) *bool { return &b }
+
+// NewTestLogger creates a logger that writes error logs to the provided io.Writer
+// and discards access logs. Useful for capturing log output in tests.
+// It sets the global log level to DEBUG for comprehensive capture.
+func NewTestLogger(errorOut io.Writer) *Logger {
+	// Discard access logs
+	discardAccessLogger := &AccessLogger{
+		logger: log.New(io.Discard, "", 0),
+		config: config.AccessLogConfig{Enabled: BoolPtr(false)}, // Ensure access logs are off
+		output: nopWriteCloser{io.Discard},                      // Use nopWriteCloser for safety
+		mu:     sync.Mutex{},
+	}
+
+	// Configure error logger to write to the provided 'errorOut'
+	errorLogConfig := config.ErrorLogConfig{
+		Target: nil, // Target is not a file path, stdout, or stderr; output is directly controlled
+	}
+	errorLogger := &ErrorLogger{
+		logger:         log.New(errorOut, "", 0), // Use the provided writer for error logs
+		config:         errorLogConfig,
+		globalLogLevel: config.LogLevelDebug,     // Log all levels for testing purposes
+		output:         nopWriteCloser{errorOut}, // Wrap errorOut in a nopWriteCloser
+		mu:             sync.Mutex{},
+	}
+
+	return &Logger{
+		accessLog:      discardAccessLogger,
+		errorLog:       errorLogger,
+		globalLogLevel: config.LogLevelDebug, // Global level for the Logger instance
+	}
+}
+
+// nopWriteCloser wraps an io.Writer to satisfy io.WriteCloser, doing nothing on Close.
+type nopWriteCloser struct {
+	io.Writer
+}
+
+// Close implements io.Closer for nopWriteCloser. It's a no-op.
+func (nwc nopWriteCloser) Close() error {
+	return nil
+}
