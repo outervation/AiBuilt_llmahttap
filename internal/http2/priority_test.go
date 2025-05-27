@@ -30,6 +30,9 @@ func TestNewPriorityTree(t *testing.T) {
 	}
 	if len(rootNode.childrenIDs) != 0 {
 		t.Errorf("Root node childrenIDs expected empty, got %v", rootNode.childrenIDs)
+		if rootNode.weight != 0 { // Weight is not strictly applicable to stream 0, but initialized to 0
+			t.Errorf("Root node weight expected 0, got %d", rootNode.weight)
+		}
 	}
 }
 
