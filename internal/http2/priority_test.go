@@ -77,54 +77,80 @@ func TestPriorityTree_AddStream_DefaultPriority(t *testing.T) {
 
 func TestPriorityTree_AddStream_SpecificPriority(t *testing.T) {
 	pt := NewPriorityTree()
-	// Add stream 1 first, it will be a child of 0
-	err := pt.AddStream(1, nil)
+
+	parentStreamID := uint32(1)
+	siblingStreamID := uint32(2)
+	testStreamID := uint32(3)
+
+	// Add parentStream (1), child of 0
+	err := pt.AddStream(parentStreamID, nil)
 	if err != nil {
-		t.Fatalf("Failed to add stream 1: %v", err)
+		t.Fatalf("Failed to add parentStreamID %d: %v", parentStreamID, err)
 	}
 
-	streamID := uint32(3)
-	prioInfo := &streamDependencyInfo{
-		StreamDependency: 1,
+	// Add siblingStream (2) as child of parentStream (1)
+	siblingPrioInfo := &streamDependencyInfo{
+		StreamDependency: parentStreamID,
+		Weight:           10, // Specific weight for sibling
+		Exclusive:        false,
+	}
+	err = pt.AddStream(siblingStreamID, siblingPrioInfo)
+	if err != nil {
+		t.Fatalf("Failed to add siblingStreamID %d: %v", siblingStreamID, err)
+	}
+
+	// Define priority for testStream (3)
+	testPrioInfo := &streamDependencyInfo{
+		StreamDependency: parentStreamID,
 		Weight:           100,
 		Exclusive:        false,
 	}
 
-	err = pt.AddStream(streamID, prioInfo)
+	// Add testStream (3) with specific, non-exclusive priority under parentStream (1)
+	err = pt.AddStream(testStreamID, testPrioInfo)
 	if err != nil {
-		t.Fatalf("AddStream failed: %v", err)
+		t.Fatalf("AddStream for testStreamID %d failed: %v", testStreamID, err)
 	}
 
-	parentID, childrenIDs, weight, err := pt.GetDependencies(streamID)
-	if err != nil {
-		t.Fatalf("GetDependencies for stream %d failed: %v", streamID, err)
+	// Verify testStream (3)
+	tsParentID, tsChildrenIDs, tsWeight, errGetTS := pt.GetDependencies(testStreamID)
+	if errGetTS != nil {
+		t.Fatalf("GetDependencies for testStreamID %d failed: %v", testStreamID, errGetTS)
+	}
+	if tsParentID != testPrioInfo.StreamDependency {
+		t.Errorf("testStreamID %d: expected parent %d, got %d", testStreamID, testPrioInfo.StreamDependency, tsParentID)
+	}
+	if tsWeight != testPrioInfo.Weight {
+		t.Errorf("testStreamID %d: expected weight %d, got %d", testStreamID, testPrioInfo.Weight, tsWeight)
+	}
+	if len(tsChildrenIDs) != 0 {
+		t.Errorf("testStreamID %d: expected no children initially, got %v", testStreamID, tsChildrenIDs)
 	}
 
-	if parentID != prioInfo.StreamDependency {
-		t.Errorf("Expected stream %d parent to be %d, got %d", streamID, prioInfo.StreamDependency, parentID)
+	// Verify parentStream (1)
+	// It should now have both siblingStream (2) and testStream (3) as children
+	_, pChildren, _, errGetP := pt.GetDependencies(parentStreamID)
+	if errGetP != nil {
+		t.Fatalf("GetDependencies for parentStreamID %d failed: %v", parentStreamID, errGetP)
 	}
-	if weight != prioInfo.Weight {
-		t.Errorf("Expected stream %d weight to be %d, got %d", streamID, prioInfo.Weight, weight)
-	}
-	if len(childrenIDs) != 0 {
-		t.Errorf("Expected stream %d to have no children initially, got %v", streamID, childrenIDs)
-	}
-
-	// Verify parent stream (1) has streamID as a child
-	_, parentChildren, _, err := pt.GetDependencies(prioInfo.StreamDependency)
-	if err != nil {
-		t.Fatalf("GetDependencies for stream %d failed: %v", prioInfo.StreamDependency, err)
+	expectedParentChildren := []uint32{siblingStreamID, testStreamID}
+	if !reflect.DeepEqual(sortUint32Slice(pChildren), sortUint32Slice(expectedParentChildren)) {
+		t.Errorf("parentStreamID %d: expected children %v, got %v", parentStreamID, expectedParentChildren, pChildren)
 	}
 
-	found := false
-	for _, child := range parentChildren {
-		if child == streamID {
-			found = true
-			break
-		}
+	// Verify siblingStream (2) - should be unaffected
+	ssParentID, ssChildrenIDs, ssWeight, errGetSS := pt.GetDependencies(siblingStreamID)
+	if errGetSS != nil {
+		t.Fatalf("GetDependencies for siblingStreamID %d failed: %v", siblingStreamID, errGetSS)
 	}
-	if !found {
-		t.Errorf("Stream %d not found in children of stream %d. Children: %v", streamID, prioInfo.StreamDependency, parentChildren)
+	if ssParentID != parentStreamID {
+		t.Errorf("siblingStreamID %d: expected parent %d (unaffected), got %d", siblingStreamID, parentStreamID, ssParentID)
+	}
+	if ssWeight != siblingPrioInfo.Weight {
+		t.Errorf("siblingStreamID %d: expected weight %d (unaffected), got %d", siblingStreamID, siblingPrioInfo.Weight, ssWeight)
+	}
+	if len(ssChildrenIDs) != 0 {
+		t.Errorf("siblingStreamID %d: expected no children (unaffected), got %v", siblingStreamID, ssChildrenIDs)
 	}
 }
 
