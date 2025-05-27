@@ -72,8 +72,7 @@ type mockConnection struct {
 	// priorityTree *PriorityTree (pointer = 1 word)
 	priorityTree *PriorityTree // Initialized by newTestStream
 
-	// hpackAdapter *HpackAdapter (pointer = 1 word)
-	_mock_hpackAdapter_placeholder uintptr
+	hpackAdapter *HpackAdapter // Actual field, not placeholder
 	// connFCManager *ConnectionFlowControlManager (pointer = 1 word)
 	connFCManager *ConnectionFlowControlManager // Initialized by newTestStream
 
@@ -113,10 +112,12 @@ type mockConnection struct {
 	// These are distinct from the layout placeholders above.
 	// The `ourInitialWindowSize` and `peerInitialWindowSize` are passed as arguments to `newStream`,
 	// not accessed via `s.conn.ourInitialWindowSize`.
-	cfgOurInitialWindowSize  uint32
-	cfgPeerInitialWindowSize uint32
-	cfgMaxFrameSize          uint32 // For configuring the aligned maxFrameSize field if needed.
-	cfgRemoteAddrStr         string // For configuring the aligned remoteAddrStr field if needed.
+	cfgOurInitialWindowSize   uint32
+	cfgPeerInitialWindowSize  uint32
+	cfgOurCurrentMaxFrameSize uint32 // For configuring Connection.ourCurrentMaxFrameSize (offset 304)
+	cfgPeerMaxFrameSize       uint32 // For configuring Connection.peerMaxFrameSize (offset 320)
+	cfgMaxFrameSize           uint32 // For configuring Connection.maxFrameSize (offset 376)
+	cfgRemoteAddrStr          string
 
 	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
 	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
@@ -341,6 +342,9 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	if mc.priorityTree == nil {
 		mc.priorityTree = NewPriorityTree()
 	}
+	if mc.hpackAdapter == nil {
+		mc.hpackAdapter = NewHpackAdapter(DefaultSettingsHeaderTableSize) // Initialize HPACK adapter
+	}
 	if mc.connFCManager == nil {
 		mc.connFCManager = NewConnectionFlowControlManager()
 	}
@@ -371,24 +375,35 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	// CRITICAL: Ensure the *Connection instance uses the mock's writerChan
 	// so that frames sent by s.conn.sendXXXFrame methods go to our consumer.
 	connAsRealConnType.writerChan = mc.writerChan
+
 	// Initialize fields on the Connection memory layout that stream.go will access.
-	// These are set from the mockConnection's 'cfg' fields.
 	connAsRealConnType.remoteAddrStr = mc.cfgRemoteAddrStr
+
+	if mc.cfgOurCurrentMaxFrameSize > 0 {
+		connAsRealConnType.ourCurrentMaxFrameSize = mc.cfgOurCurrentMaxFrameSize
+	} else {
+		connAsRealConnType.ourCurrentMaxFrameSize = DefaultSettingsMaxFrameSize // Default
+	}
+
+	if mc.cfgPeerMaxFrameSize > 0 {
+		connAsRealConnType.peerMaxFrameSize = mc.cfgPeerMaxFrameSize
+	} else {
+		connAsRealConnType.peerMaxFrameSize = DefaultSettingsMaxFrameSize // Default
+	}
+
 	if mc.cfgMaxFrameSize > 0 {
 		connAsRealConnType.maxFrameSize = mc.cfgMaxFrameSize
 	} else {
-		connAsRealConnType.maxFrameSize = DefaultMaxFrameSize // Default if not specified
-	}
-	// Ensure mc.log is also set on the actual Connection memory layout part if s.conn.log is used
-	// (it's already done by setting mc.log and then casting mc)
-
-	ourInitialWin := mc.cfgOurInitialWindowSize
-	if ourInitialWin == 0 {
-		ourInitialWin = DefaultInitialWindowSize
+		connAsRealConnType.maxFrameSize = DefaultSettingsMaxFrameSize // Default if not specified
 	}
 	peerInitialWin := mc.cfgPeerInitialWindowSize
 	if peerInitialWin == 0 {
 		peerInitialWin = DefaultInitialWindowSize
+	}
+
+	ourInitialWin := mc.cfgOurInitialWindowSize
+	if ourInitialWin == 0 {
+		ourInitialWin = DefaultInitialWindowSize
 	}
 
 	s, err := newStream(
@@ -2142,6 +2157,220 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 				t.Errorf("Stream was not in Closed state before simulating removeClosedStream call; state: %s", stream.state)
 			}
 			// newTestStream's t.Cleanup will Close stream, which will be idempotent.
+		})
+	}
+}
+
+func TestStream_SendHeaders(t *testing.T) {
+	const testStreamID = uint32(1)
+	defaultPrioWeight := uint8(16)
+	validHeaders := makeStreamWriterHeaders(":status", "200", "content-type", "text/plain")
+	invalidHpackHeaders := makeStreamWriterHeaders("", "bad-header") // Empty name to cause HPACK error
+
+	tests := []struct {
+		name                          string
+		initialState                  StreamState
+		initialResponseHeadersSent    bool
+		initialEndStreamSentToClient  bool
+		initialPendingRSTCode         *ErrorCode
+		headersToSend                 []HeaderField
+		endStreamToSend               bool
+		connErrorToSimulate           error // To simulate error from conn.sendHeadersFrame (e.g., via shutdownChan)
+		expectError                   bool
+		expectedErrorContains         string
+		expectedErrorCodeOnRST        ErrorCode // If error causes RST from stream method itself.
+		expectFrameSent               bool
+		expectedFrameEndStreamFlag    bool
+		expectedFinalState            StreamState
+		expectedResponseHeadersSent   bool
+		expectedEndStreamSentToClient bool
+	}{
+		{
+			name:                          "Success: send headers, no endStream",
+			initialState:                  StreamStateOpen,
+			headersToSend:                 validHeaders,
+			endStreamToSend:               false,
+			expectFrameSent:               true,
+			expectedFrameEndStreamFlag:    false,
+			expectedFinalState:            StreamStateOpen,
+			expectedResponseHeadersSent:   true,
+			expectedEndStreamSentToClient: false,
+		},
+		{
+			name:                          "Success: send headers, with endStream",
+			initialState:                  StreamStateOpen,
+			headersToSend:                 validHeaders,
+			endStreamToSend:               true,
+			expectFrameSent:               true,
+			expectedFrameEndStreamFlag:    true,
+			expectedFinalState:            StreamStateHalfClosedLocal,
+			expectedResponseHeadersSent:   true,
+			expectedEndStreamSentToClient: true,
+		},
+		{
+			name:                          "Error: headers already sent",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			headersToSend:                 validHeaders,
+			endStreamToSend:               false,
+			expectError:                   true,
+			expectedErrorContains:         "headers already sent",
+			expectFrameSent:               false,
+			expectedFinalState:            StreamStateOpen, // State should not change
+			expectedResponseHeadersSent:   true,            // Remains true
+			expectedEndStreamSentToClient: false,
+		},
+		{
+			name:                          "Error: stream closed",
+			initialState:                  StreamStateClosed,
+			headersToSend:                 validHeaders,
+			endStreamToSend:               false,
+			expectError:                   true,
+			expectedErrorContains:         "stream closed or being reset",
+			expectFrameSent:               false,
+			expectedFinalState:            StreamStateClosed,
+			expectedResponseHeadersSent:   false,
+			expectedEndStreamSentToClient: false,
+		},
+		{
+			name:                          "Error: stream resetting",
+			initialState:                  StreamStateOpen,
+			initialPendingRSTCode:         func() *ErrorCode { e := ErrCodeCancel; return &e }(),
+			headersToSend:                 validHeaders,
+			endStreamToSend:               false,
+			expectError:                   true,
+			expectedErrorContains:         "stream closed or being reset",
+			expectFrameSent:               false,
+			expectedFinalState:            StreamStateOpen, // State doesn't change by SendHeaders itself
+			expectedResponseHeadersSent:   false,
+			expectedEndStreamSentToClient: false,
+		},
+		{
+			name:                          "Error: half-closed (local) and END_STREAM already sent",
+			initialState:                  StreamStateHalfClosedLocal,
+			initialEndStreamSentToClient:  true, // Server already sent END_STREAM
+			headersToSend:                 validHeaders,
+			endStreamToSend:               false,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send headers on half-closed (local) stream after END_STREAM",
+			expectFrameSent:               false,
+			expectedFinalState:            StreamStateHalfClosedLocal,
+			expectedResponseHeadersSent:   false, // Should not be set to true if error occurs before send
+			expectedEndStreamSentToClient: true,  // Remains true
+		},
+		{
+			name:                          "Error: conn.sendHeadersFrame fails (HPACK encoding error)",
+			initialState:                  StreamStateOpen,
+			headersToSend:                 invalidHpackHeaders, // Triggers HPACK error in real conn.sendHeadersFrame
+			endStreamToSend:               false,
+			expectError:                   true,
+			expectedErrorContains:         "connection error: HPACK encoding error: hpack: invalid header field name: name is empty", // Error from hpack library, wrapped
+			expectFrameSent:               false,                                                                                     // Frame not successfully enqueued
+			expectedFinalState:            StreamStateOpen,
+			expectedResponseHeadersSent:   false, // Not successfully sent
+			expectedEndStreamSentToClient: false,
+		},
+		{
+			name:                          "Success: send headers from ReservedLocal, with endStream",
+			initialState:                  StreamStateReservedLocal, // Server is PUSHING
+			headersToSend:                 validHeaders,
+			endStreamToSend:               true,
+			expectFrameSent:               true,
+			expectedFrameEndStreamFlag:    true,
+			expectedFinalState:            StreamStateHalfClosedLocal,
+			expectedResponseHeadersSent:   true,
+			expectedEndStreamSentToClient: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockConnection{
+				writerChan: make(chan Frame, 1), // Buffer for one HEADERS frame or RST
+			}
+			// Configure mockConnection for specific error simulation if needed for conn.sendHeadersFrame
+			if tc.connErrorToSimulate != nil {
+				connAsReal := (*Connection)(unsafe.Pointer(mc))
+				connAsReal.connError = tc.connErrorToSimulate
+				if connAsReal.shutdownChan == nil { // Ensure shutdownChan is initializable
+					connAsReal.shutdownChan = make(chan struct{})
+				}
+				close(connAsReal.shutdownChan)
+			}
+
+			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+
+			// Setup initial stream conditions
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			stream.responseHeadersSent = tc.initialResponseHeadersSent
+			stream.endStreamSentToClient = tc.initialEndStreamSentToClient
+			if tc.initialPendingRSTCode != nil {
+				// Make a copy for the stream to own
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			}
+			stream.mu.Unlock()
+
+			err := stream.SendHeaders(tc.headersToSend, tc.endStreamToSend)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorContains != "" && !strings.Contains(err.Error(), tc.expectedErrorContains) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tc.expectedErrorContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if tc.expectFrameSent {
+				select {
+				case frame := <-mc.writerChan:
+					headersFrame, ok := frame.(*HeadersFrame)
+					if !ok {
+						t.Fatalf("Expected HeadersFrame on writerChan, got %T", frame)
+					}
+					if headersFrame.Header().StreamID != testStreamID {
+						t.Errorf("HeadersFrame StreamID mismatch: got %d, want %d", headersFrame.Header().StreamID, testStreamID)
+					}
+					if (headersFrame.Header().Flags&FlagHeadersEndStream != 0) != tc.expectedFrameEndStreamFlag {
+						t.Errorf("HeadersFrame END_STREAM flag mismatch: got %v, want %v (Flags: %08b)", (headersFrame.Header().Flags&FlagHeadersEndStream != 0), tc.expectedFrameEndStreamFlag, headersFrame.Header().Flags)
+					}
+					// Basic check on header block fragment (more detailed check if HPACK involved)
+					if len(headersFrame.HeaderBlockFragment) == 0 {
+						t.Error("HeadersFrame HeaderBlockFragment is empty")
+					}
+				case <-time.After(50 * time.Millisecond): // Increased timeout slightly
+					t.Fatal("Expected HeadersFrame on writerChan, but none found")
+				}
+			} else {
+				select {
+				case frame := <-mc.writerChan:
+					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			finalResponseHeadersSent := stream.responseHeadersSent
+			finalEndStreamSentToClient := stream.endStreamSentToClient
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedFinalState {
+				t.Errorf("Expected final stream state %s, got %s", tc.expectedFinalState, finalState)
+			}
+			if finalResponseHeadersSent != tc.expectedResponseHeadersSent {
+				t.Errorf("Expected final responseHeadersSent %v, got %v", tc.expectedResponseHeadersSent, finalResponseHeadersSent)
+			}
+			if finalEndStreamSentToClient != tc.expectedEndStreamSentToClient {
+				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedEndStreamSentToClient, finalEndStreamSentToClient)
+			}
 		})
 	}
 }
