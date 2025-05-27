@@ -1685,3 +1685,90 @@ func TestPriorityTree_UpdatePriority_CycleDetection(t *testing.T) {
 		t.Errorf("Stream 104 parent after failed cycle: expected 105, got %d", p104)
 	}
 }
+
+func TestPriorityTree_UpdatePriority_ReparentExclusive_NewParentNoChildren(t *testing.T) {
+	pt := NewPriorityTree()
+
+	newParentStreamID := uint32(1)
+	streamToReparentID := uint32(3)
+	otherRootChildID := uint32(5) // To ensure root's children list is correctly updated
+
+	newWeightForReparented := uint8(77)
+
+	// Setup:
+	// 0 -> newParentStreamID (1)
+	// 0 -> streamToReparentID (3)
+	// 0 -> otherRootChildID (5)
+	_ = pt.AddStream(newParentStreamID, nil)  // Will become parent
+	_ = pt.AddStream(streamToReparentID, nil) // Will be re-parented
+	_ = pt.AddStream(otherRootChildID, nil)   // Just another child of root
+
+	// Verify initial state for newParentStreamID (1)
+	p1Pre, c1Pre, w1Pre, _ := pt.GetDependencies(newParentStreamID)
+	if p1Pre != 0 || len(c1Pre) != 0 || w1Pre != 15 {
+		t.Fatalf("Pre-Update S1: P:%d C:%v W:%d. Expected P:0 C:[] W:15", p1Pre, c1Pre, w1Pre)
+	}
+
+	// Verify initial state for streamToReparentID (3)
+	p3Pre, c3Pre, w3Pre, _ := pt.GetDependencies(streamToReparentID)
+	if p3Pre != 0 || len(c3Pre) != 0 || w3Pre != 15 {
+		t.Fatalf("Pre-Update S3: P:%d C:%v W:%d. Expected P:0 C:[] W:15", p3Pre, c3Pre, w3Pre)
+	}
+
+	// Verify initial state for stream 0's children
+	_, rootChildrenPre, _, _ := pt.GetDependencies(0)
+	expectedRootChildrenPre := []uint32{newParentStreamID, streamToReparentID, otherRootChildID}
+	if !reflect.DeepEqual(sortUint32Slice(rootChildrenPre), sortUint32Slice(expectedRootChildrenPre)) {
+		t.Fatalf("Pre-Update Root Children: %v. Expected %v", rootChildrenPre, expectedRootChildrenPre)
+	}
+
+	// Operation: Re-parent streamToReparentID (3) to be an exclusive child of newParentStreamID (1)
+	pt.mu.Lock()
+	err := pt.UpdatePriority(streamToReparentID, newParentStreamID, newWeightForReparented, true)
+	pt.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("UpdatePriority failed: %v", err)
+	}
+
+	// --- Verifications ---
+
+	// Verify newParentStreamID (1)
+	p1Post, c1Post, w1Post, _ := pt.GetDependencies(newParentStreamID)
+	if p1Post != 0 {
+		t.Errorf("newParentStream (1) post-update: parent expected 0, got %d", p1Post)
+	}
+	if w1Post != 15 { // Weight of parent itself should be unchanged
+		t.Errorf("newParentStream (1) post-update: weight expected 15, got %d", w1Post)
+	}
+	expectedC1Post := []uint32{streamToReparentID}
+	if !reflect.DeepEqual(sortUint32Slice(c1Post), sortUint32Slice(expectedC1Post)) {
+		t.Errorf("newParentStream (1) post-update: children expected %v, got %v", expectedC1Post, c1Post)
+	}
+
+	// Verify streamToReparentID (3)
+	p3Post, c3Post, w3Post, _ := pt.GetDependencies(streamToReparentID)
+	if p3Post != newParentStreamID {
+		t.Errorf("streamToReparent (3) post-update: parent expected %d, got %d", newParentStreamID, p3Post)
+	}
+	if w3Post != newWeightForReparented {
+		t.Errorf("streamToReparent (3) post-update: weight expected %d, got %d", newWeightForReparented, w3Post)
+	}
+	if len(c3Post) != 0 { // Had no children, adopted no children
+		t.Errorf("streamToReparent (3) post-update: children expected [], got %v", c3Post)
+	}
+
+	// Verify otherRootChildID (5) is unaffected
+	p5Post, c5Post, w5Post, _ := pt.GetDependencies(otherRootChildID)
+	if p5Post != 0 || len(c5Post) != 0 || w5Post != 15 {
+		t.Errorf("otherRootChild (5) post-update: state changed. P:%d (exp 0), C:%v (exp:[]), W:%d (exp:15)", p5Post, c5Post, w5Post)
+	}
+
+	// Verify stream 0's children
+	_, rootChildrenPost, _, _ := pt.GetDependencies(0)
+	// streamToReparentID (3) is no longer a direct child of root
+	expectedRootChildrenPost := []uint32{newParentStreamID, otherRootChildID}
+	if !reflect.DeepEqual(sortUint32Slice(rootChildrenPost), sortUint32Slice(expectedRootChildrenPost)) {
+		t.Errorf("Post-Update Root Children: expected %v, got %v", expectedRootChildrenPost, rootChildrenPost)
+	}
+}
