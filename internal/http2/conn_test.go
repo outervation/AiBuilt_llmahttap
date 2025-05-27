@@ -120,63 +120,6 @@ func (m *mockNetConn) ClearWriteBuffer() {
 	m.writeBuffer.Reset()
 }
 
-// mockLogger provides a logger implementation for testing.
-type mockLogger struct {
-	mu            sync.Mutex
-	DebugMessages []string
-	InfoMessages  []string
-	WarnMessages  []string
-	ErrorMessages []string
-	AccessEntries []logger.AccessLogEntry
-}
-
-func newMockLogger() *mockLogger {
-	return &mockLogger{}
-}
-
-func (ml *mockLogger) Debug(msg string, context logger.LogFields) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-	ml.DebugMessages = append(ml.DebugMessages, msg)
-}
-
-func (ml *mockLogger) Info(msg string, context logger.LogFields) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-	ml.InfoMessages = append(ml.InfoMessages, msg)
-}
-
-func (ml *mockLogger) Warn(msg string, context logger.LogFields) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-	ml.WarnMessages = append(ml.WarnMessages, msg)
-}
-
-func (ml *mockLogger) Error(msg string, context logger.LogFields) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-	ml.ErrorMessages = append(ml.ErrorMessages, msg)
-}
-
-func (ml *mockLogger) Access(req *http.Request, streamID uint32, status int, responseBytes int64, duration time.Duration) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-	// For simplicity, not populating all fields or respecting real IP logic
-	entry := logger.AccessLogEntry{
-		Method:        req.Method,
-		URI:           req.RequestURI,
-		Status:        status,
-		ResponseBytes: responseBytes,
-		DurationMs:    duration.Nanoseconds() / 1e6,
-		H2StreamID:    streamID,
-	}
-	ml.AccessEntries = append(ml.AccessEntries, entry)
-}
-
-func (ml *mockLogger) CloseLogFiles() error { return nil }
-
-func (ml *mockLogger) ReopenLogFiles() error { return nil }
-
 // mockStreamWriter implements the StreamWriter interface for testing.
 type mockStreamWriter struct {
 	id            uint32
