@@ -54,7 +54,7 @@ func newMockResponseWriter() *mockResponseWriter {
 	}
 }
 
-func (mrw *mockResponseWriter) SendHeaders(headers []hpack.HeaderField, endStream bool) error {
+func (mrw *mockResponseWriter) SendHeaders(headers []http2.HeaderField, endStream bool) error {
 	if mrw.headersSent {
 		return errors.New("headers already sent")
 	}
@@ -86,7 +86,7 @@ func (mrw *mockResponseWriter) WriteData(p []byte, endStream bool) (n int, err e
 	return n, err
 }
 
-func (mrw *mockResponseWriter) WriteTrailers(trailers []hpack.HeaderField) error {
+func (mrw *mockResponseWriter) WriteTrailers(trailers []http2.HeaderField) error {
 	// For simplicity in this mock, assume data has been written if trailers are sent.
 	for _, hf := range trailers {
 		mrw.header.Add("Trailer-"+hf.Name, hf.Value)
@@ -500,13 +500,13 @@ type testableStream struct {
 func (ts *testableStream) ID() uint32 { return ts.streamID }
 
 // Implement http2.ResponseWriter for testableStream
-func (ts *testableStream) SendHeaders(headers []hpack.HeaderField, endStream bool) error {
+func (ts *testableStream) SendHeaders(headers []http2.HeaderField, endStream bool) error {
 	return ts.writer.SendHeaders(headers, endStream)
 }
 func (ts *testableStream) WriteData(p []byte, endStream bool) (n int, err error) {
 	return ts.writer.WriteData(p, endStream)
 }
-func (ts *testableStream) WriteTrailers(trailers []hpack.HeaderField) error {
+func (ts *testableStream) WriteTrailers(trailers []http2.HeaderField) error {
 	return ts.writer.WriteTrailers(trailers)
 }
 
