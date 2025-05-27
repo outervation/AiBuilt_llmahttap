@@ -1322,3 +1322,32 @@ func TestFlowControlWindow_Acquire_UnblockedByUpdateInitialWindowSize(t *testing
 	assert.Equal(t, int64(0), fcw.Available())
 	assert.Equal(t, newInitialSize, fcw.initialWindowSize)
 }
+
+func TestStreamFlowControlManager_ApplicationConsumedData_ThresholdOne(t *testing.T) {
+	// This test specifically checks ApplicationConsumedData when windowUpdateThreshold is 1.
+	// This occurs when ourInitialWindowSize is 1.
+	const localStreamID uint32 = 99
+	sfcm := NewStreamFlowControlManager(localStreamID, 1 /* ourInitialWindowSize */, 1000 /* peerInitialWindowSize */)
+	require.NotNil(t, sfcm)
+	assert.Equal(t, uint32(1), sfcm.windowUpdateThreshold, "Window update threshold should be 1 when ourInitialWindowSize is 1")
+
+	// Simulate data received to fill the small receive window
+	err := sfcm.DataReceived(1) // Receive 1 byte, currentReceiveWindowSize becomes 0
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), sfcm.GetStreamReceiveAvailable())
+
+	// Consume the 1 byte of data
+	increment, err := sfcm.ApplicationConsumedData(1)
+	require.NoError(t, err)
+
+	// Since threshold is 1 and 1 byte was consumed, an update should be generated.
+	assert.Equal(t, uint32(1), increment, "WINDOW_UPDATE increment should be 1")
+	assert.Equal(t, int64(1), sfcm.GetStreamReceiveAvailable(), "Receive window should be restored to 1 after consumption and update trigger")
+	assert.Equal(t, uint64(1), sfcm.bytesConsumedTotal)
+	assert.Equal(t, sfcm.bytesConsumedTotal, sfcm.lastWindowUpdateSentAt, "lastWindowUpdateSentAt should be updated")
+
+	// Consume 0 bytes, should not trigger an update
+	increment, err = sfcm.ApplicationConsumedData(0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), increment, "Consuming 0 bytes should not generate a WINDOW_UPDATE")
+}
