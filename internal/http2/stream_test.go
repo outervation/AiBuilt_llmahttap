@@ -1217,43 +1217,44 @@ func TestStream_handleRSTStreamFrame(t *testing.T) {
 				}
 
 				if tc.expectPipeClose { // This flag indicates if the test setup expects pipes to close *during this call*
+					// Check requestBodyWriter: subsequent Writes return ErrClosedPipe after CloseWithError
 					_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
 					if errWrite == nil {
 						t.Error("Expected error writing to requestBodyWriter after RST, got nil")
-					} else if !strings.Contains(errWrite.Error(), "closed pipe") {
-						t.Logf("requestBodyWriter.Write error after RST: %v (expected 'closed pipe')", errWrite)
+					} else if errWrite != io.ErrClosedPipe { // As per io.Pipe documentation for Write after CloseWithError
+						t.Errorf("requestBodyWriter.Write error: got %v (type %T), want io.ErrClosedPipe", errWrite, errWrite)
+					} else {
+						t.Logf("requestBodyWriter.Write error: %v (io.ErrClosedPipe, as expected)", errWrite)
 					}
+
+					// Check requestBodyReader: subsequent Reads return the error passed to CloseWithError
 					_, errRead := stream.requestBodyReader.Read(make([]byte, 1))
 					if errRead == nil {
 						t.Error("Expected error reading from requestBodyReader after RST, got nil")
-					} else if !strings.Contains(errRead.Error(), "closed pipe") && errRead != io.EOF {
-						// EOF is also possible if pipe was closed cleanly before read attempt.
-						t.Logf("requestBodyReader.Read error after RST: %v (expected 'closed pipe' or EOF)", errRead)
+					} else if se, ok := errRead.(*StreamError); !ok || se.Code != tc.rstErrorCode {
+						// If the stream was closed due to an RST (tc.rstErrorCode), requestBodyWriter.CloseWithError(NewStreamError(...)) is called.
+						// The reader should then see this StreamError.
+						t.Errorf("requestBodyReader.Read error: got %v (type %T), want *StreamError with code %s", errRead, errRead, tc.rstErrorCode)
+					} else {
+						t.Logf("requestBodyReader.Read error: %v (*StreamError with code %s, as expected)", errRead, tc.rstErrorCode)
 					}
-				} else if tc.initialStreamState == StreamStateClosed { // If was already closed, pipes should already be unusable.
+				} else if tc.initialStreamState == StreamStateClosed { // If was already closed, pipes should already be unusable by test setup's generic close.
+					// Test setup does: _ = stream.requestBodyWriter.Close(); _ = stream.requestBodyReader.Close() for initialStreamState == StreamStateClosed
+					// This generic close results in io.ErrClosedPipe for writer and io.EOF or io.ErrClosedPipe for reader.
 					_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
 					if errWrite == nil {
-						t.Error("requestBodyWriter was not already closed for initial Closed state")
+						t.Error("requestBodyWriter.Write: Expected error for already closed stream, got nil")
+					} else if errWrite != io.ErrClosedPipe {
+						t.Errorf("requestBodyWriter.Write error for already closed stream: got %v, want io.ErrClosedPipe", errWrite)
 					}
+
 					_, errRead := stream.requestBodyReader.Read(make([]byte, 1))
 					if errRead == nil {
-						tError(t, "requestBodyReader was not already closed for initial Closed state")
+						t.Error("requestBodyReader.Read: Expected error for already closed stream, got nil")
+					} else if errRead != io.EOF && errRead != io.ErrClosedPipe { // After a simple .Close(), reader gets EOF. If .CloseWithError(io.ErrClosedPipe) then that.
+						t.Errorf("requestBodyReader.Read error for already closed stream: got %v, want io.EOF or io.ErrClosedPipe", errRead)
 					}
 				}
-			}
-
-			if tc.expectPipeClose {
-				// Check pipe writer (handler cannot write anymore)
-				_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
-				if errWrite == nil {
-					t.Error("Expected error writing to requestBodyWriter after RST, got nil")
-				}
-				// Check pipe reader (handler cannot read anymore)
-				_, errRead := stream.requestBodyReader.Read(make([]byte, 1))
-				if errRead == nil {
-					t.Error("Expected error reading from requestBodyReader after RST, got nil")
-				}
-			} else if tc.initialStreamState == StreamStateClosed { // Pipes should already be closed
 				_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
 				if errWrite == nil {
 					t.Error("requestBodyWriter was not already closed for initial Closed state")
@@ -1311,3 +1312,98 @@ func TestStream_transitionStateOnSendEndStream(t *testing.T) {
 
 // stdio is used to make the test compatible with Go 1.22's io.EOF changes.
 // For older Go versions, "io" should be used directly.
+
+func TestHeaderFieldConversionHelpers(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputHeaders   []HeaderField // http2.HeaderField
+		expectHpackNil bool
+		expectedHpack  []hpack.HeaderField
+	}{
+		{
+			name:           "nil input",
+			inputHeaders:   nil,
+			expectHpackNil: true,
+			expectedHpack:  nil,
+		},
+		{
+			name:         "empty input",
+			inputHeaders: []HeaderField{},
+			// expectHpackNil: false, // an empty slice is not nil
+			expectedHpack: []hpack.HeaderField{},
+		},
+		{
+			name: "single header",
+			inputHeaders: []HeaderField{
+				{Name: "Content-Type", Value: "application/json"},
+			},
+			expectedHpack: []hpack.HeaderField{
+				{Name: "Content-Type", Value: "application/json"},
+			},
+		},
+		{
+			name: "multiple headers",
+			inputHeaders: []HeaderField{
+				{Name: "Content-Type", Value: "application/json"},
+				{Name: "X-Custom-Header", Value: "value123"},
+				{Name: ":status", Value: "200"},
+			},
+			expectedHpack: []hpack.HeaderField{
+				{Name: "Content-Type", Value: "application/json"},
+				{Name: "X-Custom-Header", Value: "value123"},
+				{Name: ":status", Value: "200"},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name+"_http2HeaderFieldsToHpackHeaderFields", func(t *testing.T) {
+			result := http2HeaderFieldsToHpackHeaderFields(tc.inputHeaders)
+			if tc.expectHpackNil {
+				if result != nil {
+					t.Errorf("Expected nil result, got %v", result)
+				}
+			} else {
+				if result == nil && tc.expectedHpack != nil { // if expected is nil and result is nil, that's fine.
+					t.Fatalf("Expected non-nil result, got nil. Expected: %v", tc.expectedHpack)
+				}
+				if len(result) != len(tc.expectedHpack) {
+					t.Fatalf("Length mismatch. Got %d, want %d. Result: %v, Expected: %v", len(result), len(tc.expectedHpack), result, tc.expectedHpack)
+				}
+				for i := range result {
+					if result[i].Name != tc.expectedHpack[i].Name || result[i].Value != tc.expectedHpack[i].Value {
+						t.Errorf("Header mismatch at index %d. Got %v, want %v", i, result[i], tc.expectedHpack[i])
+					}
+					// Sensitive field is not set by this conversion, so it should be default (false)
+					if result[i].Sensitive {
+						t.Errorf("Header at index %d has Sensitive=true, expected false. Got %v", i, result[i])
+					}
+				}
+			}
+		})
+
+		t.Run(tc.name+"_http2ToHpackHeaders", func(t *testing.T) {
+			result := http2ToHpackHeaders(tc.inputHeaders)
+			if tc.expectHpackNil {
+				if result != nil {
+					t.Errorf("Expected nil result, got %v", result)
+				}
+			} else {
+				if result == nil && tc.expectedHpack != nil {
+					t.Fatalf("Expected non-nil result, got nil. Expected: %v", tc.expectedHpack)
+				}
+				if len(result) != len(tc.expectedHpack) {
+					t.Fatalf("Length mismatch. Got %d, want %d. Result: %v, Expected: %v", len(result), len(tc.expectedHpack), result, tc.expectedHpack)
+				}
+				for i := range result {
+					if result[i].Name != tc.expectedHpack[i].Name || result[i].Value != tc.expectedHpack[i].Value {
+						t.Errorf("Header mismatch at index %d. Got %v, want %v", i, result[i], tc.expectedHpack[i])
+					}
+					if result[i].Sensitive {
+						t.Errorf("Header at index %d has Sensitive=true, expected false. Got %v", i, result[i])
+					}
+				}
+			}
+		})
+	}
+}
