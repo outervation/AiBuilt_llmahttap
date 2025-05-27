@@ -128,6 +128,85 @@ func TestPriorityTree_AddStream_SpecificPriority(t *testing.T) {
 	}
 }
 
+func TestPriorityTree_AddStream_ExclusivePriority(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Setup:
+	// Stream 1 (parent for new exclusive stream)
+	// Stream 1 will have children 2 and 3.
+	// New stream 4 will be added as exclusive child of 1.
+	_ = pt.AddStream(1, nil)                                                                      // Parent stream, child of 0
+	_ = pt.AddStream(2, &streamDependencyInfo{StreamDependency: 1, Weight: 10, Exclusive: false}) // Child of 1
+	_ = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 1, Weight: 20, Exclusive: false}) // Child of 1
+
+	// Verify initial state for stream 1
+	_, s1InitialChildren, _, _ := pt.GetDependencies(1)
+	if !reflect.DeepEqual(sortUint32Slice(s1InitialChildren), []uint32{2, 3}) {
+		t.Fatalf("Pre-condition: Stream 1 initial children expected [2,3], got %v", s1InitialChildren)
+	}
+
+	streamID_X := uint32(4)
+	prioInfo_X := &streamDependencyInfo{
+		StreamDependency: 1,  // Parent is stream 1
+		Weight:           50, // Weight for stream 4
+		Exclusive:        true,
+	}
+
+	err := pt.AddStream(streamID_X, prioInfo_X)
+	if err != nil {
+		t.Fatalf("AddStream for exclusive stream %d failed: %v", streamID_X, err)
+	}
+
+	// Verify stream X (4)
+	sX_parent, sX_children, sX_weight, errGetX := pt.GetDependencies(streamID_X)
+	if errGetX != nil {
+		t.Fatalf("GetDependencies for stream %d (X) failed: %v", streamID_X, errGetX)
+	}
+	if sX_parent != prioInfo_X.StreamDependency { // Parent should be 1
+		t.Errorf("Stream %d (X): expected parent %d, got %d", streamID_X, prioInfo_X.StreamDependency, sX_parent)
+	}
+	if sX_weight != prioInfo_X.Weight {
+		t.Errorf("Stream %d (X): expected weight %d, got %d", streamID_X, prioInfo_X.Weight, sX_weight)
+	}
+	// Children of X should be the former children of stream 1 (i.e., 2 and 3)
+	expected_sX_children := []uint32{2, 3}
+	if !reflect.DeepEqual(sortUint32Slice(sX_children), sortUint32Slice(expected_sX_children)) {
+		t.Errorf("Stream %d (X): expected children %v, got %v", streamID_X, expected_sX_children, sX_children)
+	}
+
+	// Verify stream P (1 - parent of X)
+	sP_parent, sP_children, _, errGetP := pt.GetDependencies(prioInfo_X.StreamDependency)
+	if errGetP != nil {
+		t.Fatalf("GetDependencies for stream %d (P) failed: %v", prioInfo_X.StreamDependency, errGetP)
+	}
+	if sP_parent != 0 { // Stream 1's parent is 0
+		t.Errorf("Stream %d (P): expected parent 0, got %d", prioInfo_X.StreamDependency, sP_parent)
+	}
+	// Stream X (4) should be the sole child of P (1)
+	expected_sP_children := []uint32{streamID_X}
+	if !reflect.DeepEqual(sortUint32Slice(sP_children), sortUint32Slice(expected_sP_children)) {
+		t.Errorf("Stream %d (P): expected children %v, got %v", prioInfo_X.StreamDependency, expected_sP_children, sP_children)
+	}
+
+	// Verify stream C1 (2 - former child of P, now child of X)
+	sC1_parent, _, sC1_weight, _ := pt.GetDependencies(2)
+	if sC1_parent != streamID_X {
+		t.Errorf("Stream 2 (C1): expected parent %d (X), got %d", streamID_X, sC1_parent)
+	}
+	if sC1_weight != 10 { // Weight should be preserved
+		t.Errorf("Stream 2 (C1): expected weight 10, got %d", sC1_weight)
+	}
+
+	// Verify stream C2 (3 - former child of P, now child of X)
+	sC2_parent, _, sC2_weight, _ := pt.GetDependencies(3)
+	if sC2_parent != streamID_X {
+		t.Errorf("Stream 3 (C2): expected parent %d (X), got %d", streamID_X, sC2_parent)
+	}
+	if sC2_weight != 20 { // Weight should be preserved
+		t.Errorf("Stream 3 (C2): expected weight 20, got %d", sC2_weight)
+	}
+}
+
 func TestPriorityTree_AddStream_SelfDependencyError(t *testing.T) {
 	pt := NewPriorityTree()
 	streamID := uint32(3)
