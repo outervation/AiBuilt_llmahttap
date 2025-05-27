@@ -965,3 +965,48 @@ func ExamplePriorityTree() {
 	//     Stream 9 (Weight: 51)
 	//   Stream 11 (Weight: 11)
 }
+
+func TestPriorityTree_GetDependencies_NodeWithParentNoChildren(t *testing.T) {
+	pt := NewPriorityTree()
+
+	parentStreamID := uint32(1)
+	targetStreamID := uint32(2)
+	targetWeight := uint8(88)
+
+	// Add parent stream (0 -> 1)
+	// Use AddStream to ensure parent node is correctly initialized and added to tree.
+	err := pt.AddStream(parentStreamID, nil)
+	if err != nil {
+		t.Fatalf("Failed to add parentStreamID %d: %v", parentStreamID, err)
+	}
+
+	// Add target stream (1 -> 2) with specific weight
+	// This stream will be the leaf node we are testing.
+	prioInfo := &streamDependencyInfo{
+		StreamDependency: parentStreamID,
+		Weight:           targetWeight,
+		Exclusive:        false,
+	}
+	err = pt.AddStream(targetStreamID, prioInfo)
+	if err != nil {
+		t.Fatalf("Failed to add targetStreamID %d: %v", targetStreamID, err)
+	}
+
+	// Test GetDependencies for targetStreamID (2), which is a leaf node.
+	pID, children, w, errGet := pt.GetDependencies(targetStreamID)
+	if errGet != nil {
+		t.Fatalf("GetDependencies for targetStreamID %d failed: %v", targetStreamID, errGet)
+	}
+
+	if pID != parentStreamID {
+		t.Errorf("targetStreamID %d: expected parent %d, got %d", targetStreamID, parentStreamID, pID)
+	}
+
+	if w != targetWeight {
+		t.Errorf("targetStreamID %d: expected weight %d, got %d", targetStreamID, targetWeight, w)
+	}
+
+	if len(children) != 0 {
+		t.Errorf("targetStreamID %d: expected no children (it's a leaf node), got %v (len %d)", targetStreamID, children, len(children))
+	}
+}
