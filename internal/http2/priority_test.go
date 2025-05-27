@@ -834,6 +834,45 @@ func TestPriorityTree_GetDependencies_Stream0(t *testing.T) {
 	}
 }
 
+func TestPriorityTree_GetDependencies_ComplexNode(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Setup:
+	// 0 -> 1 (parentStream)
+	//      -> 2 (targetStream, w:77)
+	//         -> 3 (childOfTarget1)
+	//         -> 4 (childOfTarget2)
+	parentStreamID := uint32(1)
+	targetStreamID := uint32(2)
+	childOfTarget1ID := uint32(3)
+	childOfTarget2ID := uint32(4)
+	targetWeight := uint8(77)
+
+	_ = pt.AddStream(parentStreamID, nil)                                                                                             // 0 -> 1
+	_ = pt.AddStream(targetStreamID, &streamDependencyInfo{StreamDependency: parentStreamID, Weight: targetWeight, Exclusive: false}) // 1 -> 2
+	_ = pt.AddStream(childOfTarget1ID, &streamDependencyInfo{StreamDependency: targetStreamID, Weight: 10, Exclusive: false})         // 2 -> 3
+	_ = pt.AddStream(childOfTarget2ID, &streamDependencyInfo{StreamDependency: targetStreamID, Weight: 20, Exclusive: false})         // 2 -> 4
+
+	// Test GetDependencies for targetStreamID (2)
+	pID, children, w, err := pt.GetDependencies(targetStreamID)
+	if err != nil {
+		t.Fatalf("GetDependencies for targetStreamID %d failed: %v", targetStreamID, err)
+	}
+
+	if pID != parentStreamID {
+		t.Errorf("targetStreamID %d: expected parent %d, got %d", targetStreamID, parentStreamID, pID)
+	}
+
+	if w != targetWeight {
+		t.Errorf("targetStreamID %d: expected weight %d, got %d", targetStreamID, targetWeight, w)
+	}
+
+	expectedChildren := []uint32{childOfTarget1ID, childOfTarget2ID}
+	if !reflect.DeepEqual(sortUint32Slice(children), sortUint32Slice(expectedChildren)) {
+		t.Errorf("targetStreamID %d: expected children %v, got %v", targetStreamID, expectedChildren, children)
+	}
+}
+
 func TestPriorityTree_getOrCreateNodeNoLock(t *testing.T) {
 	pt := NewPriorityTree() // Has stream 0
 
