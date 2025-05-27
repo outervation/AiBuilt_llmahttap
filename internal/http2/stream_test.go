@@ -1989,3 +1989,125 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 		})
 	}
 }
+
+func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
+	const testStreamID = uint32(10)
+	defaultPrioWeight := uint8(16)
+
+	tests := []struct {
+		name                   string
+		initialPendingRSTCode  *ErrorCode
+		expectedPipeReadError  error     // Expected error type or specific error from requestBodyReader.Read
+		expectedFcAcquireError ErrorCode // Expected error code from fcManager.sendWindow.Acquire
+	}{
+		{
+			name:                   "pendingRSTCode is nil",
+			initialPendingRSTCode:  nil,
+			expectedPipeReadError:  io.EOF,              // As per closeStreamResourcesProtected logic for nil pendingRSTCode
+			expectedFcAcquireError: ErrCodeStreamClosed, // As per closeStreamResourcesProtected logic
+		},
+		{
+			name:                   "pendingRSTCode is non-nil",
+			initialPendingRSTCode:  func() *ErrorCode { e := ErrCodeProtocolError; return &e }(),
+			expectedPipeReadError:  NewStreamError(testStreamID, ErrCodeProtocolError, "stream reset"), // Error should match this
+			expectedFcAcquireError: ErrCodeProtocolError,                                               // Error should match this
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockConnection{
+				writerChan: make(chan Frame, 1), // For teardown stream.Close()
+			}
+			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+
+			// Setup: Initial state and pendingRSTCode
+			stream.mu.Lock()
+			stream.state = StreamStateOpen // Start from an open state
+			if tc.initialPendingRSTCode != nil {
+				// Create a distinct copy for the stream to own if it's a pointer type
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			} else {
+				stream.pendingRSTCode = nil
+			}
+			stream.mu.Unlock()
+
+			// Action: Call _setState(StreamStateClosed)
+			stream.mu.Lock()
+			stream._setState(StreamStateClosed)
+			stream.mu.Unlock()
+
+			// Verification:
+			// 1. Final Stream State
+			stream.mu.RLock()
+			finalState := stream.state
+			finalPendingRSTCode := stream.pendingRSTCode
+			stream.mu.RUnlock()
+
+			if finalState != StreamStateClosed {
+				t.Errorf("Expected stream state Closed, got %s", finalState)
+			}
+			if finalPendingRSTCode != nil {
+				t.Errorf("Expected stream.pendingRSTCode to be nil after _setState(Closed), got %v", *finalPendingRSTCode)
+			}
+
+			// 2. Context Cancellation
+			select {
+			case <-stream.ctx.Done():
+				if stream.ctx.Err() != context.Canceled {
+					t.Errorf("Expected context error context.Canceled, got %v", stream.ctx.Err())
+				}
+			default:
+				t.Error("Expected stream context to be canceled")
+			}
+
+			// 3. Pipe Closures
+			_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
+			if errWrite == nil {
+				t.Error("Expected error writing to requestBodyWriter after _setState(Closed), got nil")
+			} else if errWrite != io.ErrClosedPipe {
+				// This is the specific error io.Pipe returns for Write after CloseWithError.
+				t.Errorf("requestBodyWriter.Write error: got %v (type %T), want io.ErrClosedPipe", errWrite, errWrite)
+			}
+
+			_, errRead := stream.requestBodyReader.Read(make([]byte, 1))
+			if errRead == nil {
+				t.Errorf("Expected error reading from requestBodyReader after _setState(Closed), got nil")
+			} else {
+				if tc.expectedPipeReadError == io.EOF {
+					if errRead != io.EOF {
+						// Sometimes pipe might wrap EOF, e.g. *os.PathError{Err:io.EOF}. For io.Pipe, it's typically direct io.EOF.
+						// Or if the error from CloseWithError was io.EOF.
+						t.Errorf("requestBodyReader.Read error: got %v (type %T), want io.EOF", errRead, errRead)
+					}
+				} else if expectedStreamErr, ok := tc.expectedPipeReadError.(*StreamError); ok {
+					actualStreamErr, okActual := errRead.(*StreamError)
+					if !okActual {
+						t.Errorf("requestBodyReader.Read error: got %v (type %T), want *StreamError", errRead, errRead)
+					} else if actualStreamErr.Code != expectedStreamErr.Code || actualStreamErr.StreamID != expectedStreamErr.StreamID {
+						// Msg might slightly differ due to "stream reset" vs "stream reset affecting flow control"
+						t.Errorf("requestBodyReader.Read *StreamError mismatch: got Code=%s, ID=%d; want Code=%s, ID=%d",
+							actualStreamErr.Code, actualStreamErr.StreamID, expectedStreamErr.Code, expectedStreamErr.StreamID)
+					}
+				} else {
+					t.Errorf("requestBodyReader.Read error: got %v, but expectedPipeReadError type %T not handled in test validation", errRead, tc.expectedPipeReadError)
+				}
+			}
+
+			// 4. Flow Control Manager Closure
+			errFcAcquire := stream.fcManager.sendWindow.Acquire(1)
+			if errFcAcquire == nil {
+				t.Error("Expected error acquiring from flow control sendWindow after _setState(Closed), got nil")
+			} else {
+				streamErr, ok := errFcAcquire.(*StreamError)
+				if !ok {
+					t.Errorf("Flow control acquire error was not *StreamError, got %T: %v", errFcAcquire, errFcAcquire)
+				} else if streamErr.Code != tc.expectedFcAcquireError {
+					t.Errorf("Flow control acquire *StreamError code mismatch: got %s, want %s", streamErr.Code, tc.expectedFcAcquireError)
+				}
+			}
+			// newTestStream's t.Cleanup will Close stream, which will be idempotent.
+		})
+	}
+}
