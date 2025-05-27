@@ -1223,3 +1223,52 @@ func TestFlowControlWindow_Acquire_MultipleWaiters_Increase(t *testing.T) {
 	// Initial was 0. Increased by 15. Then 15 acquired.
 	assert.Equal(t, int64(0), fcw.Available(), "Window should be fully consumed")
 }
+
+func TestFlowControlWindow_Acquire_MultipleWaiters_Close(t *testing.T) {
+	fcw := NewFlowControlWindow(10, false, testStreamID) // Initial capacity 10
+	err := fcw.Acquire(10)                               // Exhaust initial capacity
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fcw.Available())
+
+	numWaiters := 3
+	acquireAmount := uint32(5)
+	var wg sync.WaitGroup
+	wg.Add(numWaiters)
+
+	errs := make(chan error, numWaiters)
+	closeError := fmt.Errorf("test close error for multiple waiters")
+
+	for i := 0; i < numWaiters; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			t.Logf("Goroutine %d attempting to acquire %d bytes, expecting error on close", idx, acquireAmount)
+			err := fcw.Acquire(acquireAmount)
+			if err != nil {
+				t.Logf("Goroutine %d acquire error: %v", idx, err)
+			} else {
+				t.Logf("Goroutine %d acquired %d bytes successfully (unexpected)", idx, acquireAmount)
+			}
+			errs <- err
+		}(i)
+	}
+
+	// Give goroutines a chance to block
+	time.Sleep(100 * time.Millisecond)
+
+	t.Logf("Main: Closing window with error: %v", closeError)
+	fcw.Close(closeError)
+	t.Logf("Main: Window closed. Available: %d", fcw.Available())
+
+	wg.Wait() // Wait for all goroutines to complete
+	close(errs)
+
+	for i := 0; i < numWaiters; i++ {
+		err := <-errs
+		require.Error(t, err, "Goroutine %d should have received an error", i)
+		assert.Equal(t, closeError, err, "Goroutine %d received incorrect error", i)
+	}
+
+	assert.Equal(t, int64(0), fcw.Available(), "Window should remain at 0 after close")
+	assert.True(t, fcw.closed, "Window should be marked as closed")
+	assert.Equal(t, closeError, fcw.err, "Window error should be set to the closeError")
+}
