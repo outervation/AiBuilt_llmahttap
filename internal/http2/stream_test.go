@@ -1406,4 +1406,230 @@ func TestHeaderFieldConversionHelpers(t *testing.T) {
 			}
 		})
 	}
+
+}
+
+func TestNewStream_SuccessfulInitialization(t *testing.T) {
+	const testStreamID = uint32(7)
+	const ourInitialWindowSize = uint32(12345)
+	const peerInitialWindowSize = uint32(54321)
+	const prioWeight = uint8(100)
+	const prioParentID = uint32(0) // Root
+	const prioExclusive = false
+	const isInitiatedByPeer = true
+
+	mc := &mockConnection{
+		cfgOurInitialWindowSize:  ourInitialWindowSize,
+		cfgPeerInitialWindowSize: peerInitialWindowSize,
+		writerChan:               make(chan Frame, 1), // For teardown stream.Close()
+	}
+
+	stream := newTestStream(t, testStreamID, mc, prioWeight, prioParentID, prioExclusive, isInitiatedByPeer)
+
+	if stream == nil {
+		t.Fatal("newTestStream returned nil stream for successful initialization case")
+	}
+
+	// Verify ID
+	if stream.id != testStreamID {
+		t.Errorf("stream.id = %d, want %d", stream.id, testStreamID)
+	}
+
+	// Verify initial state
+	stream.mu.RLock()
+	initialState := stream.state
+	stream.mu.RUnlock()
+	if initialState != StreamStateIdle {
+		t.Errorf("stream.state = %s, want %s", initialState, StreamStateIdle)
+	}
+
+	// Verify connection
+	if stream.conn != (*Connection)(unsafe.Pointer(mc)) {
+		t.Error("stream.conn does not point to the mock connection")
+	}
+
+	// Verify Flow Control Manager
+	if stream.fcManager == nil {
+		t.Fatal("stream.fcManager is nil")
+	}
+	if stream.fcManager.streamID != testStreamID {
+		t.Errorf("stream.fcManager.streamID = %d, want %d", stream.fcManager.streamID, testStreamID)
+	}
+	// Check initial send window (based on peer's initial window size)
+	if sendAvail := stream.fcManager.GetStreamSendAvailable(); sendAvail != int64(peerInitialWindowSize) {
+		t.Errorf("stream.fcManager send window available = %d, want %d", sendAvail, peerInitialWindowSize)
+	}
+	// Check initial receive window (based on our initial window size)
+	if recvAvail := stream.fcManager.GetStreamReceiveAvailable(); recvAvail != int64(ourInitialWindowSize) {
+		t.Errorf("stream.fcManager receive window available = %d, want %d", recvAvail, ourInitialWindowSize)
+	}
+
+	// Verify Priority settings on stream
+	if stream.priorityWeight != prioWeight {
+		t.Errorf("stream.priorityWeight = %d, want %d", stream.priorityWeight, prioWeight)
+	}
+	if stream.priorityParentID != prioParentID {
+		t.Errorf("stream.priorityParentID = %d, want %d", stream.priorityParentID, prioParentID)
+	}
+	if stream.priorityExclusive != prioExclusive {
+		t.Errorf("stream.priorityExclusive = %v, want %v", stream.priorityExclusive, prioExclusive)
+	}
+
+	// Verify Priority Registration in Tree
+	// mc.priorityTree is a real PriorityTree.
+	parent, children, weight, err := mc.priorityTree.GetDependencies(testStreamID)
+	if err != nil {
+		t.Fatalf("mc.priorityTree.GetDependencies(%d) failed: %v", testStreamID, err)
+	}
+	if parent != prioParentID {
+		t.Errorf("PriorityTree parent for stream %d = %d, want %d", testStreamID, parent, prioParentID)
+	}
+	if weight != prioWeight {
+		t.Errorf("PriorityTree weight for stream %d = %d, want %d", testStreamID, weight, prioWeight)
+	}
+	// Note: Exclusive flag is part of the operation, not persistently stored on node in this simple model.
+	// Children will be empty initially.
+	if len(children) != 0 {
+		t.Errorf("PriorityTree children for stream %d = %v, want empty", testStreamID, children)
+	}
+
+	// Verify Request Body Pipes
+	if stream.requestBodyReader == nil {
+		t.Error("stream.requestBodyReader is nil")
+	}
+	if stream.requestBodyWriter == nil {
+		t.Error("stream.requestBodyWriter is nil")
+	}
+	// Test pipe connectivity
+	go func() {
+		_, err := stream.requestBodyWriter.Write([]byte("ping"))
+		if err != nil {
+			// This can happen if the stream is closed by the test cleanup before write completes.
+			// Check if error is due to closed pipe.
+			if err != io.ErrClosedPipe && !strings.Contains(err.Error(), "closed pipe") {
+				// Use t.Logf for errors in goroutines to avoid direct t.Errorf/Fatalf
+				t.Logf("Error writing to requestBodyWriter in test goroutine: %v", err)
+			}
+		}
+		stream.requestBodyWriter.Close()
+	}()
+	buf := make([]byte, 4)
+	n, err := stream.requestBodyReader.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Errorf("Error reading from requestBodyReader: %v", err)
+	}
+	if n != 4 || string(buf) != "ping" {
+		t.Errorf("Read from pipe: got %q (n=%d), want %q (n=4)", string(buf[:n]), n, "ping")
+	}
+
+	// Verify Context
+	if stream.ctx == nil {
+		t.Fatal("stream.ctx is nil")
+	}
+	if stream.cancelCtx == nil {
+		t.Fatal("stream.cancelCtx is nil")
+	}
+	select {
+	case <-stream.ctx.Done():
+		t.Error("stream.ctx was initially done")
+	default: // Expected
+	}
+
+	// Verify initiatedByPeer
+	if stream.initiatedByPeer != isInitiatedByPeer {
+		t.Errorf("stream.initiatedByPeer = %v, want %v", stream.initiatedByPeer, isInitiatedByPeer)
+	}
+
+	// Verify responseHeadersSent
+	if stream.responseHeadersSent {
+		t.Error("stream.responseHeadersSent was initially true, want false")
+	}
+}
+
+func TestNewStream_PriorityAddFailure(t *testing.T) {
+	const testStreamID = uint32(8) // Use a different ID
+	const ourInitialWindowSize = DefaultInitialWindowSize
+	const peerInitialWindowSize = DefaultInitialWindowSize
+
+	// This setup will cause PriorityTree.AddStream to fail because streamID == prioParentID
+	mc := &mockConnection{
+		cfgOurInitialWindowSize:  ourInitialWindowSize,
+		cfgPeerInitialWindowSize: peerInitialWindowSize,
+		// writerChan is not strictly needed here as newStream should fail before frames are sent
+		// but newTestStream's cleanup might try to use it if stream was non-nil.
+		// We will call newStream directly for this test.
+	}
+	// Initialize necessary fields in mc that newStream might access
+	if mc.ctx == nil {
+		mc.ctx, mc.cancelCtx = context.WithCancel(context.Background())
+		defer mc.cancelCtx() // Ensure root context for mock is cancelled
+	}
+	if mc.log == nil {
+		logTarget := os.DevNull
+		enabled := false
+		logCfg := &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: &config.AccessLogConfig{Enabled: &enabled, Target: &logTarget},
+			ErrorLog:  &config.ErrorLogConfig{Target: &logTarget},
+		}
+		var err error
+		mc.log, err = logger.NewLogger(logCfg)
+		if err != nil {
+			t.Fatalf("Failed to create logger for mock connection: %v", err)
+		}
+	}
+	if mc.priorityTree == nil {
+		mc.priorityTree = NewPriorityTree()
+	}
+
+	// Call newStream directly to test its error path
+	// Trigger error: stream depends on itself (streamID == prioParentID)
+	stream, err := newStream(
+		(*Connection)(unsafe.Pointer(mc)),
+		testStreamID,
+		ourInitialWindowSize,
+		peerInitialWindowSize,
+		16,           // prioWeight
+		testStreamID, // prioParentID - causes failure
+		false,        // prioExclusive
+		true,         // isInitiatedByPeer
+	)
+
+	if err == nil {
+		t.Fatal("newStream was expected to fail due to priority registration error, but succeeded")
+	}
+	if stream != nil {
+		t.Error("newStream returned a non-nil stream on failure")
+		// Attempt to clean up if stream was unexpectedly returned
+		// Ensure stream is not nil before trying to Close it
+		if stream != nil {
+			_ = stream.Close(fmt.Errorf("cleanup unexpected stream from failed newStream call"))
+		}
+	}
+
+	// Check the error message (optional, but good for confirming reason)
+	// The error comes from PriorityTree: "stream cannot depend on itself"
+	expectedErrSubstrings := []string{
+		"stream cannot depend on itself",                               // Original error from priority.go
+		"invalid stream dependency: stream 8",                          // Part of the more specific error
+		"stream error on stream 8",                                     // Error from stream.go wrapper
+		fmt.Sprintf("stream %d cannot depend on itself", testStreamID), // More generic check from priority
+	}
+	found := false
+	for _, sub := range expectedErrSubstrings {
+		if strings.Contains(err.Error(), sub) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("newStream error message = %q, did not contain any of the expected substrings: %v", err.Error(), expectedErrSubstrings)
+	}
+
+	// In newStream's error path, it calls cancel() for its context and closes pipes.
+	// We can't directly check the stream's internal context/pipes as stream is nil.
+	// This test primarily verifies that newStream *returns* an error and *doesn't* return a stream.
+	// The internal cleanup within newStream's error path is assumed to be tested by virtue of it being there.
+	// If we wanted to verify the pipes were closed, we'd need newStream to return them even on error,
+	// or have a more complex mock setup.
 }
