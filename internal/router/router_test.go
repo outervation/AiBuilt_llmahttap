@@ -438,38 +438,11 @@ func TestRouter_ServeHTTP(t *testing.T) {
 			// However, router.ServeHTTP will likely panic if s.ID() is called on a nil stream,
 			// or if server.WriteErrorResponse is called with a nil stream.
 			// The mock handler will also panic if it receives a nil stream.
-			t.Log("Skipping direct call to r.ServeHTTP due to http2.Stream mocking complexity. Test focuses on route lookup and error status codes if handler creation fails.")
-
-			// We can test the paths that lead to error responses based on FindRoute's outcome
-			// without actually invoking the full ServeHTTP with a stream if the stream itself is the problem.
-
-			// Let's simulate what ServeHTTP does based on FindRoute outcomes.
-			requestPath := req.URL.Path
-			matchedInfo, err := r.FindRoute(requestPath)
-
-			if err != nil { // Handler creation error
-				// Simulate server.WriteErrorResponse behavior
-				mockRW.status = http.StatusInternalServerError
-				// Here we can't easily get the body that WriteErrorResponse would produce without calling it.
-				// For this test, we're primarily checking the status.
-			} else if matchedInfo == nil { // No route
-				mockRW.status = http.StatusNotFound
-			} else { // Route found
-				// To truly test this path, the handler would be called.
-				// Our mock handler is simple. Let's assume if we got here, it's a 200.
-				// This part is tricky without a working stream.
-				// The original test called the handler. We can't call it with a nil stream.
-				// If the test expects the handler to be called, this simplified check is not enough.
-				// For "found and served" case:
-				if tt.expectedStatus == http.StatusOK {
-					// Manually set what the handler would do for the purpose of this test condition
-					mockRW.status = http.StatusOK
-					handlerServedPath = tt.expectHandlerCalledWithPath
-				}
+			testStream := &testableStream{
+				writer:   mockRW,
+				streamID: 1, // Using a fixed stream ID for simplicity in test
 			}
-
-			// Original call that fails compilation:
-			// r.ServeHTTP(testStream, req)
+			r.ServeHTTP(testStream, req)
 
 			if mockRW.status != tt.expectedStatus {
 				t.Errorf("ServeHTTP path %s: expected status %d, got %d (body: %s)", tt.path, tt.expectedStatus, mockRW.status, mockRW.body.String())
