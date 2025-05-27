@@ -93,7 +93,7 @@ type mockConnection struct {
 	// Fields before this point sum to 192 bytes.
 	// Connection.writerChan is at offset 208.
 	// Padding needed: (208 - 192) / 8 = 2 uintptrs.
-	_padd_to_writerChan [19]uintptr // CORRECTED PADDING (152 bytes to reach offset 352 for writerChan)
+	_padd_to_writerChan [18]uintptr // CORRECTED PADDING (144 bytes to reach offset 344 for writerChan)
 
 	// writerChan chan Frame (chan pointer = 1 word)
 	// This field should now be at offset 208.
