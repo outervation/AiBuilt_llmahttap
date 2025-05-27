@@ -772,3 +772,398 @@ func TestStreamFlowControlManager_Getters(t *testing.T) {
 	require.NoError(t, sfcm.DataReceived(200))
 	assert.Equal(t, int64(testOurInitialWindowSize-200), sfcm.GetStreamReceiveAvailable())
 }
+
+// --- FlowControlWindow Tests ---
+
+func TestNewFlowControlWindow(t *testing.T) {
+	t.Run("Connection window", func(t *testing.T) {
+		fcw := NewFlowControlWindow(DefaultInitialWindowSize, true, 0)
+		require.NotNil(t, fcw)
+		assert.Equal(t, int64(DefaultInitialWindowSize), fcw.available)
+		assert.Equal(t, DefaultInitialWindowSize, fcw.initialWindowSize)
+		assert.True(t, fcw.isConnection)
+		assert.Equal(t, uint32(0), fcw.streamID)
+		assert.False(t, fcw.closed)
+		assert.NoError(t, fcw.err)
+	})
+
+	t.Run("Stream window", func(t *testing.T) {
+		fcw := NewFlowControlWindow(testPeerInitialWindowSize, false, testStreamID)
+		require.NotNil(t, fcw)
+		assert.Equal(t, int64(testPeerInitialWindowSize), fcw.available)
+		assert.Equal(t, testPeerInitialWindowSize, fcw.initialWindowSize)
+		assert.False(t, fcw.isConnection)
+		assert.Equal(t, testStreamID, fcw.streamID)
+		assert.False(t, fcw.closed)
+		assert.NoError(t, fcw.err)
+	})
+
+	t.Run("Initial size exceeds MaxWindowSize", func(t *testing.T) {
+		fcw := NewFlowControlWindow(MaxWindowSize+100, true, 0)
+		require.NotNil(t, fcw)
+		assert.Equal(t, int64(MaxWindowSize), fcw.available, "Available should be capped at MaxWindowSize")
+		assert.Equal(t, uint32(MaxWindowSize), fcw.initialWindowSize, "InitialWindowSize should be capped at MaxWindowSize")
+	})
+}
+
+func TestFlowControlWindow_Available(t *testing.T) {
+	fcw := NewFlowControlWindow(1000, true, 0)
+	assert.Equal(t, int64(1000), fcw.Available())
+	fcw.available = 500 // Direct manipulation for test simplicity
+	assert.Equal(t, int64(500), fcw.Available())
+}
+
+func TestFlowControlWindow_Acquire_Simple(t *testing.T) {
+	fcw := NewFlowControlWindow(1000, true, 0)
+	err := fcw.Acquire(100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(900), fcw.Available())
+
+	err = fcw.Acquire(900)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fcw.Available())
+}
+
+func TestFlowControlWindow_Acquire_ZeroError(t *testing.T) {
+	fcw := NewFlowControlWindow(1000, true, 0)
+	err := fcw.Acquire(0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot acquire zero bytes")
+	assert.Equal(t, int64(1000), fcw.Available())
+}
+
+func TestFlowControlWindow_Acquire_BlocksAndUnblocks(t *testing.T) {
+	fcw := NewFlowControlWindow(100, false, testStreamID)
+	err := fcw.Acquire(100)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	acquired := false
+	var acquireErr error
+
+	go func() {
+		defer wg.Done()
+		acquireErr = fcw.Acquire(50)
+		acquired = true
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	assert.False(t, acquired, "Acquire should be blocking")
+
+	err = fcw.Increase(70)
+	require.NoError(t, err)
+
+	wg.Wait()
+	assert.True(t, acquired, "Acquire should have unblocked")
+	require.NoError(t, acquireErr)
+	assert.Equal(t, int64(20), fcw.Available()) // 70 - 50 = 20
+}
+
+func TestFlowControlWindow_Acquire_ErrorOnClosed(t *testing.T) {
+	fcw := NewFlowControlWindow(100, true, 0)
+	closeErr := fmt.Errorf("window deliberately closed")
+	fcw.Close(closeErr)
+
+	err := fcw.Acquire(10)
+	require.Error(t, err)
+	assert.Equal(t, closeErr, err) // Error from Close should be propagated
+}
+
+func TestFlowControlWindow_Acquire_ErrorOnPriorError(t *testing.T) {
+	fcw := NewFlowControlWindow(100, true, 0)
+	priorErr := NewConnectionError(ErrCodeInternalError, "prior internal error")
+	fcw.mu.Lock()
+	fcw.setErrorLocked(priorErr) // Simulate a prior error
+	fcw.mu.Unlock()
+
+	err := fcw.Acquire(10)
+	require.Error(t, err)
+	assert.Equal(t, priorErr, err)
+}
+
+func TestFlowControlWindow_Acquire_NegativeAvailableError(t *testing.T) {
+	t.Run("Connection window negative", func(t *testing.T) {
+		fcw := NewFlowControlWindow(100, true, 0)
+		fcw.mu.Lock()
+		fcw.available = -50 // Manually set to negative to simulate prior failure
+		fcw.mu.Unlock()
+
+		err := fcw.Acquire(10)
+		require.Error(t, err)
+		connErr, ok := err.(*ConnectionError)
+		require.True(t, ok)
+		assert.Equal(t, ErrCodeFlowControlError, connErr.Code)
+		assert.Contains(t, connErr.Msg, "window is negative")
+	})
+	t.Run("Stream window negative", func(t *testing.T) {
+		fcw := NewFlowControlWindow(100, false, testStreamID)
+		fcw.mu.Lock()
+		fcw.available = -50 // Manually set to negative
+		fcw.mu.Unlock()
+
+		err := fcw.Acquire(10)
+		require.Error(t, err)
+		streamErr, ok := err.(*StreamError)
+		require.True(t, ok)
+		assert.Equal(t, ErrCodeFlowControlError, streamErr.Code)
+		assert.Equal(t, testStreamID, streamErr.StreamID)
+		assert.Contains(t, streamErr.Msg, "window is negative")
+	})
+}
+
+func TestFlowControlWindow_Increase_Simple(t *testing.T) {
+	fcw := NewFlowControlWindow(100, true, 0)
+	err := fcw.Acquire(100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fcw.Available())
+
+	// Signal waiter for test coverage of cond.Broadcast
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = fcw.Acquire(1) // This will block then proceed
+	}()
+	time.Sleep(20 * time.Millisecond) // let goroutine block
+
+	err = fcw.Increase(50)
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), fcw.Available())
+	wg.Wait() // ensure goroutine unblocked and acquired
+	assert.Equal(t, int64(49), fcw.Available())
+}
+
+func TestFlowControlWindow_Increase_ZeroIncrement(t *testing.T) {
+	t.Run("Connection window zero increment (no-op)", func(t *testing.T) {
+		fcw := NewFlowControlWindow(100, true, 0)
+		initialAvail := fcw.Available()
+		err := fcw.Increase(0)
+		require.NoError(t, err)
+		assert.Equal(t, initialAvail, fcw.Available())
+	})
+	t.Run("Stream window zero increment (protocol error)", func(t *testing.T) {
+		fcw := NewFlowControlWindow(100, false, testStreamID)
+		err := fcw.Increase(0)
+		require.Error(t, err)
+		streamErr, ok := err.(*StreamError)
+		require.True(t, ok)
+		assert.Equal(t, ErrCodeProtocolError, streamErr.Code)
+		assert.Equal(t, testStreamID, streamErr.StreamID)
+		assert.Contains(t, streamErr.Msg, "WINDOW_UPDATE increment cannot be 0 for a stream")
+	})
+}
+
+func TestFlowControlWindow_Increase_OverflowError(t *testing.T) {
+	t.Run("Connection window overflow", func(t *testing.T) {
+		fcw := NewFlowControlWindow(MaxWindowSize-50, true, 0)
+		err := fcw.Increase(100) // MaxWindowSize - 50 + 100 = MaxWindowSize + 50
+		require.Error(t, err)
+		connErr, ok := err.(*ConnectionError)
+		require.True(t, ok)
+		assert.Equal(t, ErrCodeFlowControlError, connErr.Code)
+		assert.Contains(t, connErr.Msg, "would overflow")
+		assert.True(t, fcw.closed, "window should be closed on error")
+		assert.Equal(t, connErr, fcw.err, "window error should be set")
+	})
+	t.Run("Stream window overflow", func(t *testing.T) {
+		fcw := NewFlowControlWindow(MaxWindowSize-50, false, testStreamID)
+		err := fcw.Increase(100)
+		require.Error(t, err)
+		streamErr, ok := err.(*StreamError)
+		require.True(t, ok)
+		assert.Equal(t, ErrCodeFlowControlError, streamErr.Code)
+		assert.Equal(t, testStreamID, streamErr.StreamID)
+		assert.Contains(t, streamErr.Msg, "would overflow")
+		assert.True(t, fcw.closed, "window should be closed on error")
+		assert.Equal(t, streamErr, fcw.err, "window error should be set")
+	})
+}
+
+func TestFlowControlWindow_Increase_ErrorOnClosedOrPriorError(t *testing.T) {
+	closedErr := fmt.Errorf("deliberately closed")
+	priorErr := NewConnectionError(ErrCodeInternalError, "prior error")
+
+	tests := []struct {
+		name        string
+		setup       func(*FlowControlWindow)
+		expectedErr error
+	}{
+		{
+			name: "Closed window",
+			setup: func(fcw *FlowControlWindow) {
+				fcw.Close(closedErr)
+			},
+			expectedErr: closedErr,
+		},
+		{
+			name: "Window with prior error",
+			setup: func(fcw *FlowControlWindow) {
+				fcw.mu.Lock()
+				fcw.setErrorLocked(priorErr)
+				fcw.mu.Unlock()
+			},
+			expectedErr: priorErr,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fcw := NewFlowControlWindow(100, true, 0)
+			tc.setup(fcw)
+			err := fcw.Increase(10)
+			require.Error(t, err)
+			assert.Equal(t, tc.expectedErr, err)
+		})
+	}
+}
+
+func TestFlowControlWindow_UpdateInitialWindowSize_Stream(t *testing.T) {
+	fcw := NewFlowControlWindow(1000, false, testStreamID) // initial available & initialSize = 1000
+	require.NoError(t, fcw.Acquire(200))                   // available = 800
+
+	// Increase initial window size
+	err := fcw.UpdateInitialWindowSize(1500) // newInitial = 1500. delta = 1500 - 1000 = 500
+	require.NoError(t, err)
+	assert.Equal(t, int64(800+500), fcw.Available())     // available = 1300
+	assert.Equal(t, uint32(1500), fcw.initialWindowSize) // initialSize updated
+
+	// Decrease initial window size
+	err = fcw.UpdateInitialWindowSize(800) // newInitial = 800. delta = 800 - 1500 = -700
+	require.NoError(t, err)
+	assert.Equal(t, int64(1300-700), fcw.Available())   // available = 600
+	assert.Equal(t, uint32(800), fcw.initialWindowSize) // initialSize updated
+}
+
+func TestFlowControlWindow_UpdateInitialWindowSize_ConnectionNoOp(t *testing.T) {
+	fcw := NewFlowControlWindow(1000, true, 0)
+	initialAvail := fcw.Available()
+	initialInitialSize := fcw.initialWindowSize
+
+	err := fcw.UpdateInitialWindowSize(2000)
+	require.NoError(t, err)
+	assert.Equal(t, initialAvail, fcw.Available())
+	assert.Equal(t, initialInitialSize, fcw.initialWindowSize)
+}
+
+func TestFlowControlWindow_UpdateInitialWindowSize_InvalidNewInitialSize(t *testing.T) {
+	// This error is for peer's SETTINGS_INITIAL_WINDOW_SIZE being invalid
+	fcw := NewFlowControlWindow(1000, false, testStreamID)
+	err := fcw.UpdateInitialWindowSize(MaxWindowSize + 1)
+	require.Error(t, err)
+	connErr, ok := err.(*ConnectionError)
+	require.True(t, ok)
+	assert.Equal(t, ErrCodeFlowControlError, connErr.Code)
+	assert.Contains(t, connErr.Msg, "peer's SETTINGS_INITIAL_WINDOW_SIZE value")
+	assert.Contains(t, connErr.Msg, "exceeds MaxWindowSize")
+}
+
+func TestFlowControlWindow_UpdateInitialWindowSize_OverflowError(t *testing.T) {
+	// This error is when applying delta causes available to overflow
+	fcw := NewFlowControlWindow(100, false, testStreamID) // initialSize = 100
+	fcw.available = MaxWindowSize - 50                    // available high
+	err := fcw.UpdateInitialWindowSize(200)               // newInitial = 200, delta = 100. newAvail = MaxWindowSize - 50 + 100
+	require.Error(t, err)
+	connErr, ok := err.(*ConnectionError)
+	require.True(t, ok)
+	assert.Equal(t, ErrCodeFlowControlError, connErr.Code)
+	assert.Contains(t, connErr.Msg, "applying SETTINGS_INITIAL_WINDOW_SIZE delta")
+	assert.Contains(t, connErr.Msg, "exceeding max")
+	// fcw.err is not set by UpdateInitialWindowSize directly, it returns the connection error.
+}
+
+func TestFlowControlWindow_UpdateInitialWindowSize_ErrorOnClosedOrPriorError(t *testing.T) {
+	closedErr := fmt.Errorf("deliberately closed for update")
+	priorErr := NewConnectionError(ErrCodeInternalError, "prior error for update")
+
+	tests := []struct {
+		name        string
+		setup       func(*FlowControlWindow)
+		expectedErr error
+	}{
+		{
+			name: "Closed window",
+			setup: func(fcw *FlowControlWindow) {
+				fcw.Close(closedErr)
+			},
+			expectedErr: closedErr,
+		},
+		{
+			name: "Window with prior error",
+			setup: func(fcw *FlowControlWindow) {
+				fcw.mu.Lock()
+				fcw.setErrorLocked(priorErr)
+				fcw.mu.Unlock()
+			},
+			expectedErr: priorErr,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fcw := NewFlowControlWindow(100, false, testStreamID) // Stream window for this method
+			tc.setup(fcw)
+			err := fcw.UpdateInitialWindowSize(200)
+			require.Error(t, err)
+			assert.Equal(t, tc.expectedErr, err)
+		})
+	}
+}
+
+func TestFlowControlWindow_Close(t *testing.T) {
+	fcw := NewFlowControlWindow(100, true, 0)
+	assert.False(t, fcw.closed)
+	assert.NoError(t, fcw.err)
+
+	// Signal waiter for test coverage of cond.Broadcast on close
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var acquireErrOnClose error
+	go func() {
+		defer wg.Done()
+		acquireErrOnClose = fcw.Acquire(150) // This will block then error out
+	}()
+	time.Sleep(20 * time.Millisecond) // let goroutine block
+
+	closeErr := fmt.Errorf("closing test")
+	fcw.Close(closeErr)
+
+	assert.True(t, fcw.closed)
+	assert.Equal(t, closeErr, fcw.err)
+
+	wg.Wait() // ensure goroutine unblocked
+	require.Error(t, acquireErrOnClose)
+	assert.Equal(t, closeErr, acquireErrOnClose)
+
+	// Subsequent close should be no-op (error not overwritten)
+	fcw.Close(fmt.Errorf("another close error"))
+	assert.True(t, fcw.closed)
+	assert.Equal(t, closeErr, fcw.err) // Original error should persist
+
+	// Close with nil error when no prior error
+	fcwNil := NewFlowControlWindow(100, true, 0)
+	fcwNil.Close(nil)
+	assert.True(t, fcwNil.closed)
+	assert.NoError(t, fcwNil.err) // Error remains nil
+}
+
+func TestFlowControlWindow_setErrorLocked(t *testing.T) {
+	fcw := NewFlowControlWindow(100, true, 0)
+	err1 := fmt.Errorf("error1")
+	err2 := fmt.Errorf("error2")
+
+	fcw.mu.Lock()
+	fcw.setErrorLocked(err1)
+	fcw.mu.Unlock()
+
+	assert.True(t, fcw.closed, "setErrorLocked should close window")
+	assert.Equal(t, err1, fcw.err)
+
+	// Try to set another error, should be ignored
+	fcw.mu.Lock()
+	fcw.setErrorLocked(err2)
+	fcw.mu.Unlock()
+
+	assert.True(t, fcw.closed)
+	assert.Equal(t, err1, fcw.err, "Error should not be overwritten")
+}
