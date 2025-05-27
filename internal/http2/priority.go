@@ -166,8 +166,13 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 		// updatePriorityNoLock might return fmt.Errorf for "cannot depend on itself".
 		// We should wrap this in a StreamError for AddStream, which is often
 		// called in the context of HEADERS processing.
+		// RFC 7540, Section 5.3.3: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
+		// RFC 7540, Section 5.3.1: "A stream cannot be dependent on any of its own dependencies." This implies cycles are protocol errors.
 		if strings.Contains(err.Error(), "cannot depend on itself") {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself: %v", streamID, err)}
+		}
+		if strings.Contains(err.Error(), "cycle detected") {
+			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("cycle detected when adding/updating stream %d: %v", streamID, err)}
 		}
 		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error updating priority for stream %d: %v", streamID, err)}
 	}
