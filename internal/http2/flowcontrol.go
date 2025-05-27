@@ -85,7 +85,23 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 			return fcw.err
 		}
 		if fcw.closed { // Window explicitly closed (e.g., stream reset, connection GOAWAY)
-			return fmt.Errorf("flow control window (conn: %v, stream: %d) is closed", fcw.isConnection, fcw.streamID)
+			// Path Y: fcw.err is nil, fcw.closed is true. Original was fmt.Errorf.
+			// DIAGNOSTIC CHANGE: Replace fmt.Errorf with specific error types.
+			// This helps confirm if this specific path is the source of the *errors.errorString.
+			var errToReturn error
+			errMsg := fmt.Sprintf("DIAGNOSTIC_PATH_Y: flow control window (conn: %v, stream: %d) is closed", fcw.isConnection, fcw.streamID)
+			if fcw.isConnection {
+				// For a connection FCW, if closed, it might imply a GOAWAY was sent/received.
+				// Using ErrCodeInternalError for diagnosis, could be refined based on actual close reason if known.
+				errToReturn = NewConnectionError(ErrCodeInternalError, errMsg)
+			} else {
+				// For a stream FCW, if closed, ErrCodeStreamClosed is appropriate.
+				errToReturn = NewStreamError(fcw.streamID, ErrCodeStreamClosed, errMsg)
+			}
+			// Set fcw.err. Note: setErrorLocked also sets fcw.closed = true and broadcasts.
+			// Since fcw.closed is already true, this is fine.
+			fcw.setErrorLocked(errToReturn)
+			return fcw.err // Return the error that was just set.
 		}
 
 		if fcw.available < 0 {
