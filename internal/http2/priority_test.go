@@ -2013,3 +2013,84 @@ func TestPriorityTree_UpdatePriority_ReparentNonExclusive(t *testing.T) {
 		t.Errorf("childOfNewParent (5) post-update: weight expected 15, got %d", w5Post)
 	}
 }
+
+func TestPriorityTree_UpdatePriority_SelfDependencyError(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Setup:
+	// 0 -> 1 (originalParentID)
+	//      -> 2 (streamID, weight 50)
+	//      -> 3 (siblingID, weight 60) // Sibling to ensure originalParentID's children list is checked properly
+	originalParentID := uint32(1)
+	streamID := uint32(2)
+	siblingID := uint32(3)
+
+	originalWeightStreamID := uint8(50)
+	originalWeightSiblingID := uint8(60)
+
+	// Use AddStream for a clean setup respecting locks
+	if err := pt.AddStream(originalParentID, nil); err != nil { // 0 -> 1
+		t.Fatalf("Setup AddStream(%d) failed: %v", originalParentID, err)
+	}
+	if err := pt.AddStream(streamID, &streamDependencyInfo{StreamDependency: originalParentID, Weight: originalWeightStreamID}); err != nil { // 1 -> 2
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamID, err)
+	}
+	if err := pt.AddStream(siblingID, &streamDependencyInfo{StreamDependency: originalParentID, Weight: originalWeightSiblingID}); err != nil { // 1 -> 3
+		t.Fatalf("Setup AddStream(%d) failed: %v", siblingID, err)
+	}
+
+	// Attempt to make streamID depend on itself. Weight in call is different to check it's not applied.
+	attemptedNewWeight := uint8(100)
+	pt.mu.Lock()
+	err := pt.UpdatePriority(streamID, streamID, attemptedNewWeight, false)
+	pt.mu.Unlock()
+
+	if err == nil {
+		t.Fatalf("UpdatePriority for stream %d should have failed due to self-dependency, but did not", streamID)
+	}
+	expectedErrorMsgPart := fmt.Sprintf("stream %d cannot depend on itself", streamID)
+	if !strings.Contains(err.Error(), expectedErrorMsgPart) {
+		t.Errorf("Expected error message for stream %d to contain '%s', got: '%s'", streamID, expectedErrorMsgPart, err.Error())
+	}
+
+	// Verify streamID's properties (parent, weight) are unchanged
+	p, c, w, getErr := pt.GetDependencies(streamID)
+	if getErr != nil {
+		t.Fatalf("GetDependencies for stream %d failed after self-dependency attempt: %v", streamID, getErr)
+	}
+	if p != originalParentID {
+		t.Errorf("Stream %d: parent changed. Expected %d, got %d", streamID, originalParentID, p)
+	}
+	if w != originalWeightStreamID {
+		t.Errorf("Stream %d: weight changed. Expected %d, got %d", streamID, originalWeightStreamID, w)
+	}
+	if len(c) != 0 { // streamID had no children
+		t.Errorf("Stream %d: children changed. Expected [], got %v", streamID, c)
+	}
+
+	// Verify originalParentID's children are unchanged
+	_, opChildren, _, getErrOP := pt.GetDependencies(originalParentID)
+	if getErrOP != nil {
+		t.Fatalf("GetDependencies for original parent %d failed: %v", originalParentID, getErrOP)
+	}
+	expectedOPChildren := []uint32{streamID, siblingID}
+	if !reflect.DeepEqual(sortUint32Slice(opChildren), sortUint32Slice(expectedOPChildren)) {
+		t.Errorf("Original parent %d: children changed. Expected sorted %v, got sorted %v (original: %v)",
+			originalParentID, sortUint32Slice(expectedOPChildren), sortUint32Slice(opChildren), opChildren)
+	}
+
+	// Verify siblingID is unaffected
+	ps, cs, ws, getErrS := pt.GetDependencies(siblingID)
+	if getErrS != nil {
+		t.Fatalf("GetDependencies for sibling %d failed: %v", siblingID, getErrS)
+	}
+	if ps != originalParentID {
+		t.Errorf("Sibling %d: parent changed. Expected %d, got %d", siblingID, originalParentID, ps)
+	}
+	if ws != originalWeightSiblingID {
+		t.Errorf("Sibling %d: weight changed. Expected %d, got %d", siblingID, originalWeightSiblingID, ws)
+	}
+	if len(cs) != 0 { // siblingID had no children
+		t.Errorf("Sibling %d: children changed. Expected [], got %v", siblingID, cs)
+	}
+}
