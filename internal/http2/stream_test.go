@@ -167,6 +167,9 @@ type mockConnection struct {
 	lastExtractPseudoHeadersHF []hpack.HeaderField
 	lastStreamHandlerDoneArgs  *struct{ Stream *Stream }
 
+	removeClosedStreamCallCount int     // Added for testing interaction
+	lastStreamRemovedByClose    *Stream // Added for testing interaction
+
 	sendHeadersFrameCount      int
 	sendDataFrameCount         int
 	sendRSTStreamFrameCount    int
