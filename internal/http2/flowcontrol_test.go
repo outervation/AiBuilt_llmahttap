@@ -1033,6 +1033,14 @@ func TestFlowControlWindow_UpdateInitialWindowSize_Stream(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1300-700), fcw.Available())   // available = 600
 	assert.Equal(t, uint32(800), fcw.initialWindowSize) // initialSize updated
+
+	// No change initial window size
+	currentAvailBeforeNoChange := fcw.Available()
+	currentInitialBeforeNoChange := fcw.initialWindowSize
+	err = fcw.UpdateInitialWindowSize(currentInitialBeforeNoChange) // newInitial is same as old. delta = 0
+	require.NoError(t, err)
+	assert.Equal(t, currentAvailBeforeNoChange, fcw.Available(), "Available window should be unchanged after a no-op update")
+	assert.Equal(t, currentInitialBeforeNoChange, fcw.initialWindowSize, "Initial window size should be unchanged after a no-op update")
 }
 
 func TestFlowControlWindow_UpdateInitialWindowSize_ConnectionNoOp(t *testing.T) {
