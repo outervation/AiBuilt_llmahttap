@@ -406,25 +406,44 @@ func TestPriorityTree_ProcessPriorityFrame_Valid(t *testing.T) {
 
 func TestPriorityTree_ProcessPriorityFrame_Exclusive(t *testing.T) {
 	pt := NewPriorityTree()
-	// Stream 1: parent 0
-	// Stream 2: parent 0
-	// Stream 3: parent 1 (child of stream 1)
-	// Stream 4: parent 1 (child of stream 1)
-	_ = pt.AddStream(1, nil)
-	_ = pt.AddStream(2, nil)
-	_ = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 1, Weight: 10})
-	_ = pt.AddStream(4, &streamDependencyInfo{StreamDependency: 1, Weight: 20})
 
-	// Stream 5 will be processed by PRIORITY frame
-	_ = pt.getOrCreateNodeNoLock(5) // ensure stream 5 exists
+	// Setup:
+	// Target parent for exclusive operation: Stream 1 (parent 0)
+	//   Children of Stream 1: Stream 3 (w:10), Stream 4 (w:20)
+	if err := pt.AddStream(1, nil); err != nil { // 0 -> 1
+		t.Fatalf("Setup: AddStream(1) failed: %v", err)
+	}
+	if err := pt.AddStream(3, &streamDependencyInfo{StreamDependency: 1, Weight: 10}); err != nil { // 1 -> 3
+		t.Fatalf("Setup: AddStream(3) failed: %v", err)
+	}
+	if err := pt.AddStream(4, &streamDependencyInfo{StreamDependency: 1, Weight: 20}); err != nil { // 1 -> 4
+		t.Fatalf("Setup: AddStream(4) failed: %v", err)
+	}
+
+	// Stream to be reprioritized (Stream 5):
+	//   Initially: Stream 7 -> Stream 5 (w:original_s5_weight=10)
+	//   Stream 5 has its own child: Stream 5 -> Stream 6 (w:original_s6_weight=5)
+	originalS5Weight := uint8(10)
+	originalS6Weight := uint8(5)
+	if err := pt.AddStream(7, nil); err != nil { // 0 -> 7
+		t.Fatalf("Setup: AddStream(7) failed: %v", err)
+	}
+	if err := pt.AddStream(5, &streamDependencyInfo{StreamDependency: 7, Weight: originalS5Weight}); err != nil { // 7 -> 5
+		t.Fatalf("Setup: AddStream(5) failed: %v", err)
+	}
+	if err := pt.AddStream(6, &streamDependencyInfo{StreamDependency: 5, Weight: originalS6Weight}); err != nil { // 5 -> 6
+		t.Fatalf("Setup: AddStream(6) failed: %v", err)
+	}
 
 	// PRIORITY frame for stream 5: make it exclusive child of stream 1.
-	// Streams 3 and 4 (old children of 1) should become children of 5.
+	// New parent for stream 5: 1
+	// New weight for stream 5: new_s5_weight=50
+	newS5Weight := uint8(50)
 	frame := &PriorityFrame{
 		FrameHeader:      FrameHeader{StreamID: 5},
 		Exclusive:        true,
-		StreamDependency: 1,  // New parent for stream 5
-		Weight:           50, // New weight for stream 5
+		StreamDependency: 1, // New parent is stream 1
+		Weight:           newS5Weight,
 	}
 
 	err := pt.ProcessPriorityFrame(frame)
@@ -432,48 +451,84 @@ func TestPriorityTree_ProcessPriorityFrame_Exclusive(t *testing.T) {
 		t.Fatalf("ProcessPriorityFrame failed: %v", err)
 	}
 
-	// Verify stream 5
-	s5Parent, s5Children, s5Weight, errGet := pt.GetDependencies(5)
-	if errGet != nil {
-		t.Fatalf("GetDependencies for stream 5 failed: %v", errGet)
+	// --- Verifications ---
+
+	// Verify Stream 5 (the exclusively reprioritized stream)
+	s5Parent, s5Children, s5Weight, errGet5 := pt.GetDependencies(5)
+	if errGet5 != nil {
+		t.Fatalf("GetDependencies for stream 5 failed: %v", errGet5)
 	}
 	if s5Parent != 1 {
 		t.Errorf("Stream 5: expected parent 1, got %d", s5Parent)
 	}
-	if s5Weight != 50 {
-		t.Errorf("Stream 5: expected weight 50, got %d", s5Weight)
+	if s5Weight != newS5Weight {
+		t.Errorf("Stream 5: expected weight %d, got %d", newS5Weight, s5Weight)
 	}
-	expectedS5Children := []uint32{3, 4} // Order might not be guaranteed by append, sort for comparison
+	// Children should be its original child (6) and adopted children (3, 4)
+	expectedS5Children := []uint32{6, 3, 4}
 	if !reflect.DeepEqual(sortUint32Slice(s5Children), sortUint32Slice(expectedS5Children)) {
-		t.Errorf("Stream 5: expected children %v, got %v", expectedS5Children, s5Children)
+		t.Errorf("Stream 5: expected children %v (sorted), got %v (sorted). Original: %v",
+			sortUint32Slice(expectedS5Children), sortUint32Slice(s5Children), s5Children)
 	}
 
-	// Verify stream 1 (new parent of 5)
-	s1Parent, s1Children, _, _ := pt.GetDependencies(1)
-	if s1Parent != 0 {
+	// Verify Stream 1 (new parent of stream 5)
+	s1Parent, s1Children, _, errGet1 := pt.GetDependencies(1)
+	if errGet1 != nil {
+		t.Fatalf("GetDependencies for stream 1 failed: %v", errGet1)
+	}
+	if s1Parent != 0 { // Stream 1's parent is 0
 		t.Errorf("Stream 1: expected parent 0, got %d", s1Parent)
 	}
+	// Stream 5 should be the sole child of Stream 1
 	expectedS1Children := []uint32{5}
 	if !reflect.DeepEqual(sortUint32Slice(s1Children), sortUint32Slice(expectedS1Children)) {
-		t.Errorf("Stream 1: expected children %v (only 5), got %v", expectedS1Children, s1Children)
+		t.Errorf("Stream 1: expected children %v, got %v", expectedS1Children, s1Children)
 	}
 
-	// Verify stream 3 (now child of 5)
-	s3Parent, _, s3Weight, _ := pt.GetDependencies(3)
+	// Verify Stream 7 (original parent of stream 5)
+	_, s7Children, _, errGet7 := pt.GetDependencies(7)
+	if errGet7 != nil {
+		t.Fatalf("GetDependencies for stream 7 failed: %v", errGet7)
+	}
+	if contains(s7Children, 5) {
+		t.Errorf("Stream 7: should no longer have 5 as a child, got children %v", s7Children)
+	}
+	// (Stream 7 might have other children if they were added, but for this test, it was only parent to 5 initially among numbered streams)
+
+	// Verify Stream 6 (original child of stream 5)
+	s6Parent, _, s6Weight, errGet6 := pt.GetDependencies(6)
+	if errGet6 != nil {
+		t.Fatalf("GetDependencies for stream 6 failed: %v", errGet6)
+	}
+	if s6Parent != 5 {
+		t.Errorf("Stream 6: expected parent 5 (unchanged relationship with 5), got %d", s6Parent)
+	}
+	if s6Weight != originalS6Weight { // Weight should be preserved
+		t.Errorf("Stream 6: expected weight %d (preserved), got %d", originalS6Weight, s6Weight)
+	}
+
+	// Verify Stream 3 (original child of stream 1, now child of stream 5)
+	s3Parent, _, s3Weight, errGet3 := pt.GetDependencies(3)
+	if errGet3 != nil {
+		t.Fatalf("GetDependencies for stream 3 failed: %v", errGet3)
+	}
 	if s3Parent != 5 {
 		t.Errorf("Stream 3: expected parent 5, got %d", s3Parent)
 	}
-	if s3Weight != 10 { // Weight should be preserved
-		t.Errorf("Stream 3: expected weight 10, got %d", s3Weight)
+	if s3Weight != 10 { // Weight should be preserved (original weight when child of 1)
+		t.Errorf("Stream 3: expected weight 10 (preserved), got %d", s3Weight)
 	}
 
-	// Verify stream 4 (now child of 5)
-	s4Parent, _, s4Weight, _ := pt.GetDependencies(4)
+	// Verify Stream 4 (original child of stream 1, now child of stream 5)
+	s4Parent, _, s4Weight, errGet4 := pt.GetDependencies(4)
+	if errGet4 != nil {
+		t.Fatalf("GetDependencies for stream 4 failed: %v", errGet4)
+	}
 	if s4Parent != 5 {
 		t.Errorf("Stream 4: expected parent 5, got %d", s4Parent)
 	}
-	if s4Weight != 20 { // Weight should be preserved
-		t.Errorf("Stream 4: expected weight 20, got %d", s4Weight)
+	if s4Weight != 20 { // Weight should be preserved (original weight when child of 1)
+		t.Errorf("Stream 4: expected weight 20 (preserved), got %d", s4Weight)
 	}
 }
 
