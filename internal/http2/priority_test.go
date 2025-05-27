@@ -579,6 +579,11 @@ func TestPriorityTree_ProcessPriorityFrame_SelfDependencyError(t *testing.T) {
 		t.Errorf("Expected ProtocolError, got %v", streamErr.Code)
 	}
 	if streamErr.StreamID != streamID {
+
+		expectedMsgPart := "cannot depend on itself in PRIORITY frame"
+		if !strings.Contains(streamErr.Msg, expectedMsgPart) {
+			t.Errorf("Expected StreamError message for stream %d to contain '%s', got '%s'", streamID, expectedMsgPart, streamErr.Msg)
+		}
 		t.Errorf("Expected error for stream %d, got for stream %d", streamID, streamErr.StreamID)
 	}
 	// t.Logf("Got expected error: %v", err)
