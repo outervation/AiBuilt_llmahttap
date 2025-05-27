@@ -197,10 +197,33 @@ func (pt *PriorityTree) UpdatePriority(streamID uint32, depStreamID uint32, weig
 	// as they have specific error types (ConnectionError for stream 0 PRIORITY, StreamError for HEADERS)
 
 	if depStreamID == streamID {
-		// This check is crucial and should be here.
-		// The specific error type might vary based on the caller's context (PRIORITY vs HEADERS)
-		// For now, return a generic error, callers can wrap it.
 		return fmt.Errorf("stream %d cannot depend on itself (new parent %d)", streamID, depStreamID)
+	}
+
+	// Cycle detection: A stream cannot depend on one of its own descendants.
+	// Traverse upwards from depStreamID to see if streamID is an ancestor.
+	// This check must be done *before* any tree modifications.
+	// We must use getOrCreateNodeNoLock carefully here, as depStreamID might not exist yet,
+	// but if it doesn't, it can't be a descendant.
+	// If depStreamID exists, trace its lineage.
+	if _, depExists := pt.nodes[depStreamID]; depExists {
+		curr := depStreamID
+		for curr != 0 { // Traverse up to the root (stream 0)
+			// get node for curr. It must exist if depExists was true and curr !=0 and we haven't hit streamID
+			// unless curr is streamID itself.
+			currNode := pt.nodes[curr] // This node should exist in the path from depStreamID upwards
+			if currNode == nil {       // Should not happen if tree is consistent
+				// This indicates an issue, but cycle detection's main concern is finding streamID
+				break // or return an internal error
+			}
+			if currNode.parentID == streamID {
+				return fmt.Errorf("cycle detected: stream %d cannot depend on %d because %d is/would be an ancestor of %d", streamID, depStreamID, streamID, depStreamID)
+			}
+			if currNode.parentID == 0 { // Reached root without finding streamID as an ancestor of depStreamID
+				break
+			}
+			curr = currNode.parentID
+		}
 	}
 
 	streamNode := pt.getOrCreateNodeNoLock(streamID)
@@ -286,10 +309,14 @@ func (pt *PriorityTree) ProcessPriorityFrame(frame *PriorityFrame) error {
 	// defines the new priority settings for the 'streamID' identified in the frame header.
 	err := pt.UpdatePriority(streamID, frame.StreamDependency, frame.Weight, frame.Exclusive)
 	if err != nil {
-		// UpdatePriority can return an error if streamID tries to depend on itself.
+		// UpdatePriority can return an error if streamID tries to depend on itself or creates a cycle.
 		// RFC 7540, Section 5.3.3: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
+		// RFC 7540, Section 5.3.1: "A stream cannot be dependent on any of its own dependencies." This implies cycles are protocol errors.
 		if strings.Contains(err.Error(), "cannot depend on itself") {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself in PRIORITY frame: %v", streamID, err)}
+		}
+		if strings.Contains(err.Error(), "cycle detected") {
+			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("cycle detected in PRIORITY frame for stream %d: %v", streamID, err)}
 		}
 		// Other errors from UpdatePriority might indicate internal issues or inconsistencies.
 		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error processing PRIORITY frame for stream %d: %v", streamID, err)}
