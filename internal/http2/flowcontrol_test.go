@@ -1272,3 +1272,53 @@ func TestFlowControlWindow_Acquire_MultipleWaiters_Close(t *testing.T) {
 	assert.True(t, fcw.closed, "Window should be marked as closed")
 	assert.Equal(t, closeError, fcw.err, "Window error should be set to the closeError")
 }
+
+func TestFlowControlWindow_Acquire_UnblockedByUpdateInitialWindowSize(t *testing.T) {
+	initialSize := uint32(100)
+	fcw := NewFlowControlWindow(initialSize, false, testStreamID) // Stream window
+
+	// Exhaust the window
+	err := fcw.Acquire(initialSize)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fcw.Available())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	acquired := false
+	var acquireErr error
+	acquireAmount := uint32(50)
+
+	go func() {
+		defer wg.Done()
+		t.Logf("Goroutine attempting to acquire %d bytes", acquireAmount)
+		acquireErr = fcw.Acquire(acquireAmount)
+		if acquireErr == nil {
+			acquired = true
+			t.Logf("Goroutine acquired %d bytes successfully", acquireAmount)
+		} else {
+			t.Logf("Goroutine acquire error: %v", acquireErr)
+		}
+	}()
+
+	// Give goroutine a chance to block
+	time.Sleep(50 * time.Millisecond)
+	assert.False(t, acquired, "Acquire should be blocking")
+
+	// Increase initial window size.
+	// Delta = newInitialSize - oldInitialSize = 150 - 100 = 50.
+	// This delta should be enough to unblock the Acquire.
+	newInitialSize := initialSize + acquireAmount
+	t.Logf("Main: Calling UpdateInitialWindowSize with newInitialSize %d", newInitialSize)
+	updateErr := fcw.UpdateInitialWindowSize(newInitialSize)
+	require.NoError(t, updateErr)
+	t.Logf("Main: UpdateInitialWindowSize complete. Available: %d, InitialWindowSize: %d", fcw.Available(), fcw.initialWindowSize)
+
+	wg.Wait() // Wait for goroutine to complete
+	assert.True(t, acquired, "Acquire should have unblocked and succeeded")
+	require.NoError(t, acquireErr, "Acquire should not have errored")
+
+	// Available window: initial was 0. UpdateInitialWindowSize added delta of 50. So it became 50.
+	// Goroutine acquired 50. So it should be 0.
+	assert.Equal(t, int64(0), fcw.Available())
+	assert.Equal(t, newInitialSize, fcw.initialWindowSize)
+}
