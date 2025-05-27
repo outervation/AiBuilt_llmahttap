@@ -2954,3 +2954,215 @@ func TestStream_WriteData(t *testing.T) {
 		})
 	}
 }
+
+func TestStream_WriteTrailers(t *testing.T) {
+	const testStreamID = uint32(1)
+	defaultPrioWeight := uint8(16)
+	validTrailers := makeStreamWriterHeaders("x-trailer-1", "value1", "x-trailer-2", "value2")
+	invalidHpackTrailers := makeStreamWriterHeaders("", "bad-trailer-name") // Empty name to cause HPACK error in conn
+
+	tests := []struct {
+		name                         string
+		initialState                 StreamState
+		initialResponseHeadersSent   bool
+		initialEndStreamSentToClient bool // If true, server already sent END_STREAM (e.g. via WriteData)
+		initialPendingRSTCode        *ErrorCode
+		trailersToSend               []HeaderField
+		connSendHeadersFrameError    error // If non-nil, conn.sendHeadersFrame will be simulated to fail
+		expectError                  bool
+		expectedErrorContains        string
+		expectFrameSent              bool // True if a HEADERS frame for trailers is expected on writerChan
+		expectedFinalState           StreamState
+		expectedFinalEndStreamSent   bool // Should always be true if trailers are successfully sent
+	}{
+		{
+			name:                         "Success: send trailers after headers (no data yet)",
+			initialState:                 StreamStateOpen,
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateHalfClosedLocal, // Because trailers imply END_STREAM
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                         "Success: send trailers after data (endStreamSentToClient was false)",
+			initialState:                 StreamStateOpen, // Assume data was sent without END_STREAM
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                         "Success: send trailers when endStreamSentToClient was already true (e.g. after WriteData with endStream)",
+			initialState:                 StreamStateHalfClosedLocal, // Because server already sent END_STREAM
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: true,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateHalfClosedLocal, // Stays HalfClosedLocal, effectively re-confirming END_STREAM
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                         "Success: send trailers from HalfClosedRemote state (client sent END_STREAM, server now sends trailers)",
+			initialState:                 StreamStateHalfClosedRemote,
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateClosed, // Both sides have sent END_STREAM
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                       "Error: WriteTrailers called before SendHeaders",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: false, // Key condition
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "SendHeaders must be called before WriteTrailers",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State unchanged
+			expectedFinalEndStreamSent: false,
+		},
+		{
+			name:                       "Error: stream closed",
+			initialState:               StreamStateClosed, // Key condition
+			initialResponseHeadersSent: true,              // Irrelevant as stream is closed
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "stream closed or being reset",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateClosed,
+			expectedFinalEndStreamSent: false, // Or initialEndStreamSentToClient if it was already set
+		},
+		{
+			name:                       "Error: stream resetting (pendingRSTCode set)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialPendingRSTCode:      func() *ErrorCode { e := ErrCodeCancel; return &e }(), // Key condition
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "stream closed or being reset",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State unchanged by this call
+			expectedFinalEndStreamSent: false,
+		},
+		{
+			name:                       "Error: conn.sendHeadersFrame fails (e.g. HPACK error)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			trailersToSend:             invalidHpackTrailers, // Triggers HPACK error in real conn.sendHeadersFrame
+			expectError:                true,
+			expectedErrorContains:      "connection error: HPACK encoding error: hpack: invalid header field name: name is empty",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State doesn't change on conn send error
+			expectedFinalEndStreamSent: false,           // Not successfully sent
+		},
+		{
+			name:                       "Error: conn.sendHeadersFrame fails (simulated connection error)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			trailersToSend:             validTrailers,
+			connSendHeadersFrameError:  NewConnectionError(ErrCodeInternalError, "simulated conn internal error"),
+			expectError:                true,
+			expectedErrorContains:      "connection error: connection shutting down (pre-check), cannot send HEADERS for stream 1", // Adjusted to match generic part
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockConnection{
+				writerChan: make(chan Frame, 1), // Buffer for one HEADERS frame (trailers) or RST
+			}
+
+			realConn := (*Connection)(unsafe.Pointer(mc))
+			if tc.connSendHeadersFrameError != nil {
+				if realConn.shutdownChan == nil {
+					realConn.shutdownChan = make(chan struct{})
+				}
+				close(realConn.shutdownChan) // Simulate connection shutting down
+				realConn.connError = tc.connSendHeadersFrameError
+			}
+
+			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, false) // Server-initiated assumed for push/trailers
+
+			// Setup initial stream conditions
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			stream.responseHeadersSent = tc.initialResponseHeadersSent
+			stream.endStreamSentToClient = tc.initialEndStreamSentToClient
+			if tc.initialPendingRSTCode != nil {
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			}
+			stream.mu.Unlock()
+
+			err := stream.WriteTrailers(tc.trailersToSend)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorContains != "" && !strings.Contains(err.Error(), tc.expectedErrorContains) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tc.expectedErrorContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if tc.expectFrameSent {
+				select {
+				case frame := <-mc.writerChan:
+					headersFrame, ok := frame.(*HeadersFrame)
+					if !ok {
+						t.Fatalf("Expected HeadersFrame on writerChan, got %T", frame)
+					}
+					if headersFrame.Header().StreamID != testStreamID {
+						t.Errorf("HeadersFrame StreamID mismatch: got %d, want %d", headersFrame.Header().StreamID, testStreamID)
+					}
+					if (headersFrame.Header().Flags & FlagHeadersEndStream) == 0 {
+						t.Error("HeadersFrame for trailers did not have END_STREAM flag set")
+					}
+					// Verify that the headers sent are the trailers (simplified check for now)
+					// A full check would decode the HeaderBlockFragment.
+					// This test relies on the fact that conn.sendHeadersFrame gets the right hpack.HeaderFields.
+					if len(tc.trailersToSend) > 0 && len(headersFrame.HeaderBlockFragment) == 0 {
+						t.Error("HeadersFrame HeaderBlockFragment is empty, but trailers were provided")
+					}
+				case <-time.After(50 * time.Millisecond):
+					t.Fatal("Expected HeadersFrame on writerChan, but none found")
+				}
+			} else {
+				select {
+				case frame := <-mc.writerChan:
+					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			finalEndStreamSent := stream.endStreamSentToClient
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedFinalState {
+				t.Errorf("Expected final stream state %s, got %s (initial was %s)", tc.expectedFinalState, finalState, tc.initialState)
+			}
+			if finalEndStreamSent != tc.expectedFinalEndStreamSent {
+				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedFinalEndStreamSent, finalEndStreamSent)
+			}
+		})
+	}
+}
