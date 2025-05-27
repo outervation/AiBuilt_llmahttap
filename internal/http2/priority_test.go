@@ -801,15 +801,20 @@ func contains(slice []uint32, val uint32) bool {
 }
 
 func TestPriorityTree_GetDependencies_StreamNotFound(t *testing.T) {
-	pt := NewPriorityTree()
-	_, _, _, err := pt.GetDependencies(123) // Stream 123 does not exist
-	if err == nil {
-		t.Fatal("Expected error for non-existent stream, got nil")
-	}
-	expectedMsg := "stream 123 not found in priority tree"
-	if err.Error() != expectedMsg {
-		t.Errorf("Expected error message '%s', got '%s'", expectedMsg, err.Error())
-	}
+	t.Run("non_existent_stream_id_greater_than_0_returns_error", func(t *testing.T) {
+		pt := NewPriorityTree()
+		nonExistentStreamID := uint32(123) // Arbitrary non-existent stream ID > 0
+		_, _, _, err := pt.GetDependencies(nonExistentStreamID)
+
+		if err == nil {
+			t.Fatalf("GetDependencies(%d): expected an error for non-existent stream, but got nil", nonExistentStreamID)
+		}
+
+		expectedErrorMsg := fmt.Sprintf("stream %d not found in priority tree", nonExistentStreamID)
+		if err.Error() != expectedErrorMsg {
+			t.Errorf("GetDependencies(%d): unexpected error message.\nExpected: %s\nGot:      %s", nonExistentStreamID, expectedErrorMsg, err.Error())
+		}
+	})
 }
 
 func TestPriorityTree_GetDependencies_Stream0(t *testing.T) {
