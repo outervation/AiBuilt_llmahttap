@@ -340,23 +340,28 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 	}
 	// CRITICAL: Initialize the writerChan that Connection.sendRSTStreamFrame will use.
 	// This field must be at the correct memory offset in mockConnection.
-	mc.writerChan = make(chan Frame, 10) // Buffered to avoid blocking in simple tests
+	// Ensure writerChan is initialized (it's done where mc is declared if needed, or here)
+	if mc.writerChan == nil {
+		mc.writerChan = make(chan Frame, 10) // Default buffer if not pre-set
+	}
 
-	// Start a goroutine to drain mc.writerChan.
-	// This is necessary because the real Connection methods will send to it,
-	// and without a consumer, these sends would block.
-	go func() {
-		for {
-			select {
-			case _, ok := <-mc.writerChan:
-				if !ok {
-					return
-				} // Channel closed
-			case <-mc.ctx.Done(): // Connection context cancelled
-				return
-			}
-		}
-	}()
+	// The writerChan is initialized. Tests that expect frames to be sent
+	// must read from mc.writerChan or ensure it's drained if not inspected.
+	// The previous automatic drainer is removed to allow tests to inspect frames.
+	// If a test doesn't inspect writerChan but causes writes, it should ensure
+	// writerChan is sufficiently buffered or start a local drainer.
+	// go func() {
+	// 	for {
+	// 		select {
+	// 		case _, ok := <-mc.writerChan:
+	// 			if !ok {
+	// 				return
+	// 			} // Channel closed
+	// 		case <-mc.ctx.Done(): // Connection context cancelled
+	// 			return
+	// 		}
+	// 	}
+	// }()
 
 	// Initialize other config values in mockConnection if they are used by stream.go via s.conn.FIELD.
 	// For example, if s.conn.maxFrameSize is used:
@@ -398,15 +403,7 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		if mc.cancelCtx != nil {
 			mc.cancelCtx()
 		}
-		// Close the writerChan to signal the draining goroutine to exit.
-		// This should be done carefully, perhaps after ensuring the stream is fully closed.
-		// mc.mu.Lock() // Assuming writerChan is protected if accessed concurrently
-		// if mc.writerChan != nil {
-		// 	close(mc.writerChan)
-		// 	mc.writerChan = nil
-		// }
-		// mc.mu.Unlock()
-		// For now, relying on context cancellation for goroutine exit.
+		// No automatic writerChan close here; tests manage it or rely on context.
 	})
 
 	return s
@@ -436,54 +433,152 @@ func makeStreamWriterHeaders(kv ...string) []HeaderField {
 	return hfs
 }
 
-// TestStream_InitializationAndSimpleClose
-func TestStream_InitializationAndSimpleClose(t *testing.T) {
+// TestStream_Close_SendsRSTAndCleansUp tests the stream.Close() method.
+// It verifies that an RST_STREAM frame is sent, state transitions to Closed,
+// and associated resources are cleaned up.
+func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 	mc := &mockConnection{}
-	// Initialize config fields that newTestStream uses to pass args to newStream
-	mc.cfgOurInitialWindowSize = 1024
-	mc.cfgPeerInitialWindowSize = 2048
+	mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
+	mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
+	mc.writerChan = make(chan Frame, 1) // Buffer 1 for the RST_STREAM
 
 	stream := newTestStream(t, 1, mc, 16, 0, false, true)
 
-	if stream.id != 1 {
-		t.Errorf("Expected stream ID 1, got %d", stream.id)
-	}
-	if stream.state != StreamStateIdle {
-		t.Errorf("Expected initial state Idle, got %s", stream.state)
-	}
-
+	// Manually set stream to Open state for test
 	stream.mu.Lock()
-	stream.state = StreamStateOpen // Manually set for test purposes
+	stream.state = StreamStateOpen
 	stream.mu.Unlock()
 
-	err := stream.Close(nil) // Server initiates close with CANCEL
-	if err != nil {
-		// If this fails, it might be because writerChan related logic in Connection.sendRSTStreamFrame
-		// has other dependencies (e.g. on c.log being non-nil if it logs before/after send)
-		// The mc.log is initialized by newTestStream.
-		t.Fatalf("stream.Close() failed: %v", err)
-	}
+	closeErr := fmt.Errorf("test initiated close")
+	expectedRstCode := ErrCodeInternalError // Default if closeErr is generic
 
-	// Note: The following assertions are on mc.sendRSTStreamFrameCount and mc.lastRSTArgs.
-	// These will NOT be correct because the real Connection.sendRSTStreamFrame is called,
-	// not the mockConnection's one. This test will "pass" if no panic, but its assertions are flawed.
-	// To properly test this, one would need to inspect what was sent to mc.writerChan.
+	// Test case 1: Closing with a generic error
+	t.Run("WithGenericError", func(t *testing.T) {
+		err := stream.Close(closeErr)
+		if err != nil {
+			t.Fatalf("stream.Close() failed: %v", err)
+		}
 
-	// if mc.sendRSTStreamFrameCount != 1 {
-	// 	t.Errorf("Expected sendRSTStreamFrame to be called once, got %d (Note: this assertion is likely flawed due to unsafe.Pointer use)", mc.sendRSTStreamFrameCount)
-	// }
-	// mc.mu.Lock()
-	// if mc.lastRSTArgs == nil || mc.lastRSTArgs.StreamID != 1 || mc.lastRSTArgs.ErrorCode != ErrCodeCancel {
-	// 	t.Errorf("Unexpected RST_STREAM frame: ID=%d, Code=%s (Note: this assertion is likely flawed)", mc.lastRSTArgs.StreamID, mc.lastRSTArgs.ErrorCode)
-	// }
-	// mc.mu.Unlock()
+		// Verify RST_STREAM frame
+		select {
+		case frame := <-mc.writerChan:
+			rstFrame, ok := frame.(*RSTStreamFrame)
+			if !ok {
+				tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
+			}
+			if rstFrame.Header().StreamID != stream.id {
+				tErrorf(t, "RSTStreamFrame StreamID mismatch: got %d, want %d", rstFrame.Header().StreamID, stream.id)
+			}
+			if rstFrame.ErrorCode != expectedRstCode {
+				tErrorf(t, "RSTStreamFrame ErrorCode mismatch: got %s, want %s", rstFrame.ErrorCode, expectedRstCode)
+			}
+		default:
+			tError(t, "Expected RSTStreamFrame on writerChan, but none found")
+		}
 
-	stream.mu.RLock()
-	finalState := stream.state
-	stream.mu.RUnlock()
-	if finalState != StreamStateClosed {
-		t.Errorf("Expected stream state Closed after Close(), got %s", finalState)
-	}
+		stream.mu.RLock()
+		finalState := stream.state
+		// pendingCode := stream.pendingRSTCode // Is nil after successful cleanup
+		stream.mu.RUnlock()
+
+		if finalState != StreamStateClosed {
+			tErrorf(t, "Expected stream state Closed, got %s", finalState)
+		}
+
+		// Verify context cancellation
+		select {
+		case <-stream.ctx.Done():
+			if stream.ctx.Err() != context.Canceled {
+				tErrorf(t, "Expected context error context.Canceled, got %v", stream.ctx.Err())
+			}
+		default:
+			tError(t, "Expected stream context to be done")
+		}
+
+		// Verify pipe closures
+		_, errPipeRead := stream.requestBodyReader.Read(make([]byte, 1))
+		if errPipeRead == nil {
+			tError(t, "Expected error reading from requestBodyReader after close, got nil")
+		} else {
+			// Expected error depends on how pipe was closed; could be io.EOF or custom.
+			// *StreamError with matching code is a good sign.
+			tLogf(t, "requestBodyReader.Read() error: %v (expected)", errPipeRead)
+		}
+
+		_, errPipeWrite := stream.requestBodyWriter.Write([]byte("test"))
+		if errPipeWrite == nil {
+			tError(t, "Expected error writing to requestBodyWriter after close, got nil")
+		} else {
+			tLogf(t, "requestBodyWriter.Write() error: %v (expected)", errPipeWrite)
+		}
+
+		// Verify flow control manager closure
+		errFcAcquire := stream.fcManager.sendWindow.Acquire(1)
+		if errFcAcquire == nil {
+			tError(t, "Expected error acquiring from flow control window after close, got nil")
+		} else {
+			// Check if the error indicates closure
+			streamErr, ok := errFcAcquire.(*StreamError)
+			if !ok || (streamErr.Code != ErrCodeStreamClosed && streamErr.Code != expectedRstCode) {
+				tErrorf(t, "Flow control acquire error: %v, expected StreamError with StreamClosed or matching RST code", errFcAcquire)
+			}
+			tLogf(t, "fcManager.sendWindow.Acquire() error: %v (expected)", errFcAcquire)
+		}
+	})
+
+	// Test case 2: Closing with nil error (should use ErrCodeCancel)
+	// Need to reset the stream for this test or use a new one.
+	// For simplicity, this sub-test is illustrative; a real test suite would use t.Run with proper setup/teardown for each.
+	// This specific test needs a new stream instance as the previous one is closed.
+	t.Run("WithNilError", func(t *testing.T) {
+		mc := &mockConnection{} // New mock connection for this sub-test
+		mc.writerChan = make(chan Frame, 1)
+		stream2 := newTestStream(t, 2, mc, 16, 0, false, true)
+		stream2.mu.Lock()
+		stream2.state = StreamStateOpen
+		stream2.mu.Unlock()
+
+		err := stream2.Close(nil) // Close with nil error
+		if err != nil {
+			t.Fatalf("stream2.Close(nil) failed: %v", err)
+		}
+
+		select {
+		case frame := <-mc.writerChan:
+			rstFrame, ok := frame.(*RSTStreamFrame)
+			if !ok {
+				tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
+			}
+			if rstFrame.ErrorCode != ErrCodeCancel {
+				tErrorf(t, "RSTStreamFrame ErrorCode mismatch: got %s, want %s", rstFrame.ErrorCode, ErrCodeCancel)
+			}
+		default:
+			tError(t, "Expected RSTStreamFrame on writerChan for nil error, but none found")
+		}
+		if stream2.state != StreamStateClosed {
+			tErrorf(t, "Expected stream2 state Closed, got %s", stream2.state)
+		}
+	})
+}
+
+// Helper functions for t.Logf, t.Errorf, t.Fatalf to avoid data races on t
+// if tests are run in parallel (though these unit tests are not by default).
+// More importantly, it makes them callable from goroutines if needed.
+func tLogf(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	t.Logf(format, args...)
+}
+func tErrorf(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	t.Errorf(format, args...)
+}
+func tFatalf(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	t.Fatalf(format, args...)
+}
+func tError(t *testing.T, args ...interface{}) {
+	t.Helper()
+	t.Error(args...)
 }
 
 func TestStream_IDAndContext(t *testing.T) {
@@ -531,5 +626,147 @@ func TestStream_IDAndContext(t *testing.T) {
 		}
 	default:
 		t.Error("stream context was not done after stream.Close(), expected done")
+	}
+}
+
+func TestStream_sendRSTStream_DirectCall(t *testing.T) {
+	mc := &mockConnection{}
+	mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
+	mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
+	mc.writerChan = make(chan Frame, 1)
+
+	streamID := uint32(3)
+	stream := newTestStream(t, streamID, mc, 16, 0, false, true)
+
+	// Manually set stream to Open state for test
+	stream.mu.Lock()
+	stream.state = StreamStateOpen
+	stream.mu.Unlock()
+
+	tests := []struct {
+		name          string
+		errorCode     ErrorCode
+		initialState  StreamState
+		expectSend    bool
+		expectedState StreamState
+	}{
+		{
+			name:          "RST from Open state",
+			errorCode:     ErrCodeProtocolError,
+			initialState:  StreamStateOpen,
+			expectSend:    true,
+			expectedState: StreamStateClosed,
+		},
+		{
+			name:          "RST from HalfClosedLocal state",
+			errorCode:     ErrCodeStreamClosed, // Example code
+			initialState:  StreamStateHalfClosedLocal,
+			expectSend:    true,
+			expectedState: StreamStateClosed,
+		},
+		{
+			name:          "RST from HalfClosedRemote state",
+			errorCode:     ErrCodeCancel,
+			initialState:  StreamStateHalfClosedRemote,
+			expectSend:    true,
+			expectedState: StreamStateClosed,
+		},
+		{
+			name:          "RST from already Closed state (idempotent)",
+			errorCode:     ErrCodeInternalError,
+			initialState:  StreamStateClosed,
+			expectSend:    false, // Should not send if already closed by us with pendingRST
+			expectedState: StreamStateClosed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reset stream state for each test case.
+			// For "already Closed", we need to simulate it was closed via RST by us.
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			if tc.initialState == StreamStateClosed {
+				// Simulate it was closed due to an RST we initiated
+				// For the idempotency check, s.pendingRSTCode needs to match.
+				// s.sendRSTStream checks if s.state == StreamStateClosed && s.pendingRSTCode != nil && *s.pendingRSTCode == errorCode
+				// So, if we want to test idempotency of calling with the *same* error code, set pendingRSTCode.
+				// If it's just "closed by some other means", then pendingRSTCode would be nil.
+				// The current check is: `if s.state == StreamStateClosed && s.pendingRSTCode != nil && *s.pendingRSTCode == errorCode`
+				// Or `if s.state == StreamStateClosed` (generic closed, don't resend).
+				// Let's test the generic closed case for the specific idempotency check.
+				if tc.errorCode == ErrCodeInternalError { // Match the specific error code for idempotency part of the "already Closed state" test
+					tempErrorCode := ErrCodeInternalError
+					stream.pendingRSTCode = &tempErrorCode
+				} else {
+					stream.pendingRSTCode = nil
+				}
+			} else {
+				stream.pendingRSTCode = nil // Clear for non-closed initial states
+			}
+			stream.mu.Unlock()
+
+			err := stream.sendRSTStream(tc.errorCode)
+			if err != nil {
+				// This test assumes sendRSTStreamFrame on connection succeeds.
+				// If sendRSTStreamFrame could fail, this test would need adjustment.
+				tFatalf(t, "stream.sendRSTStream() failed: %v", err)
+			}
+
+			if tc.expectSend {
+				select {
+				case frame := <-mc.writerChan:
+					rstFrame, ok := frame.(*RSTStreamFrame)
+					if !ok {
+						tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
+					}
+					if rstFrame.Header().StreamID != streamID {
+						tErrorf(t, "RSTStreamFrame StreamID mismatch: got %d, want %d", rstFrame.Header().StreamID, streamID)
+					}
+					if rstFrame.ErrorCode != tc.errorCode {
+						tErrorf(t, "RSTStreamFrame ErrorCode mismatch: got %s, want %s", rstFrame.ErrorCode, tc.errorCode)
+					}
+				default:
+					tError(t, "Expected RSTStreamFrame on writerChan, but none found")
+				}
+			} else {
+				select {
+				case frame := <-mc.writerChan:
+					tErrorf(t, "Did not expect RSTStreamFrame, but got one: %v", frame)
+				default:
+					// Expected: no frame sent
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedState {
+				tErrorf(t, "Expected stream state %s, got %s", tc.expectedState, finalState)
+			}
+
+			if tc.expectedState == StreamStateClosed {
+				// Verify context cancellation
+				select {
+				case <-stream.ctx.Done():
+					// Expected
+				default:
+					tError(t, "Expected stream context to be done for closed stream")
+				}
+
+				// Verify pipe closures (simplified check)
+				_, errPipeRead := stream.requestBodyReader.Read(make([]byte, 1))
+				if errPipeRead == nil {
+					tError(t, "Expected error reading from requestBodyReader after RST, got nil")
+				}
+
+				// Verify flow control manager closure (simplified check)
+				errFcAcquire := stream.fcManager.sendWindow.Acquire(1)
+				if errFcAcquire == nil {
+					tError(t, "Expected error acquiring from flow control window after RST, got nil")
+				}
+			}
+		})
 	}
 }
