@@ -1539,3 +1539,149 @@ func TestPriorityTree_UpdatePriority_WeightOnly(t *testing.T) {
 		t.Errorf("SiblingOfParent %d: state changed. P:%d (exp:0), C:%v (exp:[]), W:%d (exp:15)", siblingOfParentID, p4Post, c4Post, w4Post)
 	}
 }
+
+func TestPriorityTree_UpdatePriority_StreamDoesNotExist(t *testing.T) {
+	pt := NewPriorityTree()
+
+	nonExistentStreamID := uint32(10)
+	parentStreamID := uint32(1) // This stream will be the parent, will also be created on-the-fly
+	newWeight := uint8(77)
+	isExclusive := false
+
+	// Lock is normally acquired by public methods like ProcessPriorityFrame or AddStream.
+	// For direct testing of UpdatePriority's internal logic, we manage the lock.
+	pt.mu.Lock()
+	err := pt.UpdatePriority(nonExistentStreamID, parentStreamID, newWeight, isExclusive)
+	pt.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("UpdatePriority for non-existent stream %d failed: %v", nonExistentStreamID, err)
+	}
+
+	// Verify the new stream (10)
+	pID, children, w, errGetNew := pt.GetDependencies(nonExistentStreamID)
+	if errGetNew != nil {
+		t.Fatalf("GetDependencies for newly created stream %d failed: %v", nonExistentStreamID, errGetNew)
+	}
+
+	if pID != parentStreamID {
+		t.Errorf("Stream %d: expected parent %d, got %d", nonExistentStreamID, parentStreamID, pID)
+	}
+	if w != newWeight {
+		t.Errorf("Stream %d: expected weight %d, got %d", nonExistentStreamID, newWeight, w)
+	}
+	if len(children) != 0 {
+		t.Errorf("Stream %d: expected no children, got %v", nonExistentStreamID, children)
+	}
+
+	// Verify the parent stream (1) was created and now has stream 10 as a child
+	parent_pID, parent_children, parent_w, errGetParent := pt.GetDependencies(parentStreamID)
+	if errGetParent != nil {
+		t.Fatalf("GetDependencies for parent stream %d failed: %v", parentStreamID, errGetParent)
+	}
+
+	if parent_pID != 0 { // Implicitly created parents depend on stream 0
+		t.Errorf("Parent stream %d: expected parent 0, got %d", parentStreamID, parent_pID)
+	}
+	if parent_w != 15 { // Default weight for implicitly created parent
+		t.Errorf("Parent stream %d: expected default weight 15, got %d", parentStreamID, parent_w)
+	}
+	found := false
+	for _, childID := range parent_children {
+		if childID == nonExistentStreamID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Stream %d not found in children of stream %d. Children: %v", nonExistentStreamID, parentStreamID, parent_children)
+	}
+	if len(parent_children) != 1 {
+		t.Errorf("Parent stream %d: expected 1 child (%d), got %d children: %v", parentStreamID, nonExistentStreamID, len(parent_children), parent_children)
+	}
+
+	// Verify stream 0 has the parent stream (1) as a child
+	_, stream0Children, _, errGetRoot := pt.GetDependencies(0)
+	if errGetRoot != nil {
+		t.Fatalf("GetDependencies for stream 0 failed: %v", errGetRoot)
+	}
+	foundRootChild := false
+	for _, child := range stream0Children {
+		if child == parentStreamID {
+			foundRootChild = true
+			break
+		}
+	}
+	if !foundRootChild {
+		t.Errorf("Parent stream %d not found in children of stream 0. Children: %v", parentStreamID, stream0Children)
+	}
+}
+
+func TestPriorityTree_UpdatePriority_CycleDetection(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Setup: 0 -> 1 -> 2 -> 3
+	_ = pt.AddStream(1, nil)
+	_ = pt.AddStream(2, &streamDependencyInfo{StreamDependency: 1, Weight: 10})
+	_ = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 2, Weight: 10})
+
+	// Attempt to make 1 depend on 3 (1 -> 3), creating a cycle 1 -> 2 -> 3 -> 1
+	pt.mu.Lock()
+	err := pt.UpdatePriority(1, 3, 20, false)
+	pt.mu.Unlock()
+
+	if err == nil {
+		t.Fatalf("UpdatePriority should have failed due to cycle detection (1 depends on 3)")
+	}
+	if !strings.Contains(err.Error(), "cycle detected") {
+		t.Errorf("Expected cycle detection error, got: %v", err)
+	}
+
+	// Verify state hasn't changed for 1
+	p1, _, w1, _ := pt.GetDependencies(1)
+	if p1 != 0 || w1 != 15 { // Original parent 0, original weight 15
+		t.Errorf("Stream 1 state changed after failed cycle update: P:%d (exp 0), W:%d (exp 15)", p1, w1)
+	}
+
+	// Attempt to make 2 depend on 2 (self-dependency)
+	pt.mu.Lock()
+	err = pt.UpdatePriority(2, 2, 20, false)
+	pt.mu.Unlock()
+	if err == nil {
+		t.Fatalf("UpdatePriority should have failed due to self-dependency (2 depends on 2)")
+	}
+	if !strings.Contains(err.Error(), "cannot depend on itself") {
+		t.Errorf("Expected self-dependency error, got: %v", err)
+	}
+
+	// Setup for another cycle test: 0 -> 105, 105 -> 104
+	pt.mu.Lock()
+	// Create 105 (child of 0), then 104 (child of 105)
+	// Use UpdatePriority directly for setup convenience as getOrCreateNodeNoLock is used internally.
+	_ = pt.UpdatePriority(105, 0, 10, false)
+	_ = pt.UpdatePriority(104, 105, 10, false)
+	pt.mu.Unlock()
+
+	// Attempt to make 105 depend on 104. This would create a cycle: 105 -> 104 -> 105
+	pt.mu.Lock()
+	err = pt.UpdatePriority(105, 104, 10, false)
+	pt.mu.Unlock()
+
+	if err == nil {
+		t.Fatalf("UpdatePriority should have failed due to cycle detection (105 depends on 104)")
+	}
+	if !strings.Contains(err.Error(), "cycle detected") {
+		t.Errorf("Expected cycle detection error for 105->104, got: %v", err)
+	}
+
+	// Verify stream 105 is still child of 0 (its state before the failing update)
+	p105, _, _, _ := pt.GetDependencies(105)
+	if p105 != 0 {
+		t.Errorf("Stream 105 parent after failed cycle: expected 0, got %d", p105)
+	}
+	// Stream 104 should still be child of 105
+	p104, _, _, _ := pt.GetDependencies(104)
+	if p104 != 105 {
+		t.Errorf("Stream 104 parent after failed cycle: expected 105, got %d", p104)
+	}
+}
