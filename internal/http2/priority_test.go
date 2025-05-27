@@ -1442,3 +1442,100 @@ func TestPriorityTree_GetDependencies_NodeWithParentNoChildren(t *testing.T) {
 		t.Errorf("targetStreamID %d: expected no children (it's a leaf node), got %v (len %d)", targetStreamID, children, len(children))
 	}
 }
+
+func TestPriorityTree_UpdatePriority_WeightOnly(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Setup:
+	// 0 -> 1 (parentStream)
+	//      -> 2 (targetStream, initial weight 10)
+	//         -> 3 (childOfTarget)
+	//   -> 4 (siblingOfParent)
+	parentStreamID := uint32(1)
+	targetStreamID := uint32(2)
+	childOfTargetID := uint32(3)
+	siblingOfParentID := uint32(4)
+
+	initialTargetWeight := uint8(10)
+	newTargetWeight := uint8(77)
+
+	// Add streams
+	_ = pt.AddStream(parentStreamID, nil)                                                                                                    // 0 -> 1
+	_ = pt.AddStream(targetStreamID, &streamDependencyInfo{StreamDependency: parentStreamID, Weight: initialTargetWeight, Exclusive: false}) // 1 -> 2
+	_ = pt.AddStream(childOfTargetID, &streamDependencyInfo{StreamDependency: targetStreamID, Weight: 5, Exclusive: false})                  // 2 -> 3
+	_ = pt.AddStream(siblingOfParentID, nil)                                                                                                 // 0 -> 4
+
+	// Verify initial state of targetStreamID (2)
+	pPre, cPre, wPre, errGetPre := pt.GetDependencies(targetStreamID)
+	if errGetPre != nil || pPre != parentStreamID || wPre != initialTargetWeight || !reflect.DeepEqual(sortUint32Slice(cPre), []uint32{childOfTargetID}) {
+		t.Fatalf("Pre-Update S2: P:%d W:%d C:%v. Expected P:%d W:%d C:[%d]", pPre, wPre, cPre, parentStreamID, initialTargetWeight, childOfTargetID)
+	}
+
+	// Verify initial state of parentStreamID (1)
+	_, p1ChildrenPre, _, _ := pt.GetDependencies(parentStreamID)
+	if !contains(p1ChildrenPre, targetStreamID) {
+		t.Fatalf("Pre-Update S1: children %v, expected to contain %d", p1ChildrenPre, targetStreamID)
+	}
+	initialParentChildrenCount := len(p1ChildrenPre)
+
+	// Verify initial state of childOfTargetID (3)
+	p3Pre, _, w3Pre, _ := pt.GetDependencies(childOfTargetID)
+	if p3Pre != targetStreamID || w3Pre != 5 {
+		t.Fatalf("Pre-Update S3: P:%d W:%d. Expected P:%d W:5", p3Pre, w3Pre, targetStreamID)
+	}
+
+	// Call UpdatePriority on targetStreamID (2), changing only its weight.
+	// Parent and exclusive flag remain the same as its current state implicitly.
+	// Note: UpdatePriority expects the lock to be held by the caller. This test calls it directly,
+	// which is okay for testing its internal logic if it worked without the lock.
+	// However, since it uses getOrCreateNodeNoLock, it's better to simulate external call.
+	// The public API for this through AddStream (with existing stream) or ProcessPriorityFrame.
+	// Let's acquire lock for direct UpdatePriority call test.
+	pt.mu.Lock()
+	err := pt.UpdatePriority(targetStreamID, parentStreamID, newTargetWeight, false)
+	pt.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("UpdatePriority for weight change failed: %v", err)
+	}
+
+	// Verify targetStreamID (2) after update
+	pPost, cPost, wPost, errGetPost := pt.GetDependencies(targetStreamID)
+	if errGetPost != nil {
+		t.Fatalf("Post-Update GetDependencies for targetStreamID %d failed: %v", targetStreamID, errGetPost)
+	}
+
+	if pPost != parentStreamID {
+		t.Errorf("TargetStream %d: parent changed. Expected %d, got %d", targetStreamID, parentStreamID, pPost)
+	}
+	if wPost != newTargetWeight {
+		t.Errorf("TargetStream %d: weight not updated. Expected %d, got %d", targetStreamID, newTargetWeight, wPost)
+	}
+	if !reflect.DeepEqual(sortUint32Slice(cPost), []uint32{childOfTargetID}) {
+		t.Errorf("TargetStream %d: children changed. Expected [%d], got %v", targetStreamID, childOfTargetID, cPost)
+	}
+
+	// Verify parentStreamID (1) is unaffected (still has targetStreamID as child, same number of children)
+	_, p1ChildrenPost, _, _ := pt.GetDependencies(parentStreamID)
+	if !contains(p1ChildrenPost, targetStreamID) {
+		t.Errorf("ParentStream %d: targetStream %d no longer a child. Children: %v", parentStreamID, targetStreamID, p1ChildrenPost)
+	}
+	if len(p1ChildrenPost) != initialParentChildrenCount {
+		t.Errorf("ParentStream %d: number of children changed. Expected %d, got %d. Children: %v", parentStreamID, initialParentChildrenCount, len(p1ChildrenPost), p1ChildrenPost)
+	}
+
+	// Verify childOfTargetID (3) is unaffected (still child of targetStreamID)
+	p3Post, _, w3Post, _ := pt.GetDependencies(childOfTargetID)
+	if p3Post != targetStreamID {
+		t.Errorf("ChildOfTarget %d: parent changed. Expected %d, got %d", childOfTargetID, targetStreamID, p3Post)
+	}
+	if w3Post != 5 { // Weight of child should be unchanged
+		t.Errorf("ChildOfTarget %d: weight changed. Expected 5, got %d", childOfTargetID, w3Post)
+	}
+
+	// Verify siblingOfParentID (4) is unaffected
+	p4Post, c4Post, w4Post, _ := pt.GetDependencies(siblingOfParentID)
+	if p4Post != 0 || len(c4Post) != 0 || w4Post != 15 {
+		t.Errorf("SiblingOfParent %d: state changed. P:%d (exp:0), C:%v (exp:[]), W:%d (exp:15)", siblingOfParentID, p4Post, c4Post, w4Post)
+	}
+}
