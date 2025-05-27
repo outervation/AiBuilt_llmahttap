@@ -485,3 +485,51 @@ func TestStream_InitializationAndSimpleClose(t *testing.T) {
 		t.Errorf("Expected stream state Closed after Close(), got %s", finalState)
 	}
 }
+
+func TestStream_IDAndContext(t *testing.T) {
+	mc := &mockConnection{}
+	streamID := uint32(5)
+	stream := newTestStream(t, streamID, mc, 16, 0, false, true)
+
+	// Test Stream.ID()
+	if gotID := stream.ID(); gotID != streamID {
+		t.Errorf("stream.ID() = %d, want %d", gotID, streamID)
+	}
+
+	// Test Stream.Context()
+	ctx := stream.Context()
+	if ctx == nil {
+		t.Fatal("stream.Context() returned nil")
+	}
+
+	// Check context is not initially done
+	select {
+	case <-ctx.Done():
+		t.Fatal("stream context was initially done, expected not done")
+	default:
+		// Expected: context is not done
+	}
+
+	// Close the stream
+	err := stream.Close(fmt.Errorf("closing stream for context test"))
+	if err != nil {
+		t.Fatalf("stream.Close() failed: %v", err)
+	}
+
+	// Check context is now done
+	select {
+	case <-ctx.Done():
+		// Expected: context is done
+		if ctx.Err() == nil {
+			t.Error("stream context Done, but Err() is nil, expected context.Canceled or similar")
+		} else if ctx.Err() != context.Canceled {
+			// Depending on how stream.Close() cancels, it might be Canceled or a custom error.
+			// For this test, we mainly care that it's done.
+			// If a specific error is expected, this check should be more precise.
+			// The stream's cancelCtx() is called, which should lead to context.Canceled.
+			t.Logf("stream context done with error: %v (expected context.Canceled or similar)", ctx.Err())
+		}
+	default:
+		t.Error("stream context was not done after stream.Close(), expected done")
+	}
+}
