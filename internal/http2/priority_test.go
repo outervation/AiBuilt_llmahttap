@@ -673,110 +673,202 @@ func TestPriorityTree_ComplexScenario(t *testing.T) {
 	pt := NewPriorityTree()
 
 	// 1. Add streams
-	// 0 -> 1 (w:15)
-	//   -> 2 (w:15)
+	// Initial:
+	// 0 -> 1 (w:15 def)
+	//   -> 2 (w:15 def)
 	_ = pt.AddStream(1, nil)
 	_ = pt.AddStream(2, nil)
 
 	// 2. Update 1's priority (make it child of 2, w:30)
+	// Tree:
 	// 0 -> 2 (w:15)
 	//      -> 1 (w:30)
 	err := pt.UpdatePriority(1, 2, 30, false)
 	if err != nil {
-		t.Fatalf("UpdatePriority(1) failed: %v", err)
+		t.Fatalf("Step 2 UpdatePriority(1) failed: %v", err)
 	}
 	p, c, w, _ := pt.GetDependencies(1)
 	if p != 2 || w != 30 || len(c) != 0 {
-		t.Errorf("S1 post update: P:%d W:%d C:%v. Expected P:2 W:30 C:[]", p, w, c)
+		t.Errorf("Step 2 S1: P:%d W:%d C:%v. Expected P:2 W:30 C:[]", p, w, c)
 	}
 	p, c, w, _ = pt.GetDependencies(2)
 	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
-		t.Errorf("S2 post S1-update: P:%d W:%d C:%v. Expected P:0 W:15 C:[1]", p, w, c)
+		t.Errorf("Step 2 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[1]", p, w, c)
 	}
 
 	// 3. Add stream 3 as exclusive child of 2 (w:50)
 	// Existing child of 2 (stream 1) should become child of 3.
+	// Tree:
 	// 0 -> 2 (w:15)
 	//      -> 3 (w:50)
 	//         -> 1 (w:30, parent changed from 2 to 3)
-	_ = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 2, Weight: 50, Exclusive: true})
+	err = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 2, Weight: 50, Exclusive: true})
+	if err != nil {
+		t.Fatalf("Step 3 AddStream(3) exclusive failed: %v", err)
+	}
 	p, c, w, _ = pt.GetDependencies(3)
 	if p != 2 || w != 50 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
-		t.Errorf("S3 post add: P:%d W:%d C:%v. Expected P:2 W:50 C:[1]", p, w, c)
+		t.Errorf("Step 3 S3: P:%d W:%d C:%v. Expected P:2 W:50 C:[1]", p, w, c)
 	}
-	p, _, _, _ = pt.GetDependencies(1)
+	p, _, _, _ = pt.GetDependencies(1) // Check S1's parent
 	if p != 3 {
-		t.Errorf("S1 post S3-add: P:%d. Expected P:3", p)
+		t.Errorf("Step 3 S1: P:%d. Expected P:3", p)
 	}
-	p, c, w, _ = pt.GetDependencies(2)
+	p, c, w, _ = pt.GetDependencies(2) // Check S2's children
 	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{3}) {
-		t.Errorf("S2 post S3-add: P:%d W:%d C:%v. Expected P:0 W:15 C:[3]", p, w, c)
+		t.Errorf("Step 3 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[3]", p, w, c)
 	}
 
 	// 4. Add stream 4 as child of 2 (w:25, non-exclusive)
+	// Tree:
 	// 0 -> 2 (w:15)
 	//      -> 3 (w:50)
 	//         -> 1 (w:30)
 	//      -> 4 (w:25)
-	_ = pt.AddStream(4, &streamDependencyInfo{StreamDependency: 2, Weight: 25, Exclusive: false})
+	err = pt.AddStream(4, &streamDependencyInfo{StreamDependency: 2, Weight: 25, Exclusive: false})
+	if err != nil {
+		t.Fatalf("Step 4 AddStream(4) non-exclusive failed: %v", err)
+	}
 	p, c, w, _ = pt.GetDependencies(4)
 	if p != 2 || w != 25 || len(c) != 0 {
-		t.Errorf("S4 post add: P:%d W:%d C:%v. Expected P:2 W:25 C:[]", p, w, c)
+		t.Errorf("Step 4 S4: P:%d W:%d C:%v. Expected P:2 W:25 C:[]", p, w, c)
 	}
-	p, c, w, _ = pt.GetDependencies(2)
+	p, c, w, _ = pt.GetDependencies(2) // Check S2's children
 	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{3, 4}) {
-		t.Errorf("S2 post S4-add: P:%d W:%d C:%v. Expected P:0 W:15 C:[3 4]", p, w, c)
+		t.Errorf("Step 4 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[3 4]", p, w, c)
+	}
+
+	// Step 4.5: Update stream 4 to be an exclusive child of its current parent (stream 2).
+	// Stream 3 (other child of 2) should become child of 4.
+	// Tree:
+	// 0 -> 2 (w:15)
+	//      -> 4 (w:25)
+	//         -> 3 (w:50)
+	//            -> 1 (w:30)
+	err = pt.UpdatePriority(4, 2, 25, true) // S4 becomes exclusive child of S2 (its current parent)
+	if err != nil {
+		t.Fatalf("Step 4.5 UpdatePriority(4) exclusive failed: %v", err)
+	}
+	p, c, w, _ = pt.GetDependencies(4) // Check S4
+	if p != 2 || w != 25 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{3}) {
+		t.Errorf("Step 4.5 S4: P:%d W:%d C:%v. Expected P:2 W:25 C:[3]", p, w, c)
+	}
+	p, c, w, _ = pt.GetDependencies(3) // Check S3
+	if p != 4 || w != 50 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
+		t.Errorf("Step 4.5 S3: P:%d W:%d C:%v. Expected P:4 W:50 C:[1]", p, w, c)
+	}
+	p, c, w, _ = pt.GetDependencies(2) // Check S2
+	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{4}) {
+		t.Errorf("Step 4.5 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[4]", p, w, c)
+	}
+	p, c, w, _ = pt.GetDependencies(1) // Check S1
+	if p != 3 || w != 30 || len(c) != 0 {
+		t.Errorf("Step 4.5 S1: P:%d W:%d C:%v. Expected P:3 W:30 C:[]", p, w, c)
 	}
 
 	// 5. Remove stream 3
-	// Children of 3 (stream 1) should be re-parented to 2 (parent of 3).
+	// Children of 3 (stream 1) should be re-parented to 4 (parent of 3).
+	// Tree after 4.5:
 	// 0 -> 2 (w:15)
-	//      -> 1 (w:30, parent changed from 3 to 2)
 	//      -> 4 (w:25)
+	//         -> 3 (w:50)  <-- to be removed
+	//            -> 1 (w:30)
+	// Becomes:
+	// 0 -> 2 (w:15)
+	//      -> 4 (w:25)
+	//         -> 1 (w:30, parent changed from 3 to 4)
 	err = pt.RemoveStream(3)
 	if err != nil {
-		t.Fatalf("RemoveStream(3) failed: %v", err)
+		t.Fatalf("Step 5 RemoveStream(3) failed: %v", err)
 	}
 	_, _, _, errGet3 := pt.GetDependencies(3)
 	if errGet3 == nil {
-		t.Errorf("S3 should be removed")
+		t.Errorf("Step 5 S3: Should be removed, but GetDependencies succeeded")
 	}
-	p, _, _, _ = pt.GetDependencies(1)
-	if p != 2 {
-		t.Errorf("S1 post S3-remove: P:%d. Expected P:2", p)
+	p, c, w, _ = pt.GetDependencies(1) // Check S1
+	if p != 4 || w != 30 || len(c) != 0 {
+		t.Errorf("Step 5 S1: P:%d W:%d C:%v. Expected P:4 W:30 C:[]", p, w, c)
 	}
-	p, c, w, _ = pt.GetDependencies(2)
-	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1, 4}) {
-		t.Errorf("S2 post S3-remove: P:%d W:%d C:%v. Expected P:0 W:15 C:[1 4]", p, w, c)
+	p, c, w, _ = pt.GetDependencies(4) // Check S4
+	if p != 2 || w != 25 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
+		t.Errorf("Step 5 S4: P:%d W:%d C:%v. Expected P:2 W:25 C:[1]", p, w, c)
+	}
+	p, c, w, _ = pt.GetDependencies(2) // Check S2
+	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{4}) {
+		t.Errorf("Step 5 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[4]", p, w, c)
 	}
 
-	// 6. Process PRIORITY frame for stream 4: make it child of 1 (w:60, non-exclusive)
+	// 5.5. Remove stream 4
+	// Children of 4 (stream 1) should be re-parented to 2 (parent of 4).
+	// Tree after step 5:
+	// 0 -> 2 (w:15)
+	//      -> 4 (w:25)  <-- to be removed
+	//         -> 1 (w:30)
+	// Becomes:
+	// 0 -> 2 (w:15)
+	//      -> 1 (w:30, parent changed from 4 to 2)
+	err = pt.RemoveStream(4)
+	if err != nil {
+		t.Fatalf("Step 5.5 RemoveStream(4) failed: %v", err)
+	}
+	_, _, _, errGet4 := pt.GetDependencies(4)
+	if errGet4 == nil {
+		t.Errorf("Step 5.5 S4: Should be removed, but GetDependencies succeeded")
+	}
+	p, c, w, _ = pt.GetDependencies(1) // Check S1
+	if p != 2 || w != 30 || len(c) != 0 {
+		t.Errorf("Step 5.5 S1: P:%d W:%d C:%v. Expected P:2 W:30 C:[]", p, w, c)
+	}
+	p, c, w, _ = pt.GetDependencies(2) // Check S2
+	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
+		t.Errorf("Step 5.5 S2: P:%d W:%d C:%v. Expected P:0 W:15 C:[1]", p, w, c)
+	}
+
+	// 6. Process PRIORITY frame for stream 2: make it child of 1 (w:60, non-exclusive)
+	// Current tree after step 5.5:
 	// 0 -> 2 (w:15)
 	//      -> 1 (w:30)
-	//         -> 4 (w:60)
+	// Operation: S2 to depend on S1. This creates a cycle (S1 is child of S2, S2 wants to be child of S1, effectively 0 -> S1 -> S2 -> S1).
+	// More precisely: S1's parent IS S2. If S2's parent becomes S1, then S2 -> S1 -> S2. This is a direct cycle.
+	// RFC 7540, Section 5.3.1: "A stream cannot be dependent on any of its own dependencies."
+	// This should result in a PROTOCOL_ERROR.
 	priorityFrame := &PriorityFrame{
-		FrameHeader:      FrameHeader{StreamID: 4},
-		StreamDependency: 1,
+		FrameHeader:      FrameHeader{StreamID: 2}, // Stream 2
+		StreamDependency: 1,                        // S2 to depend on S1
 		Weight:           60,
 		Exclusive:        false,
 	}
 	err = pt.ProcessPriorityFrame(priorityFrame)
-	if err != nil {
-		t.Fatalf("ProcessPriorityFrame(4) failed: %v", err)
+	if err == nil {
+		t.Errorf("Step 6 ProcessPriorityFrame(2) for stream 2 to depend on stream 1 should have failed due to cycle creation, but succeeded.")
+		// If it succeeded, log the problematic state
+		s1p_fail, s1c_fail, s1w_fail, _ := pt.GetDependencies(1)
+		s2p_fail, s2c_fail, s2w_fail, _ := pt.GetDependencies(2)
+		t.Logf("State after incorrect success: S1(P:%d, C:%v, W:%d), S2(P:%d, C:%v, W:%d)", s1p_fail, s1c_fail, s1w_fail, s2p_fail, s2c_fail, s2w_fail)
+	} else {
+		streamErr, ok := err.(*StreamError)
+		if !ok {
+			t.Fatalf("Step 6 Expected StreamError for cycle, got %T: %v", err, err)
+		}
+		if streamErr.Code != ErrCodeProtocolError {
+			t.Errorf("Step 6 Expected ProtocolError for cycle, got code %v (msg: %s)", streamErr.Code, streamErr.Msg)
+		}
+		if streamErr.StreamID != 2 { // Error should be for stream 2
+			t.Errorf("Step 6 Expected error for stream 2, got for stream %d", streamErr.StreamID)
+		}
+		// If an error occurred, the tree state should not have changed from end of step 5.5.
+		// State before this failing operation (end of 5.5):
+		// 0 -> 2 (w:15)
+		//      -> 1 (w:30)
+		p_after_err, c_after_err, w_after_err, _ := pt.GetDependencies(2) // Check S2
+		if p_after_err != 0 || w_after_err != 15 || !reflect.DeepEqual(sortUint32Slice(c_after_err), []uint32{1}) {
+			t.Errorf("Step 6 S2 (after error): P:%d W:%d C:%v. Expected P:0 W:15 C:[1] (state unchanged)", p_after_err, w_after_err, c_after_err)
+		}
+		p_after_err, c_after_err, w_after_err, _ = pt.GetDependencies(1) // Check S1
+		if p_after_err != 2 || w_after_err != 30 || len(c_after_err) != 0 {
+			t.Errorf("Step 6 S1 (after error): P:%d W:%d C:%v. Expected P:2 W:30 C:[] (state unchanged)", p_after_err, w_after_err, c_after_err)
+		}
 	}
-	p, c, w, _ = pt.GetDependencies(4)
-	if p != 1 || w != 60 || len(c) != 0 {
-		t.Errorf("S4 post PRIORITY: P:%d W:%d C:%v. Expected P:1 W:60 C:[]", p, w, c)
-	}
-	p, c, w, _ = pt.GetDependencies(1)
-	if p != 2 || w != 30 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{4}) {
-		t.Errorf("S1 post S4-PRIORITY: P:%d W:%d C:%v. Expected P:2 W:30 C:[4]", p, w, c)
-	}
-	p, c, w, _ = pt.GetDependencies(2)
-	if p != 0 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
-		t.Errorf("S2 post S4-PRIORITY: P:%d W:%d C:%v. Expected P:0 W:15 C:[1]", p, w, c)
-	}
-
 }
 
 // Helper to sort uint32 slices for consistent comparison
