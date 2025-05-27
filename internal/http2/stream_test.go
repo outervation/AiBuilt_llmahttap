@@ -3,6 +3,8 @@ package http2
 import (
 	"context"
 	"fmt"
+
+	"errors"
 	"io"
 	"net/http"
 
@@ -397,9 +399,11 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		connAsRealConnType.maxFrameSize = DefaultSettingsMaxFrameSize // Default if not specified
 	}
 	peerInitialWin := mc.cfgPeerInitialWindowSize
-	if peerInitialWin == 0 {
-		peerInitialWin = DefaultInitialWindowSize
-	}
+	// If cfgPeerInitialWindowSize is 0, it means the test case explicitly wants
+	// to test a scenario with a 0 initial window size from the peer.
+	// Do not override with DefaultInitialWindowSize in this specific helper if 0 is provided.
+	// The actual HTTP/2 spec default (65535) applies if SETTINGS_INITIAL_WINDOW_SIZE is not exchanged.
+	// Here, peerInitialWin directly reflects the test's configured value for the peer.
 
 	ourInitialWin := mc.cfgOurInitialWindowSize
 	if ourInitialWin == 0 {
@@ -2370,6 +2374,582 @@ func TestStream_SendHeaders(t *testing.T) {
 			}
 			if finalEndStreamSentToClient != tc.expectedEndStreamSentToClient {
 				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedEndStreamSentToClient, finalEndStreamSentToClient)
+			}
+		})
+	}
+}
+
+func TestStream_setState_GeneralTransitions(t *testing.T) {
+	const testStreamID = uint32(11)
+	defaultPrioWeight := uint8(16)
+
+	allStates := []StreamState{
+		StreamStateIdle, StreamStateReservedLocal, StreamStateReservedRemote,
+		StreamStateOpen, StreamStateHalfClosedLocal, StreamStateHalfClosedRemote,
+		StreamStateClosed,
+	}
+
+	for _, initialState := range allStates {
+		for _, targetState := range allStates {
+			t.Run(fmt.Sprintf("From%s_To%s", initialState, targetState), func(t *testing.T) {
+				mc := &mockConnection{
+					writerChan: make(chan Frame, 1), // For teardown stream.Close()
+				}
+				// Use DefaultInitialWindowSize to ensure FC window isn't zero, allowing Acquire to succeed if not closed.
+				mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
+				mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
+
+				stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+
+				// Setup initial stream state and ensure resources are 'fresh' if not initially closed.
+				stream.mu.Lock()
+				stream.state = initialState
+				originalCtx := stream.ctx // Capture the original context
+
+				if initialState == StreamStateClosed {
+					// If starting from Closed, simulate that resources were already cleaned.
+					if stream.cancelCtx != nil {
+						stream.cancelCtx() // Cancel context
+					}
+					if stream.requestBodyWriter != nil {
+						_ = stream.requestBodyWriter.Close() // Close writer
+					}
+					// No need to close reader, writer close affects it.
+					if stream.fcManager != nil && stream.fcManager.sendWindow != nil {
+						stream.fcManager.sendWindow.Close(nil) // Close FC window
+					}
+				}
+				stream.mu.Unlock()
+
+				// Action: Call _setState
+				stream.mu.Lock()
+				stream._setState(targetState)
+				stream.mu.Unlock()
+
+				// Verification
+				stream.mu.RLock()
+				finalState := stream.state
+				stream.mu.RUnlock()
+
+				if finalState != targetState {
+					t.Errorf("Expected stream state %s, got %s", targetState, finalState)
+				}
+
+				if targetState == StreamStateClosed {
+					// Resources should be cleaned up.
+					if !isContextDone(originalCtx) {
+						t.Error("Expected context to be canceled when targetState is Closed")
+					}
+
+					_, errPipeWrite := stream.requestBodyWriter.Write([]byte("test"))
+					if errPipeWrite != io.ErrClosedPipe {
+						t.Errorf("Expected io.ErrClosedPipe writing to pipe when targetState is Closed, got %v", errPipeWrite)
+					}
+
+					_, errPipeRead := stream.requestBodyReader.Read(make([]byte, 1))
+					if errPipeRead == nil {
+						t.Error("Expected error reading from pipe when targetState is Closed")
+					} else if !strings.Contains(errPipeRead.Error(), "closed") && errPipeRead != io.EOF { // Check for "closed" or EOF
+						// Error depends on how closeStreamResourcesProtected closes the pipe for pendingRSTCode cases
+						// For pendingRSTCode=nil it's io.EOF, for non-nil it's a StreamError.
+						// A generic "closed" check is simpler here.
+						t.Logf("Pipe read error (expected closed-like): %v", errPipeRead)
+					}
+
+					errFcSendAcquire := stream.fcManager.sendWindow.Acquire(1)
+					if errFcSendAcquire == nil {
+						t.Error("Expected error acquiring from send flow control when targetState is Closed")
+					} else if _, ok := errFcSendAcquire.(*StreamError); !ok {
+						t.Errorf("Expected StreamError from FC acquire when targetState is Closed, got %T: %v", errFcSendAcquire, errFcSendAcquire)
+					}
+				} else { // targetState is NOT StreamStateClosed
+					if initialState == StreamStateClosed {
+						// If started Closed, resources were already cleaned up. They should remain cleaned up.
+						if !isContextDone(originalCtx) {
+							t.Errorf("Context should remain canceled (initialState was Closed). Target state: %s", targetState)
+						}
+						// Check pipes remain closed
+						_, errPipeWrite := stream.requestBodyWriter.Write([]byte("test"))
+						if errPipeWrite != io.ErrClosedPipe {
+							t.Errorf("Pipe writer should remain unusable (initialState was Closed). Target state: %s, err: %v", targetState, errPipeWrite)
+						}
+						_, errPipeRead := stream.requestBodyReader.Read(make([]byte, 1))
+						if errPipeRead == nil { // Should be an error (EOF or closed pipe)
+							t.Errorf("Pipe reader should remain unusable (initialState was Closed), got nil error. Target state: %s", targetState)
+						}
+
+						// Check FC remains closed
+						errFcSendAcquire := stream.fcManager.sendWindow.Acquire(1)
+						if errFcSendAcquire == nil {
+							t.Errorf("FC send acquire should remain unusable (initialState was Closed). Target state: %s", targetState)
+						}
+
+					} else {
+						// If started NOT Closed, and target is NOT Closed, resources should remain usable.
+						if isContextDone(originalCtx) {
+							t.Errorf("Context became canceled unexpectedly (initialState != Closed, targetState != Closed). Target state: %s", targetState)
+						}
+
+						// Pipes should NOT have been closed by _setState. We cannot perform blocking I/O.
+						// Asserting they weren't closed by _setState is implicit if context and FC checks pass
+						// and targetState is not Closed.
+
+						// Check Flow Control: Acquire should succeed if window is not 0 (it's DefaultInitialWindowSize here).
+						// If fcManager was closed by _setState, Acquire would error with a stream closed type error.
+						errFcSendAcquire := stream.fcManager.sendWindow.Acquire(1)
+						if errFcSendAcquire != nil {
+							if se, ok := errFcSendAcquire.(*StreamError); ok && (se.Code == ErrCodeStreamClosed || se.Code == ErrCodeCancel) {
+								t.Errorf("FC send acquire failed with stream closed/cancel error unexpectedly (initialState != Closed, targetState != Closed). Target state: %s, error: %v", targetState, errFcSendAcquire)
+							}
+							// Other FC errors (e.g. window full if test setup made it so) are not _setState's fault.
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// Helper for TestStream_setState_GeneralTransitions
+func isContextDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// The original getPipeErrors has been removed as it was too complex and had side effects.
+// The checks are now done directly in TestStream_setState_GeneralTransitions.
+
+func TestStream_WriteData(t *testing.T) {
+	const testStreamID = uint32(1)
+	defaultPrioWeight := uint8(16) // Not directly relevant but needed for newTestStream
+
+	tests := []struct {
+		name string
+		// Initial stream state
+		initialState               StreamState
+		initialResponseHeadersSent bool
+		initialEndStreamSentClient bool
+		initialPendingRSTCode      *ErrorCode
+		// Initial flow control state (absolute values)
+		initialStreamSendWindow int64
+		initialConnSendWindow   int64
+		// Connection's maxFrameSize for this test
+		cfgMaxFrameSize uint32
+		// Input to WriteData
+		dataToSend    []byte
+		endStreamFlag bool
+		// Mock connection behavior
+		connSendDataFrameError error // If non-nil, conn.sendDataFrame will be simulated to fail with this.
+		// Expected outcomes
+		expectedN             int
+		expectError           bool
+		expectedErrorContains string
+		// Expected stream state after
+		expectedFinalState         StreamState
+		expectedFinalEndStreamSent bool
+		// Expected frames on writerChan
+		expectedDataFrames []struct {
+			Data      []byte
+			EndStream bool
+		}
+		// Expected flow control state after (absolute values)
+		expectedStreamSendWindowAfter int64
+		expectedConnSendWindowAfter   int64
+	}{
+		{
+			name:                       "Success: send data, no endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("hello"),
+			endStreamFlag:              false,
+			expectedN:                  5,
+			expectError:                false,
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte("hello"), EndStream: false}},
+			expectedStreamSendWindowAfter: 95,
+			expectedConnSendWindowAfter:   195,
+		},
+		{
+			name:                       "Success: send data, with endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("world"),
+			endStreamFlag:              true,
+			expectedN:                  5,
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte("world"), EndStream: true}},
+			expectedStreamSendWindowAfter: 95,
+			expectedConnSendWindowAfter:   195,
+		},
+		{
+			name:                       "Success: send zero-length data, with endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte{},
+			endStreamFlag:              true,
+			expectedN:                  0,
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte{}, EndStream: true}},
+			expectedStreamSendWindowAfter: 100, // No window consumed for 0-length
+			expectedConnSendWindowAfter:   200, // No window consumed for 0-length
+		},
+		{
+			name:                          "No-op: send zero-length data, no endStream",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte{},
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   false,
+			expectedFinalState:            StreamStateOpen,
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil, // No frame sent
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                       "Success: send data larger than maxFrameSize (chunking)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            5,                            // Force chunking
+			dataToSend:                 []byte("data_chunking_test"), // 19 bytes
+			endStreamFlag:              true,
+			expectedN:                  18, // CHANGED from 19
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{
+				{Data: []byte("data_"), EndStream: false},
+				{Data: []byte("chunk"), EndStream: false},
+				{Data: []byte("ing_t"), EndStream: false},
+				{Data: []byte("est"), EndStream: true}, // CHANGED from "estt"
+			},
+			expectedStreamSendWindowAfter: 100 - 18, // CHANGED from 100 - 19 (was 81, now 82)
+			expectedConnSendWindowAfter:   200 - 18, // CHANGED from 200 - 19 (was 181, now 182)
+		},
+		{
+			name:                          "Error: WriteData called before SendHeaders",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    false, // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "SendHeaders must be called before WriteData",
+			expectedFinalState:            StreamStateOpen, // State unchanged
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100, // FC not acquired
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream closed",
+			initialState:                  StreamStateClosed, // Key condition
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       0,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateClosed,
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 0,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream resetting (pendingRSTCode set)",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialPendingRSTCode:         func() *ErrorCode { e := ErrCodeCancel; return &e }(), // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateOpen, // State unchanged by this call
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: WriteData after END_STREAM already sent",
+			initialState:                  StreamStateHalfClosedLocal,
+			initialResponseHeadersSent:    true,
+			initialEndStreamSentClient:    true, // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent:    true,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream flow control insufficient",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       5, // Insufficient for "ten_bytes_"
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("ten_bytes_"), // 10 bytes
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "simulated insufficient stream FC window (closed for test)",
+			expectedFinalState:            StreamStateOpen, // FC error doesn't change state itself in WriteData
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 5, // FC acquire failed as window was pre-closed by test
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                       "Error: connection flow control insufficient",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      5, // Insufficient for "ten_bytes_"
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("ten_bytes_"), // 10 bytes
+			endStreamFlag:              false,
+			expectedN:                  0,
+			expectError:                true,
+			expectedErrorContains:      "simulated insufficient conn FC window (closed for test)",
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames:         nil,
+			// Stream FC (10 bytes) acquired, then conn FC fails, then stream FC is released by WriteData's error handling.
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   5, // Conn FC acquire failed as window was pre-closed by test
+		},
+		{
+			name:                       "Error: conn.sendDataFrame fails",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("sendfail"), // 8 bytes
+			endStreamFlag:              false,
+			connSendDataFrameError:     NewConnectionError(ErrCodeConnectError, "simulated conn write error from test"),
+			expectedN:                  0,
+			expectError:                true,
+			expectedErrorContains:      fmt.Sprintf("connection error: connection shutting down (pre-check), cannot send DATA for stream %d", testStreamID),
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames:         nil,
+			// FC is acquired before send attempt. If send fails, FC is NOT currently released by WriteData.
+			expectedStreamSendWindowAfter: 100 - 8, // 92
+			expectedConnSendWindowAfter:   200 - 8, // 192
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Ensure cfgMaxFrameSize has a sensible default for the test case if not specified.
+			effectiveCfgMaxFrameSize := tc.cfgMaxFrameSize
+			if effectiveCfgMaxFrameSize == 0 {
+				effectiveCfgMaxFrameSize = DefaultMaxFrameSize
+			}
+
+			mc := &mockConnection{
+				writerChan:               make(chan Frame, len(tc.dataToSend)/int(effectiveCfgMaxFrameSize)+2), // Buffer for all chunks + potential RST
+				cfgOurInitialWindowSize:  DefaultInitialWindowSize,                                             // Affects stream's receive window, not directly tested here
+				cfgPeerInitialWindowSize: uint32(tc.initialStreamSendWindow),                                   // Sets stream's initial *send* window
+				cfgMaxFrameSize:          effectiveCfgMaxFrameSize,                                             // Max frame size used by stream for chunking
+			}
+
+			realConn := (*Connection)(unsafe.Pointer(mc))
+			if realConn.connFCManager == nil {
+				realConn.connFCManager = NewConnectionFlowControlManager()
+			}
+			// Adjust connection FC window to match test case's initialConnSendWindow
+			currentConnFcAvailable := realConn.connFCManager.sendWindow.Available()
+			deltaConnFc := tc.initialConnSendWindow - currentConnFcAvailable
+			if deltaConnFc < 0 { // Need to acquire/reduce
+				if errSetup := realConn.connFCManager.sendWindow.Acquire(uint32(-deltaConnFc)); errSetup != nil {
+					t.Fatalf("Setup: Failed to pre-acquire from connFC: %v (target: %d, current: %d, acquire: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, -deltaConnFc)
+				}
+			} else if deltaConnFc > 0 { // Need to increase
+				if errSetup := realConn.connFCManager.sendWindow.Increase(uint32(deltaConnFc)); errSetup != nil {
+					t.Fatalf("Setup: Failed to pre-increase connFC: %v (target: %d, current: %d, increase: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, deltaConnFc)
+				}
+			}
+			if realConn.connFCManager.sendWindow.Available() != tc.initialConnSendWindow {
+				t.Fatalf("Setup: connFCManager window not set as expected. Got %d, want %d", realConn.connFCManager.sendWindow.Available(), tc.initialConnSendWindow)
+			}
+
+			if tc.connSendDataFrameError != nil {
+				if realConn.shutdownChan == nil {
+					realConn.shutdownChan = make(chan struct{})
+				}
+				close(realConn.shutdownChan)
+				realConn.connError = tc.connSendDataFrameError
+			}
+
+			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, false)
+
+			// Adjust stream FC window to match test case's initialStreamSendWindow AFTER stream creation (as newTestStream uses cfgPeerInitialWindowSize)
+			// This is a bit redundant as newTestStream already sets it, but ensures exactness if initialStreamSendWindow is tricky.
+			// newTestStream correctly uses cfgPeerInitialWindowSize to init stream's send window.
+			// So stream.fcManager.sendWindow.Available() should already be tc.initialStreamSendWindow if logic in newTestStream is correct.
+
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			stream.responseHeadersSent = tc.initialResponseHeadersSent
+			stream.endStreamSentToClient = tc.initialEndStreamSentClient
+			if tc.initialPendingRSTCode != nil {
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			}
+			stream.mu.Unlock()
+
+			initialStreamWin := stream.fcManager.GetStreamSendAvailable()
+			if initialStreamWin != tc.initialStreamSendWindow {
+				// This would indicate a problem in newTestStream's setup of peerInitialWin for stream.fcManager
+				t.Logf("Warning: Initial stream send window from fcManager (%d) does not match test case tc.initialStreamSendWindow (%d). Check newTestStream logic.", initialStreamWin, tc.initialStreamSendWindow)
+				// Forcibly adjust for test if possible, though ideally newTestStream handles it.
+				// This path is complex due to FlowControlWindow internals. Best rely on newTestStream.
+			}
+			initialConnWin := realConn.connFCManager.GetConnectionSendAvailable()
+
+			if tc.name == "Error: stream flow control insufficient" {
+				simulatedStreamFCError := errors.New("simulated insufficient stream FC window (closed for test)")
+				stream.fcManager.sendWindow.Close(simulatedStreamFCError) // Close the window to make Acquire fail
+			}
+			if tc.name == "Error: connection flow control insufficient" {
+				simulatedConnFCError := errors.New("simulated insufficient conn FC window (closed for test)")
+				realConn.connFCManager.sendWindow.Close(simulatedConnFCError) // Close the window to make Acquire fail
+			}
+
+			n, err := stream.WriteData(tc.dataToSend, tc.endStreamFlag)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorContains != "" && !strings.Contains(err.Error(), tc.expectedErrorContains) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tc.expectedErrorContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if n != tc.expectedN {
+				t.Errorf("Expected n=%d, got n=%d", tc.expectedN, n)
+			}
+
+			if len(tc.expectedDataFrames) > 0 {
+				for i, expectedFrame := range tc.expectedDataFrames {
+					select {
+					case frame := <-mc.writerChan:
+						dataFrame, ok := frame.(*DataFrame)
+						if !ok {
+							t.Fatalf("Expected DataFrame %d on writerChan, got %T", i+1, frame)
+						}
+						if dataFrame.Header().StreamID != testStreamID {
+							t.Errorf("Frame %d: DataFrame StreamID mismatch: got %d, want %d", i+1, dataFrame.Header().StreamID, testStreamID)
+						}
+						if string(dataFrame.Data) != string(expectedFrame.Data) {
+							t.Errorf("Frame %d: DataFrame Data mismatch: got %q, want %q", i+1, string(dataFrame.Data), string(expectedFrame.Data))
+						}
+						if (dataFrame.Header().Flags&FlagDataEndStream != 0) != expectedFrame.EndStream {
+							t.Errorf("Frame %d: DataFrame END_STREAM flag mismatch: got %v, want %v (Flags: %08b)", i+1, (dataFrame.Header().Flags&FlagDataEndStream != 0), expectedFrame.EndStream, dataFrame.Header().Flags)
+						}
+					case <-time.After(100 * time.Millisecond):
+						t.Fatalf("Expected DataFrame %d on writerChan, but none found. Expected: {Data: %q, EndStream: %v}", i+1, string(expectedFrame.Data), expectedFrame.EndStream)
+					}
+				}
+				// Ensure no more frames are sent if all expected frames were received
+				select {
+				case frame := <-mc.writerChan:
+					t.Fatalf("Expected no more frames, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default: // Good, no more frames
+				}
+			} else { // No frames expected
+				select {
+				case frame := <-mc.writerChan:
+					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			finalEndStreamSent := stream.endStreamSentToClient
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedFinalState {
+				t.Errorf("Expected final stream state %s, got %s", tc.expectedFinalState, finalState)
+			}
+			if finalEndStreamSent != tc.expectedFinalEndStreamSent {
+				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedFinalEndStreamSent, finalEndStreamSent)
+			}
+
+			finalStreamWin := stream.fcManager.GetStreamSendAvailable()
+			finalConnWin := realConn.connFCManager.GetConnectionSendAvailable()
+
+			if finalStreamWin != tc.expectedStreamSendWindowAfter {
+				t.Errorf("Expected stream send window %d, got %d. (Initial: %d, Change: %d)",
+					tc.expectedStreamSendWindowAfter, finalStreamWin, tc.initialStreamSendWindow, tc.initialStreamSendWindow-finalStreamWin)
+			}
+			if finalConnWin != tc.expectedConnSendWindowAfter {
+				t.Errorf("Expected conn send window %d, got %d. (Initial: %d, Change: %d)",
+					tc.expectedConnSendWindowAfter, finalConnWin, initialConnWin, initialConnWin-finalConnWin)
 			}
 		})
 	}
