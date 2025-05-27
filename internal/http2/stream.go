@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http" // For http.Header, http.Request
 	"net/url"  // For url.URL
-	"os"       // Added for os.Stdout.Sync()
 
 	"runtime/debug" // For stack traces in panic recovery
 	"strings"       // For strings.Index and strings.HasPrefix
@@ -587,15 +586,9 @@ func (s *Stream) transitionStateOnSendEndStream() {
 
 func (s *Stream) _setState(newState StreamState) {
 	if s.state == newState {
-		fmt.Printf("STREAM_DEBUG: _setState ENTERED for stream ID: %d, current state: %s, new state: %s, s.conn nil: %t, s.conn.log nil: %t\n", s.id, s.state.String(), newState.String(), s.conn == nil, s.conn != nil && s.conn.log == nil)
-		os.Stdout.Sync() // Force flush
 		return
 	}
-	fmt.Printf("STREAM_DEBUG: _setState BEFORE s.conn.log.Debug for stream ID: %d\n", s.id)
-	os.Stdout.Sync() // Force flush
 	oldState := s.state
-	fmt.Printf("STREAM_DEBUG: _setState BEFORE s.conn.log.Debug for stream ID: %d\n", s.id)
-	os.Stdout.Sync() // Force flush
 	s.state = newState
 	s.conn.log.Debug("Stream state changed", logger.LogFields{"stream_id": s.id, "old_state": oldState.String(), "new_state": newState.String()})
 
@@ -629,9 +622,9 @@ func (s *Stream) closeStreamResourcesProtected() {
 		}
 		_ = s.requestBodyWriter.CloseWithError(closeReason) // Best effort
 	}
-	if s.requestBodyReader != nil {
-		_ = s.requestBodyReader.Close() // Reader side often just needs Close()
-	}
+	// if s.requestBodyReader != nil {
+	// 	_ = s.requestBodyReader.Close() // Reader side often just needs Close()
+	// }
 
 	// Cancel the stream's context.
 
