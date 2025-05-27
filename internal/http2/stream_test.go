@@ -119,6 +119,7 @@ type mockConnection struct {
 	cfgRemoteAddrStr         string // For configuring the aligned remoteAddrStr field if needed.
 
 	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
+	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
 	onSendHeadersFrameImpl      func(s *Stream, headers []hpack.HeaderField, endStream bool) error
 	onSendDataFrameImpl         func(s *Stream, data []byte, endStream bool) (int, error)
 	onSendRSTStreamFrameImpl    func(streamID uint32, errorCode ErrorCode) error
@@ -127,8 +128,10 @@ type mockConnection struct {
 	onStreamHandlerDoneImpl     func(s *Stream)
 
 	// --- Test inspection fields (will not be populated correctly by current call path) ---
-	mu                  sync.Mutex
-	lastSendHeadersArgs *struct {
+	mu                          sync.Mutex
+	removeClosedStreamCallCount int     // Added for testing interaction
+	lastStreamRemovedByClose    *Stream // Added for testing interaction
+	lastSendHeadersArgs         *struct {
 		Stream    *Stream
 		Headers   []hpack.HeaderField
 		EndStream bool
@@ -166,9 +169,6 @@ type mockConnection struct {
 	}
 	lastExtractPseudoHeadersHF []hpack.HeaderField
 	lastStreamHandlerDoneArgs  *struct{ Stream *Stream }
-
-	removeClosedStreamCallCount int     // Added for testing interaction
-	lastStreamRemovedByClose    *Stream // Added for testing interaction
 
 	sendHeadersFrameCount      int
 	sendDataFrameCount         int
