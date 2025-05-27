@@ -260,6 +260,68 @@ func TestPriorityTree_AddStream_SelfDependencyError(t *testing.T) {
 	// t.Logf("Got expected error: %v", err)
 }
 
+func TestPriorityTree_AddStream_ParentDoesNotExist(t *testing.T) {
+	pt := NewPriorityTree()
+
+	nonExistentParentID := uint32(5)
+	childStreamID := uint32(6)
+	childWeight := uint8(77)
+
+	prioInfo := &streamDependencyInfo{
+		StreamDependency: nonExistentParentID,
+		Weight:           childWeight,
+		Exclusive:        false,
+	}
+
+	err := pt.AddStream(childStreamID, prioInfo)
+	if err != nil {
+		t.Fatalf("AddStream for childStreamID %d failed: %v", childStreamID, err)
+	}
+
+	// Verify childStreamID (6)
+	childParent, _, childActualWeight, errGetChild := pt.GetDependencies(childStreamID)
+	if errGetChild != nil {
+		t.Fatalf("GetDependencies for childStreamID %d failed: %v", childStreamID, errGetChild)
+	}
+	if childParent != nonExistentParentID {
+		t.Errorf("Child stream %d: expected parent %d, got %d", childStreamID, nonExistentParentID, childParent)
+	}
+	if childActualWeight != childWeight {
+		t.Errorf("Child stream %d: expected weight %d, got %d", childStreamID, childWeight, childActualWeight)
+	}
+
+	// Verify nonExistentParentID (5) - should have been created
+	createdParentParentID, createdParentChildren, createdParentWeight, errGetCreatedParent := pt.GetDependencies(nonExistentParentID)
+	if errGetCreatedParent != nil {
+		t.Fatalf("GetDependencies for created parent stream %d failed: %v", nonExistentParentID, errGetCreatedParent)
+	}
+	if createdParentParentID != 0 { // Implicitly created parents should depend on stream 0
+		t.Errorf("Created parent stream %d: expected parent 0, got %d", nonExistentParentID, createdParentParentID)
+	}
+	if createdParentWeight != 15 { // Default weight for implicitly created parent
+		t.Errorf("Created parent stream %d: expected default weight 15, got %d", nonExistentParentID, createdParentWeight)
+	}
+	expectedCreatedParentChildren := []uint32{childStreamID}
+	if !reflect.DeepEqual(sortUint32Slice(createdParentChildren), sortUint32Slice(expectedCreatedParentChildren)) {
+		t.Errorf("Created parent stream %d: expected children %v, got %v", nonExistentParentID, expectedCreatedParentChildren, createdParentChildren)
+	}
+
+	// Verify stream 0 has the created parent as a child
+	_, stream0Children, _, errGetRoot := pt.GetDependencies(0)
+	if errGetRoot != nil {
+		t.Fatalf("GetDependencies for stream 0 failed: %v", errGetRoot)
+	}
+	found := false
+	for _, child := range stream0Children {
+		if child == nonExistentParentID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Created parent stream %d not found in children of stream 0. Children: %v", nonExistentParentID, stream0Children)
+	}
+}
 func TestPriorityTree_ProcessPriorityFrame_Valid(t *testing.T) {
 	pt := NewPriorityTree()
 	// Add stream 1 and 3, both children of 0 initially
