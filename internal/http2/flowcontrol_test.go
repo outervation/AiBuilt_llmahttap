@@ -1175,3 +1175,51 @@ func TestFlowControlWindow_setErrorLocked(t *testing.T) {
 	assert.True(t, fcw.closed)
 	assert.Equal(t, err1, fcw.err, "Error should not be overwritten")
 }
+
+func TestFlowControlWindow_Acquire_MultipleWaiters_Increase(t *testing.T) {
+	fcw := NewFlowControlWindow(10, false, testStreamID) // Initial capacity 10
+	err := fcw.Acquire(10)                               // Exhaust initial capacity
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fcw.Available())
+
+	numWaiters := 3
+	acquireAmount := uint32(5)
+	var wg sync.WaitGroup
+	wg.Add(numWaiters)
+
+	errs := make(chan error, numWaiters)
+
+	for i := 0; i < numWaiters; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			t.Logf("Goroutine %d attempting to acquire %d bytes", idx, acquireAmount)
+			err := fcw.Acquire(acquireAmount)
+			if err != nil {
+				t.Logf("Goroutine %d acquire error: %v", idx, err)
+			} else {
+				t.Logf("Goroutine %d acquired %d bytes successfully", idx, acquireAmount)
+			}
+			errs <- err
+		}(i)
+	}
+
+	// Give goroutines a chance to block
+	time.Sleep(100 * time.Millisecond) // Increased sleep to ensure goroutines likely hit cond.Wait()
+
+	t.Logf("Main: Increasing window by %d", acquireAmount*uint32(numWaiters))
+	increaseErr := fcw.Increase(acquireAmount * uint32(numWaiters)) // Increase by 5 * 3 = 15
+	require.NoError(t, increaseErr)
+	t.Logf("Main: Window increased. Available: %d", fcw.Available())
+
+	wg.Wait() // Wait for all goroutines to complete
+	close(errs)
+
+	for i := 0; i < numWaiters; i++ {
+		err := <-errs
+		assert.NoError(t, err, "Goroutine %d should have acquired successfully", i)
+	}
+
+	// All 3 waiters should have acquired 5 bytes each, total 15.
+	// Initial was 0. Increased by 15. Then 15 acquired.
+	assert.Equal(t, int64(0), fcw.Available(), "Window should be fully consumed")
+}
