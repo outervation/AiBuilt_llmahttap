@@ -149,12 +149,11 @@ func GenerateRSTStreamFrame(streamID uint32, errCode ErrorCode, err error) *RSTS
 	finalStreamID := streamID
 
 	if se, ok := err.(*StreamError); ok {
-		// If the passed streamID is 0 (or not set) and the StreamError has a valid StreamID,
-		// prioritize the StreamID from the StreamError.
-		if finalStreamID == 0 && se.StreamID != 0 {
+		codeToUse = se.Code   // Always use StreamError's code
+		if se.StreamID != 0 { // Prioritize StreamError's StreamID if it's set
 			finalStreamID = se.StreamID
 		}
-		codeToUse = se.Code
+		// If se.StreamID is 0, finalStreamID (initialized from streamID arg) is used.
 	}
 
 	// Ensure FrameHeader is fully initialized
@@ -179,20 +178,21 @@ func GenerateRSTStreamFrame(streamID uint32, errCode ErrorCode, err error) *RSTS
 func GenerateGoAwayFrame(lastStreamID uint32, errCode ErrorCode, debugStr string, err error) *GoAwayFrame {
 	codeToUse := errCode
 	finalLastStreamID := lastStreamID
-	debugDataBytes := []byte(debugStr) // Default to provided string
+	var debugDataBytes []byte // Initialize as nil/empty
 
 	if ce, ok := err.(*ConnectionError); ok {
-		// ConnectionError's LastStreamID takes precedence if set.
-		// Note: ce.LastStreamID could legitimately be 0 for early connection errors.
-		finalLastStreamID = ce.LastStreamID
-		codeToUse = ce.Code
+		finalLastStreamID = ce.LastStreamID // Already set before this block if not *ConnectionError
+		codeToUse = ce.Code                 // Already set before this block if not *ConnectionError
 
 		if len(ce.DebugData) > 0 {
-			debugDataBytes = ce.DebugData
-		} else if ce.Msg != "" && len(debugDataBytes) == 0 && debugStr == "" {
-			// Use ConnectionError.Msg as debug data only if no explicit debugData (from ce or debugStr) was provided
-			debugDataBytes = []byte(ce.Msg)
+			debugDataBytes = ce.DebugData // Prio 1 for ConnectionError
+		} else if ce.Msg != "" {
+			debugDataBytes = []byte(ce.Msg) // Prio 2 for ConnectionError
+		} else {
+			debugDataBytes = []byte(debugStr) // Prio 3 for ConnectionError (fallback to arg)
 		}
+	} else {
+		debugDataBytes = []byte(debugStr) // If not ConnectionError, use debugStrArg
 	}
 
 	// Ensure FrameHeader is fully initialized

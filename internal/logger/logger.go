@@ -2,14 +2,16 @@ package logger
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/textproto" // Added for CanonicalMIMEHeaderKey
 	"os"
-	"path/filepath" // Added
-	"runtime"       // Added
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,8 +105,10 @@ func NewLogger(cfg *config.LoggingConfig) (*Logger, error) {
 
 	// Setup Error Logger
 	if cfg.ErrorLog != nil {
+
 		var errorOutput io.WriteCloser = os.Stderr // Default
-		if *cfg.ErrorLog.Target != "stderr" {
+		// Check if ErrorLog.Target is non-nil before dereferencing
+		if cfg.ErrorLog.Target != nil && *cfg.ErrorLog.Target != "stderr" {
 			if *cfg.ErrorLog.Target == "stdout" {
 				errorOutput = os.Stdout
 			} else if config.IsFilePath(*cfg.ErrorLog.Target) {
@@ -141,8 +145,10 @@ func NewLogger(cfg *config.LoggingConfig) (*Logger, error) {
 
 	// Setup Access Logger
 	if cfg.AccessLog != nil && (cfg.AccessLog.Enabled == nil || *cfg.AccessLog.Enabled) {
+
 		var accessOutput io.WriteCloser = os.Stdout // Default
-		if *cfg.AccessLog.Target != "stdout" {
+		// Check if AccessLog.Target is non-nil before dereferencing
+		if cfg.AccessLog.Target != nil && *cfg.AccessLog.Target != "stdout" {
 			if *cfg.AccessLog.Target == "stderr" {
 				accessOutput = os.Stderr
 			} else if config.IsFilePath(*cfg.AccessLog.Target) {
@@ -247,59 +253,93 @@ func isIPTrusted(ip net.IP, trustedProxies parsedProxiesContainer) bool {
 // trustedProxies contains the pre-parsed list of trusted proxy IPs and CIDRs.
 
 func getRealClientIP(remoteAddr string, headers http.Header, realIPHeaderName string, trustedProxies parsedProxiesContainer) string {
-	var determinedDirectPeerIP string
+	log.Printf("[getRealClientIP TRACE V4] Entry: remoteAddr=%s, realIPHeaderName='%s' (len: %d)", remoteAddr, realIPHeaderName, len(realIPHeaderName))
+	log.Printf("[getRealClientIP TRACE V4] realIPHeaderName (bytes): %v", []byte(realIPHeaderName))
+
+	log.Printf("[getRealClientIP TRACE V4] All headers received in getRealClientIP (map dump):")
+	for k, v := range headers {
+		log.Printf("[getRealClientIP TRACE V4]   HEADER KEY: '%s' (len: %d, bytes: %v), VALUE: '%v', Get('%s'): '%s'",
+			k, len(k), []byte(k), v, k, headers.Get(k))
+	}
+	if val, ok := headers["CF-Connecting-IP"]; ok { // Test with exact string literal
+		log.Printf("[getRealClientIP TRACE V4] Direct map access headers[\"CF-Connecting-IP\"] exists. Value: %v. len: %d", val, len(val))
+	} else {
+		log.Printf("[getRealClientIP TRACE V4] Direct map access headers[\"CF-Connecting-IP\"] DOES NOT exist.")
+	}
+	if val, ok := headers[textproto.CanonicalMIMEHeaderKey("CF-Connecting-IP")]; ok { // Test with canonicalized string literal
+		log.Printf("[getRealClientIP TRACE V4] Direct map access headers[Canonical(\"CF-Connecting-IP\")] exists. Value: %v. len: %d", val, len(val))
+	} else {
+		log.Printf("[getRealClientIP TRACE V4] Direct map access headers[Canonical(\"CF-Connecting-IP\")] DOES NOT exist.")
+	}
+
+	canonicalRealIPHeaderName := textproto.CanonicalMIMEHeaderKey(realIPHeaderName)
+	log.Printf("[getRealClientIP TRACE V4] Canonical form of realIPHeaderName ('%s') is: '%s' (len: %d)", realIPHeaderName, canonicalRealIPHeaderName, len(canonicalRealIPHeaderName))
+	log.Printf("[getRealClientIP TRACE V4] Canonical form of string literal \"CF-Connecting-IP\" is: '%s'", textproto.CanonicalMIMEHeaderKey("CF-Connecting-IP"))
+
+	headerValueForDebug := headers.Get(realIPHeaderName)
+	log.Printf("[getRealClientIP TRACE V4] Value from headers.Get(realIPHeaderName) (realIPHeaderName='%s') for debug: '%s'", realIPHeaderName, headerValueForDebug)
+
+	directPeerIP := remoteAddr
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err == nil {
-		// Successfully split host:port. host is the host part.
-		// It could be an IP literal like "1.2.3.4" or "::1", or a hostname "localhost".
-		determinedDirectPeerIP = host
+		directPeerIP = host
 	} else {
-		// net.SplitHostPort failed. remoteAddr is not in "host:port" format.
-		// It might be a bare IP address (e.g. "1.2.3.4", "::1"),
-		// or a hostname, or a path (e.g. for Unix sockets).
-		// Try to parse it as an IP. If successful, use its canonical string form.
-		ip := net.ParseIP(remoteAddr)
-		if ip != nil {
-			determinedDirectPeerIP = ip.String() // Use canonical string representation
-		} else {
-			// Not a parseable IP. Use remoteAddr as is (e.g. "localhost", "[::1]" if malformed by user, path).
-			determinedDirectPeerIP = remoteAddr
+		ipAddr := net.ParseIP(remoteAddr)
+		if ipAddr != nil {
+			directPeerIP = ipAddr.String()
 		}
 	}
+	log.Printf("[getRealClientIP TRACE V4] directPeerIP initialized to: %s", directPeerIP)
 
 	if realIPHeaderName == "" {
-		return determinedDirectPeerIP
+		log.Printf("[getRealClientIP TRACE V4] realIPHeaderName is empty, returning directPeerIP: %s", directPeerIP)
+		return directPeerIP
 	}
 
-	headerValue := headers.Get(realIPHeaderName)
+	// Use canonicalRealIPHeaderName for the actual Get, just in case, though Get() should do this internally.
+	headerValue := headers.Get(canonicalRealIPHeaderName)
+	log.Printf("[getRealClientIP TRACE V4] headerValue for logic from headers.Get(canonicalRealIPHeaderName) (canonicalRealIPHeaderName='%s'): '%s'", canonicalRealIPHeaderName, headerValue)
+
 	if headerValue == "" {
-		return determinedDirectPeerIP
+		log.Printf("[getRealClientIP TRACE V4] headerValue is empty (after trying canonical), returning directPeerIP: %s", directPeerIP)
+		return directPeerIP
 	}
 
-	// X-Forwarded-For can be "client, proxy1, proxy2"
-	// We need to parse from right to left.
-	ipsInHeader := strings.Split(headerValue, ",")
-	for i := len(ipsInHeader) - 1; i >= 0; i-- {
-		ipStr := strings.TrimSpace(ipsInHeader[i])
-		if ipStr == "" { // Handle potential empty strings from "foo,,bar"
+	ipsInHeaderStrings := strings.Split(headerValue, ",")
+	log.Printf("[getRealClientIP TRACE V4] ipsInHeaderStrings: %v", ipsInHeaderStrings)
+	var candidateIPs []net.IP
+
+	for idx, ipStr := range ipsInHeaderStrings {
+		trimmedIPStr := strings.TrimSpace(ipStr)
+		log.Printf("[getRealClientIP TRACE V4] Processing ipsInHeaderStrings[%d]: '%s' (trimmed: '%s')", idx, ipStr, trimmedIPStr)
+		if trimmedIPStr == "" {
+			log.Printf("[getRealClientIP TRACE V4] Trimmed IP string is empty, skipping.")
 			continue
 		}
-
-		ip := net.ParseIP(ipStr)
+		ip := net.ParseIP(trimmedIPStr)
 		if ip == nil {
-			// "If ... the header is malformed, the direct peer IP is used."
-			// A single unparseable IP string in the list makes the header chain unreliable here.
-			return determinedDirectPeerIP
+			log.Printf("[getRealClientIP TRACE V4] Malformed IP '%s', returning directPeerIP: %s", trimmedIPStr, directPeerIP)
+			return directPeerIP
 		}
+		log.Printf("[getRealClientIP TRACE V4] Parsed IP: %s", ip.String())
+		candidateIPs = append(candidateIPs, ip)
+	}
+	log.Printf("[getRealClientIP TRACE V4] candidateIPs: %v", candidateIPs)
 
-		if !isIPTrusted(ip, trustedProxies) {
-			return ipStr // This is the first non-trusted IP from the right
+	for i := len(candidateIPs) - 1; i >= 0; i-- {
+		ip := candidateIPs[i]
+		log.Printf("[getRealClientIP TRACE V4] Checking candidateIPs[%d]: %s", i, ip.String())
+		trusted := isIPTrusted(ip, trustedProxies)
+		log.Printf("[getRealClientIP TRACE V4] isIPTrusted(%s) result: %v", ip.String(), trusted)
+		if !trusted {
+			log.Printf("[getRealClientIP TRACE V4] IP %s is NOT trusted. Returning it.", ip.String())
+			return ip.String()
 		}
+		log.Printf("[getRealClientIP TRACE V4] IP %s IS trusted. Continuing loop.", ip.String())
 	}
 
-	// If we reach here, all IPs in the header were valid and trusted,
-	// or the header was effectively empty after trimming spaces.
-	return determinedDirectPeerIP
+	log.Printf("[getRealClientIP TRACE V4] All IPs in header were trusted or header empty of non-trusted IPs. Returning directPeerIP: %s", directPeerIP)
+	return directPeerIP
 }
 
 // writeLogLine ensures the log line is written atomically using the logger's mutex.
@@ -712,25 +752,41 @@ func (l *Logger) Access(req *http.Request, streamID uint32, status int, response
 
 func (l *Logger) CloseLogFiles() error {
 	var firstErr error
+	var closeErrs []string
+
 	if l.accessLog != nil && l.accessLog.output != nil {
-		if config.IsFilePath(*l.accessLog.config.Target) { // Only close if it's a file
-			if err := l.accessLog.output.Close(); err != nil {
-				l.Error("Failed to close access log file", LogFields{"target": *l.accessLog.config.Target, "error": err.Error()})
+		// Only close if it's a file; check Target pointer first
+		if l.accessLog.config.Target != nil && config.IsFilePath(*l.accessLog.config.Target) {
+			if err := l.accessLog.output.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				errMsg := fmt.Sprintf("Failed to close access log file %s: %v", *l.accessLog.config.Target, err)
+				l.Error(errMsg, LogFields{"target": *l.accessLog.config.Target, "error": err.Error()})
 				if firstErr == nil {
 					firstErr = fmt.Errorf("closing access log '%s': %w", *l.accessLog.config.Target, err)
 				}
+				closeErrs = append(closeErrs, errMsg)
 			}
 		}
 	}
+
 	if l.errorLog != nil && l.errorLog.output != nil {
-		if config.IsFilePath(*l.errorLog.config.Target) { // Only close if it's a file
-			if err := l.errorLog.output.Close(); err != nil {
+		// Only close if it's a file; check Target pointer first
+		if l.errorLog.config.Target != nil && config.IsFilePath(*l.errorLog.config.Target) {
+			if err := l.errorLog.output.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 				// Use a more primitive logger here if the main one is compromised
-				fmt.Fprintf(os.Stderr, "[ERRORLOGGER] Failed to close error log file %s: %v\n", *l.errorLog.config.Target, err)
+				errMsg := fmt.Sprintf("Failed to close error log file %s: %v", *l.errorLog.config.Target, err)
+				fmt.Fprintf(os.Stderr, "[ERRORLOGGER] %s\n", errMsg)
 				if firstErr == nil {
 					firstErr = fmt.Errorf("closing error log '%s': %w", *l.errorLog.config.Target, err)
 				}
+				closeErrs = append(closeErrs, errMsg)
 			}
+		}
+	}
+
+	if len(closeErrs) > 0 {
+		// If firstErr is still nil but there were errors, synthesize one.
+		if firstErr == nil {
+			return fmt.Errorf("encountered errors while closing log files: %s", strings.Join(closeErrs, "; "))
 		}
 	}
 	return firstErr

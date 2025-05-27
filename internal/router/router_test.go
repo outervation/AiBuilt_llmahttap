@@ -22,6 +22,11 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
+// Helper function to get a pointer to a string.
+func strPtr(s string) *string {
+	return &s
+}
+
 // mockHandler is a simple implementation of http2.Handler for testing.
 type mockHandler struct {
 	id          string
@@ -118,11 +123,11 @@ func newDefaultBaseTestConfig() *config.Config {
 			LogLevel: config.LogLevelInfo,
 			AccessLog: &config.AccessLogConfig{
 				Enabled: &trueVal,
-				Target:  "stdout",
+				Target:  strPtr("stdout"),
 				Format:  "json",
 			},
 			ErrorLog: &config.ErrorLogConfig{
-				Target: "stderr",
+				Target: strPtr("stderr"),
 			},
 		},
 	}

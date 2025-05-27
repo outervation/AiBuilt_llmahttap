@@ -102,7 +102,7 @@ type MatchedRouteInfo struct {
 func (r *Router) Match(path string) (matchedRoute *config.Route, handler server.Handler, err error) {
 	// 1. Attempt Exact Match
 	if routeConfig, ok := r.exactRoutes[path]; ok {
-		h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.mainLogger) // Use r.mainLogger
+		h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig.Bytes(), r.mainLogger)
 		if e != nil {
 			r.mainLogger.Error("Failed to create handler for exact match route", logger.LogFields{ // Use r.mainLogger
 				"path":        path,
@@ -121,7 +121,7 @@ func (r *Router) Match(path string) (matchedRoute *config.Route, handler server.
 	// r.prefixRoutes is already sorted by length (longest first).
 	for _, routeConfig := range r.prefixRoutes {
 		if strings.HasPrefix(path, routeConfig.PathPattern) {
-			h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig, r.mainLogger) // Use r.mainLogger
+			h, e := r.handlerRegistry.CreateHandler(routeConfig.HandlerType, routeConfig.HandlerConfig.Bytes(), r.mainLogger)
 			if e != nil {
 				r.mainLogger.Error("Failed to create handler for prefix match route", logger.LogFields{ // Use r.mainLogger
 					"path":        path,
@@ -151,7 +151,7 @@ func (r *Router) Match(path string) (matchedRoute *config.Route, handler server.
 func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 	// First, check exact matches.
 	if route, ok := r.exactRoutes[path]; ok {
-		handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.mainLogger)
+		handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig.Bytes(), r.mainLogger)
 		if err != nil {
 			r.mainLogger.Error("Failed to create handler for exact route", logger.LogFields{
 				"path":        path,
@@ -166,7 +166,7 @@ func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 	// Then, check prefix matches (sorted by longest prefix first).
 	for _, route := range r.prefixRoutes {
 		if strings.HasPrefix(path, route.PathPattern) {
-			handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig, r.mainLogger)
+			handler, err := r.handlerRegistry.CreateHandler(route.HandlerType, route.HandlerConfig.Bytes(), r.mainLogger)
 			if err != nil {
 				r.mainLogger.Error("Failed to create handler for prefix route", logger.LogFields{
 					"path":        path,

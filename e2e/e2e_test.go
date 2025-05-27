@@ -26,6 +26,11 @@ var (
 	curlPath string
 )
 
+// Helper function to get a pointer to a string.
+func strPtr(s string) *string {
+	return &s
+}
+
 func TeardownServer(serverInstance *testutil.ServerInstance) {
 	// Teardown: Stop the server
 	fmt.Println("Stopping server after E2E tests...")
@@ -119,11 +124,11 @@ func SetupServer() *testutil.ServerInstance {
 			LogLevel: logLevelDebug,
 			AccessLog: &config.AccessLogConfig{
 				Enabled: &logEnabled,
-				Target:  logTarget,
+				Target:  strPtr(logTarget),
 				Format:  "json",
 			},
 			ErrorLog: &config.ErrorLogConfig{
-				Target: logTarget,
+				Target: strPtr(logTarget),
 			},
 		},
 	}
@@ -478,8 +483,8 @@ func TestRouting_MatchingLogic(t *testing.T) {
 			Server: &config.ServerConfig{Address: &defaultListenAddress},
 			Logging: &config.LoggingConfig{
 				LogLevel:  config.LogLevelDebug,
-				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"},
-				ErrorLog:  &config.ErrorLogConfig{Target: "stdout"},
+				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
 			},
 			Routing: &config.RoutingConfig{
 				Routes: []config.Route{
@@ -538,7 +543,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 		serverCfg := config.Config{
 			Server:  &config.ServerConfig{Address: &defaultListenAddress},
-			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: "stdout"}},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
 			Routing: &config.RoutingConfig{
 				Routes: []config.Route{
 					{
@@ -612,7 +617,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 		serverCfg := config.Config{
 			Server:  &config.ServerConfig{Address: &defaultListenAddress},
-			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: "stdout"}},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
 			Routing: &config.RoutingConfig{
 				Routes: []config.Route{
 					{ // Exact match for /path
@@ -682,7 +687,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 		serverCfg := config.Config{
 			Server:  &config.ServerConfig{Address: &defaultListenAddress},
-			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: "stdout"}},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
 			Routing: &config.RoutingConfig{
 				Routes: []config.Route{
 					{ // Shorter prefix /api/
@@ -749,7 +754,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 			serverCfg := config.Config{
 				Server:  &config.ServerConfig{Address: &defaultListenAddress},
-				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: "stdout"}},
+				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
 				Routing: &config.RoutingConfig{Routes: []config.Route{
 					{PathPattern: "/", MatchType: config.MatchTypeExact, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
 				}},
@@ -783,7 +788,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 			serverCfg := config.Config{
 				Server:  &config.ServerConfig{Address: &defaultListenAddress},
-				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: "stdout"}},
+				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
 				Routing: &config.RoutingConfig{Routes: []config.Route{
 					{PathPattern: "/", MatchType: config.MatchTypePrefix, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
 				}},
@@ -883,8 +888,8 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 				},
 				Logging: &config.LoggingConfig{
 					LogLevel:  config.LogLevelDebug, // Use debug to capture most output
-					AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: "stdout", Format: "json"},
-					ErrorLog:  &config.ErrorLogConfig{Target: "stdout"},
+					AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+					ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
 				},
 				Routing: &config.RoutingConfig{Routes: []config.Route{}}, // Start with empty routes
 			}

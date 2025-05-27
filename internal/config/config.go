@@ -101,11 +101,53 @@ type RoutingConfig struct {
 }
 
 // Route defines a single routing rule.
+
+// RawMessageWrapper is a wrapper around json.RawMessage to enable
+// custom TOML unmarshalling for string content into a raw JSON byte slice.
+type RawMessageWrapper json.RawMessage
+
+// UnmarshalText implements the encoding.TextUnmarshaler interface.
+// This allows TOML to unmarshal a string directly into the RawMessageWrapper.
+func (r *RawMessageWrapper) UnmarshalText(text []byte) error {
+	// The TOML parser gives us the raw string content (without TOML quotes).
+	// We want to store this as a json.RawMessage ([]byte).
+	// A direct cast or copy is needed.
+	*r = RawMessageWrapper(text)
+	return nil
+}
+
+// MarshalJSON ensures that RawMessageWrapper marshals as its underlying json.RawMessage.
+func (r RawMessageWrapper) MarshalJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("null"), nil
+	}
+	return json.RawMessage(r).MarshalJSON()
+}
+
+// UnmarshalJSON ensures that RawMessageWrapper unmarshals JSON as its underlying json.RawMessage.
+func (r *RawMessageWrapper) UnmarshalJSON(data []byte) error {
+	// Delegate to json.RawMessage's UnmarshalJSON
+	// Need to cast r to *json.RawMessage conceptually, but json.RawMessage is []byte.
+	// So, we unmarshal into a temporary json.RawMessage and then assign.
+	var temp json.RawMessage
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+	*r = RawMessageWrapper(temp)
+	return nil
+}
+
+// Bytes returns the underlying []byte slice.
+func (r RawMessageWrapper) Bytes() []byte {
+	return []byte(r)
+}
+
 type Route struct {
-	PathPattern   string          `json:"path_pattern" toml:"path_pattern"`
-	MatchType     MatchType       `json:"match_type" toml:"match_type"`
-	HandlerType   string          `json:"handler_type" toml:"handler_type"`
-	HandlerConfig json.RawMessage `json:"handler_config,omitempty" toml:"handler_config,omitempty"`
+	PathPattern string    `json:"path_pattern" toml:"path_pattern"`
+	MatchType   MatchType `json:"match_type" toml:"match_type"`
+	HandlerType string    `json:"handler_type" toml:"handler_type"`
+
+	HandlerConfig RawMessageWrapper `json:"handler_config,omitempty" toml:"handler_config,omitempty"`
 }
 
 // LoggingConfig holds logging configurations.
