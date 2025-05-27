@@ -584,6 +584,66 @@ func TestPriorityTree_ProcessPriorityFrame_SelfDependencyError(t *testing.T) {
 	// t.Logf("Got expected error: %v", err)
 }
 
+func TestPriorityTree_ProcessPriorityFrame_StreamDoesNotExist(t *testing.T) {
+	pt := NewPriorityTree()
+
+	nonExistentStreamID := uint32(7)
+	parentStreamID := uint32(1) // This stream will be the parent
+	priorityWeight := uint8(66)
+	isExclusive := false
+
+	// Create the parent stream so it exists
+	err := pt.AddStream(parentStreamID, nil)
+	if err != nil {
+		t.Fatalf("Setup: Failed to add parentStreamID %d: %v", parentStreamID, err)
+	}
+
+	frame := &PriorityFrame{
+		FrameHeader:      FrameHeader{StreamID: nonExistentStreamID},
+		Exclusive:        isExclusive,
+		StreamDependency: parentStreamID,
+		Weight:           priorityWeight,
+	}
+
+	err = pt.ProcessPriorityFrame(frame)
+	if err != nil {
+		t.Fatalf("ProcessPriorityFrame for non-existent stream %d failed: %v", nonExistentStreamID, err)
+	}
+
+	// Verify the new stream (7)
+	pID, children, w, errGet := pt.GetDependencies(nonExistentStreamID)
+	if errGet != nil {
+		t.Fatalf("GetDependencies for newly created stream %d failed: %v", nonExistentStreamID, errGet)
+	}
+
+	if pID != parentStreamID {
+		t.Errorf("Stream %d: expected parent %d, got %d", nonExistentStreamID, parentStreamID, pID)
+	}
+	if w != priorityWeight {
+		t.Errorf("Stream %d: expected weight %d, got %d", nonExistentStreamID, priorityWeight, w)
+	}
+	if len(children) != 0 {
+		t.Errorf("Stream %d: expected no children, got %v", nonExistentStreamID, children)
+	}
+
+	// Verify the parent stream (1) now has stream 7 as a child
+	_, parentChildren, _, errGetParent := pt.GetDependencies(parentStreamID)
+	if errGetParent != nil {
+		t.Fatalf("GetDependencies for parent stream %d failed: %v", parentStreamID, errGetParent)
+	}
+
+	found := false
+	for _, childID := range parentChildren {
+		if childID == nonExistentStreamID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Stream %d not found in children of stream %d. Children: %v", nonExistentStreamID, parentStreamID, parentChildren)
+	}
+}
+
 func TestPriorityTree_RemoveStream_Simple(t *testing.T) {
 	pt := NewPriorityTree()
 	// 0 -> 1
