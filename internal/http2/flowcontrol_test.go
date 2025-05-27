@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -289,9 +290,12 @@ func TestConnectionFlowControlManager_ApplicationConsumedData_ErrorConditions(t 
 		// Consuming 100 should make newCurrentReceiveWindowSize = MaxWindowSize - 50 + 100 = MaxWindowSize + 50
 		_, err := cfcm.ApplicationConsumedData(100)
 		require.Error(t, err)
-		connErr, ok := err.(*ConnectionError)
-		require.True(t, ok)
-		assert.Equal(t, ErrCodeInternalError, connErr.Code)
+		var connErr *ConnectionError
+		isConnErr := errors.As(err, &connErr)
+		require.True(t, isConnErr, "Error was expected to be a *http2.ConnectionError, but it was %T (%v)", err, err)
+		if isConnErr {
+			assert.Equal(t, ErrCodeInternalError, connErr.Code)
+		}
 		assert.Contains(t, err.Error(), "connection receive window effective size")
 		assert.Contains(t, err.Error(), "exceed MaxWindowSize")
 	})
