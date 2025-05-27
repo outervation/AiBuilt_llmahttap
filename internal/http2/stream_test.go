@@ -333,7 +333,7 @@ func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8
 		mc.connFCManager = NewConnectionFlowControlManager()
 	}
 	if mc.writerChan == nil {
-		mc.writerChan = make(chan Frame, 1) // Buffered by default for one frame
+		mc.writerChan = make(chan Frame, 2) // Buffered to handle RST from test and potentially cleanup
 	}
 
 	// REMOVED: Interfering consumer goroutine. Tests will consume frames directly.
