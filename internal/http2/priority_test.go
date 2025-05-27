@@ -327,6 +327,30 @@ func TestPriorityTree_AddStream_ParentDoesNotExist(t *testing.T) {
 		t.Errorf("Created parent stream %d not found in children of stream 0. Children: %v", nonExistentParentID, stream0Children)
 	}
 }
+
+func TestPriorityTree_AddStream_Stream0Error(t *testing.T) {
+	pt := NewPriorityTree()
+
+	err := pt.AddStream(0, nil) // Attempt to add stream 0
+	if err == nil {
+		t.Fatalf("AddStream(0, nil) should have failed, but returned no error")
+	}
+
+	connErr, ok := err.(*ConnectionError)
+	if !ok {
+		t.Fatalf("Expected AddStream(0, nil) to return *ConnectionError, got %T: %v", err, err)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("Expected ConnectionError with code ErrCodeProtocolError, got %v", connErr.Code)
+	}
+
+	expectedMsg := "cannot add or modify priority for stream 0 via AddStream"
+	if !strings.Contains(connErr.Msg, expectedMsg) {
+		t.Errorf("Expected ConnectionError message to contain '%s', got '%s'", expectedMsg, connErr.Msg)
+	}
+}
+
 func TestPriorityTree_ProcessPriorityFrame_Valid(t *testing.T) {
 	pt := NewPriorityTree()
 	// Add stream 1 and 3, both children of 0 initially
