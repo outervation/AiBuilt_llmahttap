@@ -788,6 +788,83 @@ func TestPriorityTree_RemoveStream_Stream0Error(t *testing.T) {
 	// t.Logf("Got expected error: %v", err)
 }
 
+func TestPriorityTree_RemoveStream_LeafNode(t *testing.T) {
+	pt := NewPriorityTree()
+	// Structure:
+	// 0 -> 1 (parentStream)
+	//      -> 2 (leafStream, to be removed)
+	//   -> 3 (siblingOfParentStream)
+
+	parentStreamID := uint32(1)
+	leafStreamID := uint32(2)
+	siblingStreamID := uint32(3)
+
+	// Add streams
+	_ = pt.AddStream(parentStreamID, nil)                                                               // 0 -> 1
+	_ = pt.AddStream(leafStreamID, &streamDependencyInfo{StreamDependency: parentStreamID, Weight: 10}) // 1 -> 2
+	_ = pt.AddStream(siblingStreamID, nil)                                                              // 0 -> 3
+
+	// Verify initial state for parentStreamID (1)
+	_, pChildrenPre, _, errGetPPre := pt.GetDependencies(parentStreamID)
+	if errGetPPre != nil {
+		t.Fatalf("Pre-Remove: GetDependencies for parentStreamID %d failed: %v", parentStreamID, errGetPPre)
+	}
+	if !contains(pChildrenPre, leafStreamID) {
+		t.Fatalf("Pre-Remove: leafStreamID %d not found in children of parentStreamID %d. Children: %v", leafStreamID, parentStreamID, pChildrenPre)
+	}
+
+	// Verify initial state for leafStreamID (2)
+	lParentPre, lChildrenPre, lWeightPre, errGetLPre := pt.GetDependencies(leafStreamID)
+	if errGetLPre != nil {
+		t.Fatalf("Pre-Remove: GetDependencies for leafStreamID %d failed: %v", leafStreamID, errGetLPre)
+	}
+	if lParentPre != parentStreamID {
+		t.Fatalf("Pre-Remove: leafStreamID %d parent expected %d, got %d", leafStreamID, parentStreamID, lParentPre)
+	}
+	if len(lChildrenPre) != 0 {
+		t.Fatalf("Pre-Remove: leafStreamID %d expected no children, got %v", leafStreamID, lChildrenPre)
+	}
+	if lWeightPre != 10 {
+		t.Fatalf("Pre-Remove: leafStreamID %d expected weight 10, got %d", leafStreamID, lWeightPre)
+	}
+
+	// Remove the leaf stream
+	err := pt.RemoveStream(leafStreamID)
+	if err != nil {
+		t.Fatalf("RemoveStream(%d) failed: %v", leafStreamID, err)
+	}
+
+	// Verify leafStreamID is removed from the tree
+	_, _, _, errGetLeafPost := pt.GetDependencies(leafStreamID)
+	if errGetLeafPost == nil {
+		t.Errorf("leafStreamID %d should not be found after removal, but GetDependencies succeeded", leafStreamID)
+	} else if !strings.Contains(errGetLeafPost.Error(), "not found") {
+		t.Errorf("Expected 'not found' error for leafStreamID %d, got: %v", leafStreamID, errGetLeafPost)
+	}
+
+	// Verify parentStreamID no longer has leafStreamID as a child
+	_, pChildrenPost, _, errGetPPost := pt.GetDependencies(parentStreamID)
+	if errGetPPost != nil {
+		t.Fatalf("Post-Remove: GetDependencies for parentStreamID %d failed: %v", parentStreamID, errGetPPost)
+	}
+	if contains(pChildrenPost, leafStreamID) {
+		t.Errorf("Post-Remove: leafStreamID %d still found in children of parentStreamID %d. Children: %v", leafStreamID, parentStreamID, pChildrenPost)
+	}
+	if len(pChildrenPost) != 0 { // In this setup, parentStream (1) had only leafStream (2) as child.
+		t.Errorf("Post-Remove: parentStreamID %d children expected empty after removing its only child, got %v", parentStreamID, pChildrenPost)
+	}
+
+	// Verify stream 0 still has parentStreamID and siblingStreamID as children
+	_, stream0Children, _, errGetRoot := pt.GetDependencies(0)
+	if errGetRoot != nil {
+		t.Fatalf("Post-Remove: GetDependencies for stream 0 failed: %v", errGetRoot)
+	}
+	expectedStream0Children := []uint32{parentStreamID, siblingStreamID}
+	if !reflect.DeepEqual(sortUint32Slice(stream0Children), sortUint32Slice(expectedStream0Children)) {
+		t.Errorf("Post-Remove: Stream 0 children: expected %v, got %v", expectedStream0Children, stream0Children)
+	}
+}
+
 // TestComplexScenario combines multiple operations to check tree integrity.
 func TestPriorityTree_ComplexScenario(t *testing.T) {
 	pt := NewPriorityTree()
