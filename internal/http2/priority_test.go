@@ -354,7 +354,7 @@ func TestPriorityTree_AddStream_Stream0Error(t *testing.T) {
 	}
 }
 
-func TestPriorityTree_ProcessPriorityFrame_Valid(t *testing.T) {
+func TestPriorityTree_ProcessPriorityFrame_NonExclusive_UpdateExistingStream(t *testing.T) {
 	pt := NewPriorityTree()
 	// Add stream 1 and 3, both children of 0 initially
 	_ = pt.AddStream(1, nil)
