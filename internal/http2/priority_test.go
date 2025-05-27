@@ -256,6 +256,11 @@ func TestPriorityTree_AddStream_SelfDependencyError(t *testing.T) {
 	}
 	if streamErr.StreamID != streamID {
 		t.Errorf("Expected error for stream %d, got for stream %d", streamID, streamErr.StreamID)
+
+		expectedMsgPart := "cannot depend on itself"
+		if !strings.Contains(streamErr.Msg, expectedMsgPart) {
+			t.Errorf("Expected StreamError message for stream %d to contain '%s', got '%s'", streamID, expectedMsgPart, streamErr.Msg)
+		}
 	}
 	// t.Logf("Got expected error: %v", err)
 }
