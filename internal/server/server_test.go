@@ -2341,56 +2341,54 @@ func TestServer_InitializeListeners(t *testing.T) {
 
 	t.Run("ParentProcess_CreateListenerSuccess", func(t *testing.T) {
 		lg := newMockLogger(nil)
-		// Create a new config for this subtest to avoid mutating baseCfg
-		cfg := newTestConfig("127.0.0.1:0") // Dynamic port for real listener
+		cfg := newTestConfig("127.0.0.1:0") // Address here is mostly for config validity
 		s := newTestSrv(t, cfg, lg)
 		s.isChild = false
 
-		// utilCreateListenerAndGetFDFunc = func... // Mock is not effective
+		// Mock util.CreateListenerAndGetFD for this subtest
+		originalFunc := util.CreateListenerAndGetFD // Save to restore
+		mockList := newMockListener("127.0.0.1:9999")
+		var mockFD uintptr = 777
+		var createListenerCalled bool
+		util.CreateListenerAndGetFD = func(address string) (net.Listener, uintptr, error) {
+			createListenerCalled = true
+			// Check if the address from config was passed (optional, but good for thoroughness)
+			if address != *cfg.Server.Address {
+				t.Errorf("util.CreateListenerAndGetFD called with address '%s', expected '%s'", address, *cfg.Server.Address)
+			}
+			return mockList, mockFD, nil
+		}
+		defer func() { util.CreateListenerAndGetFD = originalFunc }() // Restore
 
 		err := s.initializeListeners()
 		if err != nil {
 			t.Fatalf("initializeListeners failed: %v", err)
 		}
 
+		if !createListenerCalled {
+			t.Error("Expected util.CreateListenerAndGetFD to be called, but it wasn't")
+		}
+
 		if len(s.listeners) != 1 {
 			t.Fatalf("Expected 1 listener, got %d", len(s.listeners))
 		}
-		// Check type of real listener
-		if _, ok := s.listeners[0].(*net.TCPListener); !ok {
-			// On some systems it might be other types like *net.UnixListener if address was a path
-			// but for "127.0.0.1:0" it should be TCP.
-			// For robustness, check if it implements net.Listener and Addr() works.
-			if s.listeners[0] == nil {
-				t.Error("Listener is nil")
-			} else {
-				t.Logf("Listener type is %T, not *net.TCPListener, but could be valid.", s.listeners[0])
-			}
-		}
-		if s.listeners[0].Addr() == nil {
-			t.Errorf("Expected listener address to be non-nil")
-		} else {
-			// Check if port is non-zero (dynamically assigned)
-			tcpAddr, ok := s.listeners[0].Addr().(*net.TCPAddr)
-			if !ok {
-				t.Logf("Listener address type is %T, not *net.TCPAddr. Addr: %s", s.listeners[0].Addr(), s.listeners[0].Addr().String())
-			} else if tcpAddr.Port == 0 {
-				t.Errorf("Expected dynamically assigned port to be non-zero, got %d for addr %s", tcpAddr.Port, tcpAddr.String())
-			}
+		if s.listeners[0] != mockList {
+			t.Errorf("Expected listener to be the mockListener instance, got %T", s.listeners[0])
 		}
 
 		if len(s.listenerFDs) != 1 {
 			t.Fatalf("Expected 1 listener FD, got %d", len(s.listenerFDs))
 		}
-		// Check if FD is a plausible value (typically > 2 on Unix-like systems)
-		if s.listenerFDs[0] <= 2 { // 0,1,2 are usually stdin, stdout, stderr
-			// This check might be flaky on some OS or test environments.
-			// For now, it's a basic sanity check.
-			t.Logf("Listener FD is %d, which is unusually low (<=2). This might be okay in some environments.", s.listenerFDs[0])
+		if s.listenerFDs[0] != mockFD {
+			t.Errorf("Expected listener FD to be %d, got %d", mockFD, s.listenerFDs[0])
 		}
-		// Close the listener that was created by the real util function
-		if s.listeners[0] != nil {
-			s.listeners[0].Close()
+
+		// Ensure the mock listener wasn't closed by initializeListeners
+		select {
+		case <-mockList.closed:
+			t.Error("mockListener was closed by initializeListeners, which it shouldn't")
+		default:
+			// Not closed, good
 		}
 	})
 
