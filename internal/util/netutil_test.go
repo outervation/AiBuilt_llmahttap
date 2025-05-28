@@ -303,11 +303,14 @@ func TestCreateListener(t *testing.T) {
 		}
 
 		// The FD_CLOEXEC property for the listener's *own* FD (for self-restart)
-		// is ensured by CreateListener's internal logic.
-		// For passing FDs to children, TestCreateListenerAndGetFD (for the explicitly returned FD)
-		// and eventually PrepareExecEnv (for FDs from listener.File()) are more relevant.
-		// The check on listener.File().Fd()'s CLOEXEC state here was removed as .File() often
-		// returns a new FD with CLOEXEC set by default.
+		// is ensured by CreateListener's internal logic. TestCreateListenerAndGetFD
+		// more directly verifies the mechanism of clearing FD_CLOEXEC on an FD
+		// that a listener then uses.
+		// A check on listener.File().Fd()'s CLOEXEC state here was removed, as .File()
+		// often returns a new FD that might have FD_CLOEXEC set by default by the OS
+		// during duplication, regardless of the original FD's state.
+		// The key is that CreateListener returns a listener that *operates on* an FD
+		// suitable for inheritance.
 
 		// Verify the listener is actually listening
 		listeningAddr := listener.Addr().String()
