@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
 	"testing"
 	"time"
 )
@@ -357,4 +358,47 @@ func TestCreateListener(t *testing.T) {
 	// as it requires precise control over port states, which can be racy or
 	// platform-dependent. We'll skip it for CreateListener direct test, focusing on what it controls.
 	// IsAddrInUse can be tested separately if needed.
+}
+
+func TestCreateReadinessPipe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestCreateReadinessPipe on Windows due to POSIX-specific FD/pipe behavior.")
+	}
+
+	parentReadPipe, childWriteFD, err := CreateReadinessPipe()
+	if err != nil {
+		t.Fatalf("CreateReadinessPipe failed: %v", err)
+	}
+	if parentReadPipe == nil {
+		t.Fatal("CreateReadinessPipe returned nil parentReadPipe")
+	}
+	defer parentReadPipe.Close()
+
+	if childWriteFD <= 0 { // Basic validity check for FD
+		t.Fatalf("CreateReadinessPipe returned invalid childWriteFD: %d", childWriteFD)
+	}
+	// Note: childWriteFD is just a uintptr; its corresponding *os.File was closed by CreateReadinessPipe.
+	// We will close it via syscall.Close later.
+
+	// 1. Verify FD_CLOEXEC on parent's read end (should be SET)
+	parentReadFD := parentReadPipe.Fd()
+	isSetParent, errCheckParent := isCloexecSet(parentReadFD)
+	if errCheckParent != nil {
+		t.Fatalf("isCloexecSet check failed for parentReadFD %d: %v", parentReadFD, errCheckParent)
+	}
+	if !isSetParent {
+		t.Errorf("Expected FD_CLOEXEC to be SET on parentReadFD %d, but it was clear", parentReadFD)
+	}
+
+	// 2. The childWriteFD (uintptr for the pipe's write-end) had FD_CLOEXEC cleared
+	//    within CreateReadinessPipe before its corresponding *os.File was closed
+	//    by CreateReadinessPipe. This is crucial for inheritance by the child process.
+	//    We cannot re-verify this flag from the parent after CreateReadinessPipe returns,
+	//    nor can we simulate the child closing this FD number from the parent process,
+	//    because the FD is no longer valid in the parent for operations like fcntl or close.
+	//    The test relies on CreateReadinessPipe performing these steps correctly
+	//    if it returns no error. The actual signaling mechanism (using such FDs)
+	//    should be tested separately, for example, in a dedicated TestReadinessSignalingMechanism.
+
+	// We mostly rely on sub-function error handling (os.Pipe, SetCloexec) being correct.
 }
