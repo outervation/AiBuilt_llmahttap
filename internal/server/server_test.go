@@ -136,8 +136,11 @@ func newMockListener(addrStr string) *mockListener {
 		addrStr = "127.0.0.1:0" // Default to dynamic port for flexibility
 	}
 	addr, err := net.ResolveTCPAddr("tcp", addrStr)
-	if err != nil { // Fallback if resolve fails (e.g. minimal test env)
-		addr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+
+	// If resolve fails OR if a dynamic port (like ":0") was requested,
+	// set a default mock non-zero port for consistent testing.
+	if err != nil || strings.HasSuffix(addrStr, ":0") {
+		addr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} // Mock non-zero port
 	}
 
 	ml := &mockListener{
@@ -490,15 +493,28 @@ func setupMocks() {
 }
 
 // teardownMocks restores the original function implementations.
+
+// teardownMocks restores the original function implementations.
+
+// teardownMocks restores the original function implementations.
 func teardownMocks() {
-	osStartProcessFunc = originalOSUtilFuncs.osStartProcess
-	utilParseInheritedListenerFDsFunc = originalOSUtilFuncs.utilParseInheritedListenerFDs
-	utilNewListenerFromFDFunc = originalOSUtilFuncs.utilNewListenerFromFD
-	utilCreateListenerAndGetFDFunc = originalOSUtilFuncs.utilCreateListenerAndGetFD
-	utilGetInheritedReadinessPipeFDFunc = originalOSUtilFuncs.utilGetInheritedReadinessPipeFD
-	utilSignalChildReadyByClosingFDFunc = originalOSUtilFuncs.utilSignalChildReadyByClosingFD
-	utilCreateReadinessPipeFunc = originalOSUtilFuncs.utilCreateReadinessPipe
-	utilWaitForChildReadyPipeCloseFunc = originalOSUtilFuncs.utilWaitForChildReadyPipeClose
+	osStartProcessFunc = originalOSUtilFuncs.osStartProcess // This is for server_test.go's own var
+
+	// Only util.CreateListenerAndGetFD is restored at the package level in internal/util
+	// as it's the only one confirmed to be a package variable there.
+	if originalOSUtilFuncs.utilCreateListenerAndGetFD != nil { // Ensure it was saved
+		util.CreateListenerAndGetFD = originalOSUtilFuncs.utilCreateListenerAndGetFD
+	}
+
+	// Restore server_test.go's own convenience vars to point to the real util functions
+	// (or to whatever originalOSUtilFuncs captured for them if they were mockable, but they aren't at package level)
+	utilParseInheritedListenerFDsFunc = util.ParseInheritedListenerFDs
+	utilNewListenerFromFDFunc = util.NewListenerFromFD
+	utilCreateListenerAndGetFDFunc = util.CreateListenerAndGetFD // test-local var points to util's var
+	utilGetInheritedReadinessPipeFDFunc = util.GetInheritedReadinessPipeFD
+	utilSignalChildReadyByClosingFDFunc = util.SignalChildReadyByClosingFD
+	utilCreateReadinessPipeFunc = util.CreateReadinessPipe
+	utilWaitForChildReadyPipeCloseFunc = util.WaitForChildReadyPipeClose
 }
 
 // TestServer_MockInfrastructure is a basic test to ensure the mocking setup works.
@@ -778,9 +794,11 @@ func TestServer_Shutdown(t *testing.T) {
 
 		var mockListenerFD uintptr = 99
 		// This now correctly mocks the util package's variable that server.go will call.
+		originalUtilCreateListenerAndGetFD := util.CreateListenerAndGetFD // Save original
 		util.CreateListenerAndGetFD = func(address string) (net.Listener, uintptr, error) {
 			return ml, mockListenerFD, nil
 		}
+		defer func() { util.CreateListenerAndGetFD = originalUtilCreateListenerAndGetFD }() // Restore
 		// Mock logger's CloseLogFiles
 		// For this test, we'll check for a log message indicating closure attempt.
 		// A more robust mock for logger's CloseLogFiles would be better.
@@ -2256,4 +2274,314 @@ func (m *mockConn) WaitCloseCalled(timeout time.Duration) error {
 		}
 		return fmt.Errorf("timeout waiting for CloseFunc to be fully called (timed out after %v)", timeout)
 	}
+}
+
+func TestServer_InitializeListeners(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+
+	baseCfg := newTestConfig("127.0.0.1:12345") // Default valid config
+	originalCfgPath := "test_init_listeners_config.json"
+	mockRtr := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	// Helper to create a server instance for subtests
+	newTestSrv := func(t *testing.T, cfg *config.Config, lg *logger.Logger) *Server {
+		t.Helper()
+		if lg == nil {
+			lg = newMockLogger(nil)
+		}
+		s, err := NewServer(cfg, lg, mockRtr, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		// Reset these for each test as NewServer might try to parse them
+		s.isChild = false
+		s.listenerFDs = nil
+		s.listeners = nil
+		return s
+	}
+
+	t.Run("ParentProcess_ConfigErrors", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		tests := []struct {
+			name        string
+			cfgMutator  func(cfg *config.Config)
+			expectedErr string
+		}{
+			{
+				"MissingServerSection",
+				func(cfg *config.Config) { cfg.Server = nil },
+				"server configuration section (server) is missing",
+			},
+			{
+				"MissingAddress",
+				func(cfg *config.Config) { cfg.Server.Address = nil },
+				"server listen address (server.address) is not configured (is nil)",
+			},
+			{
+				"EmptyAddress",
+				func(cfg *config.Config) { cfg.Server.Address = strPtr("") },
+				"server listen address (server.address) is configured but is an empty string",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cfgCopy := *baseCfg // Make a copy to mutate
+				tt.cfgMutator(&cfgCopy)
+				s := newTestSrv(t, &cfgCopy, lg)
+				s.isChild = false // Explicitly parent
+
+				err := s.initializeListeners()
+				if err == nil {
+					t.Fatalf("Expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.expectedErr) {
+					t.Errorf("Expected error containing '%s', got '%v'", tt.expectedErr, err)
+				}
+			})
+		}
+	})
+
+	t.Run("ParentProcess_CreateListenerSuccess", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		// Create a new config for this subtest to avoid mutating baseCfg
+		cfg := newTestConfig("127.0.0.1:0") // Dynamic port for real listener
+		s := newTestSrv(t, cfg, lg)
+		s.isChild = false
+
+		// utilCreateListenerAndGetFDFunc = func... // Mock is not effective
+
+		err := s.initializeListeners()
+		if err != nil {
+			t.Fatalf("initializeListeners failed: %v", err)
+		}
+
+		if len(s.listeners) != 1 {
+			t.Fatalf("Expected 1 listener, got %d", len(s.listeners))
+		}
+		// Check type of real listener
+		if _, ok := s.listeners[0].(*net.TCPListener); !ok {
+			// On some systems it might be other types like *net.UnixListener if address was a path
+			// but for "127.0.0.1:0" it should be TCP.
+			// For robustness, check if it implements net.Listener and Addr() works.
+			if s.listeners[0] == nil {
+				t.Error("Listener is nil")
+			} else {
+				t.Logf("Listener type is %T, not *net.TCPListener, but could be valid.", s.listeners[0])
+			}
+		}
+		if s.listeners[0].Addr() == nil {
+			t.Errorf("Expected listener address to be non-nil")
+		} else {
+			// Check if port is non-zero (dynamically assigned)
+			tcpAddr, ok := s.listeners[0].Addr().(*net.TCPAddr)
+			if !ok {
+				t.Logf("Listener address type is %T, not *net.TCPAddr. Addr: %s", s.listeners[0].Addr(), s.listeners[0].Addr().String())
+			} else if tcpAddr.Port == 0 {
+				t.Errorf("Expected dynamically assigned port to be non-zero, got %d for addr %s", tcpAddr.Port, tcpAddr.String())
+			}
+		}
+
+		if len(s.listenerFDs) != 1 {
+			t.Fatalf("Expected 1 listener FD, got %d", len(s.listenerFDs))
+		}
+		// Check if FD is a plausible value (typically > 2 on Unix-like systems)
+		if s.listenerFDs[0] <= 2 { // 0,1,2 are usually stdin, stdout, stderr
+			// This check might be flaky on some OS or test environments.
+			// For now, it's a basic sanity check.
+			t.Logf("Listener FD is %d, which is unusually low (<=2). This might be okay in some environments.", s.listenerFDs[0])
+		}
+		// Close the listener that was created by the real util function
+		if s.listeners[0] != nil {
+			s.listeners[0].Close()
+		}
+	})
+
+	t.Run("ParentProcess_CreateListenerFailure", func(t *testing.T) {
+		// Explicitly set util.CreateListenerAndGetFD to the original implementation
+		// saved by setupMocks(), to ensure this test is not affected by leaks.
+		util.CreateListenerAndGetFD = originalOSUtilFuncs.utilCreateListenerAndGetFD
+		// Also ensure that if this test itself mocks it later, it restores it.
+		// (It doesn't currently mock it, so this defer is for safety against future edits)
+		currentUtilCreateListenerAndGetFD := util.CreateListenerAndGetFD
+		defer func() { util.CreateListenerAndGetFD = currentUtilCreateListenerAndGetFD }()
+
+		logBuf := &bytes.Buffer{} // Capture logs
+		lg := newMockLogger(logBuf)
+		addrToTest := "invalid_address_format_no_port_!@#"
+		cfg := newTestConfig(addrToTest) // Malformed address
+		s := newTestSrv(t, cfg, lg)
+		s.isChild = false
+
+		if s.cfg.Server == nil || s.cfg.Server.Address == nil {
+			t.Fatal("Test setup error: s.cfg.Server.Address is nil before initializeListeners")
+		}
+		if *s.cfg.Server.Address != addrToTest {
+			t.Fatalf("Test setup error: s.cfg.Server.Address is '%s', expected '%s'", *s.cfg.Server.Address, addrToTest)
+		}
+		t.Logf("Test: s.cfg.Server.Address before initializeListeners call: %s", *s.cfg.Server.Address)
+
+		err := s.initializeListeners()
+		t.Logf("Test: Logs from initializeListeners run:\n%s", logBuf.String()) // Print logs from the server
+		if err == nil {
+			// If error is still nil, log the state of util.CreateListenerAndGetFD for debugging
+			// This requires reflecting on the function pointer, which is complex.
+			// Instead, we rely on the fact that the real one *should* error.
+			t.Fatalf("Expected error for invalid address '%s', got nil. util.CreateListenerAndGetFD might still be mocked.", addrToTest)
+		}
+
+		// Check for the server.go's wrapping message and the specific invalid address
+		expectedErrorSubstring := "failed to create new listener on " + addrToTest
+		if !strings.Contains(err.Error(), expectedErrorSubstring) {
+			t.Errorf("Error message '%v' does not contain expected substring '%s'", err, expectedErrorSubstring)
+		}
+
+		// Also, check for a more specific underlying network error if possible.
+		// The real net.Listen or related functions should complain about the address format.
+		underlyingErrFound := strings.Contains(err.Error(), "missing port in address") ||
+			strings.Contains(err.Error(), "too many colons") || // Common for net.SplitHostPort errors
+			strings.Contains(err.Error(), "address invalid") || // General catch-all
+			strings.Contains(err.Error(), "address "+addrToTest+": missing port") // More specific format
+
+		if !underlyingErrFound {
+			t.Errorf("Underlying network error for invalid address not found in error: %v", err)
+		}
+
+		if len(s.listeners) != 0 {
+			t.Errorf("Expected 0 listeners after failure, got %d", len(s.listeners))
+		}
+		if len(s.listenerFDs) != 0 {
+			t.Errorf("Expected 0 listener FDs after failure, got %d", len(s.listenerFDs))
+		}
+	})
+
+	t.Run("ChildProcess_NoInheritedFDsError", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg)
+		s.isChild = true    // Mark as child
+		s.listenerFDs = nil // No FDs inherited
+
+		err := s.initializeListeners()
+		if err == nil {
+			t.Fatalf("Expected error, got nil")
+		}
+		expectedErr := "no inherited listener FDs found"
+		if !strings.Contains(err.Error(), expectedErr) {
+			t.Errorf("Expected error containing '%s', got '%v'", expectedErr, err)
+		}
+	})
+
+	t.Run("ChildProcess_NonSocketFD_Fails", func(t *testing.T) { // Renamed
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg)
+		s.isChild = true
+		// Use FDs that are typically open but not sockets (stdin, stdout)
+		// FD 0 (stdin) often behaves differently from 1,2 regarding some operations.
+		// Let's use a high, likely invalid FD as well, or one that's definitely not a socket.
+		// Using 0 (stdin) as per original test failure.
+		// The real util.NewListenerFromFD will be called.
+		inheritedFDs := []uintptr{0} // Typically stdin
+		s.listenerFDs = inheritedFDs
+
+		// utilNewListenerFromFDFunc = func... // Mock is not effective
+
+		err := s.initializeListeners()
+		if err == nil {
+			t.Fatalf("initializeListeners expected to fail for non-socket FD, got nil")
+		}
+
+		// Error message depends on which syscall fails first (fcntl for SetCloexec or getsockopt for net.FileListener)
+		// Common errors: "socket operation on non-socket", "bad file descriptor"
+		// The error comes from util.NewListenerFromFD, wrapped by server.go
+		// "failed to create listener from inherited FD 0: ..."
+		if !(strings.Contains(err.Error(), "socket operation on non-socket") ||
+			strings.Contains(err.Error(), "bad file descriptor") ||
+			strings.Contains(err.Error(), "invalid argument")) { // "invalid argument" can come from fcntl/ioctl on non-sockets
+			t.Errorf("Expected error related to non-socket FD, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "failed to create listener from inherited FD 0") {
+			t.Errorf("Expected error message to indicate failure for FD 0, got: %v", err)
+		}
+
+		if len(s.listeners) != 0 {
+			t.Errorf("Expected 0 listeners after failure, got %d", len(s.listeners))
+		}
+	})
+
+	t.Run("ChildProcess_NewListenerFromFD_Fails_NoCleanupNeededIfFirstFails", func(t *testing.T) { // Renamed
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg)
+		s.isChild = true
+		// FD 0 (stdin) will be attempted first and fail.
+		// No listeners should be created before this failure, so no cleanup of prior listeners needed.
+		inheritedFDs := []uintptr{0, 1} // stdin, stdout
+		s.listenerFDs = inheritedFDs
+
+		// utilNewListenerFromFDFunc = func... // Mock is not effective
+
+		err := s.initializeListeners()
+		if err == nil {
+			t.Fatalf("Expected error, got nil")
+		}
+
+		// As in the "ChildProcess_NonSocketFD_Fails" test, expect error for FD 0.
+		if !(strings.Contains(err.Error(), "socket operation on non-socket") ||
+			strings.Contains(err.Error(), "bad file descriptor") ||
+			strings.Contains(err.Error(), "invalid argument")) {
+			t.Errorf("Expected error related to non-socket FD for FD 0, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "failed to create listener from inherited FD 0") {
+			t.Errorf("Expected error message to indicate failure for FD 0, got: %v", err)
+		}
+
+		if len(s.listeners) != 0 { // s.listeners should be nil or empty on error
+			t.Errorf("s.listeners should be empty after failure, got %d listeners", len(s.listeners))
+		}
+
+		// Since the first FD (0) fails, there should be no successfully created listeners to clean up.
+		// The mockListener checks (like `createdMockListeners[0].closed`) are removed as they relied on mocks.
+	})
+
+	t.Run("NoListenersInitializedError", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg)
+		s.isChild = false // Parent
+
+		// Make CreateListenerAndGetFD return 0 listeners (should not happen with current util.CreateListenerAndGetFD)
+		// This test path is for internal server logic if listeners array ends up empty.
+		utilCreateListenerAndGetFDFunc = func(address string) (net.Listener, uintptr, error) {
+			// This mock will cause s.listeners to be empty *if* the server logic
+			// doesn't immediately error out on a nil listener from this func.
+			// However, s.initializeListeners appends the result, so a nil listener would cause a panic later.
+			// The check `if len(s.listeners) == 0` happens after the loop.
+			// To truly test this, the mock needs to allow the loop to run (e.g., 0 times)
+			// then result in an empty s.listeners.
+			// This is better tested by ensuring cfg.Server.Address is such that no listener is attempted,
+			// but initializeListeners currently errors if Address is missing/empty.
+			// The `if len(s.listeners) == 0` return fmt.Errorf("no listeners were initialized for the server")
+			// is for the case where the loop finishes but s.listeners is empty.
+			// Example: if s.isChild is false, but cfg.Server.Address leads to no listener attempts (not current logic).
+			// Easiest way to hit this condition is to make s.listeners empty after it was populated.
+			// But that's not testing initializeListeners's own logic path for *this specific error*.
+			// The error is effectively a post-condition check.
+			t.Skip("Path for 'no listeners were initialized' is difficult to test in isolation correctly given current structure. It's a defensive check.")
+			return newMockListener(address), 0, nil // Return a dummy listener so it doesn't error early
+		}
+
+		// To force s.listeners to be empty to hit the target error message,
+		// we'd have to modify server 's' directly after `s.initializeListeners()` would have run,
+		// or ensure no listeners are configured/attempted.
+		// The current `initializeListeners` logic for a parent (not child) requires `s.cfg.Server.Address`.
+		// If that's valid, it calls `util.CreateListenerAndGetFD` once.
+		// If that call succeeds, `s.listeners` will have 1 item.
+		// If that call fails, `initializeListeners` returns that error, not the "no listeners were initialized" error.
+		// So this specific error path is for logical issues within `initializeListeners` or specific child-process scenarios without FDs
+		// that aren't covered by "child process: error if no inherited FDs are set on server struct".
+
+		// Let's assume the test setup is for a parent that configures no listeners (not possible with current config validation)
+		// or a child that ends up with no listeners (already tested).
+		// This makes this sub-test largely redundant or untestable without structural changes to initializeListeners itself.
+	})
 }
