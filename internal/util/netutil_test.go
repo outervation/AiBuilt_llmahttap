@@ -1607,3 +1607,99 @@ func TestSignalChildReadyByClosingFD_InvalidFDs(t *testing.T) {
 		}
 	})
 }
+
+func TestWaitForChildReadyPipeClose(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestWaitForChildReadyPipeClose on Windows due to POSIX-specific FD/pipe behavior.")
+	}
+
+	t.Run("NilPipe", func(t *testing.T) {
+		err := WaitForChildReadyPipeClose(nil, 1*time.Millisecond)
+		if err == nil {
+			t.Fatal("Expected an error when parentReadPipe is nil, but got nil")
+		}
+		if !strings.Contains(err.Error(), "parentReadPipe cannot be nil") {
+			t.Errorf("Expected error message to contain 'parentReadPipe cannot be nil', got: %v", err)
+		}
+	})
+
+	t.Run("Success_ChildClosesPipe", func(t *testing.T) {
+		r, w, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("os.Pipe() failed: %v", errPipe)
+		}
+		defer r.Close() // Parent's read end
+
+		// Goroutine to simulate child closing its write end
+		go func() {
+			time.Sleep(50 * time.Millisecond) // Give parent a moment to start waiting
+			errCloseW := w.Close()            // Child closes its write end
+			if errCloseW != nil {
+				// This error occurs in the goroutine, log it for test debugging
+				t.Logf("Error closing write end of pipe in child goroutine: %v", errCloseW)
+			}
+		}()
+
+		err := WaitForChildReadyPipeClose(r, 1*time.Second)
+		if err != nil {
+			t.Errorf("WaitForChildReadyPipeClose returned an error: %v (expected nil for EOF)", err)
+		}
+	})
+
+	t.Run("Timeout_ChildDoesNotClosePipe", func(t *testing.T) {
+		r, w, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("os.Pipe() failed: %v", errPipe)
+		}
+		defer r.Close()
+		defer w.Close() // Ensure write end is eventually closed for cleanup
+
+		timeoutDuration := 50 * time.Millisecond
+		err := WaitForChildReadyPipeClose(r, timeoutDuration)
+		if err == nil {
+			t.Fatal("Expected a timeout error, but got nil")
+		}
+		if !strings.Contains(err.Error(), "timeout waiting for child readiness signal") {
+			t.Errorf("Expected error message to contain 'timeout waiting for child readiness signal', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), timeoutDuration.String()) {
+			t.Errorf("Expected error message to contain the timeout duration '%v', got: %v", timeoutDuration, err)
+		}
+	})
+
+	t.Run("ParentReadPipeAlreadyClosed", func(t *testing.T) {
+		r, w, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("os.Pipe() failed: %v", errPipe)
+		}
+		// Close w to prevent other side from blocking if we only close r
+		defer w.Close()
+
+		// Close the parent's read end *before* calling WaitForChildReadyPipeClose
+		if errCloseR := r.Close(); errCloseR != nil {
+			t.Fatalf("Failed to close parent's read end of pipe for test setup: %v", errCloseR)
+		}
+
+		err := WaitForChildReadyPipeClose(r, 1*time.Millisecond)
+		if err == nil {
+			t.Fatal("Expected an error when parentReadPipe is already closed, but got nil")
+		}
+
+		// The error from r.Read() on a closed pipe is typically os.ErrClosed or similar.
+		// WaitForChildReadyPipeClose wraps this.
+		// We expect "error reading from readiness pipe: file already closed" or similar.
+		if !strings.Contains(err.Error(), "error reading from readiness pipe") {
+			t.Errorf("Expected error message to indicate read error, got: %v", err)
+		}
+		// Check for the underlying "file already closed" or similar OS-specific error.
+		// errors.Is(err, os.ErrClosed) might be too specific if it's wrapped differently by OS.
+		// A string check on the unwrapped error is more robust for this platform variance.
+		unwrappedErr := errors.Unwrap(err)
+		if unwrappedErr == nil {
+			t.Errorf("Expected wrapped error to have an underlying cause, but unwrap returned nil. Error: %v", err)
+		} else if !strings.Contains(strings.ToLower(unwrappedErr.Error()), "file already closed") &&
+			!strings.Contains(strings.ToLower(unwrappedErr.Error()), "bad file descriptor") { // EBADF
+			t.Errorf("Expected underlying error for closed pipe to be 'file already closed' or 'bad file descriptor', got: %v (original full error: %v)", unwrappedErr, err)
+		}
+	})
+}
