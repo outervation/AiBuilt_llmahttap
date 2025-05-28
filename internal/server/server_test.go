@@ -2236,6 +2236,71 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 					t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
 				}
 			})
+
+			t.Run("HandshakeFailure_InvalidPreface", func(t *testing.T) {
+				logBuf := &bytes.Buffer{}
+				lg := newMockLogger(logBuf)
+				s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+				if err != nil {
+					t.Fatalf("NewServer failed: %v", err)
+				}
+
+				mockNetC := newMockConn("127.0.0.1:1234", "127.0.0.1:54321")
+				// Provide an invalid preface
+				invalidPreface := "THIS IS NOT THE CORRECT PREFACE*"
+				mockNetC.SetReadBuffer([]byte(invalidPreface))
+				mockNetC.autoEOF = true // Ensure EOF after sending the invalid preface
+
+				var newHTTP2ConnectionCalledOnFailure bool
+				// Store the original newHTTP2Connection and restore it after this subtest
+				originalNewH2ConnFunc := newHTTP2Connection
+				defer func() { newHTTP2Connection = originalNewH2ConnFunc }()
+
+				newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+					newHTTP2ConnectionCalledOnFailure = true
+					// Call the original (real) http2.NewConnection
+					return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+				}
+
+				handleDone := make(chan struct{})
+				go func() {
+					s.handleTCPConnection(mockNetC)
+					close(handleDone)
+				}()
+
+				select {
+				case <-handleDone:
+				case <-time.After(1 * time.Second):
+					t.Fatal("handleTCPConnection did not complete in time for invalid preface handshake failure")
+				}
+
+				if !newHTTP2ConnectionCalledOnFailure {
+					t.Error("newHTTP2Connection was not called by handleTCPConnection during handshake failure path")
+				}
+
+				if err := mockNetC.WaitCloseCalled(1 * time.Second); err != nil {
+					t.Errorf("mockNetC.CloseFunc was not fully executed via WaitCloseCalled: %v", err)
+				}
+
+				serverLogs := logBuf.String()
+				if !strings.Contains(serverLogs, "HTTP/2 server handshake failed") {
+					t.Errorf("Expected log for handshake failure, not found. Logs: %s", serverLogs)
+				}
+				// Check for the specific "invalid client connection preface" error detail
+				if !strings.Contains(serverLogs, "invalid client connection preface") {
+					t.Errorf("Expected log detail 'invalid client connection preface', not found. Logs: %s", serverLogs)
+				}
+
+				s.mu.RLock()
+				if len(s.activeConns) != 0 {
+					t.Errorf("Expected activeConns to be empty after handshake failure, found %d", len(s.activeConns))
+				}
+				s.mu.RUnlock()
+
+				if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
+					t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+				}
+			})
 		}
 	})
 }
