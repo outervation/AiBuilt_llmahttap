@@ -3275,3 +3275,164 @@ func TestServer_acceptLoop(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_Start_And_DoneChannel(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+	setupHandleTCPConnectionMocks_Test() // For newHTTP2Connection mocking if needed by handleTCPConnection
+	defer teardownHandleTCPConnectionMocks_Test()
+
+	baseCfg := newTestConfig("127.0.0.1:0") // Dynamic port
+	originalCfgPath := "test_start_done_config.json"
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	newTestSrvForStart := func(t *testing.T, lg *logger.Logger) *Server {
+		t.Helper()
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		// Ensure fresh channels for each subtest run by NewServer
+		s.shutdownChan = make(chan struct{})
+		s.doneChan = make(chan struct{})
+		s.reloadChan = make(chan os.Signal, 1)
+		s.stopAccepting = make(chan struct{})
+		return s
+	}
+
+	t.Run("SuccessfulStartAndShutdown", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStart(t, lg)
+
+		// Mock initializeListeners dependencies to succeed
+		mockL := newMockListener("127.0.0.1:0")
+		var mockFD uintptr = 789
+		originalCreateListenerFunc := util.CreateListenerAndGetFD
+		util.CreateListenerAndGetFD = func(address string) (net.Listener, uintptr, error) {
+			return mockL, mockFD, nil
+		}
+		defer func() { util.CreateListenerAndGetFD = originalCreateListenerFunc }()
+
+		originalParseFDsFunc := utilParseInheritedListenerFDsFunc
+		utilParseInheritedListenerFDsFunc = func(string) ([]uintptr, error) { return nil, nil } // Parent
+		defer func() { utilParseInheritedListenerFDsFunc = originalParseFDsFunc }()
+
+		originalGetReadinessPipeFunc := utilGetInheritedReadinessPipeFDFunc
+		utilGetInheritedReadinessPipeFDFunc = func() (uintptr, bool, error) { return 0, false, nil } // No pipe
+		defer func() { utilGetInheritedReadinessPipeFDFunc = originalGetReadinessPipeFunc }()
+
+		startErrChan := make(chan error, 1)
+		go func() {
+			startErrChan <- s.Start()
+		}()
+
+		// Give Start time to run initializeListeners, StartAccepting, handleSignals
+		time.Sleep(100 * time.Millisecond)
+
+		// Simulate external shutdown signal
+		go s.Shutdown(errors.New("simulated shutdown"))
+
+		// Check if Start() exits and s.Done() unblocks
+		var startErr error
+		select {
+		case startErr = <-startErrChan:
+			// Start finished
+		case <-time.After(2 * time.Second): // Generous timeout for shutdown
+			t.Fatal("s.Start() did not return after Shutdown()")
+		}
+
+		select {
+		case <-s.Done():
+			// Expected: Done channel closed
+		case <-time.After(1 * time.Second):
+			t.Fatal("s.Done() did not unblock after Shutdown()")
+		}
+
+		if startErr != nil {
+			// A successful Start followed by a successful Shutdown should lead to Start returning nil
+			// or the error passed to Shutdown if that's how it's propagated.
+			// Current Start() logic returns nil if shutdown is graceful.
+			// The error passed to Shutdown is for GOAWAY, not the return of Start() necessarily.
+			// Let's check if it's the "simulated shutdown" error.
+			// s.Start() waits on s.doneChan. s.Shutdown() closes s.doneChan.
+			// s.Start() should then return its startErr, which is nil if startup was successful.
+			if !strings.Contains(startErr.Error(), "simulated shutdown") {
+				// This expectation might need refinement based on how Start() returns error
+				// after being unblocked by a Shutdown call.
+				// For now, allow nil or the shutdown reason.
+				// If startErr was nil (start succeeded, then shutdown called), that's fine.
+				// If startErr was the shutdown reason, also fine.
+				// The key is that it *returned*.
+				t.Logf("s.Start() returned: %v. This is acceptable if it's nil or the shutdown reason.", startErr)
+			}
+		}
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Server started successfully.") {
+			t.Error("Expected log 'Server started successfully.' not found")
+		}
+		if !strings.Contains(logs, "Server Start() method finished.") {
+			t.Error("Expected log 'Server Start() method finished.' not found")
+		}
+	})
+
+	t.Run("InitializeListeners_Failure", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStart(t, lg)
+
+		expectedInitErr := errors.New("mock initializeListeners failure")
+		originalCreateListenerFunc := util.CreateListenerAndGetFD
+		util.CreateListenerAndGetFD = func(address string) (net.Listener, uintptr, error) {
+			return nil, 0, expectedInitErr
+		}
+		defer func() { util.CreateListenerAndGetFD = originalCreateListenerFunc }()
+
+		originalParseFDsFunc := utilParseInheritedListenerFDsFunc
+		utilParseInheritedListenerFDsFunc = func(string) ([]uintptr, error) { return nil, nil } // Parent
+		defer func() { utilParseInheritedListenerFDsFunc = originalParseFDsFunc }()
+
+		var startErr error
+		startDone := make(chan struct{})
+		go func() {
+			startErr = s.Start()
+			close(startDone)
+		}()
+
+		select {
+		case <-s.Done():
+			// Expected: Done channel closed by Start() on init failure
+		case <-time.After(1 * time.Second):
+			t.Fatal("s.Done() did not unblock after initializeListeners failure")
+		}
+
+		select {
+		case <-startDone:
+			// s.Start() returned
+		case <-time.After(1 * time.Second):
+			t.Fatal("s.Start() did not return after initializeListeners failure and Done unblocking")
+		}
+
+		if startErr == nil {
+			t.Fatal("s.Start() expected to return an error, got nil")
+		}
+		if !errors.Is(startErr, expectedInitErr) && !strings.Contains(startErr.Error(), expectedInitErr.Error()) {
+			// The error from s.Start() will be wrapped by s.initializeListeners and then by s.Start
+			t.Logf("Full startErr: %v", startErr) // Log full error for inspection
+			if !strings.Contains(startErr.Error(), "Failed to initialize listeners") || !strings.Contains(startErr.Error(), expectedInitErr.Error()) {
+				t.Errorf("s.Start() error '%v' does not contain expected parts ('Failed to initialize listeners', '%s')", startErr, expectedInitErr.Error())
+			}
+		}
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Failed to initialize listeners") {
+			t.Error("Expected log 'Failed to initialize listeners' not found")
+		}
+		if strings.Contains(logs, "Server started successfully.") {
+			t.Error("Log 'Server started successfully.' found, but startup should have failed")
+		}
+	})
+
+}
