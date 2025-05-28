@@ -194,10 +194,12 @@ type mockConn struct {
 	writeBuffer *bytes.Buffer // Data written to this mockConn via Write()
 	closeOnce   sync.Once
 	closed      chan struct{}
+	closeCalled bool // Added to track if CloseFunc was invoked
 
-	mu       sync.Mutex // Protects buffers and closed state
-	readCond *sync.Cond // Condition variable for reads
-	autoEOF  bool       // if true, return EOF when buffer empty, otherwise block
+	mu              sync.Mutex    // Protects buffers and closed state
+	readCond        *sync.Cond    // Condition variable for reads
+	autoEOF         bool          // if true, return EOF when buffer empty, otherwise block
+	closeCalledChan chan struct{} // Channel to signal CloseFunc completion
 }
 
 // newMockConn creates a new mockConn.
@@ -212,18 +214,15 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 	lAddr, _ := net.ResolveTCPAddr("tcp", localStr)
 	rAddr, _ := net.ResolveTCPAddr("tcp", remoteStr)
 
-	// Initialize mc first without readCond
 	mc := &mockConn{
-		localAddr:   lAddr,
-		remoteAddr:  rAddr,
-		readBuffer:  bytes.NewBuffer(nil),
-		writeBuffer: bytes.NewBuffer(nil),
-		closed:      make(chan struct{}),
-		autoEOF:     false, // Default to blocking on read when buffer is empty
-		// mu is zero-value initialized (sync.Mutex)
+		localAddr:       lAddr,
+		remoteAddr:      rAddr,
+		readBuffer:      bytes.NewBuffer(nil),
+		writeBuffer:     bytes.NewBuffer(nil),
+		closed:          make(chan struct{}),
+		autoEOF:         false,
+		closeCalledChan: make(chan struct{}),
 	}
-
-	// Now initialize readCond using mc.mu
 	mc.readCond = sync.NewCond(&mc.mu)
 
 	// Default implementations
@@ -231,7 +230,6 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 		mc.mu.Lock()
 		defer mc.mu.Unlock()
 
-		// Loop as long as the buffer is empty, autoEOF is not set, and the connection is not closed.
 		for mc.readBuffer.Len() == 0 && !mc.autoEOF {
 			select {
 			case <-mc.closed:
@@ -250,7 +248,6 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 			n, err = mc.readBuffer.Read(b)
 			return n, err
 		}
-
 		return 0, io.EOF
 	}
 	mc.WriteFunc = func(b []byte) (n int, err error) {
@@ -266,23 +263,21 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 	mc.CloseFunc = func() error {
 		mc.closeOnce.Do(func() {
 			mc.mu.Lock()
-			alreadyClosed := false
+			defer mc.mu.Unlock()
+			mc.closeCalled = true
 			select {
 			case <-mc.closed:
-				alreadyClosed = true
+				// Already closed
 			default:
 				close(mc.closed)
-			}
-			mc.mu.Unlock() // Unlock before broadcast to avoid deadlock if signaled goroutine tries to lock
-			if !alreadyClosed {
-				mc.readCond.Broadcast() // Wake up all waiting readers
+				mc.readCond.Broadcast()
 			}
 		})
 		return nil
 	}
 	mc.LocalAddrFunc = func() net.Addr { return mc.localAddr }
 	mc.RemoteAddrFunc = func() net.Addr { return mc.remoteAddr }
-	mc.SetNoDelayFunc = func(bool) error { return nil } // Mock SetNoDelay
+	mc.SetNoDelayFunc = func(bool) error { return nil }
 	mc.SetDeadlineFunc = func(time.Time) error { return nil }
 	mc.SetReadDeadlineFunc = func(time.Time) error { return nil }
 	mc.SetWriteDeadlineFunc = func(time.Time) error { return nil }
@@ -1982,4 +1977,219 @@ func TestServer_HandleSignals(t *testing.T) {
 			t.Errorf("Expected log message for signal handler exiting due to reloadChan closure, not found. Logs: %s", logs)
 		}
 	})
+}
+
+var (
+	originalNewHTTP2Connection_TestHandleTCP func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection
+)
+
+func setupHandleTCPConnectionMocks_Test() {
+	originalNewHTTP2Connection_TestHandleTCP = newHTTP2Connection // Save the real one from server.go
+}
+
+func teardownHandleTCPConnectionMocks_Test() {
+	newHTTP2Connection = originalNewHTTP2Connection_TestHandleTCP // Restore
+}
+
+func TestServer_HandleTCPConnection(t *testing.T) {
+	setupHandleTCPConnectionMocks_Test()
+	defer teardownHandleTCPConnectionMocks_Test()
+
+	baseCfg := newTestConfig("127.0.0.1:1234")            // Fixed port, not actually listening
+	originalCfgPath := "test_handle_tcp_conn_config.json" // Dummy path
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	t.Run("SuccessPath", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		mockNetC := newMockConn("127.0.0.1:1234", "127.0.0.1:54321")
+
+		// --- Setup mockConn for handshake and minimal serve ---
+		readData := []byte(http2.ClientPreface)
+		// Client SETTINGS frame (empty)
+		settingsFrame := http2.SettingsFrame{}
+		settingsFrameHdr := http2.FrameHeader{Type: http2.FrameSettings, Length: 0, StreamID: 0}
+		settingsFrame.FrameHeader = settingsFrameHdr
+		var settingsBuf bytes.Buffer
+		if err := http2.WriteFrame(&settingsBuf, &settingsFrame); err != nil {
+			t.Fatalf("Failed to write client settings frame: %v", err)
+		}
+		readData = append(readData, settingsBuf.Bytes()...)
+		// Client SETTINGS ACK frame (in response to server's initial SETTINGS)
+		settingsAckFrame := http2.SettingsFrame{FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Flags: http2.FlagSettingsAck, Length: 0, StreamID: 0}}
+		var settingsAckBuf bytes.Buffer
+		if err := http2.WriteFrame(&settingsAckBuf, &settingsAckFrame); err != nil {
+			t.Fatalf("Failed to write client SETTINGS ACK frame: %v", err)
+		}
+		readData = append(readData, settingsAckBuf.Bytes()...)
+		mockNetC.SetReadBuffer(readData)
+		mockNetC.autoEOF = true // Ensure EOF after reading pre-set data
+
+		// Modify the newHTTP2Connection mock to capture the created http2.Connection
+		var capturedH2Conn *http2.Connection
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			if nc != mockNetC {
+				t.Errorf("newHTTP2Connection called with wrong net.Conn. Expected %p, got %p", mockNetC, nc)
+			}
+			if lgLogger != lg {
+				t.Errorf("newHTTP2Connection called with wrong logger. Expected %p, got %p", lg, lgLogger)
+			}
+			capturedH2Conn = originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+			return capturedH2Conn
+		}
+
+		originalSetNoDelay := mockNetC.SetNoDelayFunc
+		mockNetC.SetNoDelayFunc = func(noDelay bool) error {
+			if !noDelay {
+				t.Errorf("Expected SetNoDelay(true) to be called")
+			}
+			return originalSetNoDelay(noDelay)
+		}
+
+		handleDone := make(chan struct{})
+		go func() {
+			s.handleTCPConnection(mockNetC)
+			close(handleDone)
+		}()
+
+		select {
+		case <-handleDone:
+		case <-time.After(1 * time.Second):
+			t.Fatal("handleTCPConnection did not complete in time")
+		}
+
+		// Check that server.go logged that it couldn't call SetNoDelay due to type
+		serverLogsSoFar := logBuf.String() // Capture logs up to this point
+		expectedNoDelayLog := "Underlying connection is not *net.TCPConn, cannot set TCP_NODELAY."
+		if !strings.Contains(serverLogsSoFar, expectedNoDelayLog) {
+			t.Errorf("Expected log message '%s', but not found. Logs: %s", expectedNoDelayLog, serverLogsSoFar)
+		}
+
+		if len(mockNetC.GetWriteBuffer()) == 0 {
+			t.Error("Expected server to write initial SETTINGS, but write buffer is empty")
+		} else {
+			writtenBytes := mockNetC.GetWriteBuffer()
+			if len(writtenBytes) < 9 {
+				t.Errorf("Write buffer too short to be a frame: len %d", len(writtenBytes))
+			} else if http2.FrameType(writtenBytes[3]) != http2.FrameSettings {
+				t.Errorf("Expected first written frame to be SETTINGS, got type %v", http2.FrameType(writtenBytes[3]))
+			}
+		}
+
+		// Wait for the mock connection's CloseFunc to be fully executed.
+		if err := mockNetC.WaitCloseCalled(1 * time.Second); err != nil {
+			// Log current state for debugging
+			mockNetC.mu.Lock()
+			closedChState := "open"
+			select {
+			case <-mockNetC.closed:
+				closedChState = "closed"
+			default:
+			}
+			t.Fatalf("mockNetC.CloseFunc was not fully executed via WaitCloseCalled: %v. State: closeCalled=%v, closedChannelState=%s",
+				err, mockNetC.closeCalled, closedChState)
+			mockNetC.mu.Unlock()
+		}
+
+		// If WaitCloseCalled succeeded, then CloseFunc's logic (including closing mc.closed) should have completed.
+		select {
+		case <-mockNetC.closed:
+			// Expected: .closed channel is now confirmed closed.
+		default:
+			t.Error("mockNetC.closed channel was not closed even after WaitCloseCalled confirmed CloseFunc ran")
+		}
+
+		s.mu.RLock()
+		if len(s.activeConns) != 0 {
+			t.Errorf("Expected activeConns to be empty, found %d", len(s.activeConns))
+		}
+		s.mu.RUnlock()
+
+		serverLogs := logBuf.String()
+		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
+			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+		}
+	})
+
+	t.Run("HandshakeFailure_ClosesConnection", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		mockNetC := newMockConn("127.0.0.1:1234", "127.0.0.1:54321")
+		mockNetC.SetReadBuffer([]byte{}) // Empty buffer will cause EOF during preface read
+		mockNetC.autoEOF = true          // Ensure EOF immediately
+
+		var newHTTP2ConnectionCalledOnFailure bool
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			newHTTP2ConnectionCalledOnFailure = true
+			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+		}
+
+		handleDone := make(chan struct{})
+		go func() {
+			s.handleTCPConnection(mockNetC)
+			close(handleDone)
+		}()
+
+		select {
+		case <-handleDone:
+		case <-time.After(1 * time.Second):
+			t.Fatal("handleTCPConnection did not complete in time for handshake failure")
+		}
+
+		if !newHTTP2ConnectionCalledOnFailure {
+			t.Error("newHTTP2Connection was not called by handleTCPConnection during handshake failure path")
+		}
+
+		select {
+		case <-mockNetC.closed:
+		default:
+			t.Error("mockNetC was not closed after handshake failure")
+		}
+
+		serverLogs := logBuf.String()
+		if !strings.Contains(serverLogs, "HTTP/2 server handshake failed") {
+			t.Errorf("Expected log for handshake failure, not found. Logs: %s", serverLogs)
+		}
+
+		s.mu.RLock()
+		if len(s.activeConns) != 0 {
+			t.Errorf("Expected activeConns to be empty after handshake failure, found %d", len(s.activeConns))
+		}
+		s.mu.RUnlock()
+
+		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
+			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+		}
+	})
+}
+
+// WaitCloseCalled waits for the CloseFunc to be called and its main logic to complete.
+func (m *mockConn) WaitCloseCalled(timeout time.Duration) error {
+	if m.closeCalledChan == nil {
+		return fmt.Errorf("mockConn.closeCalledChan is nil, cannot wait")
+	}
+	select {
+	case <-m.closeCalledChan:
+		return nil
+	case <-time.After(timeout):
+		// Final check on the flag, in case channel close was missed due to extreme race (unlikely)
+		m.mu.Lock()
+		called := m.closeCalled
+		m.mu.Unlock()
+		if called {
+			return nil // Flag indicates it was called
+		}
+		return fmt.Errorf("timeout waiting for CloseFunc to be fully called (timed out after %v)", timeout)
+	}
 }
