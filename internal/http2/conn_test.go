@@ -1941,14 +1941,6 @@ func TestConnection_DispatchDataFrame(t *testing.T) {
 	}
 }
 
-func newTestHpackEncoder(t *testing.T) *hpack.Encoder {
-	t.Helper()
-	var hpackBuf bytes.Buffer
-	// Use a reasonable table size, matching default server settings if possible.
-	// conn.ourSettings[SettingHeaderTableSize] is DefaultSettingsHeaderTableSize (4096)
-	return hpack.NewEncoder(&hpackBuf)
-}
-
 func encodeHeadersForTest(t *testing.T, headers []hpack.HeaderField) []byte {
 	t.Helper()
 
