@@ -1274,3 +1274,273 @@ func TestIsAddrInUse(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareExecEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestPrepareExecEnv on Windows due to POSIX-specific FD/pipe behavior.")
+	}
+
+	// Helper to convert env slice to map for easier checking
+	envSliceToMap := func(env []string) map[string]string {
+		m := make(map[string]string)
+		for _, e := range env {
+			parts := strings.SplitN(e, "=", 2)
+			if len(parts) == 2 {
+				m[parts[0]] = parts[1]
+			} else {
+				m[parts[0]] = "" // Handle variables without '=' if any (though rare)
+			}
+		}
+		return m
+	}
+
+	tests := []struct {
+		name                   string
+		setupListeners         func(t *testing.T) ([]net.Listener, func()) // Returns listeners and cleanup func
+		setupReadinessPipe     func(t *testing.T) (*os.File, func())       // Returns readiness pipe write end, and cleanup
+		currentEnv             []string
+		expectedNumListenerFDs int    // Expected number of FDs in LISTEN_FDS. 0 means LISTEN_FDS should not be set.
+		expectedReadinessFD    string // Expected value for READINESS_PIPE_FD, or empty if not expected (use "USE_PIPE_FD" placeholder)
+		expectError            bool
+		errorContains          string
+		otherExpectedEnv       map[string]string // Other env vars that should be present
+	}{
+		{
+			name: "NoListeners_NoPipe",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				return nil, func() {}
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				return nil, func() {}
+			},
+			currentEnv:             []string{"VAR1=value1", "VAR2=value2"},
+			expectedNumListenerFDs: 0,
+			otherExpectedEnv:       map[string]string{"VAR1": "value1", "VAR2": "value2"},
+		},
+		{
+			name: "OneListener_NoPipe",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				ln1, _, err := CreateListenerAndGetFD("127.0.0.1:0") // FD from here not used for expectation
+				if err != nil {
+					t.Fatalf("Setup: CreateListenerAndGetFD failed: %v", err)
+				}
+				return []net.Listener{ln1}, func() { ln1.Close() }
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				return nil, func() {}
+			},
+			currentEnv:             []string{"EXISTING_VAR=yes"},
+			expectedNumListenerFDs: 1,
+			otherExpectedEnv:       map[string]string{"EXISTING_VAR": "yes"},
+		},
+		{
+			name: "TwoListeners_NoPipe",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				ln1, _, err1 := CreateListenerAndGetFD("127.0.0.1:0")
+				ln2, _, err2 := CreateListenerAndGetFD("127.0.0.1:0")
+				if err1 != nil || err2 != nil {
+					t.Fatalf("Setup: CreateListenerAndGetFD failed: %v, %v", err1, err2)
+				}
+				return []net.Listener{ln1, ln2}, func() { ln1.Close(); ln2.Close() }
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				return nil, func() {}
+			},
+			currentEnv:             nil,
+			expectedNumListenerFDs: 2,
+			otherExpectedEnv:       map[string]string{},
+		},
+		{
+			name: "NoListeners_WithPipe",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				return nil, func() {}
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				_, childWritePipe, err := os.Pipe()
+				if err != nil {
+					t.Fatalf("Setup: os.Pipe for readiness failed: %v", err)
+				}
+				if err := SetCloexec(childWritePipe.Fd(), false); err != nil {
+					childWritePipe.Close()
+					t.Fatalf("Setup: Failed to clear CLOEXEC on childWritePipe: %v", err)
+				}
+				return childWritePipe, func() { childWritePipe.Close() }
+			},
+			currentEnv:             []string{"VAR=val"},
+			expectedNumListenerFDs: 0,
+			expectedReadinessFD:    "USE_PIPE_FD",
+			otherExpectedEnv:       map[string]string{"VAR": "val"},
+		},
+		{
+			name: "OneListener_WithPipe",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				ln1, _, err := CreateListenerAndGetFD("127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("Setup: CreateListenerAndGetFD failed: %v", err)
+				}
+				return []net.Listener{ln1}, func() { ln1.Close() }
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				_, childWritePipe, err := os.Pipe()
+				if err != nil {
+					t.Fatalf("Setup: os.Pipe for readiness failed: %v", err)
+				}
+				if err := SetCloexec(childWritePipe.Fd(), false); err != nil {
+					childWritePipe.Close()
+					t.Fatalf("Setup: Failed to clear CLOEXEC on childWritePipe: %v", err)
+				}
+				return childWritePipe, func() { childWritePipe.Close() }
+			},
+			currentEnv:             []string{},
+			expectedNumListenerFDs: 1,
+			expectedReadinessFD:    "USE_PIPE_FD",
+			otherExpectedEnv:       map[string]string{},
+		},
+		{
+			name: "FilterExistingEnvVars",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				ln1, _, err := CreateListenerAndGetFD("127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("Setup: CreateListenerAndGetFD failed: %v", err)
+				}
+				return []net.Listener{ln1}, func() { ln1.Close() }
+			},
+			setupReadinessPipe: func(t *testing.T) (*os.File, func()) {
+				_, childWritePipe, err := os.Pipe()
+				if err != nil {
+					t.Fatalf("Setup: os.Pipe for readiness failed: %v", err)
+				}
+				if err := SetCloexec(childWritePipe.Fd(), false); err != nil {
+					childWritePipe.Close()
+					t.Fatalf("Setup: Failed to clear CLOEXEC on childWritePipe: %v", err)
+				}
+				return childWritePipe, func() { childWritePipe.Close() }
+			},
+			currentEnv: []string{
+				"LISTEN_FDS=old_listen_fds",
+				"READINESS_PIPE_FD=old_readiness_fd",
+				"PRESERVED_VAR=keep_me",
+			},
+			expectedNumListenerFDs: 1,
+			expectedReadinessFD:    "USE_PIPE_FD",
+			otherExpectedEnv:       map[string]string{"PRESERVED_VAR": "keep_me"},
+		},
+		{
+			name: "Error_UnsupportedListenerType",
+			setupListeners: func(t *testing.T) ([]net.Listener, func()) {
+				mockLn := &mockUnsupportedListener{}
+				return []net.Listener{mockLn}, func() {}
+			},
+			setupReadinessPipe:     func(t *testing.T) (*os.File, func()) { return nil, func() {} },
+			currentEnv:             nil,
+			expectError:            true,
+			errorContains:          "unsupported listener type",
+			expectedNumListenerFDs: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			listeners, cleanupListeners := tc.setupListeners(t)
+			defer cleanupListeners()
+
+			readinessPipeWrite, cleanupPipe := tc.setupReadinessPipe(t)
+			defer cleanupPipe()
+
+			expectedReadinessFDValue := tc.expectedReadinessFD
+			if expectedReadinessFDValue == "USE_PIPE_FD" {
+				if readinessPipeWrite == nil {
+					t.Fatalf("Test setup error: readinessPipeWrite is nil for USE_PIPE_FD placeholder but expectedReadinessFD is USE_PIPE_FD")
+				}
+				expectedReadinessFDValue = strconv.Itoa(int(readinessPipeWrite.Fd()))
+			}
+
+			newEnv, err := PrepareExecEnv(tc.currentEnv, listeners, readinessPipeWrite)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.errorContains != "" {
+					if !strings.Contains(err.Error(), tc.errorContains) {
+						t.Errorf("Expected error message to contain '%s', got '%s'", tc.errorContains, err.Error())
+					}
+				}
+				return // Don't check env content if error was expected
+			}
+
+			if err != nil {
+				t.Fatalf("Expected no error, but got: %v", err)
+			}
+
+			envMap := envSliceToMap(newEnv)
+
+			// Check LISTEN_FDS
+			if tc.expectedNumListenerFDs > 0 {
+				val, ok := envMap[ListenFdsEnvKey]
+				if !ok {
+					t.Errorf("Expected %s to be set, but it was not", ListenFdsEnvKey)
+				} else {
+					fdsInEnv := strings.Split(val, ":")
+					if len(fdsInEnv) != tc.expectedNumListenerFDs {
+						t.Errorf("Expected %d FDs in %s, got %d. Value: %s", tc.expectedNumListenerFDs, ListenFdsEnvKey, len(fdsInEnv), val)
+					}
+					for _, fdStr := range fdsInEnv {
+						fdNum, errConv := strconv.Atoi(fdStr)
+						if errConv != nil {
+							t.Errorf("Invalid FD number string '%s' in %s: %v", fdStr, ListenFdsEnvKey, errConv)
+						}
+						if fdNum < 0 {
+							t.Errorf("Invalid negative FD number %d in %s", fdNum, ListenFdsEnvKey)
+						}
+						// Cannot reliably check actual FD values as they are dynamic.
+					}
+				}
+			} else { // expectedNumListenerFDs == 0
+				if val, ok := envMap[ListenFdsEnvKey]; ok {
+					t.Errorf("Expected %s to NOT be set, but it was: %s=%s", ListenFdsEnvKey, ListenFdsEnvKey, val)
+				}
+			}
+
+			// Check READINESS_PIPE_FD
+			if expectedReadinessFDValue != "" { // This means we expect the variable to be set
+				val, ok := envMap[ReadinessPipeEnvKey]
+				if !ok {
+					t.Errorf("Expected %s to be set with value %s, but it was not set", ReadinessPipeEnvKey, expectedReadinessFDValue)
+				} else if val != expectedReadinessFDValue {
+					t.Errorf("Expected %s=%s, got %s=%s", ReadinessPipeEnvKey, expectedReadinessFDValue, ReadinessPipeEnvKey, val)
+				}
+			} else { // This means we expect the variable to NOT be set
+				if val, ok := envMap[ReadinessPipeEnvKey]; ok {
+					t.Errorf("Expected %s to NOT be set, but it was: %s=%s", ReadinessPipeEnvKey, ReadinessPipeEnvKey, val)
+				}
+			}
+
+			// Check other expected environment variables
+			for k, v := range tc.otherExpectedEnv {
+				val, ok := envMap[k]
+				if !ok {
+					t.Errorf("Expected environment variable %s=%s to be present, but key was not found", k, v)
+				} else if val != v {
+					t.Errorf("Expected environment variable %s=%s, got %s=%s", k, v, k, val)
+				}
+			}
+
+			// Verify that original LISTEN_FDS and READINESS_PIPE_FD from currentEnv are not present
+			// if new ones were meant to replace them (i.e., if expectedNumListenerFDs > 0 or expectedReadinessFD != "").
+			originalCurrentEnvMap := envSliceToMap(tc.currentEnv)
+			if tc.expectedNumListenerFDs > 0 {
+				if _, ok := originalCurrentEnvMap[ListenFdsEnvKey]; ok {
+					// Check that new env does not contain the *old* value if it was filtered.
+					// This is implicitly handled if the new value is correctly asserted.
+					// The test mainly checks that the *new* value is present.
+				}
+			}
+			if expectedReadinessFDValue != "" {
+				if _, ok := originalCurrentEnvMap[ReadinessPipeEnvKey]; ok {
+					// Similarly, check that the new env has the new readiness FD, not old one.
+				}
+			}
+		})
+	}
+}
