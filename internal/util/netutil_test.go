@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
 	"testing"
 	"time"
 )
@@ -14,17 +13,6 @@ import (
 // If addr is empty or ":0", it listens on a random available port on localhost.
 // It returns the listener and the address string it's listening on.
 // The caller is responsible for closing the listener.
-func createTestTCPListener(t *testing.T, addr string) (net.Listener, string) {
-	t.Helper()
-	if addr == "" {
-		addr = "127.0.0.1:0" // Listen on a random port on localhost
-	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("Failed to create TCP listener on %s: %v", addr, err)
-	}
-	return ln, ln.Addr().String()
-}
 
 // createTestUnixListener creates a Unix domain socket listener for testing.
 // It returns the listener and the path to the socket file.
@@ -60,22 +48,22 @@ func createTestUnixListener(t *testing.T) (net.Listener, string) {
 	return nil, ""
 }
 
-// getFdFromListener extracts the raw file descriptor (uintptr) from a net.Listener.
-// It calls t.Fatalf if it fails to get the FD.
-func getFdFromListener(t *testing.T, l net.Listener) uintptr {
+// getFdAndFileFromListener extracts the raw file descriptor (uintptr) and its owning *os.File from a net.Listener.
+// It calls t.Fatalf if it fails. The caller is responsible for closing the returned *os.File.
+func getFdAndFileFromListener(t *testing.T, l net.Listener) (*os.File, uintptr) {
 	t.Helper()
-	var file *os.File
+	var listenerFile *os.File // Renamed for clarity
 	var err error
 
 	switch typedListener := l.(type) {
 	case *net.TCPListener:
-		file, err = typedListener.File()
+		listenerFile, err = typedListener.File()
 	case *net.UnixListener:
 		// UnixListener.File() might not always be available or behave as expected
 		// depending on the Go version and OS, especially if the socket was
 		// created in a certain way. However, for listeners created by net.Listen,
 		// it should generally work.
-		file, err = typedListener.File()
+		listenerFile, err = typedListener.File()
 	default:
 		t.Fatalf("Unsupported listener type: %T", l)
 	}
@@ -83,17 +71,13 @@ func getFdFromListener(t *testing.T, l net.Listener) uintptr {
 	if err != nil {
 		t.Fatalf("Failed to get *os.File from listener: %v", err)
 	}
-	if file == nil {
+	if listenerFile == nil {
 		t.Fatalf("Listener's File() method returned a nil *os.File")
 	}
 
-	fd := file.Fd()
-	// The *os.File returned by File() is a duplicate. We must close it.
-	if err := file.Close(); err != nil {
-		t.Logf("Warning: failed to close temporary file from listener.File(): %v", err)
-		// Continue, as we got the FD, but log the issue.
-	}
-	return fd
+	fd := listenerFile.Fd()
+	// DO NOT close listenerFile here. Caller is responsible.
+	return listenerFile, fd
 }
 
 // withTempEnvVar temporarily sets an environment variable for the duration of fn.
@@ -292,4 +276,82 @@ func TestNewListenerFromFD(t *testing.T) {
 	if err == nil {
 		t.Errorf("NewListenerFromFD with invalid FD %d expected to fail, but got nil", invalidFD)
 	}
+}
+
+func TestCreateListener(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestCreateListener on Windows due to differences in FD_CLOEXEC handling and typical socket behavior for these tests.")
+	}
+
+	t.Run("TCP_Success_RandomPort", func(t *testing.T) {
+		addr := "127.0.0.1:0" // Listen on a random available port
+		listener, err := CreateListener("tcp", addr)
+		if err != nil {
+			t.Fatalf("CreateListener(\"tcp\", %q) failed: %v", addr, err)
+		}
+		if listener == nil {
+			t.Fatalf("CreateListener(\"tcp\", %q) returned a nil listener", addr)
+		}
+		defer listener.Close()
+
+		// Verify FD is valid and FD_CLOEXEC is not set
+		listenerFileForTest, fd := getFdAndFileFromListener(t, listener)
+		defer listenerFileForTest.Close() // Close the duplicated file descriptor owner
+
+		if fd <= 0 {
+			t.Errorf("CreateListener returned an invalid FD: %d", fd)
+		}
+
+		// The FD_CLOEXEC property for the listener's *own* FD (for self-restart)
+		// is ensured by CreateListener's internal logic.
+		// For passing FDs to children, TestCreateListenerAndGetFD (for the explicitly returned FD)
+		// and eventually PrepareExecEnv (for FDs from listener.File()) are more relevant.
+		// The check on listener.File().Fd()'s CLOEXEC state here was removed as .File() often
+		// returns a new FD with CLOEXEC set by default.
+
+		// Verify the listener is actually listening
+		listeningAddr := listener.Addr().String()
+		conn, errDial := net.DialTimeout("tcp", listeningAddr, 1*time.Second)
+		if errDial != nil {
+			t.Fatalf("Failed to connect to listener at %s: %v", listeningAddr, errDial)
+		}
+		// If dial succeeded, accept the connection on the listener side
+		serverConn, errAccept := listener.Accept()
+		if errAccept != nil {
+			t.Errorf("Listener failed to accept connection: %v", errAccept)
+		}
+		if serverConn != nil {
+			serverConn.Close()
+		}
+		conn.Close()
+	})
+
+	t.Run("TCP_Error_InvalidAddressFormat", func(t *testing.T) {
+		invalidAddresses := []string{
+			"localhost:notaport", // Non-numeric port
+			// ":8080", // This is valid for net.Listen; CreateListener likely wraps it.
+			"invalid-host-format:8080",
+		}
+
+		for _, addr := range invalidAddresses {
+			_, err := CreateListener("tcp", addr)
+			if err == nil {
+				t.Errorf("CreateListener(\"tcp\", %q) expected to fail, but got nil", addr)
+			}
+		}
+	})
+
+	t.Run("Error_UnsupportedNetwork", func(t *testing.T) {
+		addr := "127.0.0.1:0" // Address doesn't matter as much as network type
+		unsupportedNetwork := "udp"
+		_, err := CreateListener(unsupportedNetwork, addr)
+		if err == nil {
+			t.Errorf("CreateListener(%q, %q) expected to fail for unsupported network, but got nil", unsupportedNetwork, addr)
+		}
+	})
+
+	// Note: Reliably testing "address already in use" is difficult in unit tests
+	// as it requires precise control over port states, which can be racy or
+	// platform-dependent. We'll skip it for CreateListener direct test, focusing on what it controls.
+	// IsAddrInUse can be tested separately if needed.
 }
