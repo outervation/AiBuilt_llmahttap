@@ -2663,3 +2663,248 @@ func TestConnection_DispatchPriorityFrame(t *testing.T) {
 		})
 	}
 }
+
+func TestConnection_DispatchRSTStreamFrame(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                       string
+		setupFunc                  func(t *testing.T, conn *Connection) *Stream // Returns the stream if one is created for the test
+		rstStreamFrame             *RSTStreamFrame
+		expectedError              bool
+		expectedConnectionError    *ConnectionError // If expectedError is true and it's a ConnectionError
+		checkStreamStateAfter      bool             // If true, checks the stream's state and existence
+		expectedStreamClosed       bool             // If checkStreamStateAfter, expect stream to be closed
+		expectedStreamRemoved      bool             // If checkStreamStateAfter, expect stream to be removed from conn.streams
+		expectGoAwayFromConnClose  bool             // If true, expects a GOAWAY if conn.Close is called with returned error
+		expectedGoAwayErrorCode    ErrorCode        // If expectGoAwayFromConnClose, this is the expected code
+		expectedFramesFromDispatch int              // Number of frames expected to be written directly by dispatchRSTStreamFrame or its callees (e.g., no RST for valid peer RST)
+	}{
+		{
+			name: "Valid RST_STREAM for open stream",
+			setupFunc: func(t *testing.T, conn *Connection) *Stream {
+				s, err := conn.createStream(1, nil, true /*isPeerInitiated*/)
+				if err != nil {
+					t.Fatalf("Setup: Failed to create stream: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+				return s
+			},
+			rstStreamFrame: &RSTStreamFrame{
+				FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: 1, Length: 4},
+				ErrorCode:   ErrCodeCancel,
+			},
+			expectedError:         false,
+			checkStreamStateAfter: true,
+			expectedStreamClosed:  true,
+			expectedStreamRemoved: true,
+		},
+		{
+			name: "RST_STREAM on stream 0",
+			rstStreamFrame: &RSTStreamFrame{
+				FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: 0, Length: 4},
+				ErrorCode:   ErrCodeCancel,
+			},
+			expectedError:             true,
+			expectedConnectionError:   &ConnectionError{Code: ErrCodeProtocolError, Msg: "RST_STREAM frame received on stream 0"},
+			expectGoAwayFromConnClose: true,
+			expectedGoAwayErrorCode:   ErrCodeProtocolError,
+		},
+		{
+			name: "RST_STREAM for unknown stream (never existed or already removed)",
+			rstStreamFrame: &RSTStreamFrame{
+				FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: 99, Length: 4}, // Stream 99 does not exist
+				ErrorCode:   ErrCodeStreamClosed,
+			},
+			expectedError: false, // Ignored as per RFC
+		},
+		{
+			name: "RST_STREAM for known stream that is already closed (but still in map temporarily for test)",
+			setupFunc: func(t *testing.T, conn *Connection) *Stream {
+				s, err := conn.createStream(3, nil, true)
+				if err != nil {
+					t.Fatalf("Setup: Failed to create stream: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateClosed // Stream is already closed
+				s.mu.Unlock()
+				return s
+			},
+			rstStreamFrame: &RSTStreamFrame{
+				FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: 3, Length: 4},
+				ErrorCode:   ErrCodeCancel,
+			},
+			expectedError:         false, // Still processed to ensure cleanup, but effectively "ignored" in terms of protocol response
+			checkStreamStateAfter: true,
+			expectedStreamClosed:  true, // Should remain closed
+			expectedStreamRemoved: true, // Should be removed
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn, mnc := newTestConnection(t, false, nil)
+			var closeErr error = errors.New("test cleanup: " + tc.name)
+			// Defer Close needs to be conditional or handled carefully if the test itself calls conn.Close.
+			// Let's assume for these direct dispatch tests, the test is responsible for final conn.Close if checking GOAWAY.
+			// Otherwise, this deferred Close cleans up.
+			defer func() {
+				if !tc.expectGoAwayFromConnClose { // If test doesn't handle Close itself
+					if conn != nil {
+						conn.Close(closeErr)
+					}
+				} else if conn != nil && closeErr != nil { // If test handles Close but an error occurred before that point
+					conn.Close(closeErr) // Close with the setup/test error
+				}
+			}()
+
+			var streamToCheck *Stream
+			if tc.setupFunc != nil {
+				streamToCheck = tc.setupFunc(t, conn)
+			}
+
+			dispatchErr := conn.dispatchRSTStreamFrame(tc.rstStreamFrame)
+
+			if tc.expectedError {
+				if dispatchErr == nil {
+					closeErr = errors.New("Expected error from dispatchRSTStreamFrame, got nil")
+					t.Fatal(closeErr)
+				}
+				if tc.expectedConnectionError != nil {
+					connErr, ok := dispatchErr.(*ConnectionError)
+					if !ok {
+						closeErr = fmt.Errorf("Expected *ConnectionError, got %T: %v", dispatchErr, dispatchErr)
+						t.Fatal(closeErr)
+					}
+					if connErr.Code != tc.expectedConnectionError.Code {
+						e := fmt.Errorf("Expected ConnectionError code %s, got %s", tc.expectedConnectionError.Code, connErr.Code)
+						if closeErr == nil {
+							closeErr = e
+						} else {
+							closeErr = fmt.Errorf("%w; %w", closeErr, e)
+						}
+						t.Error(e)
+					}
+					if tc.expectedConnectionError.Msg != "" && !strings.Contains(connErr.Msg, tc.expectedConnectionError.Msg) {
+						e := fmt.Errorf("ConnectionError message mismatch: got '%s', expected to contain '%s'", connErr.Msg, tc.expectedConnectionError.Msg)
+						if closeErr == nil {
+							closeErr = e
+						} else {
+							closeErr = fmt.Errorf("%w; %w", closeErr, e)
+						}
+						t.Error(e)
+					}
+				}
+			} else { // No error expected from dispatchRSTStreamFrame
+				if dispatchErr != nil {
+					closeErr = fmt.Errorf("Expected no error from dispatchRSTStreamFrame, got %v", dispatchErr)
+					t.Fatal(closeErr)
+				}
+			}
+
+			if tc.checkStreamStateAfter && streamToCheck != nil {
+				streamToCheck.mu.RLock()
+				state := streamToCheck.state
+				streamToCheck.mu.RUnlock()
+
+				if tc.expectedStreamClosed && state != StreamStateClosed {
+					e := fmt.Errorf("Stream %d: expected state Closed, got %s", streamToCheck.id, state)
+					if closeErr == nil {
+						closeErr = e
+					} else {
+						closeErr = fmt.Errorf("%w; %w", closeErr, e)
+					}
+					t.Error(e)
+				}
+
+				if tc.expectedStreamRemoved {
+					_, exists := conn.getStream(streamToCheck.id)
+					if exists {
+						e := fmt.Errorf("Stream %d: expected to be removed from connection, but still exists", streamToCheck.id)
+						if closeErr == nil {
+							closeErr = e
+						} else {
+							closeErr = fmt.Errorf("%w; %w", closeErr, e)
+						}
+						t.Error(e)
+					}
+				}
+			}
+
+			// Check for GOAWAY if dispatchRSTStreamFrame returned a ConnectionError.
+			// This simulates the Serve loop calling conn.Close(dispatchErr).
+			if tc.expectGoAwayFromConnClose && tc.expectedError && dispatchErr != nil {
+				// Perform handshake if not already done (mnc needs to be able to write)
+				// To simplify, ensure writerLoop is running. newTestConnection starts it.
+
+				// Now explicitly call conn.Close with the error from dispatchRSTStreamFrame
+				_ = conn.Close(dispatchErr) // Error from this Close is not primary for this test part
+
+				var goAwayFrame *GoAwayFrame
+				waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					for _, f := range frames {
+						if gaf, ok := f.(*GoAwayFrame); ok {
+							if gaf.ErrorCode == tc.expectedGoAwayErrorCode {
+								goAwayFrame = gaf
+								return true
+							}
+						}
+					}
+					return false
+				}, fmt.Sprintf("GOAWAY frame with ErrorCode %s after RST_STREAM on stream 0", tc.expectedGoAwayErrorCode))
+
+				if goAwayFrame == nil {
+					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					e := fmt.Errorf("GOAWAY frame not written or with wrong error code. Expected code %s. Frames on wire: %+v", tc.expectedGoAwayErrorCode, allFrames)
+					if closeErr == nil {
+						closeErr = e
+					} else {
+						closeErr = fmt.Errorf("%w; %w", closeErr, e)
+					}
+					t.Error(e) // Use Error to not stop other subtests if parallel
+				}
+				// Mark closeErr as nil for the defer if this path is successful.
+				// This indicates the test logic itself passed, and the deferred conn.Close(nil) is fine.
+				if t.Failed() == false { // If no t.Error/Fatal so far in this branch
+					closeErr = nil
+				}
+
+			} else { // No GOAWAY expected as a direct consequence of this dispatch
+				// Give writerLoop a moment to ensure no unexpected frames are sent.
+				time.Sleep(50 * time.Millisecond)
+				writtenBytes := mnc.GetWriteBufferBytes()
+				if len(writtenBytes) > tc.expectedFramesFromDispatch*FrameHeaderLen { // Crude check, allow for some minimum frame size
+					// More precise: check if any frames OTHER than expected ones (e.g., PING ACKs from other activities) were written.
+					// For this test, assume expectedFramesFromDispatch is 0 if not checking GOAWAY.
+					frames := readAllFramesFromBuffer(t, writtenBytes)
+					var unexpectedFrames []string
+					for _, f := range frames {
+						// Basic PING ACK filter, assuming other tests might trigger these.
+						// This test itself should not cause PING ACKs.
+						if pf, ok := f.(*PingFrame); ok && (pf.Flags&FlagPingAck) != 0 {
+							continue
+						}
+						unexpectedFrames = append(unexpectedFrames, fmt.Sprintf("%T", f))
+					}
+					if len(unexpectedFrames) > tc.expectedFramesFromDispatch {
+						e := fmt.Errorf("Unexpected frames written to connection: %v. Expected %d frames.", unexpectedFrames, tc.expectedFramesFromDispatch)
+						if closeErr == nil {
+							closeErr = e
+						} else {
+							closeErr = fmt.Errorf("%w; %w", closeErr, e)
+						}
+						t.Error(e)
+					}
+				}
+				if t.Failed() == false {
+					closeErr = nil
+				}
+			}
+		})
+	}
+}
