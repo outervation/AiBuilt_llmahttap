@@ -221,7 +221,8 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 		writeBuffer:     bytes.NewBuffer(nil),
 		closed:          make(chan struct{}),
 		autoEOF:         false,
-		closeCalledChan: make(chan struct{}),
+		closeCalledChan: make(chan struct{}), // Corrected: lowercase 'c'
+
 	}
 	mc.readCond = sync.NewCond(&mc.mu)
 
