@@ -2908,3 +2908,352 @@ func TestConnection_DispatchRSTStreamFrame(t *testing.T) {
 		})
 	}
 }
+
+func TestConnection_HandleSettingsFrame(t *testing.T) {
+	t.Parallel()
+
+	defaultPeerSettingsMap := func() map[SettingID]uint32 {
+		return map[SettingID]uint32{
+			SettingHeaderTableSize:      DefaultSettingsHeaderTableSize,
+			SettingEnablePush:           DefaultServerEnablePush, // Assuming peer is a server by default for initial values
+			SettingInitialWindowSize:    DefaultSettingsInitialWindowSize,
+			SettingMaxFrameSize:         DefaultSettingsMaxFrameSize,
+			SettingMaxConcurrentStreams: 0xffffffff, // Default "unlimited"
+			SettingMaxHeaderListSize:    0xffffffff, // Default "unlimited"
+		}
+	}
+
+	tests := []struct {
+		name                        string
+		setupFunc                   func(t *testing.T, conn *Connection, mnc *mockNetConn) // Optional setup
+		settingsFrameToProcess      *SettingsFrame
+		expectError                 bool
+		expectedConnectionErrorCode ErrorCode
+		expectedConnectionErrorMsg  string // Substring to check in error message
+		expectAckSent               bool   // True if a SETTINGS ACK should be sent by the server
+		checkPeerSettings           bool   // True to verify conn.peerSettings map after processing
+		expectedPeerSettings        map[SettingID]uint32
+		checkOperationalValues      func(t *testing.T, conn *Connection) // Custom checks for conn.peerMaxFrameSize, etc.
+		checkStreamUpdates          func(t *testing.T, conn *Connection) // Custom checks for stream updates (e.g., FCW)
+	}{
+		{
+			name: "Valid SETTINGS frame from peer (not ACK)",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 18 /* 3 settings * 6 bytes */},
+				Settings: []Setting{
+					{ID: SettingInitialWindowSize, Value: 123456},
+					{ID: SettingMaxFrameSize, Value: 32768},
+					{ID: SettingHeaderTableSize, Value: 8192},
+				},
+			},
+			expectError:       false,
+			expectAckSent:     true,
+			checkPeerSettings: true,
+			expectedPeerSettings: func() map[SettingID]uint32 {
+				ps := defaultPeerSettingsMap()
+				ps[SettingInitialWindowSize] = 123456
+				ps[SettingMaxFrameSize] = 32768
+				ps[SettingHeaderTableSize] = 8192
+				return ps
+			}(),
+			checkOperationalValues: func(t *testing.T, conn *Connection) {
+				conn.settingsMu.RLock()
+				defer conn.settingsMu.RUnlock()
+				if conn.peerInitialWindowSize != 123456 {
+					t.Errorf("conn.peerInitialWindowSize: got %d, want %d", conn.peerInitialWindowSize, 123456)
+				}
+				if conn.peerMaxFrameSize != 32768 {
+					t.Errorf("conn.peerMaxFrameSize: got %d, want %d", conn.peerMaxFrameSize, 32768)
+				}
+				if conn.hpackAdapter == nil {
+					t.Error("conn.hpackAdapter is nil")
+				} else {
+					// This check assumes direct setting. HPACK adapter might have internal limits or behavior.
+					// For now, assume direct update of its configured max table size.
+					// The hpackAdapter.SetMaxEncoderDynamicTableSize is called by applyPeerSettings.
+					// No direct way to get current max encoder table size from hpackAdapter, it's internal to hpack.Encoder.
+					// We trust applyPeerSettings calls it.
+				}
+			},
+		},
+		{
+			name: "Valid SETTINGS ACK from peer",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, Flags: FlagSettingsAck, StreamID: 0, Length: 0},
+			},
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) {
+				// Simulate server having sent SETTINGS and is awaiting ACK
+				conn.settingsMu.Lock()
+				conn.settingsAckTimeoutTimer = time.NewTimer(10 * time.Second) // Dummy timer
+				conn.settingsMu.Unlock()
+			},
+			expectError:       false,
+			expectAckSent:     false,
+			checkPeerSettings: false, // ACK doesn't change settings
+			checkOperationalValues: func(t *testing.T, conn *Connection) {
+				conn.settingsMu.RLock()
+				defer conn.settingsMu.RUnlock()
+				if conn.settingsAckTimeoutTimer != nil {
+					// Timer should be stopped and set to nil upon receiving ACK.
+					// This check might be racy if timer fires exactly as test runs.
+					// The waitForCondition approach in earlier tests is better for this.
+					// For direct handleSettingsFrame call, timer should be nil.
+					t.Error("settingsAckTimeoutTimer was not cleared after ACK")
+				}
+			},
+		},
+		{
+			name: "SETTINGS frame with non-zero StreamID",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 1, Length: 0}, // StreamID = 1
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeProtocolError,
+			expectedConnectionErrorMsg:  "SETTINGS frame received with non-zero stream ID",
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS ACK with non-zero payload length",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, Flags: FlagSettingsAck, StreamID: 0, Length: 6}, // Length = 6
+				Settings:    []Setting{{ID: SettingInitialWindowSize, Value: 100}},
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeFrameSizeError,
+			expectedConnectionErrorMsg:  "SETTINGS ACK frame received with non-zero length",
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS (not ACK) with length not multiple of 6",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 7}, // Length = 7
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeFrameSizeError,
+			expectedConnectionErrorMsg:  "SETTINGS frame received with length not a multiple of 6",
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS with invalid SETTINGS_ENABLE_PUSH value",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 6},
+				Settings:    []Setting{{ID: SettingEnablePush, Value: 2}}, // Invalid value 2
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeProtocolError,
+			expectedConnectionErrorMsg:  "invalid SETTINGS_ENABLE_PUSH value: 2",
+			expectAckSent:               false, // Error occurs before ACK can be sent
+		},
+		{
+			name: "SETTINGS with SETTINGS_INITIAL_WINDOW_SIZE > MaxWindowSize",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 6},
+				Settings:    []Setting{{ID: SettingInitialWindowSize, Value: MaxWindowSize + 1}},
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeFlowControlError,
+			expectedConnectionErrorMsg:  fmt.Sprintf("invalid SETTINGS_INITIAL_WINDOW_SIZE value %d exceeds maximum %d", MaxWindowSize+1, MaxWindowSize),
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS with SETTINGS_MAX_FRAME_SIZE too low",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 6},
+				Settings:    []Setting{{ID: SettingMaxFrameSize, Value: MinMaxFrameSize - 1}},
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeProtocolError,
+			expectedConnectionErrorMsg:  fmt.Sprintf("invalid SETTINGS_MAX_FRAME_SIZE value: %d", MinMaxFrameSize-1),
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS with SETTINGS_MAX_FRAME_SIZE too high",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 6},
+				Settings:    []Setting{{ID: SettingMaxFrameSize, Value: MaxAllowedFrameSizeValue + 1}},
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeProtocolError,
+			expectedConnectionErrorMsg:  fmt.Sprintf("invalid SETTINGS_MAX_FRAME_SIZE value: %d", MaxAllowedFrameSizeValue+1),
+			expectAckSent:               false,
+		},
+		{
+			name: "SETTINGS with unknown setting ID (should be ignored)",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 12 /* 2 settings */},
+				Settings: []Setting{
+					{ID: SettingInitialWindowSize, Value: 99999}, // Known
+					{ID: SettingID(0xFFFF), Value: 123},          // Unknown ID
+				},
+			},
+			expectError:       false,
+			expectAckSent:     true,
+			checkPeerSettings: true,
+			expectedPeerSettings: func() map[SettingID]uint32 {
+				ps := defaultPeerSettingsMap()
+				ps[SettingInitialWindowSize] = 99999
+				// Unknown setting 0xFFFF should not be in ps
+				return ps
+			}(),
+		},
+		{
+			name: "SETTINGS changes SETTINGS_INITIAL_WINDOW_SIZE, updates streams",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) {
+				// Create a stream
+				_, err := conn.createStream(1, nil, true /*isPeerInitiated*/)
+				if err != nil {
+					t.Fatalf("Setup: Failed to create stream: %v", err)
+				}
+			},
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: 6},
+				Settings:    []Setting{{ID: SettingInitialWindowSize, Value: 70000}},
+			},
+			expectError:   false,
+			expectAckSent: true,
+			checkStreamUpdates: func(t *testing.T, conn *Connection) {
+				stream, exists := conn.getStream(1)
+				if !exists {
+					t.Fatal("Stream 1 not found after SETTINGS update")
+				}
+				// fcManager.HandlePeerSettingsInitialWindowSizeChange updates sendWindow.initialWindowSize and adjusts 'available'
+				stream.fcManager.sendWindow.mu.Lock()
+				newInitialSend := stream.fcManager.sendWindow.initialWindowSize
+				stream.fcManager.sendWindow.mu.Unlock()
+
+				if newInitialSend != 70000 {
+					t.Errorf("Stream 1 sendWindow.initialWindowSize: got %d, want %d", newInitialSend, 70000)
+				}
+				// Check `available` is more complex due to potential previous subtractions.
+				// The core check is that initialWindowSize itself on the FlowControlWindow object is updated.
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			var closeErr error = errors.New("test cleanup: " + tc.name)
+			defer func() {
+				if conn != nil {
+					// If an error was expected and occurred, close with that error.
+					// This might trigger a GOAWAY if the test expects it.
+					if tc.expectError && conn.connError != nil {
+						conn.Close(conn.connError)
+					} else {
+						conn.Close(closeErr) // Otherwise, close with test-specific or nil.
+					}
+				}
+			}()
+
+			// performHandshakeForTest(t, conn, mnc) // Not strictly needed for direct handleSettingsFrame calls
+			// mnc.ResetWriteBuffer()
+
+			// Apply initial default peer settings for baseline
+			conn.settingsMu.Lock()
+			conn.peerSettings = defaultPeerSettingsMap()
+			conn.applyPeerSettings()
+			conn.settingsMu.Unlock()
+
+			if tc.setupFunc != nil {
+				tc.setupFunc(t, conn, mnc)
+			}
+
+			// Store initial HPACK encoder table size for comparison if settings change it.
+			// Note: cannot directly query hpack.Encoder.MaxDynamicTableSize(), rely on conn.peerSettings and applyPeerSettings logic.
+			// Initial peer settings are default, so hpackAdapter's encoder max table size reflects default.
+
+			err := conn.handleSettingsFrame(tc.settingsFrameToProcess)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected error, got nil")
+				}
+				connErr, ok := err.(*ConnectionError)
+				if !ok {
+					t.Fatalf("Expected *ConnectionError, got %T: %v", err, err)
+				}
+				if connErr.Code != tc.expectedConnectionErrorCode {
+					t.Errorf("Expected ConnectionError code %s, got %s", tc.expectedConnectionErrorCode, connErr.Code)
+				}
+				if tc.expectedConnectionErrorMsg != "" && !strings.Contains(connErr.Msg, tc.expectedConnectionErrorMsg) {
+					t.Errorf("ConnectionError message '%s' does not contain substring '%s'", connErr.Msg, tc.expectedConnectionErrorMsg)
+				}
+				// Store the error on conn so deferred Close can use it for GOAWAY check
+				conn.streamsMu.Lock()
+				conn.connError = err
+				conn.streamsMu.Unlock()
+
+			} else { // No error expected
+				if err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+			}
+
+			if tc.expectAckSent {
+				var ackFrame *SettingsFrame
+				waitForCondition(t, 200*time.Millisecond, 10*time.Millisecond, func() bool {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					for _, f := range frames {
+						if sf, ok := f.(*SettingsFrame); ok && (sf.Header().Flags&FlagSettingsAck != 0) {
+							ackFrame = sf
+							return true
+						}
+					}
+					return false
+				}, "SETTINGS ACK frame to be written")
+
+				if ackFrame == nil {
+					t.Fatal("Expected SETTINGS ACK to be sent, but not found")
+				}
+				if ackFrame.Header().Length != 0 {
+					t.Errorf("SETTINGS ACK frame length: got %d, want 0", ackFrame.Header().Length)
+				}
+			} else {
+				// Ensure no ACK (or any other frame) was sent if not expected
+				time.Sleep(50 * time.Millisecond) // Give writer a chance
+				if mnc.GetWriteBufferLen() > 0 {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					t.Errorf("Unexpected frames written: %+v", frames)
+				}
+			}
+
+			if tc.checkPeerSettings {
+				conn.settingsMu.RLock()
+				currentPeerSettings := make(map[SettingID]uint32)
+				for k, v := range conn.peerSettings { // Make a copy for comparison
+					currentPeerSettings[k] = v
+				}
+				conn.settingsMu.RUnlock()
+
+				if len(currentPeerSettings) != len(tc.expectedPeerSettings) {
+					t.Errorf("Peer settings map length mismatch: got %d, want %d. Got: %+v, Want: %+v",
+						len(currentPeerSettings), len(tc.expectedPeerSettings), currentPeerSettings, tc.expectedPeerSettings)
+				}
+				for id, expectedVal := range tc.expectedPeerSettings {
+					if actualVal, ok := currentPeerSettings[id]; !ok {
+						t.Errorf("Expected peer setting ID %s not found", id)
+					} else if actualVal != expectedVal {
+						t.Errorf("Peer setting ID %s: got value %d, want %d", id, actualVal, expectedVal)
+					}
+				}
+				// Also check for unexpected settings
+				for id, actualVal := range currentPeerSettings {
+					if _, ok := tc.expectedPeerSettings[id]; !ok {
+						t.Errorf("Unexpected peer setting ID %s found with value %d", id, actualVal)
+					}
+				}
+			}
+
+			if tc.checkOperationalValues != nil {
+				tc.checkOperationalValues(t, conn)
+			}
+			if tc.checkStreamUpdates != nil {
+				tc.checkStreamUpdates(t, conn)
+			}
+			closeErr = nil // Test logic for this subtest passed
+		})
+	}
+}
