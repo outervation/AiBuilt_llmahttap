@@ -619,6 +619,309 @@ func TestConnection_Serve_DispatchPing(t *testing.T) {
 	closeErr = nil // Test passed
 }
 
+func TestConnection_SendGoAway_Idempotency(t *testing.T) {
+	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	var closeErr error = errors.New("test cleanup: TestConnection_SendGoAway_Idempotency")
+	defer func() { conn.Close(closeErr) }()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer() // Clear handshake frames
+
+	lastStreamID1 := uint32(5)
+	errorCode1 := ErrCodeNoError
+	debugData1 := []byte("first goaway")
+
+	// First call to sendGoAway
+	if err := conn.sendGoAway(lastStreamID1, errorCode1, debugData1); err != nil {
+		t.Fatalf("First sendGoAway failed: %v", err)
+	}
+
+	var goAwayFrame1 *GoAwayFrame
+	waitForCondition(t, 1*time.Second, 10*time.Millisecond, func() bool {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		for _, f := range frames {
+			if gaf, ok := f.(*GoAwayFrame); ok {
+				goAwayFrame1 = gaf
+				return true
+			}
+		}
+		return false
+	}, "first GOAWAY frame to be written")
+
+	if goAwayFrame1 == nil {
+		t.Fatal("First GOAWAY frame not written")
+	}
+	if goAwayFrame1.LastStreamID != lastStreamID1 {
+		t.Errorf("First GOAWAY LastStreamID: got %d, want %d", goAwayFrame1.LastStreamID, lastStreamID1)
+	}
+	if goAwayFrame1.ErrorCode != errorCode1 {
+		t.Errorf("First GOAWAY ErrorCode: got %s, want %s", goAwayFrame1.ErrorCode, errorCode1)
+	}
+	if string(goAwayFrame1.AdditionalDebugData) != string(debugData1) {
+		t.Errorf("First GOAWAY DebugData: got '%s', want '%s'", string(goAwayFrame1.AdditionalDebugData), string(debugData1))
+	}
+
+	conn.streamsMu.RLock()
+	goAwaySent1 := conn.goAwaySent
+	conn.streamsMu.RUnlock()
+	if !goAwaySent1 {
+		t.Error("conn.goAwaySent should be true after first sendGoAway")
+	}
+
+	mnc.ResetWriteBuffer() // Clear the first GOAWAY frame
+
+	// Second call to sendGoAway - should be ignored
+	lastStreamID2 := uint32(7)
+	errorCode2 := ErrCodeProtocolError
+	debugData2 := []byte("second goaway attempt")
+
+	if err := conn.sendGoAway(lastStreamID2, errorCode2, debugData2); err != nil {
+		t.Fatalf("Second sendGoAway unexpectedly failed: %v", err) // Should return nil as it's idempotent
+	}
+
+	// Wait a bit to ensure no new frame is written
+	time.Sleep(50 * time.Millisecond)
+	if mnc.GetWriteBufferLen() > 0 {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		t.Fatalf("Second GOAWAY frame was unexpectedly written. Frames: %+v", frames)
+	}
+
+	conn.streamsMu.RLock()
+	goAwaySent2 := conn.goAwaySent
+	conn.streamsMu.RUnlock()
+	if !goAwaySent2 { // Should still be true from the first call
+		t.Error("conn.goAwaySent was false after second sendGoAway call")
+	}
+	closeErr = nil
+}
+
+func TestConnection_HandleGoAwayFrame_MultipleValid(t *testing.T) {
+	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	var closeErr error = errors.New("test cleanup: TestConnection_HandleGoAwayFrame_MultipleValid")
+	defer func() { conn.Close(closeErr) }()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	// Dispatch first GOAWAY from peer
+	peerLastStreamID1 := uint32(10)
+	peerGoAwayFrame1 := &GoAwayFrame{
+		FrameHeader:  FrameHeader{Type: FrameGoAway, StreamID: 0, Length: 8 /* LSID + ErrCode */},
+		LastStreamID: peerLastStreamID1,
+		ErrorCode:    ErrCodeNoError,
+	}
+	err1 := conn.dispatchFrame(peerGoAwayFrame1)
+	if err1 != nil {
+		closeErr = fmt.Errorf("dispatchFrame for first GOAWAY failed: %w", err1)
+		t.Fatal(closeErr)
+	}
+
+	// Server should process this and initiate shutdown, sending its own GOAWAY.
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		conn.streamsMu.RLock()
+		defer conn.streamsMu.RUnlock()
+		select {
+		case <-conn.shutdownChan:
+			return conn.goAwayReceived && conn.peerReportedLastStreamID == peerLastStreamID1
+		default:
+			return false
+		}
+	}, "first GOAWAY to be processed and shutdown initiated")
+
+	mnc.ResetWriteBuffer() // Clear server's response GOAWAY for now
+
+	// Dispatch second, valid GOAWAY from peer (lower LastStreamID)
+	peerLastStreamID2 := uint32(5)
+	peerGoAwayFrame2 := &GoAwayFrame{
+		FrameHeader:  FrameHeader{Type: FrameGoAway, StreamID: 0, Length: 8},
+		LastStreamID: peerLastStreamID2,
+		ErrorCode:    ErrCodeNoError, // Can be different, but NO_ERROR is fine for valid sequence test
+	}
+	err2 := conn.dispatchFrame(peerGoAwayFrame2)
+	if err2 != nil {
+		closeErr = fmt.Errorf("dispatchFrame for second GOAWAY failed: %w", err2)
+		t.Fatal(closeErr)
+	}
+
+	// Wait for the second GOAWAY to be processed and peerReportedLastStreamID updated
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		conn.streamsMu.RLock()
+		defer conn.streamsMu.RUnlock()
+		// goAwayReceived should still be true
+		return conn.goAwayReceived && conn.peerReportedLastStreamID == peerLastStreamID2
+	}, "second GOAWAY (lower LSID) to be processed and peerReportedLastStreamID updated")
+
+	// No new GOAWAY should be sent by the server in response to this second valid GOAWAY.
+	// The connection is already shutting down.
+	time.Sleep(50 * time.Millisecond) // Give time for any incorrect frame to be written
+	if mnc.GetWriteBufferLen() > 0 {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		t.Errorf("Server sent unexpected frames after second valid GOAWAY: %+v", frames)
+	}
+
+	// Explicitly close the connection to ensure cleanup, as Serve loop isn't running
+	// The error for Close can be nil as the test is about valid GOAWAY processing.
+	finalCloseErr := conn.Close(nil)
+	if finalCloseErr != nil && !errors.Is(finalCloseErr, io.EOF) && !strings.Contains(finalCloseErr.Error(), "use of closed network connection") {
+		t.Logf("conn.Close() at end of test returned: %v", finalCloseErr)
+	}
+	closeErr = nil
+}
+
+func TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID(t *testing.T) {
+	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	var closeErr error = errors.New("test cleanup: TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID")
+	// Defer Close needs to be careful here. We call it explicitly at the end.
+	// Let defer only close if test panics or fails early.
+	defer func() {
+		if conn == nil {
+			return
+		}
+		if t.Failed() || recover() != nil { // If test failed or panicked
+			conn.Close(closeErr) // closeErr might be updated
+		} else if closeErr == nil { // Test passed, closeErr is nil for this defer
+			conn.Close(nil) // Graceful close if test passed
+		}
+		// If test passed but closeErr is not nil (from an explicit conn.Close call), it means conn.Close was already called successfully.
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	// Dispatch first GOAWAY from peer
+	peerLastStreamID1 := uint32(5)
+	peerGoAwayFrame1 := &GoAwayFrame{
+		FrameHeader:  FrameHeader{Type: FrameGoAway, StreamID: 0, Length: 8},
+		LastStreamID: peerLastStreamID1,
+		ErrorCode:    ErrCodeNoError,
+	}
+	err1 := conn.dispatchFrame(peerGoAwayFrame1) // Directly dispatch
+	if err1 != nil {
+		closeErr = fmt.Errorf("dispatchFrame for first GOAWAY failed: %w", err1)
+		t.Fatal(closeErr)
+	}
+
+	// Server processes this, should initiate shutdown.
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		conn.streamsMu.RLock()
+		defer conn.streamsMu.RUnlock()
+		// Check that shutdownChan is closed AND goAwayReceived is true, and peerReportedLastStreamID is correct
+		select {
+		case <-conn.shutdownChan:
+			return conn.goAwayReceived && conn.peerReportedLastStreamID == peerLastStreamID1
+		default:
+			return false
+		}
+	}, "first GOAWAY to be processed and shutdown initiated")
+
+	// Server sent its own GOAWAY in response to the first peer GOAWAY.
+	// This GOAWAY should have ErrCodeNoError.
+	var serverSentGoAwayFrame *GoAwayFrame
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		for _, f := range frames {
+			if gaf, ok := f.(*GoAwayFrame); ok {
+				serverSentGoAwayFrame = gaf
+				return true // Found the server's GOAWAY
+			}
+		}
+		return false
+	}, "server's GOAWAY frame (in response to first peer GOAWAY) to be written")
+
+	if serverSentGoAwayFrame == nil {
+		closeErr = errors.New("Server's GOAWAY frame not found after first peer GOAWAY")
+		t.Fatal(closeErr)
+	}
+	if serverSentGoAwayFrame.ErrorCode != ErrCodeNoError {
+		closeErr = fmt.Errorf("Server's GOAWAY frame ErrorCode: got %s, want %s (response to first valid peer GOAWAY)", serverSentGoAwayFrame.ErrorCode, ErrCodeNoError)
+		t.Fatal(closeErr)
+	}
+	// Clear the buffer *after* capturing and verifying the server's response to the first GOAWAY.
+	mnc.ResetWriteBuffer()
+
+	// Dispatch second, *invalid* GOAWAY from peer (higher LastStreamID)
+	peerLastStreamID2 := uint32(10) // Higher than first
+	peerGoAwayFrame2 := &GoAwayFrame{
+		FrameHeader:  FrameHeader{Type: FrameGoAway, StreamID: 0, Length: 8},
+		LastStreamID: peerLastStreamID2,
+		ErrorCode:    ErrCodeNoError, // Error code of peer's second GOAWAY doesn't primarily drive server's reaction if LSID is invalid
+	}
+	err2 := conn.dispatchFrame(peerGoAwayFrame2) // Directly dispatch
+
+	if err2 == nil {
+		closeErr = errors.New("dispatchFrame for second (invalid) GOAWAY returned nil error, expected ConnectionError")
+		t.Fatal(closeErr)
+	}
+
+	connErr, ok := err2.(*ConnectionError)
+	if !ok {
+		closeErr = fmt.Errorf("Second dispatchFrame error type: got %T, want *ConnectionError. Err: %w", err2, err2)
+		t.Fatal(closeErr)
+	}
+	if connErr.Code != ErrCodeProtocolError {
+		closeErr = fmt.Errorf("Expected PROTOCOL_ERROR from invalid subsequent GOAWAY, got %s", connErr.Code)
+		t.Error(closeErr) // Use t.Error to allow further checks
+	}
+	if !strings.Contains(connErr.Msg, "subsequent GOAWAY has LastStreamID") || !strings.Contains(connErr.Msg, "which is greater than previous") {
+		e := fmt.Errorf("Error message '%s' doesn't match expected for invalid GOAWAY sequence", connErr.Msg)
+		if closeErr == nil {
+			closeErr = e
+		} else {
+			closeErr = fmt.Errorf("%w; %w", closeErr, e)
+		}
+		t.Error(e)
+	}
+
+	// Check that conn.connError is updated to reflect the more severe error from the invalid GOAWAY
+	conn.streamsMu.RLock()
+	finalConnErrorStored := conn.connError
+	conn.streamsMu.RUnlock()
+
+	if finalConnErrorStored == nil {
+		e := errors.New("conn.connError is nil after invalid GOAWAY dispatch")
+		if closeErr == nil {
+			closeErr = e
+		} else {
+			closeErr = fmt.Errorf("%w; %w", closeErr, e)
+		}
+		t.Error(e)
+	} else {
+		ceFinal, okFinal := finalConnErrorStored.(*ConnectionError)
+		if !okFinal || ceFinal.Code != ErrCodeProtocolError { // Expect PROTOCOL_ERROR here
+			e := fmt.Errorf("conn.connError is '%v', expected it to reflect PROTOCOL_ERROR from the invalid GOAWAY (got code %s)", finalConnErrorStored, ceFinal.Code)
+			if closeErr == nil {
+				closeErr = e
+			} else {
+				closeErr = fmt.Errorf("%w; %w", closeErr, e)
+			}
+			t.Error(e)
+		}
+	}
+
+	// Now call conn.Close() with the error from the invalid dispatch.
+	// This ensures cleanup but should NOT send a new GOAWAY frame.
+	explicitCloseErr := conn.Close(err2)
+	if explicitCloseErr != nil && !errors.Is(explicitCloseErr, err2) && !strings.Contains(explicitCloseErr.Error(), "use of closed network connection") {
+		t.Logf("conn.Close(err2) returned: %v. err2 was: %v", explicitCloseErr, err2)
+	}
+
+	// Verify no *new* GOAWAY frame was sent. The buffer was reset before this stage.
+	time.Sleep(50 * time.Millisecond) // Give time for any incorrect frame write
+	if mnc.GetWriteBufferLen() > 0 {
+		unexpectedFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		e := fmt.Errorf("Server sent unexpected new GOAWAY frame after processing second invalid peer GOAWAY: %+v", unexpectedFrames)
+		if closeErr == nil {
+			closeErr = e
+		} else {
+			closeErr = fmt.Errorf("%w; %w", closeErr, e)
+		}
+		t.Error(e)
+	}
+	// If we reach here and no t.Error/t.Fatal was called for logic errors, the test itself has passed.
+	// The defer logic handles conn.Close based on t.Failed().
+	// We've already called conn.Close(err2) so the connection is being shut down.
+}
+
 func TestConnection_Serve_DispatchRSTStream(t *testing.T) {
 	conn, mnc := newTestConnection(t, false, nil) // Server-side
 	mockDispatcher := &mockRequestDispatcher{}
@@ -1234,4 +1537,404 @@ func TestConnection_DispatchWindowUpdateFrame_ConnLevel_Overflow(t *testing.T) {
 		t.Errorf("Connection send window has invalid size after overflow: %d", conn.connFCManager.GetConnectionSendAvailable())
 	}
 	closeErr = nil
+}
+
+// TestConnection_DispatchDataFrame tests the connection's dispatchDataFrame method.
+func TestConnection_DispatchDataFrame(t *testing.T) {
+	t.Parallel()
+
+	const testStreamID = uint32(1) // Client-initiated stream
+	const testPayload = "hello"
+
+	// Helper to create a DATA frame
+	newDataFrameForTest := func(streamID uint32, data []byte, endStream bool) *DataFrame {
+		fh := FrameHeader{
+			Length:   uint32(len(data)),
+			Type:     FrameData,
+			StreamID: streamID,
+		}
+		if endStream {
+			fh.Flags |= FlagDataEndStream
+		}
+		return &DataFrame{
+			FrameHeader: fh,
+			Data:        data,
+		}
+	}
+
+	tests := []struct {
+		name                       string
+		setupFunc                  func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream // Returns the stream if one is created for the test
+		frameToSend                *DataFrame
+		expectedError              bool
+		expectedConnectionError    *ConnectionError                                // If expectError, check if it's this specific ConnectionError
+		expectedRSTStreamErrorCode ErrorCode                                       // If an RST_STREAM is expected to be sent by the connection
+		expectedConnFCDecrease     uint32                                          // Expected decrease in connection's receive window
+		streamHandleDataFrameCheck func(t *testing.T, s *Stream, frame *DataFrame) // Optional: to verify stream.handleDataFrame interaction
+	}{
+		{
+			name: "Success: DATA frame for open stream",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream {
+				s, err := conn.createStream(testStreamID, nil, true /*isPeerInitiated*/)
+				if err != nil {
+					t.Fatalf("Failed to create stream for test: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateOpen // Manually set state
+				s.mu.Unlock()
+				return s
+			},
+			frameToSend:            newDataFrameForTest(testStreamID, []byte(testPayload), false),
+			expectedError:          false,
+			expectedConnFCDecrease: uint32(len(testPayload)),
+			streamHandleDataFrameCheck: func(t *testing.T, s *Stream, frame *DataFrame) {
+				// Verify data reached the stream's pipe (indirectly testing handleDataFrame call)
+				data := make([]byte, len(frame.Data))
+				// Use a timeout for reading from the pipe, as it might block if data isn't written
+				// or if the writer end is not closed as expected by the test logic.
+				readDone := make(chan struct{})
+				var n int
+				var err error
+				go func() {
+					defer close(readDone)
+					n, err = s.requestBodyReader.Read(data)
+				}()
+
+				select {
+				case <-readDone:
+					// Read completed or errored. If err is nil here, it means Read returned 0, io.EOF.
+					// If n > 0 and err is nil, means read was successful.
+					// If err is io.EOF and n == len(frame.Data), that's perfect for endStream=true.
+					// If err is io.EOF and n < len(frame.Data), that's an issue.
+					// If err is not nil and not EOF, that's an issue.
+					// The original check `if err != nil && !errors.Is(err, io.EOF)` was good.
+					// The blocking happens if Read() is called again after all data is read but pipe not closed.
+					// The goroutine will exit after the first Read() call that gets all expected data
+					// or encounters an error/EOF.
+					// The issue is if the test expects further interaction.
+					// For this specific test, the pipe write happens in stream.handleDataFrame,
+					// and the check reads it. If frame.EndStream is false, handleDataFrame won't close pipe writer.
+					// So, the reader must not expect EOF.
+					if (frame.Header().Flags&FlagDataEndStream == 0) && err == io.EOF && n < len(frame.Data) {
+						t.Errorf("Premature EOF reading from stream's requestBodyReader: read %d, expected %d", n, len(frame.Data))
+					} else if err != nil && !errors.Is(err, io.EOF) {
+						t.Errorf("Error reading from stream's requestBodyReader: %v", err)
+					}
+
+				case <-time.After(200 * time.Millisecond): // Increased timeout slightly
+					t.Error("Timeout reading from stream's requestBodyReader")
+					_ = s.requestBodyWriter.CloseWithError(errors.New("test read timeout, closing writer"))
+					<-readDone
+					return
+				}
+
+				// This part is outside the select, after readDone or timeout.
+				// This check should only be done if timeout did not occur.
+				// The select already handles error logging on timeout.
+				// If timeout did not occur, n and err are set from the read operation.
+				// The error check previously inside 'case <-readDone:' is sufficient.
+
+				if n != len(frame.Data) {
+					// This can happen if read returned an error or EOF prematurely.
+					// Avoid duplicate error if already logged.
+					if err == nil || (errors.Is(err, io.EOF) && n != len(frame.Data)) { // If no error but wrong length, or EOF but wrong length
+						t.Errorf("Data length mismatch: read %d bytes, expected %d bytes. Data: %q", n, len(frame.Data), string(data[:n]))
+					}
+				} else if string(data[:n]) != string(frame.Data) { // n == len(frame.Data)
+					t.Errorf("Data in stream pipe mismatch: got %q, want %q", string(data[:n]), string(frame.Data))
+				}
+
+				if err != nil && !errors.Is(err, io.EOF) { // EOF is fine if endStream was true and pipe closed
+					t.Errorf("Error reading from stream's requestBodyReader: %v", err)
+				}
+				if n != len(frame.Data) || string(data[:n]) != string(frame.Data) {
+					t.Errorf("Data in stream pipe mismatch: got %q (n=%d), want %q", string(data[:n]), n, string(frame.Data))
+				}
+			},
+		},
+		{
+			name:                    "Error: DATA frame on stream 0",
+			setupFunc:               func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream { return nil },
+			frameToSend:             newDataFrameForTest(0, []byte(testPayload), false),
+			expectedError:           true,
+			expectedConnectionError: &ConnectionError{Code: ErrCodeProtocolError, Msg: "DATA frame received on stream 0"},
+			// For DATA on stream 0, dispatchDataFrame errors *before* calling connFCManager.DataReceived.
+			expectedConnFCDecrease: 0,
+		},
+		{
+			name: "Error: Connection flow control violation",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream {
+				// Reduce connection's receive window to be less than payload
+				conn.connFCManager.receiveWindowMu.Lock()
+				conn.connFCManager.currentReceiveWindowSize = int64(len(testPayload) - 1)
+				conn.connFCManager.receiveWindowMu.Unlock()
+
+				s, err := conn.createStream(testStreamID, nil, true)
+				if err != nil {
+					t.Fatalf("Setup: failed to create dummy stream for FC violation test: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+				return s
+			},
+			frameToSend:             newDataFrameForTest(testStreamID, []byte(testPayload), false),
+			expectedError:           true,
+			expectedConnectionError: &ConnectionError{Code: ErrCodeFlowControlError},
+			expectedConnFCDecrease:  0, // FC manager should reject it, so no decrease in available window.
+		},
+		{
+			name:                    "Error: DATA frame for unopened stream (ID > lastProcessed)",
+			setupFunc:               func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream { return nil },
+			frameToSend:             newDataFrameForTest(testStreamID+2, []byte(testPayload), false), // Use an ID known to be higher
+			expectedError:           true,
+			expectedConnectionError: &ConnectionError{Code: ErrCodeProtocolError}, // Message will contain specific stream ID
+			// Conn FC IS consumed before stream existence check (if stream ID is not 0).
+			expectedConnFCDecrease: uint32(len(testPayload)),
+		},
+		{
+			name: "Error: DATA frame for known but closed stream",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream {
+				s, err := conn.createStream(testStreamID, nil, true)
+				if err != nil {
+					t.Fatalf("Failed to create stream: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateClosed // Stream is closed
+				conn.streamsMu.Lock()
+				conn.lastProcessedStreamID = testStreamID // Ensure stream ID is considered "known"
+				conn.streamsMu.Unlock()
+				s.mu.Unlock()
+				// Explicitly remove from conn.streams map to simulate it being fully removed after closure
+				conn.streamsMu.Lock()
+				delete(conn.streams, testStreamID)
+				conn.streamsMu.Unlock()
+
+				return s // Return s for logging, though it's "removed" from conn's map
+			},
+			frameToSend:                newDataFrameForTest(testStreamID, []byte(testPayload), false),
+			expectedError:              false, // dispatchDataFrame sends RST and returns nil
+			expectedRSTStreamErrorCode: ErrCodeStreamClosed,
+			expectedConnFCDecrease:     uint32(len(testPayload)), // Conn FC is consumed
+		},
+		{
+			name: "Error: DATA frame for stream in HalfClosedRemote state",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream {
+				s, err := conn.createStream(testStreamID, nil, true)
+				if err != nil {
+					t.Fatalf("Failed to create stream: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateHalfClosedRemote
+				s.mu.Unlock()
+				return s
+			},
+			frameToSend:                newDataFrameForTest(testStreamID, []byte(testPayload), false),
+			expectedError:              false, // dispatchDataFrame sends RST and returns nil
+			expectedRSTStreamErrorCode: ErrCodeStreamClosed,
+			expectedConnFCDecrease:     uint32(len(testPayload)),
+		},
+		{
+			name: "Error: stream.handleDataFrame returns StreamError (simulated by stream FC violation)",
+			setupFunc: func(t *testing.T, conn *Connection, mnc *mockNetConn) *Stream {
+				s, err := conn.createStream(testStreamID, nil, true)
+				if err != nil {
+					t.Fatalf("Failed to create stream: %v", err)
+				}
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				// Make stream's receive FC window too small
+				s.fcManager.receiveWindowMu.Lock()
+				s.fcManager.currentReceiveWindowSize = int64(len(testPayload) - 1)
+				s.fcManager.receiveWindowMu.Unlock()
+				s.mu.Unlock()
+				return s
+			},
+			frameToSend:                newDataFrameForTest(testStreamID, []byte(testPayload), false),
+			expectedError:              false,                   // dispatchDataFrame sends RST for StreamError and returns nil
+			expectedRSTStreamErrorCode: ErrCodeFlowControlError, // Expected from stream's FC violation
+			expectedConnFCDecrease:     uint32(len(testPayload)),
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()                                  // Subtests can run in parallel if they don't interfere
+			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			var closeErr error = errors.New("test cleanup: " + tc.name)
+			defer func() {
+				if conn != nil {
+					conn.Close(closeErr)
+				}
+			}()
+
+			var s *Stream
+			if tc.setupFunc != nil {
+				s = tc.setupFunc(t, conn, mnc)
+			}
+
+			initialConnFCReceiveAvailable := conn.connFCManager.GetConnectionReceiveAvailable()
+			var dispatchErr error
+
+			if tc.name == "Success: DATA frame for open stream" && s != nil {
+				// Special handling for the success case to read from the pipe concurrently
+				readDone := make(chan struct{})
+				var readN int
+				var pipeReadErr error
+				readData := make([]byte, len(tc.frameToSend.Data))
+
+				go func() {
+					defer close(readDone)
+					// t.Logf("Test '%s': Goroutine starting to read from s.requestBodyReader (stream %d)", tc.name, s.id)
+					readN, pipeReadErr = s.requestBodyReader.Read(readData)
+					// t.Logf("Test '%s': Goroutine finished read: n=%d, err=%v", tc.name, readN, pipeReadErr)
+				}()
+
+				dispatchErr = conn.dispatchDataFrame(tc.frameToSend)
+
+				// Check for dispatch error first
+				if tc.expectedError {
+					if dispatchErr == nil {
+						t.Fatalf("Expected error from dispatchDataFrame, got nil")
+					}
+				} else {
+					if dispatchErr != nil {
+						t.Fatalf("Expected no error from dispatchDataFrame, got %v", dispatchErr)
+					}
+				}
+
+				// Wait for the reader goroutine to finish and check results
+				select {
+				case <-readDone:
+					isEndStreamFrame := (tc.frameToSend.Header().Flags & FlagDataEndStream) != 0
+					expectedDataRead := (isEndStreamFrame && errors.Is(pipeReadErr, io.EOF) && readN == len(tc.frameToSend.Data)) || // Correct EOF for endStream
+						(!isEndStreamFrame && pipeReadErr == nil && readN == len(tc.frameToSend.Data)) // Correct no-EOF for not endStream
+
+					if !expectedDataRead {
+						if errors.Is(pipeReadErr, io.EOF) {
+							if !isEndStreamFrame {
+								t.Errorf("Unexpected EOF reading from stream's requestBodyReader (frame not EndStream): read %d, expected %d. Error: %v", readN, len(tc.frameToSend.Data), pipeReadErr)
+							} else if readN != len(tc.frameToSend.Data) {
+								t.Errorf("Premature EOF reading from stream's requestBodyReader (frame IS EndStream but not all data read): read %d, expected %d. Error: %v", readN, len(tc.frameToSend.Data), pipeReadErr)
+							}
+							// If isEndStreamFrame and EOF and readN == len, it's good, so no error log here.
+						} else if pipeReadErr != nil {
+							t.Errorf("Error reading from stream's requestBodyReader: %v", pipeReadErr)
+						}
+					}
+
+					if readN != len(tc.frameToSend.Data) {
+						// This check might be redundant if pipeReadErr already caught a premature EOF.
+						// However, it's a good explicit check, especially if pipeReadErr was nil but readN was wrong.
+						if pipeReadErr == nil || (errors.Is(pipeReadErr, io.EOF) && readN != len(tc.frameToSend.Data)) { // Added condition for logging
+							t.Errorf("Data length mismatch: read %d bytes, expected %d bytes. Data: %q", readN, len(tc.frameToSend.Data), string(readData[:readN]))
+						}
+					} else if string(readData[:readN]) != string(tc.frameToSend.Data) { // Only if readN == expected length
+						t.Errorf("Data in stream pipe mismatch: got %q, want %q", string(readData[:readN]), string(tc.frameToSend.Data))
+					}
+
+				case <-time.After(1 * time.Second): // Timeout for pipe read
+					t.Errorf("Timeout waiting for stream data to be read")
+					if s != nil && s.requestBodyWriter != nil {
+						_ = s.requestBodyWriter.CloseWithError(errors.New("test timeout, closing writer from test"))
+						select { // ensure goroutine exits if it was blocked on read
+						case <-readDone:
+						case <-time.After(100 * time.Millisecond): // short secondary timeout
+							t.Logf("Test '%s': Secondary timeout waiting for reader goroutine to exit after pipe close.", tc.name)
+						}
+					}
+				}
+
+			} else { // Original logic for other test cases
+				dispatchErr = conn.dispatchDataFrame(tc.frameToSend)
+				if tc.expectedError {
+					if dispatchErr == nil {
+						t.Fatalf("Expected error from dispatchDataFrame, got nil")
+					}
+				} else {
+					if dispatchErr != nil {
+						t.Fatalf("Expected no error from dispatchDataFrame, got %v", dispatchErr)
+					}
+				}
+				if tc.streamHandleDataFrameCheck != nil && s != nil && !tc.expectedError && tc.expectedRSTStreamErrorCode == 0 {
+					tc.streamHandleDataFrameCheck(t, s, tc.frameToSend)
+				}
+			}
+
+			// Common checks for all test cases based on dispatchErr
+			if tc.expectedError {
+				// (dispatchErr already checked for non-nil)
+				if tc.expectedConnectionError != nil {
+					connErr, ok := dispatchErr.(*ConnectionError)
+					if !ok {
+						t.Fatalf("Expected *ConnectionError, got %T: %v", dispatchErr, dispatchErr)
+					}
+					if connErr.Code != tc.expectedConnectionError.Code {
+						t.Errorf("Expected ConnectionError code %s, got %s", tc.expectedConnectionError.Code, connErr.Code)
+					}
+					if tc.expectedConnectionError.Msg != "" {
+						if !strings.Contains(connErr.Msg, tc.expectedConnectionError.Msg) {
+							t.Errorf("ConnectionError message mismatch: got '%s', expected to contain '%s'", connErr.Msg, tc.expectedConnectionError.Msg)
+						}
+					}
+				}
+			}
+			// No 'else' here for tc.expectedError == false, because errors are already checked.
+
+			if tc.expectedRSTStreamErrorCode != 0 {
+				var rstFrame *RSTStreamFrame
+				foundRST := false
+				// Use waitForCondition as sending RST is async via writerChan
+				waitForCondition(t, 200*time.Millisecond, 10*time.Millisecond, func() bool {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					for _, f := range frames {
+						if rf, ok := f.(*RSTStreamFrame); ok {
+							if rf.Header().StreamID == tc.frameToSend.Header().StreamID {
+								rstFrame = rf
+								foundRST = true
+								return true
+							}
+						}
+					}
+					return false
+				}, fmt.Sprintf("RST_STREAM frame for stream %d", tc.frameToSend.Header().StreamID))
+
+				if !foundRST {
+					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					t.Fatalf("Expected RST_STREAM frame for stream %d, none found. Frames on wire: %+v", tc.frameToSend.Header().StreamID, allFrames)
+				}
+				if rstFrame.ErrorCode != tc.expectedRSTStreamErrorCode {
+					t.Errorf("RST_STREAM ErrorCode: got %s, want %s", rstFrame.ErrorCode, tc.expectedRSTStreamErrorCode)
+				}
+			} else if !tc.expectedError { // No RST expected AND no connection error expected
+				// Give writerLoop a moment to process (if it were to send something unexpectedly)
+				time.Sleep(50 * time.Millisecond)
+				if mnc.GetWriteBufferLen() > 0 {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					// Filter out PING ACKs if any, those are normal background activity in some test setups
+					var unexpectedFrames []Frame
+					for _, fr := range frames {
+						if pf, ok := fr.(*PingFrame); ok && (pf.Flags&FlagPingAck) != 0 {
+							continue // Ignore PING ACKs
+						}
+						unexpectedFrames = append(unexpectedFrames, fr)
+					}
+					if len(unexpectedFrames) > 0 {
+						t.Errorf("Unexpected frames written to connection: %+v", unexpectedFrames)
+					}
+				}
+			}
+
+			finalConnFCReceiveAvailable := conn.connFCManager.GetConnectionReceiveAvailable()
+			actualDecrease := initialConnFCReceiveAvailable - finalConnFCReceiveAvailable
+
+			if uint32(actualDecrease) != tc.expectedConnFCDecrease {
+				t.Errorf("Connection FC receive window decrease: got %d, want %d. (Initial: %d, Final: %d)",
+					actualDecrease, tc.expectedConnFCDecrease, initialConnFCReceiveAvailable, finalConnFCReceiveAvailable)
+			}
+
+			closeErr = nil // Mark test as passed for deferred cleanup
+		})
+	}
 }
