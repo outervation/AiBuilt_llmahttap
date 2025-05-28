@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/net/http2/hpack"
 	"time"
 
 	"example.com/llmahttap/v2/internal/logger"
@@ -1935,6 +1937,396 @@ func TestConnection_DispatchDataFrame(t *testing.T) {
 			}
 
 			closeErr = nil // Mark test as passed for deferred cleanup
+		})
+	}
+}
+
+func newTestHpackEncoder(t *testing.T) *hpack.Encoder {
+	t.Helper()
+	var hpackBuf bytes.Buffer
+	// Use a reasonable table size, matching default server settings if possible.
+	// conn.ourSettings[SettingHeaderTableSize] is DefaultSettingsHeaderTableSize (4096)
+	return hpack.NewEncoder(&hpackBuf)
+}
+
+func encodeHeadersForTest(t *testing.T, enc *hpack.Encoder, headers []hpack.HeaderField) []byte {
+	t.Helper()
+
+	// var buf bytes.Buffer // Unused
+	// Reset the encoder's buffer for each encoding operation if it's reused.
+	// Here, enc is created with a new buffer that it writes to, so we just need to read from it.
+	// The hpack.Encoder itself manages its internal buffer. We need to capture its output.
+
+	// The hpack.Encoder writes to the buffer given at its creation.
+	// To get the bytes, we need to make it write, then get buffer contents.
+	// This is a bit tricky as hpack.Encoder interface is write-based.
+	// A common pattern is to make a new Encoder for each test encoding or manage a single buffer carefully.
+	// Let's re-create a buffer and encoder for simplicity per call to ensure clean state,
+	// or ensure the encoder's internal buffer is accessible and reset.
+
+	// Simpler approach: create a new buffer for each encoding.
+	// The hpack.Encoder takes an io.Writer.
+	var tempEncBuf bytes.Buffer
+	tempEncoder := hpack.NewEncoder(&tempEncBuf)
+	// Copy settings from the main test encoder if necessary (e.g., dynamic table size)
+	// For basic tests, default encoder settings are often fine.
+
+	for _, hf := range headers {
+		if err := tempEncoder.WriteField(hf); err != nil {
+			t.Fatalf("encodeHeadersForTest: Error writing field %+v: %v", hf, err)
+		}
+	}
+	return tempEncBuf.Bytes()
+}
+
+func TestConnection_HeaderProcessingScenarios(t *testing.T) {
+	t.Parallel()
+
+	stdHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/test"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: "user-agent", Value: "test-client/1.0"},
+	}
+
+	// testHpackEncoder is created once and used for all encodings in this test suite.
+	// It accumulates dynamic table state, which is good for testing HPACK.
+	testHpackEncoder := newTestHpackEncoder(t)
+
+	tests := []struct {
+		name                       string
+		setupFunc                  func(t *testing.T, conn *Connection, mnc *mockNetConn) // Optional setup
+		framesToFeed               func(t *testing.T) [][]byte                            // Function to generate frame bytes to feed
+		expectDispatcherCall       bool
+		expectDispatcherStreamID   uint32
+		expectConnectionError      bool
+		expectedConnErrorCode      ErrorCode
+		expectedConnErrorMsgSubstr string
+		expectedGoAway             bool // If connection error leads to GOAWAY
+		customOurMaxHeaderListSize *uint32
+	}{
+		{
+			name: "Valid HEADERS, END_HEADERS",
+			framesToFeed: func(t *testing.T) [][]byte {
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader: FrameHeader{
+						Type:     FrameHeaders,
+						Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream,
+						StreamID: 1,
+						Length:   uint32(len(hpackPayload)),
+					},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:     true,
+			expectDispatcherStreamID: 1,
+		},
+		{
+			name: "HEADERS + CONTINUATION, END_HEADERS on CONTINUATION",
+			framesToFeed: func(t *testing.T) [][]byte {
+				hpackPayload1 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[:2]) // :method, :scheme
+				hpackPayload2 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[2:]) // :path, :authority, user-agent
+
+				headersFrame := &HeadersFrame{ // END_HEADERS not set
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndStream, StreamID: 3, Length: uint32(len(hpackPayload1))},
+					HeaderBlockFragment: hpackPayload1,
+				}
+				continuationFrame := &ContinuationFrame{ // END_HEADERS set
+					FrameHeader:         FrameHeader{Type: FrameContinuation, Flags: FlagContinuationEndHeaders, StreamID: 3, Length: uint32(len(hpackPayload2))},
+					HeaderBlockFragment: hpackPayload2,
+				}
+				return [][]byte{frameToBytes(t, headersFrame), frameToBytes(t, continuationFrame)}
+			},
+			expectDispatcherCall:     true,
+			expectDispatcherStreamID: 3,
+		},
+		{
+			name: "HEADERS on stream 0",
+			framesToFeed: func(t *testing.T) [][]byte {
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders, StreamID: 0, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeProtocolError,
+			expectedGoAway:        true,
+		},
+		{
+			name: "CONTINUATION without HEADERS",
+			framesToFeed: func(t *testing.T) [][]byte {
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				continuationFrame := &ContinuationFrame{
+					FrameHeader:         FrameHeader{Type: FrameContinuation, Flags: FlagContinuationEndHeaders, StreamID: 5, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, continuationFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeProtocolError,
+			expectedGoAway:        true,
+		},
+		{
+			name: "CONTINUATION on wrong stream ID",
+			framesToFeed: func(t *testing.T) [][]byte {
+				hpackPayload1 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[:2])
+				hpackPayload2 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[2:])
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: 0 /* No END_HEADERS */, StreamID: 7, Length: uint32(len(hpackPayload1))},
+					HeaderBlockFragment: hpackPayload1,
+				}
+				continuationFrame := &ContinuationFrame{ // Wrong StreamID
+					FrameHeader:         FrameHeader{Type: FrameContinuation, Flags: FlagContinuationEndHeaders, StreamID: 9, Length: uint32(len(hpackPayload2))},
+					HeaderBlockFragment: hpackPayload2,
+				}
+				return [][]byte{frameToBytes(t, headersFrame), frameToBytes(t, continuationFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeProtocolError,
+			expectedGoAway:        true,
+		},
+		{
+			name:                       "MaxHeaderListSize exceeded (compressed, initial HEADERS)",
+			customOurMaxHeaderListSize: func() *uint32 { s := uint32(10); return &s }(),
+			framesToFeed: func(t *testing.T) [][]byte {
+				// Create headers that will compress to > 10 bytes
+				largeHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "a", Value: "aaaaaaaaaa"}, {Name: "b", Value: "bbbbbbbbbb"}, // These should push it over
+				}
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, largeHeaders)
+				if len(hpackPayload) <= 10 { // Ensure test condition is met
+					t.Logf("Warning: HPACK payload for MaxHeaderListSize (compressed) test is too small: %d bytes. Test may not be effective.", len(hpackPayload))
+				}
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders, StreamID: 11, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectConnectionError: true,
+			// RFC 7540 6.5.2: "SETTINGS_MAX_HEADER_LIST_SIZE ... A server that receives a larger header list MUST treat this as a connection error (Section 5.4.1) of type ENHANCE_YOUR_CALM."
+			// Sometimes PROTOCOL_ERROR is also acceptable if the check is on compressed size. Let's target ENHANCE_YOUR_CALM.
+			expectedConnErrorCode: ErrCodeEnhanceYourCalm, // Or ProtocolError depending on where check is
+			expectedGoAway:        true,
+		},
+		{
+			name:                       "MaxHeaderListSize exceeded (uncompressed, after decoding)",
+			customOurMaxHeaderListSize: func() *uint32 { s := uint32(50); return &s }(), // Sum of N+V+32 per header. (3+3+32)+(6+3+32)+(4+1+32)+(9+11+32) = 38+41+37+52 = 168 for stdHeaders(4)
+			// For 2 std headers: (3+3+32) + (6+3+32) = 38+41 = 79. This should exceed 50.
+			framesToFeed: func(t *testing.T) [][]byte {
+				// Use few headers, but their uncompressed size will be large due to N+V+32 rule
+				twoHeaders := stdHeaders[:2] // :method:GET, :scheme:https
+				// Uncompressed: (len(":method")+len("GET")+32) + (len(":scheme")+len("https")+32)
+				// (7+3+32) + (7+5+32) = 42 + 44 = 86. This should exceed customMaxHeaderListSize of 50.
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, twoHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 13, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeEnhanceYourCalm,
+			expectedGoAway:        true,
+		},
+		{
+			name: "Pseudo-header validation: Missing :method",
+			framesToFeed: func(t *testing.T) [][]byte {
+				missingMethodHeaders := []hpack.HeaderField{
+					{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+				}
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, missingMethodHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 15, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			// This error occurs *after* stream creation, in extractPseudoHeaders.
+			// The stream should be RST, not necessarily connection GOAWAY unless stream creation fails.
+			// However, spec 8.1.2.6: Malformed requests/responses are connection errors.
+			// "An HTTP/2 request or response is malformed if ... mandatory pseudo-header fields are omitted"
+			// So, GOAWAY is expected.
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeProtocolError,
+			expectedGoAway:        true,
+		},
+		{
+			name: "Pseudo-header validation: Invalid :path",
+			framesToFeed: func(t *testing.T) [][]byte {
+				invalidPathHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "no-slash"}, {Name: ":authority", Value: "example.com"},
+				}
+				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, invalidPathHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 17, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeProtocolError,
+			expectedGoAway:        true,
+		},
+		{
+			name: "HPACK decoding error (invalid HPACK stream)",
+			framesToFeed: func(t *testing.T) [][]byte {
+				invalidHpackPayload := []byte{0x8F, 0xFF, 0xFF, 0xFF} // Example of potentially invalid HPACK (too large index or literal)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 19, Length: uint32(len(invalidHpackPayload))},
+					HeaderBlockFragment: invalidHpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectConnectionError: true,
+			expectedConnErrorCode: ErrCodeCompressionError,
+			expectedGoAway:        true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mockDispatcher := &mockRequestDispatcher{}
+			conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+			var closeErr error = errors.New("test cleanup: " + tc.name) // Default close error
+			defer func() {
+				if conn != nil {
+					conn.Close(closeErr)
+				}
+			}()
+
+			if tc.customOurMaxHeaderListSize != nil {
+				conn.settingsMu.Lock()
+				conn.ourSettings[SettingMaxHeaderListSize] = *tc.customOurMaxHeaderListSize
+				conn.applyOurSettings() // Re-apply to update conn.ourMaxHeaderListSize
+				conn.settingsMu.Unlock()
+			}
+
+			performHandshakeForTest(t, conn, mnc) // Includes ServerHandshake
+			mnc.ResetWriteBuffer()                // Clear handshake frames
+
+			serveErrChan := make(chan error, 1)
+			go func() {
+				err := conn.Serve(nil) // Pass nil context for test simplicity
+				serveErrChan <- err
+			}()
+
+			for _, frameBytes := range tc.framesToFeed(t) {
+				mnc.FeedReadBuffer(frameBytes)
+			}
+
+			var serveExitError error
+			if tc.expectConnectionError || tc.expectedGoAway {
+				select {
+				case serveExitError = <-serveErrChan:
+					// Expected to exit due to error or GOAWAY processing
+				case <-time.After(2 * time.Second): // Increased timeout
+					t.Fatalf("Timeout waiting for conn.Serve to exit for an expected error/GOAWAY case")
+				}
+
+				if tc.expectConnectionError {
+					if serveExitError == nil {
+						t.Fatalf("conn.Serve exited with nil error, expected a ConnectionError")
+					}
+					connErr, ok := serveExitError.(*ConnectionError)
+					if !ok {
+						// If not ConnectionError, check if it's EOF from mnc.Close() if no error was actually triggered by test.
+						if !(errors.Is(serveExitError, io.EOF) || strings.Contains(serveExitError.Error(), "use of closed network connection")) {
+							t.Fatalf("conn.Serve error type: got %T, want *ConnectionError. Err: %v", serveExitError, serveExitError)
+						} else {
+							t.Logf("conn.Serve exited with EOF/closed, but expected specific ConnectionError: %s", tc.expectedConnErrorCode)
+						}
+					} else {
+						if connErr.Code != tc.expectedConnErrorCode {
+							t.Errorf("Expected ConnectionError code %s, got %s. Msg: %s", tc.expectedConnErrorCode, connErr.Code, connErr.Msg)
+						}
+						if tc.expectedConnErrorMsgSubstr != "" && !strings.Contains(connErr.Msg, tc.expectedConnErrorMsgSubstr) {
+							t.Errorf("ConnectionError message '%s' does not contain substring '%s'", connErr.Msg, tc.expectedConnErrorMsgSubstr)
+						}
+					}
+				}
+
+				if tc.expectedGoAway {
+					var goAwayFrame *GoAwayFrame
+					// The GOAWAY might have been sent by conn.Close called from Serve's defer, or explicitly by error handling.
+					// conn.Close() is idempotent. Calling it again with serveExitError ensures it uses the right error code.
+					_ = conn.Close(serveExitError) // Ensure Close uses the error from Serve.
+
+					waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+						frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+						for _, f := range frames {
+							if gaf, ok := f.(*GoAwayFrame); ok {
+								if gaf.ErrorCode == tc.expectedConnErrorCode { // GOAWAY should reflect the error code
+									goAwayFrame = gaf
+									return true
+								}
+							}
+						}
+						return false
+					}, fmt.Sprintf("GOAWAY frame with ErrorCode %s to be written", tc.expectedConnErrorCode))
+
+					if goAwayFrame == nil {
+						// Dump all frames seen if specific GOAWAY not found
+						allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+						var frameSummaries []string
+						for _, fr := range allFrames {
+							if fr != nil && fr.Header() != nil {
+								frameSummaries = append(frameSummaries, fmt.Sprintf("{Type:%s, StreamID:%d, ErrorCodeIfExists:%v}", fr.Header().Type, fr.Header().StreamID, getErrorCode(fr)))
+							} else {
+								frameSummaries = append(frameSummaries, "{NIL_FRAME_OR_HEADER}")
+							}
+						}
+						t.Fatalf("GOAWAY frame not written or with wrong error code. Expected code %s. Frames on wire: %s", tc.expectedConnErrorCode, strings.Join(frameSummaries, ", "))
+					}
+				}
+				closeErr = nil // Error was expected and handled.
+			} else { // No connection error expected.
+				if tc.expectDispatcherCall {
+					waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+						mockDispatcher.mu.Lock()
+						defer mockDispatcher.mu.Unlock()
+						return mockDispatcher.called && mockDispatcher.lastStreamID == tc.expectDispatcherStreamID
+					}, fmt.Sprintf("dispatcher to be called for stream %d", tc.expectDispatcherStreamID))
+
+					mockDispatcher.mu.Lock()
+					if !mockDispatcher.called {
+						t.Error("Dispatcher was not called")
+					}
+					if mockDispatcher.lastStreamID != tc.expectDispatcherStreamID {
+						t.Errorf("Dispatcher called for stream %d, want %d", mockDispatcher.lastStreamID, tc.expectDispatcherStreamID)
+					}
+					mockDispatcher.mu.Unlock()
+				} else {
+					// Ensure dispatcher was NOT called
+					time.Sleep(100 * time.Millisecond) // Give time for it to be called if it were going to be
+					mockDispatcher.mu.Lock()
+					if mockDispatcher.called {
+						t.Errorf("Dispatcher was unexpectedly called for stream %d", mockDispatcher.lastStreamID)
+					}
+					mockDispatcher.mu.Unlock()
+				}
+
+				// If no error was expected, Serve should not exit prematurely.
+				// Terminate Serve gracefully for cleanup.
+				mnc.Close() // Trigger EOF for Serve loop
+				select {
+				case serveExitError = <-serveErrChan:
+					if serveExitError != nil && !errors.Is(serveExitError, io.EOF) && !strings.Contains(serveExitError.Error(), "use of closed network connection") {
+						t.Errorf("conn.Serve exited with unexpected error: %v", serveExitError)
+					}
+				case <-time.After(1 * time.Second):
+					t.Errorf("Timeout waiting for conn.Serve to exit after mnc.Close()")
+				}
+				closeErr = nil // Test case passed.
+			}
 		})
 	}
 }
