@@ -466,29 +466,24 @@ var originalOSUtilFuncs struct {
 // setupMocks initializes mockable functions to their real implementations.
 // Call this at the beginning of tests or test suites that need to mock these.
 // Defer teardownMocks to restore them.
+
+// setupMocks initializes mockable functions to their real implementations.
+// Call this at the beginning of tests or test suites that need to mock these.
+// Defer teardownMocks to restore them.
 func setupMocks() {
 	originalOSUtilFuncs.osStartProcess = os.StartProcess
 	osStartProcessFunc = os.StartProcess
 
-	originalOSUtilFuncs.utilParseInheritedListenerFDs = util.ParseInheritedListenerFDs
-	utilParseInheritedListenerFDsFunc = util.ParseInheritedListenerFDs
-
-	originalOSUtilFuncs.utilNewListenerFromFD = util.NewListenerFromFD
-	utilNewListenerFromFDFunc = util.NewListenerFromFD
-
+	// util.CreateListenerAndGetFD is a package variable in internal/util
 	originalOSUtilFuncs.utilCreateListenerAndGetFD = util.CreateListenerAndGetFD
-	utilCreateListenerAndGetFDFunc = util.CreateListenerAndGetFD
-
-	originalOSUtilFuncs.utilGetInheritedReadinessPipeFD = util.GetInheritedReadinessPipeFD
+	// The following are test-local vars, pointing to real util functions.
+	// server.go calls real util functions directly (except CreateListenerAndGetFD).
+	utilParseInheritedListenerFDsFunc = util.ParseInheritedListenerFDs
+	utilNewListenerFromFDFunc = util.NewListenerFromFD
+	utilCreateListenerAndGetFDFunc = util.CreateListenerAndGetFD // test-local var points to util's var
 	utilGetInheritedReadinessPipeFDFunc = util.GetInheritedReadinessPipeFD
-
-	originalOSUtilFuncs.utilSignalChildReadyByClosingFD = util.SignalChildReadyByClosingFD
 	utilSignalChildReadyByClosingFDFunc = util.SignalChildReadyByClosingFD
-
-	originalOSUtilFuncs.utilCreateReadinessPipe = util.CreateReadinessPipe
 	utilCreateReadinessPipeFunc = util.CreateReadinessPipe
-
-	originalOSUtilFuncs.utilWaitForChildReadyPipeClose = util.WaitForChildReadyPipeClose
 	utilWaitForChildReadyPipeCloseFunc = util.WaitForChildReadyPipeClose
 }
 
