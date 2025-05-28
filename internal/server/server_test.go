@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+
 	"os"
+	"strings"
 	"sync"
 	// "syscall" // Not directly used in mocks, but tests might send signals
 	"testing"
@@ -571,4 +573,153 @@ func TestServer_NewServer_NilArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServer_DispatchRequest(t *testing.T) {
+	cfg := newTestConfig("")
+	originalCfgPath := "test_config.json" // Dummy path
+
+	// Common setup for NewServer
+	newTestServer := func(t *testing.T, lg *logger.Logger, rtr RouterInterface) *Server {
+		t.Helper()
+		registry := NewHandlerRegistry() // Required by NewServer
+		// For these tests, we don't need SIGHUP/reload logic, so os/util mocks are not strictly configured per test.
+		// NewServer itself might call util.ParseInheritedListenerFDs, ensure it's mocked if problematic.
+		// Default setupMocks/teardownMocks will use real implementations if not overridden.
+		// Here, we assume default (no inherited FDs) is fine for NewServer in these specific tests.
+		s, err := NewServer(cfg, lg, rtr, originalCfgPath, registry)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		return s
+	}
+
+	t.Run("ValidStream_RouterCalled", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		mockLog := newMockLogger(logBuf)
+		mockRtr := newMockRouter()
+		s := newTestServer(t, mockLog, mockRtr)
+
+		mockStream := newMockResponseWriterStream(1, context.Background())
+		req, _ := http.NewRequest("GET", "/test", nil)
+
+		s.dispatchRequest(mockStream, req)
+
+		if mockRtr.GetServeHTTPCallCount() != 1 {
+			t.Errorf("Expected router.ServeHTTP to be called once, got %d", mockRtr.GetServeHTTPCallCount())
+		} else {
+			calledStream, calledReq, err := mockRtr.GetServeHTTPArgsForCall(0)
+			if err != nil {
+				t.Fatalf("GetServeHTTPArgsForCall(0) failed: %v", err)
+			}
+			if calledStream != mockStream {
+				t.Errorf("Router called with wrong stream. Expected %p, got %p", mockStream, calledStream)
+			}
+			if calledReq != req {
+				t.Errorf("Router called with wrong request. Expected %p, got %p", req, calledReq)
+			}
+		}
+		// Check if the log contains the specific error message we want to avoid
+		if logBuf.Len() > 0 && strings.Contains(logBuf.String(), "does not implement server.ResponseWriterStream") {
+			t.Errorf("Expected no error log about stream type mismatch, but got: %s", logBuf.String())
+		}
+	})
+
+	t.Run("InvalidStream_NilStream_Panics", func(t *testing.T) {
+		logBuf := &bytes.Buffer{} // To check if any logging happens *before* panic
+		mockLog := newMockLogger(logBuf)
+		mockRtr := newMockRouter()
+		s := newTestServer(t, mockLog, mockRtr)
+
+		var nilStream http2.StreamWriter // Explicitly nil
+		req, _ := http.NewRequest("GET", "/test", nil)
+
+		var panicked bool
+		var panicValue interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicked = true
+					panicValue = r
+				}
+			}()
+			// This call is expected to panic because server.dispatchRequest will
+			// attempt to call methods (e.g., stream.ID()) on the nil stream
+			// after the type assertion `nil.(ResponseWriterStream)` results in `ok == false`.
+			s.dispatchRequest(nilStream, req)
+		}()
+
+		if !panicked {
+			t.Errorf("Expected a panic when dispatchRequest is called with a nil stream, but it did not panic.")
+		} else {
+			// Optional: check the panic value if it's specific, e.g., related to nil pointer dereference.
+			// For now, just logging it is fine for confirming the panic.
+			t.Logf("Caught expected panic with nil stream: %v", panicValue)
+			// Example check: if !strings.Contains(fmt.Sprintf("%v", panicValue), "nil pointer dereference") {
+			//	 t.Errorf("Panic value does not seem to be a nil pointer dereference: %v", panicValue)
+			// }
+		}
+
+		// With the current server.go implementation, no logging or router call will happen due to the panic.
+		if mockRtr.GetServeHTTPCallCount() > 0 {
+			t.Errorf("Expected router.ServeHTTP not to be called due to panic, but it was called %d times", mockRtr.GetServeHTTPCallCount())
+		}
+		// The specific log message "does not implement server.ResponseWriterStream" comes from
+		// the block that would be executed if ok was false. The panic on stream.ID() inside that block
+		// means the full log line might not be written, or the panic occurs at stream.ID().
+		// Checking the log buffer for this specific message can be tricky if the panic happens mid-log.
+		// For this test, the primary check is the panic itself.
+		if logBuf.Len() > 0 && strings.Contains(logBuf.String(), "dispatchRequest: provided stream") {
+			t.Logf("Log buffer contains initial part of error message, as expected before panic: %s", logBuf.String())
+		}
+	})
+
+	// The following test case ("InvalidStream_TypeMismatch_LogsAndAttempts500") is commented out.
+	// Reason: In Go, interface satisfaction is structural. The interfaces
+	// `http2.StreamWriter` (from internal/http2/stream_writer.go) and
+	// `server.ResponseWriterStream` (from internal/server/handler.go) are currently
+	// structurally identical (same methods, same parameter/return types, including
+	// both using `http2.HeaderField`).
+	// Therefore, any non-nil variable that satisfies `http2.StreamWriter` will also
+	// satisfy `server.ResponseWriterStream`. The type assertion
+	// `stream.(server.ResponseWriterStream)` will only result in `ok == false` if `stream` is `nil`.
+	// The `nil` case is covered by "InvalidStream_NilStream_Panics".
+	//
+	// To test the `if !ok` block in `dispatchRequest` for a non-nil stream that somehow
+	// fails the type assertion, the interfaces would need to be genuinely different,
+	// or `server.dispatchRequest` would need to be refactored for mockability of the
+	// type assertion itself. As `server.go` stands, this specific scenario is not
+	// practically constructible for a non-nil stream.
+	/*
+		t.Run("InvalidStream_TypeMismatch_LogsAndAttempts500", func(t *testing.T) {
+			t.Skip("Skipping: Difficult to construct a non-nil http2.StreamWriter that fails server.ResponseWriterStream assertion due to identical interface structures.")
+
+			// Hypothetical test structure if such a stream could be created:
+			// logBuf := &bytes.Buffer{}
+			// mockLog := newMockLogger(logBuf)
+			// mockRtr := newMockRouter()
+			// s := newTestServer(t, mockLog, mockRtr)
+
+			// // 1. Create 'faultyStream': a non-nil http2.StreamWriter that would cause
+			// //    `faultyStream.(server.ResponseWriterStream)` to return `_ , false`.
+			// //    This mock would need to capture SendHeaders and WriteData calls.
+			// var faultyStream http2.StreamWriter // = newMockFaultyStream()
+			// req, _ := http.NewRequest("GET", "/test-faulty", nil)
+
+			// s.dispatchRequest(faultyStream, req)
+
+			// // 2. Assert router was NOT called
+			// if mockRtr.GetServeHTTPCallCount() > 0 {
+			// 	t.Errorf("Expected router.ServeHTTP not to be called, got %d", mockRtr.GetServeHTTPCallCount())
+			// }
+
+			// // 3. Assert error was logged
+			// if !strings.Contains(logBuf.String(), "does not implement server.ResponseWriterStream") {
+			// 	t.Errorf("Expected log message about stream type mismatch, got: %s", logBuf.String())
+			// }
+
+			// // 4. Assert 500-like response was attempted on faultyStream
+			// //    (e.g., check headers sent to faultyStream for :status 500, and body content)
+		})
+	*/
 }
