@@ -2577,4 +2577,91 @@ func TestServer_InitializeListeners(t *testing.T) {
 		// or a child that ends up with no listeners (already tested).
 		// This makes this sub-test largely redundant or untestable without structural changes to initializeListeners itself.
 	})
+
+	t.Run("ChildProcess_Success_WithRealSocketFDs", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg) // baseCfg has a dynamic port
+		s.isChild = true
+
+		// 1. Create real listeners to get valid FDs
+		numListeners := 2
+		realListeners := make([]net.Listener, numListeners)
+		inheritedFDs := make([]uintptr, numListeners)
+		listenerAddresses := make([]string, numListeners)
+
+		for i := 0; i < numListeners; i++ {
+			// Create a real TCP listener on a dynamic port
+			// The address "127.0.0.1:0" ensures the OS picks an available port.
+			tempListener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("Failed to create real temp listener %d: %v", i, err)
+			}
+			defer tempListener.Close() // Ensure cleanup
+
+			// Get its file descriptor
+			tcpListener, ok := tempListener.(*net.TCPListener)
+			if !ok {
+				t.Fatalf("Temp listener %d is not TCP, cannot get FD", i)
+			}
+			file, err := tcpListener.File()
+			if err != nil {
+				t.Fatalf("Failed to get file from temp listener %d: %v", i, err)
+			}
+			defer file.Close() // Close the duplicated FD from .File()
+
+			inheritedFDs[i] = file.Fd()
+			listenerAddresses[i] = tempListener.Addr().String()
+			realListeners[i] = tempListener // Keep a reference for potential Addr check, though closed by defer
+		}
+
+		s.listenerFDs = inheritedFDs
+
+		// util.NewListenerFromFD will be the real one, called by s.initializeListeners()
+
+		err := s.initializeListeners()
+		if err != nil {
+			t.Fatalf("initializeListeners failed with real socket FDs: %v", err)
+		}
+
+		if len(s.listeners) != numListeners {
+			t.Fatalf("Expected %d listeners, got %d", numListeners, len(s.listeners))
+		}
+
+		// Verify that the listeners are functional (or at least have the addresses
+		// of the original real listeners we created).
+		// Note: After util.NewListenerFromFD, the original tempListener objects are closed
+		// by their defers (or should be if they were returned by CreateListenerAndGetFD).
+		// The s.listeners will be new net.Listener objects wrapping the same FDs.
+		// We can check if their Addr() matches what we expect or if they can accept.
+		for i, createdListener := range s.listeners {
+			if createdListener == nil {
+				t.Errorf("Listener %d is nil", i)
+				continue
+			}
+			// Ensure the listener FD is not FD_CLOEXEC (util.NewListenerFromFD should handle this)
+			// This check is harder without direct access to the listener's FD after NewListenerFromFD.
+			// We trust util.NewListenerFromFD to clear it.
+
+			// Check address (optional, but good sanity check if possible)
+			// If the original realListeners[i] is closed, its Addr() might fail.
+			// The new listener `createdListener` should have a valid Addr.
+			if createdListener.Addr().String() == "" { // Simple check
+				t.Errorf("Listener %d address is empty, expected non-empty (original was %s)", i, listenerAddresses[i])
+			}
+			t.Logf("Child success: Listener %d on %s (original %s), FD %d", i, createdListener.Addr().String(), listenerAddresses[i], s.listenerFDs[i])
+
+			// Simple test: try to close it to ensure it's a valid listener object
+			if err := createdListener.Close(); err != nil {
+				t.Errorf("Failed to close created listener %d: %v", i, err)
+			}
+		}
+
+		// Ensure the original real listener FDs (from file.Fd()) were used.
+		// s.listenerFDs should still hold the original FDs passed in.
+		for i, fd := range inheritedFDs {
+			if s.listenerFDs[i] != fd {
+				t.Errorf("s.listenerFDs[%d] was %d, expected original FD %d", i, s.listenerFDs[i], fd)
+			}
+		}
+	})
 }
