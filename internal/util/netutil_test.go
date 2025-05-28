@@ -1544,3 +1544,66 @@ func TestPrepareExecEnv(t *testing.T) {
 		})
 	}
 }
+
+func TestSignalChildReadyByClosingFD_InvalidFDs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestSignalChildReadyByClosingFD_InvalidFDs on Windows due to POSIX-specific FD behavior.")
+	}
+
+	t.Run("ClosedFD", func(t *testing.T) {
+		// 1. Create a pipe
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe() failed: %v", err)
+		}
+		defer r.Close() // Close read end eventually
+
+		childWriteFD := w.Fd()
+
+		// 2. Close the write end of the pipe *os.File
+		if err := w.Close(); err != nil {
+			t.Fatalf("Failed to close write end of pipe *os.File: %v", err)
+		}
+		// Now childWriteFD refers to a closed file descriptor.
+
+		// 3. Call SignalChildReadyByClosingFD with the closed FD
+		errSignal := SignalChildReadyByClosingFD(childWriteFD)
+		if errSignal == nil {
+			t.Errorf("SignalChildReadyByClosingFD with a closed FD was expected to fail, but got nil error")
+		} else {
+			// Expect EBADF (bad file descriptor)
+			// errors.Is doesn't work well with direct syscall.Errno values sometimes.
+			// Check string or if it's an os.SyscallError wrapping EBADF.
+			if !strings.Contains(errSignal.Error(), syscall.EBADF.Error()) {
+				var syscallErr *os.SyscallError
+				if errors.As(errSignal, &syscallErr) {
+					if syscallErr.Err != syscall.EBADF {
+						t.Errorf("Expected error for closed FD to be EBADF, got: %v (underlying syscall error: %v)", errSignal, syscallErr.Err)
+					}
+				} else {
+					t.Errorf("Expected error for closed FD to contain '%s', got: %v", syscall.EBADF.Error(), errSignal)
+				}
+			}
+		}
+	})
+
+	t.Run("BogusFD", func(t *testing.T) {
+		bogusFD := uintptr(99999) // A large number unlikely to be a valid open FD
+
+		errSignal := SignalChildReadyByClosingFD(bogusFD)
+		if errSignal == nil {
+			t.Errorf("SignalChildReadyByClosingFD with bogus FD %d was expected to fail, but got nil error", bogusFD)
+		} else {
+			if !strings.Contains(errSignal.Error(), syscall.EBADF.Error()) {
+				var syscallErr *os.SyscallError
+				if errors.As(errSignal, &syscallErr) {
+					if syscallErr.Err != syscall.EBADF {
+						t.Errorf("Expected error for bogus FD to be EBADF, got: %v (underlying syscall error: %v)", errSignal, syscallErr.Err)
+					}
+				} else {
+					t.Errorf("Expected error for bogus FD to contain '%s', got: %v", syscall.EBADF.Error(), errSignal)
+				}
+			}
+		}
+	})
+}
