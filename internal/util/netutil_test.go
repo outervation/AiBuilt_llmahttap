@@ -1088,3 +1088,113 @@ func TestGetInheritedListeners(t *testing.T) {
 		})
 	}
 }
+
+func TestGetInheritedReadinessPipeFD(t *testing.T) {
+	const testEnvVar = ReadinessPipeEnvKey // Use the actual constant
+
+	tests := []struct {
+		name          string
+		envValue      *string // Pointer to distinguish between not set and empty string
+		expectedFD    uintptr
+		expectedFound bool
+		expectError   bool
+		errorContains string // Substring to check in error message
+	}{
+		{
+			name:          "EnvVarNotSet",
+			envValue:      nil, // Not set
+			expectedFD:    0,
+			expectedFound: false,
+			expectError:   false,
+		},
+		{
+			name:          "EmptyStringValue", // os.Getenv returns empty if var is set to empty or not set.
+			envValue:      func() *string { s := ""; return &s }(),
+			expectedFD:    0,
+			expectedFound: false, // If env var is empty string, GetInheritedReadinessPipeFD returns found=false
+			expectError:   false,
+		},
+		{
+			name:          "ValidPositiveInteger",
+			envValue:      func() *string { s := "123"; return &s }(),
+			expectedFD:    123,
+			expectedFound: true,
+			expectError:   false,
+		},
+		{
+			name:          "ValidZero",
+			envValue:      func() *string { s := "0"; return &s }(),
+			expectedFD:    0,
+			expectedFound: true,
+			expectError:   false,
+		},
+		{
+			name:          "InvalidStringNotAnInteger",
+			envValue:      func() *string { s := "not-a-number"; return &s }(),
+			expectedFD:    0,
+			expectedFound: true, // Found is true because env var is set, but parsing fails.
+			expectError:   true,
+			errorContains: "invalid FD for readiness pipe",
+		},
+		{
+			name:          "NegativeIntegerString",
+			envValue:      func() *string { s := "-5"; return &s }(),
+			expectedFD:    0,
+			expectedFound: true, // Found is true because env var is set
+			expectError:   true,
+			errorContains: "invalid negative FD for readiness pipe",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			originalValue, wasSet := os.LookupEnv(testEnvVar)
+
+			if tc.envValue == nil { // Unset the var for this test case
+				if err := os.Unsetenv(testEnvVar); err != nil {
+					t.Fatalf("Failed to unset env var %s for test: %v", testEnvVar, err)
+				}
+			} else { // Set the var for this test case
+				if err := os.Setenv(testEnvVar, *tc.envValue); err != nil {
+					t.Fatalf("Failed to set env var %s to %q for test: %v", testEnvVar, *tc.envValue, err)
+				}
+			}
+
+			// Defer restoration of the environment variable
+			defer func() {
+				if wasSet {
+					if err := os.Setenv(testEnvVar, originalValue); err != nil {
+						t.Logf("Error restoring env var %s to '%s': %v", testEnvVar, originalValue, err)
+					}
+				} else {
+					if err := os.Unsetenv(testEnvVar); err != nil {
+						t.Logf("Error unsetting env var %s after test: %v", testEnvVar, err)
+					}
+				}
+			}()
+
+			fd, found, err := GetInheritedReadinessPipeFD()
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.errorContains != "" {
+					if !strings.Contains(err.Error(), tc.errorContains) {
+						t.Errorf("Expected error message to contain '%s', got '%s'", tc.errorContains, err.Error())
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+				if fd != tc.expectedFD {
+					t.Errorf("Expected FD %d, but got %d", tc.expectedFD, fd)
+				}
+				if found != tc.expectedFound {
+					t.Errorf("Expected found flag to be %t, but got %t", tc.expectedFound, found)
+				}
+			}
+		})
+	}
+}
