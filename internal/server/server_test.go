@@ -575,43 +575,225 @@ func TestServer_MockInfrastructure(t *testing.T) {
 	// If real util.ParseInheritedListenerFDs was called now, it'd behave normally.
 }
 
-// TestServer_NewServer_NilArgs tests argument validation for NewServer.
-func TestServer_NewServer_NilArgs(t *testing.T) {
-	// Mocks for valid arguments
-	lg := newMockLogger(nil)
-	rt := newMockRouter()
-	hr := NewHandlerRegistry()
-	cfg := newTestConfig("") // A valid config
+// TestNewServer tests the NewServer constructor under various conditions.
+func TestNewServer(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+
+	// Common valid arguments for most tests
+	baseLog := newMockLogger(nil)
+	baseRouter := newMockRouter()
+	baseRegistry := NewHandlerRegistry()
+	baseCfg := newTestConfig("")
+	basePath := "test.json"
 
 	tests := []struct {
-		name        string
-		cfg         *config.Config
-		lg          *logger.Logger
-		rt          RouterInterface
-		hr          *HandlerRegistry
-		path        string
-		expectedErr string
+		name       string
+		cfg        *config.Config
+		lg         *logger.Logger
+		rt         RouterInterface
+		hr         *HandlerRegistry
+		path       string
+		setupEnv   func(t *testing.T) // For setting environment variables
+		mockSetup  func(t *testing.T) // For setting up mocks for util functions
+		checkFunc  func(t *testing.T, s *Server, err error)
+		cleanupEnv func(t *testing.T) // For cleaning up environment variables
 	}{
-		{"nil config", nil, lg, rt, hr, "test.json", "config cannot be nil"},
-		{"nil logger", cfg, nil, rt, hr, "test.json", "logger cannot be nil"},
-		{"nil router", cfg, lg, nil, hr, "test.json", "router cannot be nil"},
-		{"nil registry", cfg, lg, rt, nil, "test.json", "handler registry cannot be nil"},
+		// --- Nil Argument Tests ---
+		{"NilConfig", nil, baseLog, baseRouter, baseRegistry, basePath, nil, nil, func(t *testing.T, s *Server, err error) {
+			if err == nil {
+				t.Fatal("Expected error for nil config, got nil")
+			}
+			if !strings.Contains(err.Error(), "config cannot be nil") {
+				t.Errorf("Expected 'config cannot be nil' error, got: %v", err)
+			}
+		}, nil},
+		{"NilLogger", baseCfg, nil, baseRouter, baseRegistry, basePath, nil, nil, func(t *testing.T, s *Server, err error) {
+			if err == nil {
+				t.Fatal("Expected error for nil logger, got nil")
+			}
+			if !strings.Contains(err.Error(), "logger cannot be nil") {
+				t.Errorf("Expected 'logger cannot be nil' error, got: %v", err)
+			}
+		}, nil},
+		{"NilRouter", baseCfg, baseLog, nil, baseRegistry, basePath, nil, nil, func(t *testing.T, s *Server, err error) {
+			if err == nil {
+				t.Fatal("Expected error for nil router, got nil")
+			}
+			if !strings.Contains(err.Error(), "router cannot be nil") {
+				t.Errorf("Expected 'router cannot be nil' error, got: %v", err)
+			}
+		}, nil},
+		{"NilRegistry", baseCfg, baseLog, baseRouter, nil, basePath, nil, nil, func(t *testing.T, s *Server, err error) {
+			if err == nil {
+				t.Fatal("Expected error for nil registry, got nil")
+			}
+			if !strings.Contains(err.Error(), "handler registry cannot be nil") {
+				t.Errorf("Expected 'handler registry cannot be nil' error, got: %v", err)
+			}
+		}, nil},
+
+		// --- Parent Process Tests ---
+		{"ValidInputs_ParentProcess", baseCfg, baseLog, baseRouter, baseRegistry, basePath,
+			nil, // No special env setup
+			func(t *testing.T) { // Mock setup
+				// Ensure ParseInheritedListenerFDs returns nil, nil for parent
+				utilParseInheritedListenerFDsFunc = func(envVarName string) ([]uintptr, error) {
+					if envVarName != util.ListenFdsEnvKey {
+						t.Errorf("ParseInheritedListenerFDs called with unexpected env var: %s", envVarName)
+					}
+					return nil, nil
+				}
+			},
+			func(t *testing.T, s *Server, err error) { // Check function
+				if err != nil {
+					t.Fatalf("NewServer failed: %v", err)
+				}
+				if s == nil {
+					t.Fatal("Server instance is nil")
+				}
+				if s.cfg != baseCfg {
+					t.Error("Server config not set correctly")
+				}
+				if s.log != baseLog {
+					t.Error("Server logger not set correctly")
+				}
+				if s.router != baseRouter {
+					t.Error("Server router not set correctly")
+				}
+				if s.handlerRegistry != baseRegistry {
+					t.Error("Server handlerRegistry not set correctly")
+				}
+				if s.configFilePath != basePath {
+					t.Errorf("Server configFilePath expected '%s', got '%s'", basePath, s.configFilePath)
+				}
+				if s.isChild {
+					t.Error("Expected s.isChild to be false for parent process")
+				}
+				if len(s.listenerFDs) != 0 {
+					t.Errorf("Expected s.listenerFDs to be empty for parent process, got %v", s.listenerFDs)
+				}
+			},
+			nil, // No special env cleanup
+		},
+
+		// --- Child Process Tests ---
+		{"ChildProcess_ValidInheritedFDs", baseCfg, baseLog, baseRouter, baseRegistry, basePath,
+			func(t *testing.T) { os.Setenv(util.ListenFdsEnvKey, "3:4:5") },
+			func(t *testing.T) {
+				expectedFDs := []uintptr{3, 4, 5}
+				utilParseInheritedListenerFDsFunc = func(envVarName string) ([]uintptr, error) {
+					if envVarName != util.ListenFdsEnvKey {
+						t.Errorf("ParseInheritedListenerFDs called with unexpected env var: %s", envVarName)
+					}
+					return expectedFDs, nil
+				}
+			},
+			func(t *testing.T, s *Server, err error) {
+				if err != nil {
+					t.Fatalf("NewServer failed: %v", err)
+				}
+				if !s.isChild {
+					t.Error("Expected s.isChild to be true for child process with FDs")
+				}
+				expectedFDs := []uintptr{3, 4, 5}
+				if len(s.listenerFDs) != len(expectedFDs) {
+					t.Fatalf("Expected %d listenerFDs, got %d", len(expectedFDs), len(s.listenerFDs))
+				}
+				for i, fd := range expectedFDs {
+					if s.listenerFDs[i] != fd {
+						t.Errorf("Expected listenerFDs[%d] to be %d, got %d", i, fd, s.listenerFDs[i])
+					}
+				}
+			},
+			func(t *testing.T) { os.Unsetenv(util.ListenFdsEnvKey) },
+		},
+		{"ChildProcess_InvalidInheritedFDs_ParseError", baseCfg, baseLog, baseRouter, baseRegistry, basePath,
+			func(t *testing.T) { os.Setenv(util.ListenFdsEnvKey, "3:abc:5") },
+			func(t *testing.T) {
+				utilParseInheritedListenerFDsFunc = func(envVarName string) ([]uintptr, error) {
+					// Simulate the actual error that util.ParseInheritedListenerFDs would return
+					return nil, fmt.Errorf("invalid FD number in environment variable %s (value: %q): %s (%w)",
+						envVarName, "3:abc:5", "abc", errors.New("strconv.Atoi: parsing \"abc\": invalid syntax"))
+				}
+			},
+			func(t *testing.T, s *Server, err error) {
+				if err == nil {
+					t.Fatal("Expected error for invalid LISTEN_FDS, got nil")
+				}
+				expectedErr := "error parsing inherited listener FDs"
+				if !strings.Contains(err.Error(), expectedErr) {
+					t.Errorf("Expected error containing '%s', got: %v", expectedErr, err)
+				}
+				if !strings.Contains(err.Error(), "invalid syntax") { // Check for underlying strconv error
+					t.Errorf("Expected underlying strconv error detail, got: %v", err)
+				}
+			},
+			func(t *testing.T) { os.Unsetenv(util.ListenFdsEnvKey) },
+		},
+		{"ChildProcess_NoInheritedFDs_EnvVarSetButEmpty", baseCfg, baseLog, baseRouter, baseRegistry, basePath,
+			func(t *testing.T) { os.Setenv(util.ListenFdsEnvKey, "") },
+			func(t *testing.T) {
+				// Real util.ParseInheritedListenerFDsFunc will return nil, nil if env var is empty.
+				// We can rely on the default mock setup which uses the real function.
+				// utilParseInheritedListenerFDsFunc = util.ParseInheritedListenerFDs // Or let default handle it
+			},
+			func(t *testing.T, s *Server, err error) {
+				if err != nil {
+					t.Fatalf("NewServer failed: %v", err)
+				}
+				// If LISTEN_FDS is set but empty, util.ParseInheritedListenerFDs returns nil, nil.
+				// NewServer should then treat it as a parent (isChild=false) because no FDs were actually parsed.
+				if s.isChild {
+					t.Error("Expected s.isChild to be false when LISTEN_FDS is empty string")
+				}
+				if len(s.listenerFDs) != 0 {
+					t.Errorf("Expected s.listenerFDs to be empty when LISTEN_FDS is empty string, got %v", s.listenerFDs)
+				}
+			},
+			func(t *testing.T) { os.Unsetenv(util.ListenFdsEnvKey) },
+		},
+		{"ChildProcess_NoInheritedFDs_EnvVarNotSet", baseCfg, baseLog, baseRouter, baseRegistry, basePath,
+			nil, // No env setup, LISTEN_FDS will be unset
+			func(t *testing.T) {
+				// utilParseInheritedListenerFDsFunc = util.ParseInheritedListenerFDs // Rely on default real func
+			},
+			func(t *testing.T, s *Server, err error) {
+				if err != nil {
+					t.Fatalf("NewServer failed: %v", err)
+				}
+				if s.isChild {
+					t.Error("Expected s.isChild to be false when LISTEN_FDS is not set")
+				}
+				if len(s.listenerFDs) != 0 {
+					t.Errorf("Expected s.listenerFDs to be empty when LISTEN_FDS is not set, got %v", s.listenerFDs)
+				}
+			},
+			nil,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// This uses the real util.ParseInheritedListenerFDs etc. unless mocks are set
-			// For NewServer, these are not called immediately, so default mocks are fine.
-			setupMocks()
-			defer teardownMocks()
+			// Store the original value of utilParseInheritedListenerFDsFunc before this subtest modifies it.
+			originalUtilParseFDs := utilParseInheritedListenerFDsFunc
 
-			_, err := NewServer(tt.cfg, tt.lg, tt.rt, tt.path, tt.hr)
-			if err == nil {
-				t.Fatalf("Expected error for %s, got nil", tt.name)
+			if tt.setupEnv != nil {
+				tt.setupEnv(t)
 			}
-			if errMsg := err.Error(); errMsg != tt.expectedErr {
-				t.Errorf("For %s, expected error message '%s', got '%s'", tt.name, tt.expectedErr, errMsg)
+			if tt.mockSetup != nil {
+				tt.mockSetup(t)
 			}
+
+			// Call NewServer with the potentially modified util functions
+			s, err := NewServer(tt.cfg, tt.lg, tt.rt, tt.path, tt.hr)
+			tt.checkFunc(t, s, err)
+
+			if tt.cleanupEnv != nil {
+				tt.cleanupEnv(t)
+			}
+			// Restore utilParseInheritedListenerFDsFunc to what it was before this specific subtest's mockSetup.
+			utilParseInheritedListenerFDsFunc = originalUtilParseFDs
 		})
 	}
 }
