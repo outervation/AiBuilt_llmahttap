@@ -66,12 +66,6 @@ func newTestStream(t *testing.T, id uint32, conn *Connection, isInitiatedByPeer 
 	}
 
 	peerWin := initialPeerWindow
-	if peerWin == 0 { // If 0, use the connection's configured peer initial window size
-		peerWin = conn.peerInitialWindowSize
-	}
-	if peerWin == 0 { // If still 0, use http2 default
-		peerWin = DefaultInitialWindowSize
-	}
 
 	t.Logf("newTestStream: Creating stream %d with ourInitialWin=%d, peerInitialWin=%d. (conn.ourInitialWindowSize=%d, conn.peerInitialWindowSize=%d)",
 		id, ourWin, peerWin, conn.ourInitialWindowSize, conn.peerInitialWindowSize)
