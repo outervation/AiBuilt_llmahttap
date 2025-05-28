@@ -22,6 +22,10 @@ import (
 	"example.com/llmahttap/v2/internal/util"
 )
 
+// newHTTP2Connection is a variable that holds the function to create a new http2.Connection.
+// It's used to allow mocking in tests.
+var newHTTP2Connection = http2.NewConnection
+
 // Server manages the HTTP/2 server lifecycle, including listening sockets,
 // connection handling, configuration reloading, and graceful shutdown.
 type Server struct {
@@ -294,7 +298,7 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 	// The dispatcherFunc uses s.dispatchRequest which correctly handles type assertions.
 	dispatcherFunc := s.dispatchRequest
 
-	h2conn := http2.NewConnection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, dispatcherFunc)
+	h2conn := newHTTP2Connection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, dispatcherFunc)
 
 	s.mu.Lock()
 	s.activeConns[h2conn] = struct{}{}
