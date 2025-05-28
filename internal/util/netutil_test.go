@@ -589,3 +589,133 @@ func TestGetChildWritePipeFD(t *testing.T) {
 		})
 	}
 }
+
+// mockUnsupportedListener is a custom net.Listener for testing unsupported types.
+type mockUnsupportedListener struct {
+	net.Listener // Embed for convenience, won't provide File()
+}
+
+// Provide dummy implementations for net.Listener for the mock
+func (m *mockUnsupportedListener) Accept() (net.Conn, error) {
+	return nil, errors.New("mockUnsupportedListener: Accept not implemented")
+}
+func (m *mockUnsupportedListener) Close() error {
+	return errors.New("mockUnsupportedListener: Close not implemented")
+}
+func (m *mockUnsupportedListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234} // Dummy address
+}
+
+func TestGetFileFromListener(t *testing.T) {
+	t.Run("TCPListener", func(t *testing.T) {
+		ln, _ := createTestTCPListener(t, "127.0.0.1:0")
+		defer ln.Close()
+
+		tcpLn, ok := ln.(*net.TCPListener)
+		if !ok {
+			t.Fatalf("createTestTCPListener did not return a *net.TCPListener")
+		}
+
+		// Get the expected file and FD directly for comparison
+		expectedFile, err := tcpLn.File()
+		if err != nil {
+			t.Fatalf("Failed to get expected file from TCPListener: %v", err)
+		}
+		defer expectedFile.Close()
+
+		// Call the function under test
+		gotFile, err := getFileFromListener(ln) // Pass the net.Listener interface
+		if err != nil {
+			t.Fatalf("getFileFromListener with TCPListener failed: %v", err)
+		}
+		if gotFile == nil {
+			t.Fatal("getFileFromListener with TCPListener returned nil file")
+		}
+		defer gotFile.Close()
+
+		// We don't compare FDs directly.
+		// Instead, use os.SameFile to check if they refer to the same underlying file.
+		expectedFi, errStatExpected := expectedFile.Stat()
+		if errStatExpected != nil {
+			t.Fatalf("Failed to stat expectedFile from TCPListener: %v", errStatExpected)
+		}
+		gotFi, errStatGot := gotFile.Stat()
+		if errStatGot != nil {
+			t.Fatalf("Failed to stat gotFile from getFileFromListener (TCP): %v", errStatGot)
+		}
+
+		if !os.SameFile(expectedFi, gotFi) {
+			t.Errorf("getFileFromListener with TCPListener: expected returned file to be the same as listener's file, but os.SameFile returned false. (Debug FDs: got %d from getFileFromListener, direct call was %d)", gotFile.Fd(), expectedFile.Fd())
+		}
+
+		// Basic check: try to use the listener via the original ln handle
+		// to ensure it wasn't messed up by getFileFromListener.
+		// (getFileFromListener duplicates the FD, so original listener should be fine)
+		_, testDialErr := net.Dial("tcp", ln.Addr().String())
+		if testDialErr != nil {
+			t.Errorf("Dialing TCP listener after getFileFromListener failed: %v", testDialErr)
+		}
+	})
+
+	t.Run("UnixListener", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Skipping UnixListener test on Windows")
+		}
+		ln, socketPath := createTestUnixListener(t)
+		defer ln.Close()
+		defer os.Remove(socketPath) // Ensure socket file is cleaned up
+
+		unixLn, ok := ln.(*net.UnixListener)
+		if !ok {
+			t.Fatalf("createTestUnixListener did not return a *net.UnixListener")
+		}
+
+		expectedFile, err := unixLn.File()
+		if err != nil {
+			t.Fatalf("Failed to get expected file from UnixListener: %v", err)
+		}
+		defer expectedFile.Close()
+
+		gotFile, err := getFileFromListener(ln)
+		if err != nil {
+			t.Fatalf("getFileFromListener with UnixListener failed: %v", err)
+		}
+		if gotFile == nil {
+			t.Fatal("getFileFromListener with UnixListener returned nil file")
+		}
+		defer gotFile.Close()
+
+		// We don't compare FDs directly.
+		// Instead, use os.SameFile to check if they refer to the same underlying file.
+		expectedFi, errStatExpected := expectedFile.Stat()
+		if errStatExpected != nil {
+			t.Fatalf("Failed to stat expectedFile from UnixListener: %v", errStatExpected)
+		}
+		gotFi, errStatGot := gotFile.Stat()
+		if errStatGot != nil {
+			t.Fatalf("Failed to stat gotFile from getFileFromListener (Unix): %v", errStatGot)
+		}
+
+		if !os.SameFile(expectedFi, gotFi) {
+			t.Errorf("getFileFromListener with UnixListener: expected returned file to be the same as listener's file, but os.SameFile returned false. (Debug FDs: got %d from getFileFromListener, direct call was %d)", gotFile.Fd(), expectedFile.Fd())
+		}
+
+		// Basic check for UnixListener
+		_, testDialErr := net.Dial("unix", ln.Addr().String())
+		if testDialErr != nil {
+			t.Errorf("Dialing Unix listener after getFileFromListener failed: %v", testDialErr)
+		}
+	})
+
+	t.Run("UnsupportedListener", func(t *testing.T) {
+		unsupportedLn := &mockUnsupportedListener{}
+
+		_, err := getFileFromListener(unsupportedLn)
+		if err == nil {
+			t.Fatal("getFileFromListener with unsupported type expected to fail, but got nil error")
+		}
+		if !strings.Contains(err.Error(), "unsupported listener type") {
+			t.Errorf("Expected error message to contain 'unsupported listener type', got: %v", err)
+		}
+	})
+}
