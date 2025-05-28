@@ -132,12 +132,21 @@ func (e *ConnectionError) Unwrap() error {
 
 // NewConnectionError creates a new ConnectionError.
 func NewConnectionError(code ErrorCode, msg string) *ConnectionError {
-	return &ConnectionError{Code: code, Msg: msg}
+	return &ConnectionError{
+		Code: code,
+		Msg:  msg,
+		// DebugData will be nil by default
+	}
 }
 
 // NewConnectionErrorWithCause creates a new ConnectionError with an underlying cause.
 func NewConnectionErrorWithCause(code ErrorCode, msg string, cause error) *ConnectionError {
-	return &ConnectionError{Code: code, Msg: msg, Cause: cause}
+	return &ConnectionError{
+		Code:  code,
+		Msg:   msg,
+		Cause: cause,
+		// DebugData will be nil by default
+	}
 }
 
 // GenerateRSTStreamFrame creates an RSTStreamFrame from a StreamError or a generic error code.

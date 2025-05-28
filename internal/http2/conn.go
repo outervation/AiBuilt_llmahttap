@@ -1902,21 +1902,31 @@ func (c *Connection) Close(err error) error {
 			gracefulTimeout = 5 * time.Second // Default graceful timeout
 		} else if ce, ok := currentErrForGoAway.(*ConnectionError); ok {
 			goAwayErrorCode = ce.Code
-			debugData = ce.DebugData
+			if len(ce.DebugData) > 0 {
+				debugData = ce.DebugData
+			} else if ce.Msg != "" {
+				debugData = []byte(ce.Msg)
+			}
+			// If both ce.DebugData and ce.Msg are empty, debugData remains nil.
 			gracefulTimeout = 0 // Connection errors usually imply immediate shutdown
 		} else {
+			// For generic errors, use their message as debug data.
+			if currentErrForGoAway != nil {
+				debugData = []byte(currentErrForGoAway.Error())
+			}
+
 			if errors.Is(currentErrForGoAway, io.EOF) {
 				goAwayErrorCode = ErrCodeNoError
 				gracefulTimeout = 5 * time.Second
-			} else if errors.Is(currentErrForGoAway, net.ErrClosed) || strings.Contains(currentErrForGoAway.Error(), "use of closed network connection") {
+			} else if errors.Is(currentErrForGoAway, net.ErrClosed) || (currentErrForGoAway != nil && strings.Contains(currentErrForGoAway.Error(), "use of closed network connection")) {
 				goAwayErrorCode = ErrCodeConnectError
 				gracefulTimeout = 0
 			} else {
 				goAwayErrorCode = ErrCodeProtocolError // Default for other unexpected errors
-				if strings.Contains(currentErrForGoAway.Error(), "connection reset by peer") ||
+				if currentErrForGoAway != nil && (strings.Contains(currentErrForGoAway.Error(), "connection reset by peer") ||
 					strings.Contains(currentErrForGoAway.Error(), "broken pipe") ||
 					strings.Contains(currentErrForGoAway.Error(), "forcibly closed") ||
-					currentErrForGoAway == context.Canceled || currentErrForGoAway == context.DeadlineExceeded {
+					currentErrForGoAway == context.Canceled || currentErrForGoAway == context.DeadlineExceeded) {
 					goAwayErrorCode = ErrCodeConnectError
 				}
 				gracefulTimeout = 0
