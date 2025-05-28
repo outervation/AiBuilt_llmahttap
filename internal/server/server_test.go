@@ -2664,4 +2664,63 @@ func TestServer_InitializeListeners(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("ChildProcess_SubsequentNewListenerFromFDFails", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrv(t, baseCfg, lg)
+		s.isChild = true
+
+		// 1. Create one real listener to get a valid FD
+		tempListenerValid, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Failed to create real temp listener for valid FD: %v", err)
+		}
+		defer tempListenerValid.Close()
+
+		tcpListenerValid, ok := tempListenerValid.(*net.TCPListener)
+		if !ok {
+			tempListenerValid.Close()
+			t.Fatalf("Valid temp listener is not TCP, cannot get FD")
+		}
+		fileValid, err := tcpListenerValid.File()
+		if err != nil {
+			tempListenerValid.Close()
+			t.Fatalf("Failed to get file from valid temp listener: %v", err)
+		}
+		defer fileValid.Close()
+		fdValidSocket := fileValid.Fd()
+
+		// 2. Use an FD for a pipe (which is not a socket)
+		pipeR, pipeW, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("Failed to create pipe: %v", errPipe)
+		}
+		defer pipeR.Close()
+		defer pipeW.Close()
+		fdInvalidPipe := pipeR.Fd() // Use the read end of the pipe
+
+		s.listenerFDs = []uintptr{fdValidSocket, fdInvalidPipe}
+
+		// The real util.NewListenerFromFD will be called.
+		// It should succeed for fdValidSocket and fail for fdInvalidPipe.
+		errInit := s.initializeListeners()
+
+		if errInit == nil {
+			t.Fatalf("initializeListeners expected to fail but succeeded")
+		}
+
+		// Check that the error message points to the failing FD (fdInvalidPipe)
+		// net.FileListener on a pipe usually gives "socket operation on non-socket" (ENOTSOCK)
+		expectedErrPart := fmt.Sprintf("failed to create listener from inherited FD %d", fdInvalidPipe)
+		if !strings.Contains(errInit.Error(), expectedErrPart) {
+			t.Errorf("Error message '%v' does not contain expected part '%s'", errInit, expectedErrPart)
+		}
+		if !strings.Contains(errInit.Error(), "socket operation on non-socket") {
+			t.Errorf("Expected 'socket operation on non-socket' for pipe FD, got: %v", errInit)
+		}
+
+		if len(s.listeners) != 0 {
+			t.Errorf("Expected s.listeners to be empty (or nil) after failure, got %d listeners", len(s.listeners))
+		}
+	})
 }
