@@ -719,3 +719,155 @@ func TestGetFileFromListener(t *testing.T) {
 		}
 	})
 }
+
+func TestParseInheritedListenerFDs(t *testing.T) {
+	const testEnvVar = "TEST_LISTEN_FDS_FOR_PARSE"
+
+	tests := []struct {
+		name          string
+		envValue      *string // Pointer to distinguish between not set and empty string
+		expectedFDs   []uintptr
+		expectError   bool
+		errorContains string // Substring to check in error message
+	}{
+		{
+			name:        "EnvVarNotSet",
+			envValue:    nil, // Not set
+			expectedFDs: nil,
+			expectError: false,
+		},
+		{
+			name:        "EmptyStringValue",
+			envValue:    func() *string { s := ""; return &s }(),
+			expectedFDs: nil,
+			expectError: false,
+		},
+		{
+			name:        "ValidSingleFD",
+			envValue:    func() *string { s := "3"; return &s }(),
+			expectedFDs: []uintptr{3},
+			expectError: false,
+		},
+		{
+			name:        "ValidMultipleFDs",
+			envValue:    func() *string { s := "3:4:5"; return &s }(),
+			expectedFDs: []uintptr{3, 4, 5},
+			expectError: false,
+		},
+		{
+			name:        "ValidFDZero",
+			envValue:    func() *string { s := "0"; return &s }(),
+			expectedFDs: []uintptr{0},
+			expectError: false,
+		},
+		{
+			name:          "InvalidNonNumericPart_Single",
+			envValue:      func() *string { s := "abc"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid FD number",
+		},
+		{
+			name:          "InvalidNonNumericPart_Mixed",
+			envValue:      func() *string { s := "3:abc:5"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid FD number",
+		},
+		{
+			name:          "InvalidNegativeFD",
+			envValue:      func() *string { s := "-1"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid negative FD number",
+		},
+		{
+			name:          "InvalidEmptyPartStart",
+			envValue:      func() *string { s := ":3"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid FD number", // strconv.Atoi("") fails
+		},
+		{
+			name:          "InvalidEmptyPartMiddle",
+			envValue:      func() *string { s := "3::4"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid FD number", // strconv.Atoi("") fails
+		},
+		{
+			name:          "InvalidEmptyPartEnd",
+			envValue:      func() *string { s := "3:"; return &s }(),
+			expectedFDs:   nil,
+			expectError:   true,
+			errorContains: "invalid FD number", // strconv.Atoi("") fails
+		},
+		{
+			name:        "ValidFDLargeNumber",
+			envValue:    func() *string { s := "1023"; return &s }(),
+			expectedFDs: []uintptr{1023},
+			expectError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var originalValue string
+			var wasSet bool
+
+			if tc.envValue == nil {
+				// Ensure env var is not set
+				originalValue, wasSet = os.LookupEnv(testEnvVar)
+				if wasSet {
+					if err := os.Unsetenv(testEnvVar); err != nil {
+						t.Fatalf("Failed to unset env var %s for test: %v", testEnvVar, err)
+					}
+				}
+			} else {
+				// Set env var
+				originalValue, wasSet = os.LookupEnv(testEnvVar)
+				if err := os.Setenv(testEnvVar, *tc.envValue); err != nil {
+					t.Fatalf("Failed to set env var %s to %q for test: %v", testEnvVar, *tc.envValue, err)
+				}
+			}
+
+			defer func() {
+				if wasSet {
+					if err := os.Setenv(testEnvVar, originalValue); err != nil {
+						t.Logf("Error restoring env var %s to '%s': %v", testEnvVar, originalValue, err)
+					}
+				} else {
+					if err := os.Unsetenv(testEnvVar); err != nil {
+						t.Logf("Error unsetting env var %s after test: %v", testEnvVar, err)
+					}
+				}
+			}()
+
+			fds, err := ParseInheritedListenerFDs(testEnvVar)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil. Env value: %v", tc.envValue)
+				}
+				if tc.errorContains != "" {
+					if !strings.Contains(err.Error(), tc.errorContains) {
+						t.Errorf("Expected error message to contain '%s', got '%s'", tc.errorContains, err.Error())
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v. Env value: %v", err, tc.envValue)
+				}
+				if len(fds) != len(tc.expectedFDs) {
+					t.Errorf("FD count mismatch: expected %d, got %d. Expected: %v, Got: %v", len(tc.expectedFDs), len(fds), tc.expectedFDs, fds)
+				} else {
+					for i := range fds {
+						if fds[i] != tc.expectedFDs[i] {
+							t.Errorf("FD mismatch at index %d: expected %d, got %d. Expected: %v, Got: %v", i, tc.expectedFDs[i], fds[i], tc.expectedFDs, fds)
+						}
+					}
+				}
+			}
+		})
+	}
+}
