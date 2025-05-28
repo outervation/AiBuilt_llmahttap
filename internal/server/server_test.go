@@ -9,10 +9,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath" // Added import
+	"path/filepath"
 	"strings"
 	"sync"
-	// "syscall" // Not directly used in mocks, but tests might send signals
+	"syscall" // ADDED
 	"testing"
 	"time"
 
@@ -1736,6 +1736,250 @@ func TestServer_HandleSIGHUP(t *testing.T) {
 			t.Error("s.Done() was closed, indicating shutdown, which should not happen if os.StartProcess failed.")
 		default:
 			// Expected: s.Done() not closed
+		}
+	})
+}
+
+// TestServer_HandleSignals tests the server's main signal handling loop.
+func TestServer_HandleSignals(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+
+	defaultCfg := newTestConfig("127.0.0.1:0")
+	originalCfgPath := "test_signals_config.json"
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	// Helper to create a server for signal tests
+	// This server won't actually listen or accept, just needs to exist for signal handling.
+	newSignalTestServer := func(t *testing.T, lg *logger.Logger) *Server {
+		t.Helper()
+		// Mock listener creation to avoid real network operations during signal tests
+		// utilCreateListenerAndGetFDFunc = func(address string) (net.Listener, uintptr, error) {
+		// 	return newMockListener(address), 0, nil
+		// }
+		// utilParseInheritedListenerFDsFunc = func(envVarName string) ([]uintptr, error) {
+		// 	return nil, nil
+		// }
+
+		s, err := NewServer(defaultCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed for signal test: %v", err)
+		}
+		// s.initializeListeners() // Don't initialize listeners for this test, focus on signals
+		return s
+	}
+
+	t.Run("SIGINT_CallsShutdown", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newSignalTestServer(t, lg)
+
+		// Ensure reloadChan is buffered as in server.go
+		s.reloadChan = make(chan os.Signal, 1)
+		s.shutdownChan = make(chan struct{}) // Fresh shutdownChan for this subtest
+		s.doneChan = make(chan struct{})     // Fresh doneChan
+
+		var shutdownCalled bool
+		shutdownMu := sync.Mutex{}
+
+		// Mock s.Shutdown
+		// Instead, we'll check s.shutdownChan and log messages.
+		// Or, for a more direct test, s.Shutdown could be an interface method if Server implemented an interface.
+
+		go s.handleSignals()
+		defer func() { // Ensure signal handler goroutine can exit
+			// To prevent panic on double close if test logic already closed it:
+			shutdownMu.Lock()
+			select {
+			case <-s.shutdownChan:
+			// Already closed
+			default:
+				close(s.shutdownChan) // This will stop the handleSignals loop
+			}
+			shutdownMu.Unlock()
+		}()
+
+		// Send SIGINT
+		s.reloadChan <- syscall.SIGINT
+
+		// Wait for shutdown to be triggered
+		// s.Shutdown is called in a goroutine by handleSignals, so we check its effects.
+		select {
+		case <-s.shutdownChan: // s.Shutdown should close this.
+			shutdownCalled = true
+		case <-time.After(100 * time.Millisecond):
+			t.Error("s.Shutdown was not called (or s.shutdownChan not closed) within timeout after SIGINT")
+		}
+
+		if !shutdownCalled {
+			t.Error("Shutdown (evidenced by s.shutdownChan closure) was not initiated after SIGINT")
+		}
+		logs := logBuf.String()
+		if !strings.Contains(logs, "SIGINT/SIGTERM received, initiating graceful shutdown.") {
+			t.Errorf("Expected log message for SIGINT shutdown, not found. Logs: %s", logs)
+		}
+		if !strings.Contains(logs, "Signal handler started.") { // check if handler even started
+			t.Errorf("Signal handler did not log startup. Logs: %s", logs)
+		}
+	})
+
+	t.Run("SIGTERM_CallsShutdown", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newSignalTestServer(t, lg)
+
+		s.reloadChan = make(chan os.Signal, 1)
+		s.shutdownChan = make(chan struct{})
+		s.doneChan = make(chan struct{})
+		shutdownMu := sync.Mutex{}
+
+		var shutdownCalled bool
+		go s.handleSignals()
+		defer func() {
+			shutdownMu.Lock()
+			select {
+			case <-s.shutdownChan:
+			default:
+				close(s.shutdownChan)
+			}
+			shutdownMu.Unlock()
+		}()
+
+		s.reloadChan <- syscall.SIGTERM
+
+		select {
+		case <-s.shutdownChan:
+			shutdownCalled = true
+		case <-time.After(100 * time.Millisecond):
+			t.Error("s.Shutdown was not called (or s.shutdownChan not closed) within timeout after SIGTERM")
+		}
+
+		if !shutdownCalled {
+			t.Error("Shutdown (evidenced by s.shutdownChan closure) was not initiated after SIGTERM")
+		}
+		logs := logBuf.String()
+		if !strings.Contains(logs, "SIGINT/SIGTERM received, initiating graceful shutdown.") {
+			t.Errorf("Expected log message for SIGTERM shutdown, not found. Logs: %s", logs)
+		}
+	})
+
+	t.Run("SIGHUP_CallsHandleSIGHUP", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newSignalTestServer(t, lg)
+
+		s.reloadChan = make(chan os.Signal, 1)
+		s.shutdownChan = make(chan struct{})
+		s.doneChan = make(chan struct{})
+		shutdownMu := sync.Mutex{}
+
+		// Mock handleSIGHUP to check if it's called
+		// This requires handleSIGHUP to be a method that can be replaced on the instance,
+		// or more complex mocking. For now, check logs.
+		// As handleSIGHUP is a private method, we rely on logs.
+		// The real handleSIGHUP will error out due to os.StartProcess issues, but it should log "SIGHUP received".
+
+		go s.handleSignals()
+		defer func() {
+			shutdownMu.Lock()
+			select {
+			case <-s.shutdownChan:
+			default:
+				close(s.shutdownChan)
+			}
+			shutdownMu.Unlock()
+		}()
+
+		s.reloadChan <- syscall.SIGHUP
+
+		// Wait for SIGHUP handling to log something.
+		// This is an indirect check. The real handleSIGHUP will likely fail later.
+		time.Sleep(50 * time.Millisecond) // Give time for log to appear
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "SIGHUP received, handling.") {
+			t.Errorf("Expected log message for SIGHUP handling, not found. Logs: %s", logs)
+		}
+		// It will also try to load config, etc. We're just checking the initial SIGHUP log here.
+	})
+
+	t.Run("ShutdownChanClose_ExitsHandler", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newSignalTestServer(t, lg)
+
+		s.reloadChan = make(chan os.Signal, 1)
+		s.shutdownChan = make(chan struct{})
+		s.doneChan = make(chan struct{})
+		shutdownMu := sync.Mutex{}
+
+		handlerExited := make(chan struct{})
+		go func() {
+			s.handleSignals()
+			close(handlerExited)
+		}()
+
+		// Close shutdownChan to signal the handler to exit
+		shutdownMu.Lock()
+		select {
+		case <-s.shutdownChan: // already closed
+		default:
+			close(s.shutdownChan)
+		}
+		shutdownMu.Unlock()
+
+		select {
+		case <-handlerExited:
+			// Expected: handler goroutine exited
+		case <-time.After(100 * time.Millisecond):
+			t.Error("handleSignals goroutine did not exit within timeout after shutdownChan was closed")
+		}
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Shutdown initiated (detected via shutdownChan), signal handler exiting.") {
+			t.Errorf("Expected log message for signal handler exiting due to shutdownChan, not found. Logs: %s", logs)
+		}
+	})
+
+	t.Run("ReloadChanClose_ExitsHandler", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newSignalTestServer(t, lg)
+
+		s.reloadChan = make(chan os.Signal, 1) // Will be closed by test
+		s.shutdownChan = make(chan struct{})   // Kept open for this test
+		s.doneChan = make(chan struct{})
+		shutdownMu := sync.Mutex{}
+
+		handlerExited := make(chan struct{})
+		go func() {
+			s.handleSignals()
+			close(handlerExited)
+		}()
+		defer func() {
+			shutdownMu.Lock()
+			select {
+			case <-s.shutdownChan:
+			default:
+				close(s.shutdownChan)
+			}
+			shutdownMu.Unlock()
+		}() // Ensure cleanup if test fails before this
+
+		// Close reloadChan to signal the handler to exit (simulates Stop a different way)
+		close(s.reloadChan)
+
+		select {
+		case <-handlerExited:
+			// Expected
+		case <-time.After(100 * time.Millisecond):
+			t.Error("handleSignals goroutine did not exit within timeout after reloadChan was closed")
+		}
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Signal channel (reloadChan) closed, signal handler exiting.") {
+			t.Errorf("Expected log message for signal handler exiting due to reloadChan closure, not found. Logs: %s", logs)
 		}
 	})
 }
