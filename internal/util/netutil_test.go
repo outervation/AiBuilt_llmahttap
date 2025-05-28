@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -868,6 +870,221 @@ func TestParseInheritedListenerFDs(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestGetInheritedListeners(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestGetInheritedListeners on Windows due to POSIX-specific FD semantics.")
+	}
+
+	const testEnvVar = ListenFdsEnvKey // Use the actual constant
+
+	// Helper to create a TCP listener and return its FD string and the listener itself for cleanup
+	setupTCPListenerFD := func(t *testing.T) (string, net.Listener) {
+		t.Helper()
+		// CreateListenerAndGetFD ensures the FD has CLOEXEC cleared.
+		ln, fd, err := CreateListenerAndGetFD("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Setup: CreateListenerAndGetFD failed: %v", err)
+		}
+		// ln needs to be closed by the caller of setupTCPListenerFD
+		return strconv.Itoa(int(fd)), ln
+	}
+
+	// Helper to create a pipe and return its read-end FD string and the pipe files for cleanup
+	setupPipeReadFD := func(t *testing.T) (string, *os.File, *os.File) {
+		t.Helper()
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("Setup: os.Pipe() failed: %v", err)
+		}
+		// r and w need to be closed by the caller.
+		// GetInheritedListeners will try to use r.Fd().
+		// SetCloexec on r.Fd() within GetInheritedListeners should work fine.
+		// net.FileListener(r) will fail, which is one of the test cases.
+		return strconv.Itoa(int(r.Fd())), r, w
+	}
+
+	tests := []struct {
+		name          string
+		setupFn       func(t *testing.T) (envValue string, cleanup func()) // Returns env string and a cleanup func
+		expectError   bool
+		errorContains string
+		expectedCount int // Expected number of listeners
+	}{
+		{
+			name: "NoEnvVar",
+			setupFn: func(t *testing.T) (string, func()) {
+				// Ensure env var is not set
+				originalValue, wasSet := os.LookupEnv(testEnvVar)
+				if wasSet {
+					if err := os.Unsetenv(testEnvVar); err != nil {
+						t.Fatalf("Failed to unset env var %s for test: %v", testEnvVar, err)
+					}
+				}
+				return "", func() { // No LISTEN_FDS value to set
+					if wasSet {
+						if err := os.Setenv(testEnvVar, originalValue); err != nil {
+							t.Logf("Error restoring env var %s to '%s': %v", testEnvVar, originalValue, err)
+						}
+					}
+				}
+			},
+			expectError:   false,
+			expectedCount: 0,
+		},
+		{
+			name: "EmptyEnvVar",
+			setupFn: func(t *testing.T) (string, func()) {
+				return "", func() {} // Effectively sets LISTEN_FDS="" via withTempEnvVar
+			},
+			expectError:   false,
+			expectedCount: 0,
+		},
+		{
+			name: "ValidSingleTCPSocketFD",
+			setupFn: func(t *testing.T) (string, func()) {
+				fdStr, ln1 := setupTCPListenerFD(t)
+				return fdStr, func() { ln1.Close() }
+			},
+			expectError:   false,
+			expectedCount: 1,
+		},
+		{
+			name: "ValidMultipleTCPSocketFDs",
+			setupFn: func(t *testing.T) (string, func()) {
+				fdStr1, ln1 := setupTCPListenerFD(t)
+				fdStr2, ln2 := setupTCPListenerFD(t)
+				return fdStr1 + ":" + fdStr2, func() {
+					ln1.Close()
+					ln2.Close()
+				}
+			},
+			expectError:   false,
+			expectedCount: 2,
+		},
+		{
+			name: "InvalidFDString_NonNumeric",
+			setupFn: func(t *testing.T) (string, func()) {
+				return "abc", func() {}
+			},
+			expectError:   true,
+			errorContains: "invalid FD", // From strconv.Atoi
+		},
+		{
+			name: "InvalidFDString_Mixed",
+			setupFn: func(t *testing.T) (string, func()) {
+				fdStr1, ln1 := setupTCPListenerFD(t)
+				// ln1 will be closed by GetInheritedListeners's internal cleanup on error
+				return fdStr1 + ":xyz:" + fdStr1, func() { ln1.Close() /* Safety close */ }
+			},
+			expectError:   true,
+			errorContains: "invalid FD", // From strconv.Atoi for "xyz"
+		},
+		{
+			name: "Error_SetCloexecFails_BogusFD",
+			setupFn: func(t *testing.T) (string, func()) {
+				return "99999", func() {} // A large, likely unused FD
+			},
+			expectError:   true,
+			errorContains: "failed to clear FD_CLOEXEC", // Error from SetCloexec
+		},
+		{
+			name: "Error_OsNewFileFails_ClosedPipeFD",
+			setupFn: func(t *testing.T) (string, func()) {
+				r, w, err := os.Pipe()
+				if err != nil {
+					t.Fatalf("Setup: os.Pipe failed: %v", err)
+				}
+				fdVal := int(r.Fd()) // Get FD before closing r
+				r.Close()            // Close the read end
+				w.Close()            // Close the write end
+				// Now fdVal is a closed FD. SetCloexec might pass or fail mildly,
+				// but os.NewFile should robustly fail.
+				return strconv.Itoa(fdVal), func() {}
+			},
+
+			expectError:   true,
+			errorContains: "failed to clear FD_CLOEXEC", // Error from SetCloexec on closed FD
+		},
+		{
+			name: "Error_FileListenerFails_PipeFD",
+			setupFn: func(t *testing.T) (string, func()) {
+				fdStr, rPipe, wPipe := setupPipeReadFD(t)
+				// rPipe.Fd() is passed. net.FileListener should fail.
+				return fdStr, func() {
+					rPipe.Close()
+					wPipe.Close()
+				}
+			},
+			expectError:   true,
+			errorContains: "failed to create net.Listener from inherited FD", // Error from net.FileListener
+			// The specific OS error might be "socket operation on non-socket" or similar.
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			envValueToSet, cleanup := tc.setupFn(t)
+			defer cleanup()
+
+			withTempEnvVar(t, testEnvVar, envValueToSet, func() {
+				listeners, err := GetInheritedListeners()
+				// Ensure all returned listeners are closed, even if test fails later
+				defer func() {
+					for _, l := range listeners {
+						if l != nil {
+							l.Close()
+						}
+					}
+				}()
+
+				if tc.expectError {
+					if err == nil {
+						t.Fatalf("Expected an error, but got nil. LISTEN_FDS=%q", envValueToSet)
+					}
+					if tc.errorContains != "" {
+						if !strings.Contains(err.Error(), tc.errorContains) {
+							t.Errorf("Expected error message to contain '%s', got '%s'", tc.errorContains, err.Error())
+						}
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("Expected no error, but got: %v. LISTEN_FDS=%q", err, envValueToSet)
+					}
+					if len(listeners) != tc.expectedCount {
+						t.Errorf("Expected %d listeners, got %d", tc.expectedCount, len(listeners))
+					}
+					// Further checks on listener properties (e.g., address, usability) could be added here.
+					// For TCP listeners, check they are indeed TCP and listening.
+					for i, l := range listeners {
+						if l == nil {
+							t.Errorf("Listener at index %d is nil", i)
+							continue
+						}
+						// Try to accept a connection to confirm it's a working listener
+						// This check is primarily for valid socket FDs.
+						if strings.Count(envValueToSet, ":") < i && !strings.Contains(tc.name, "Pipe") { // Only for presumed TCP FDs
+							go func(listener net.Listener) {
+								c, dialErr := net.Dial("tcp", listener.Addr().String())
+								if dialErr == nil {
+									c.Close()
+								}
+							}(l)
+							acceptConn, acceptErr := l.Accept()
+							if acceptErr != nil {
+								// This can happen if the original listener FD (from setupFn) was closed too soon
+								// or if there's some other issue.
+								t.Errorf("Listener %d (%s) failed to accept: %v. Test name: %s", i, l.Addr(), acceptErr, tc.name)
+							} else {
+								acceptConn.Close()
+							}
+						}
+					}
+				}
+			})
 		})
 	}
 }
