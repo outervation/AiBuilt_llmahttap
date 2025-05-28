@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
 	"testing"
 	"time"
 )
@@ -401,4 +400,65 @@ func TestCreateReadinessPipe(t *testing.T) {
 	//    should be tested separately, for example, in a dedicated TestReadinessSignalingMechanism.
 
 	// We mostly rely on sub-function error handling (os.Pipe, SetCloexec) being correct.
+}
+
+// TestReadinessSignalingMechanism tests the core signaling logic:
+// a child closing its write FD and the parent detecting this via EOF on its read FD.
+func TestReadinessSignalingMechanism(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping TestReadinessSignalingMechanism on Windows due to POSIX-specific FD/pipe behavior.")
+	}
+
+	// 1. Manually create a pipe for this test.
+	// This simulates the pipe that CreateReadinessPipe would set up.
+	parentReadPipe, childWritePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() failed: %v", err)
+	}
+	// parentReadPipe *os.File is used by WaitForChildReadyPipeClose, defer its close.
+	defer parentReadPipe.Close()
+	// childWritePipe *os.File should also be closed eventually.
+	// If SignalChildReadyByClosingFD succeeds, childWriteFD is closed.
+	// The deferred close here will then try to close an already closed FD, which is fine for cleanup.
+	defer childWritePipe.Close()
+
+	// 2. Get the FD for the child's write end.
+	childWriteFD := childWritePipe.Fd()
+
+	// 3. Simulate what CreateReadinessPipe does for the child's FD: clear CLOEXEC.
+	// This isn't strictly necessary for *this specific test's logic* to pass if we don't fork,
+	// but it mirrors the setup for which SignalChildReadyByClosingFD is intended.
+	if err := SetCloexec(childWriteFD, false); err != nil {
+		// No need to close childWritePipe here, defer will handle it.
+		t.Fatalf("Failed to clear CLOEXEC on childWriteFD %d: %v", childWriteFD, err)
+	}
+
+	// 4. DO NOT close the *os.File wrapper for the child's write end here.
+	// SignalChildReadyByClosingFD will operate on the raw FD number and perform the close.
+	// The previous explicit close: `// if err := childWritePipe.Close(); err != nil { ... }` was the bug.
+
+	// 5. Start a goroutine to wait for the child's signal (EOF on parentReadPipe).
+	waitErrChan := make(chan error, 1)
+	go func() {
+		// Use a reasonable timeout for the wait.
+		waitErrChan <- WaitForChildReadyPipeClose(parentReadPipe, 2*time.Second)
+	}()
+
+	// 6. Simulate the child signaling readiness by closing its FD.
+	// Give a slight delay to ensure WaitForChildReadyPipeClose is likely waiting.
+	time.Sleep(50 * time.Millisecond)
+	if err := SignalChildReadyByClosingFD(childWriteFD); err != nil {
+		t.Fatalf("SignalChildReadyByClosingFD failed for FD %d: %v", childWriteFD, err)
+	}
+
+	// 7. Check the result from WaitForChildReadyPipeClose.
+	select {
+	case err := <-waitErrChan:
+		if err != nil {
+			t.Errorf("WaitForChildReadyPipeClose returned an error: %v (expected nil for EOF)", err)
+		}
+		// If err is nil, it means EOF was received, which is success.
+	case <-time.After(3 * time.Second): // Slightly longer timeout for the overall check
+		t.Fatal("Timeout waiting for result from WaitForChildReadyPipeClose goroutine")
+	}
 }
