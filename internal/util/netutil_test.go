@@ -2,13 +2,12 @@ package util
 
 import (
 	"errors"
-	// "io/fs" // Removed: imported and not used
+	// "io/fs" // No longer needed here as test was moved
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	// "syscall" // Removed: imported and not used
 	"testing"
 	"time"
 )
