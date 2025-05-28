@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"io"
+	"syscall"
+
 	"strconv"
 	"strings"
 	"testing"
@@ -1194,6 +1197,79 @@ func TestGetInheritedReadinessPipeFD(t *testing.T) {
 				if found != tc.expectedFound {
 					t.Errorf("Expected found flag to be %t, but got %t", tc.expectedFound, found)
 				}
+			}
+		})
+	}
+}
+
+func TestIsAddrInUse(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "NilError",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "Direct_EADDRINUSE",
+			err:      syscall.EADDRINUSE,
+			expected: true,
+		},
+		{
+			name:     "Wrapped_EADDRINUSE_SyscallError",
+			err:      &os.SyscallError{Err: syscall.EADDRINUSE, Syscall: "listen"},
+			expected: true,
+		},
+		{
+			name:     "Wrapped_EADDRINUSE_NetOpError",
+			err:      &net.OpError{Op: "listen", Net: "tcp", Source: nil, Addr: nil, Err: syscall.EADDRINUSE},
+			expected: true,
+		},
+		{
+			name:     "StringMatch_Lowercase",
+			err:      errors.New("some error: address already in use"),
+			expected: true,
+		},
+		{
+			name:     "StringMatch_Capitalized",
+			err:      errors.New("listen tcp 127.0.0.1:8080: Address already in use"),
+			expected: true,
+		},
+		{
+			name:     "StringMatch_DifferentCapitalization",
+			err:      errors.New("ADDRess AlReAdY IN uSe"),
+			expected: true,
+		},
+		{
+			name:     "UnrelatedError_EOF",
+			err:      io.EOF,
+			expected: false,
+		},
+		{
+			name:     "UnrelatedError_Generic",
+			err:      errors.New("some other network problem"),
+			expected: false,
+		},
+		{
+			name:     "Unrelated_SyscallError_NotEADDRINUSE",
+			err:      &os.SyscallError{Err: syscall.ECONNREFUSED, Syscall: "connect"},
+			expected: false,
+		},
+		{
+			name:     "Unrelated_NetOpError_NotEADDRINUSE",
+			err:      &net.OpError{Op: "dial", Net: "tcp", Source: nil, Addr: nil, Err: errors.New("connection refused")},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := IsAddrInUse(tc.err)
+			if got != tc.expected {
+				t.Errorf("IsAddrInUse(%v) = %t; want %t", tc.err, got, tc.expected)
 			}
 		})
 	}
