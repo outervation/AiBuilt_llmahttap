@@ -2906,3 +2906,372 @@ func TestServer_InitializeListeners(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_StartAccepting(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+
+	baseCfg := newTestConfig("127.0.0.1:0")
+	originalCfgPath := "test_start_accepting_config.json"
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	newTestSrvForStartAccepting := func(t *testing.T, lg *logger.Logger, isChild bool) *Server {
+		t.Helper()
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		s.isChild = isChild
+		s.listeners = nil // Ensure listeners are controlled by test
+		s.listenerFDs = nil
+		s.stopAccepting = make(chan struct{}) // Fresh channel for each test
+		return s
+	}
+
+	t.Run("ErrorIfNoListeners", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrvForStartAccepting(t, lg, false)
+		s.listeners = []net.Listener{} // Explicitly empty
+
+		err := s.StartAccepting()
+		if err == nil {
+			t.Fatal("Expected error when no listeners are initialized, got nil")
+		}
+		if !strings.Contains(err.Error(), "no listeners initialized") {
+			t.Errorf("Expected error message to contain 'no listeners initialized', got: %v", err.Error())
+		}
+	})
+
+	t.Run("ChildProcess_ReadinessSignal_PipeFoundAndSignalSuccess", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStartAccepting(t, lg, true)
+
+		ml := newMockListener("127.0.0.1:0")
+		s.listeners = []net.Listener{ml}
+
+		rPipe, wPipe, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("Failed to create pipe for readiness signal: %v", errPipe)
+		}
+		defer rPipe.Close()
+		// wPipe will be closed by the server logic via util.SignalChildReadyByClosingFD
+
+		pipeFdStr := fmt.Sprintf("%d", wPipe.Fd())
+		origEnvVal, envWasSet := os.LookupEnv(util.ReadinessPipeEnvKey)
+		os.Setenv(util.ReadinessPipeEnvKey, pipeFdStr)
+		defer func() {
+			if envWasSet {
+				os.Setenv(util.ReadinessPipeEnvKey, origEnvVal)
+			} else {
+				os.Unsetenv(util.ReadinessPipeEnvKey)
+			}
+			wPipe.Close() // Ensure write pipe is closed if test fails before server logic does
+		}()
+
+		go func() {
+			_ = s.StartAccepting()
+		}()
+		defer close(s.stopAccepting) // Terminate acceptLoop
+
+		// Wait for wPipe to be closed by checking if rPipe gets EOF
+		readErrChan := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 1)
+			_, errRead := rPipe.Read(buf)
+			readErrChan <- errRead
+		}()
+
+		select {
+		case readErr := <-readErrChan:
+			if readErr != io.EOF {
+				t.Errorf("Expected pipe read to result in EOF (signaling closure), got: %v", readErr)
+			}
+		case <-time.After(200 * time.Millisecond): // Increased timeout slightly for pipe operations
+			t.Error("Timeout waiting for readiness pipe to be closed")
+		}
+
+		// Add a small delay to allow the log message to be processed.
+		time.Sleep(50 * time.Millisecond)
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Child process: Successfully signaled readiness") {
+			t.Errorf("Expected log for successful readiness signal, not found. Logs: %s", logs)
+		}
+	})
+
+	t.Run("ChildProcess_ReadinessSignal_PipeFoundAndSignalFailure", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStartAccepting(t, lg, true)
+		s.listeners = []net.Listener{newMockListener("127.0.0.1:0")}
+
+		// Create a pipe, get its FD, then close it.
+		// syscall.Close on an already closed FD should return EBADF.
+		_, wPipe, errPipe := os.Pipe()
+		if errPipe != nil {
+			t.Fatalf("Failed to create pipe: %v", errPipe)
+		}
+		fdToPass := wPipe.Fd()
+		wPipe.Close() // Close it immediately
+
+		pipeFdStr := fmt.Sprintf("%d", fdToPass)
+		origEnvVal, envWasSet := os.LookupEnv(util.ReadinessPipeEnvKey)
+		os.Setenv(util.ReadinessPipeEnvKey, pipeFdStr)
+		defer func() {
+			if envWasSet {
+				os.Setenv(util.ReadinessPipeEnvKey, origEnvVal)
+			} else {
+				os.Unsetenv(util.ReadinessPipeEnvKey)
+			}
+		}()
+
+		go s.StartAccepting() // Runs acceptLoop in goroutine
+		defer close(s.stopAccepting)
+		time.Sleep(50 * time.Millisecond) // Allow calls to happen
+
+		logs := logBuf.String()
+		// EBADF can be "bad file descriptor" or "bad file number" depending on OS/Go version
+		if !strings.Contains(logs, "Child process: Error signaling readiness") ||
+			!(strings.Contains(logs, "bad file descriptor") || strings.Contains(logs, "bad file number")) {
+			t.Errorf("Expected log for failed readiness signal (EBADF), not found or incorrect. Logs: %s", logs)
+		}
+	})
+
+	t.Run("ChildProcess_ReadinessSignal_PipeNotFound", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStartAccepting(t, lg, true)
+		s.listeners = []net.Listener{newMockListener("127.0.0.1:0")}
+
+		origEnvVal, envWasSet := os.LookupEnv(util.ReadinessPipeEnvKey)
+		os.Unsetenv(util.ReadinessPipeEnvKey) // Ensure it's not set
+		defer func() {
+			if envWasSet {
+				os.Setenv(util.ReadinessPipeEnvKey, origEnvVal)
+			}
+		}()
+
+		go s.StartAccepting()
+		defer close(s.stopAccepting)
+		time.Sleep(50 * time.Millisecond)
+
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Child process: No readiness pipe FD found") {
+			t.Errorf("Expected log for no readiness pipe, not found. Logs: %s", logs)
+		}
+	})
+
+	t.Run("ChildProcess_ReadinessSignal_GetPipeError", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForStartAccepting(t, lg, true)
+		s.listeners = []net.Listener{newMockListener("127.0.0.1:0")}
+
+		invalidFdStr := "not-a-number"
+		origEnvVal, envWasSet := os.LookupEnv(util.ReadinessPipeEnvKey)
+		os.Setenv(util.ReadinessPipeEnvKey, invalidFdStr)
+		defer func() {
+			if envWasSet {
+				os.Setenv(util.ReadinessPipeEnvKey, origEnvVal)
+			} else {
+				os.Unsetenv(util.ReadinessPipeEnvKey)
+			}
+		}()
+
+		go s.StartAccepting()
+		defer close(s.stopAccepting)
+		time.Sleep(50 * time.Millisecond)
+
+		logs := logBuf.String()
+		// The real util.GetInheritedReadinessPipeFD will produce an error like "invalid syntax" from strconv.Atoi
+		if !strings.Contains(logs, "Child process: Error getting readiness pipe FD") || !strings.Contains(logs, "invalid syntax") {
+			t.Errorf("Expected log for error getting pipe FD (invalid syntax), not found or incorrect. Logs: %s", logs)
+		}
+	})
+}
+
+func TestServer_acceptLoop(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+	setupHandleTCPConnectionMocks_Test() // For newHTTP2Connection mocking
+	defer teardownHandleTCPConnectionMocks_Test()
+
+	baseCfg := newTestConfig("127.0.0.1:0")
+	originalCfgPath := "test_acceptloop_config.json"
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	newTestSrvForAcceptLoop := func(t *testing.T, lg *logger.Logger) *Server {
+		t.Helper()
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		s.stopAccepting = make(chan struct{}) // Fresh channel for each test
+		return s
+	}
+
+	t.Run("AcceptsConnection_CallsHandleTCPConnection_ThenTerminatesOnListenerClose", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrvForAcceptLoop(t, lg)
+
+		ml := newMockListener("127.0.0.1:8080")
+		mockNetC := newMockConn("", "")
+
+		var newH2ConnCalled bool
+		var acceptedNetConn net.Conn
+		handleTCPConnCalledForMockC := make(chan struct{})
+
+		// Save original to restore
+		originalNewH2ConnFunc_subtest := newHTTP2Connection
+		defer func() { newHTTP2Connection = originalNewH2ConnFunc_subtest }()
+
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			if nc == mockNetC {
+				newH2ConnCalled = true
+				acceptedNetConn = nc
+				close(handleTCPConnCalledForMockC) // Signal that handleTCPConnection was called for mockNetC
+			}
+
+			// Configure nc (which should be mockNetC if called for it) for handshake & quick EOF
+			if concreteMockNc, ok := nc.(*mockConn); ok {
+				concreteMockNc.autoEOF = true
+
+				var clientSettingsBuf bytes.Buffer
+				settingsFrame := http2.SettingsFrame{FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Length: 0}}
+				http2.WriteFrame(&clientSettingsBuf, &settingsFrame)
+
+				var clientSettingsAckBuf bytes.Buffer
+				settingsAckFrame := http2.SettingsFrame{FrameHeader: http2.FrameHeader{Type: http2.FrameSettings, Flags: http2.FlagSettingsAck, Length: 0}}
+				http2.WriteFrame(&clientSettingsAckBuf, &settingsAckFrame)
+
+				readDataForMockC := append([]byte(http2.ClientPreface), clientSettingsBuf.Bytes()...)
+				readDataForMockC = append(readDataForMockC, clientSettingsAckBuf.Bytes()...)
+				concreteMockNc.SetReadBuffer(readDataForMockC)
+			} else {
+				// If nc is not *mockConn, this test setup is problematic.
+				// This can happen if nc is quickEOFConn from previous test logic, needs careful mock management.
+				// For this specific subtest, newHTTP2Connection should be called with mockNetC.
+				t.Logf("Warning: newHTTP2Connection called with nc of type %T, expected *mockConn", nc)
+			}
+
+			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+		}
+
+		acceptCallCount := 0
+		ml.AcceptFunc = func() (net.Conn, error) {
+			acceptCallCount++
+			if acceptCallCount == 1 {
+				return mockNetC, nil
+			}
+			return nil, net.ErrClosed
+		}
+
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+
+		// Wait for handleTCPConnection to be called for mockNetC
+		select {
+		case <-handleTCPConnCalledForMockC:
+			// Successfully called for mockNetC
+		case <-time.After(1 * time.Second): // Increased timeout to allow for internal processing in http2.Connection
+			t.Fatal("handleTCPConnection was not called for mockNetC within timeout")
+		}
+
+		// Wait for acceptLoop to finish (it will after getting net.ErrClosed)
+		select {
+		case <-acceptLoopDone:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("acceptLoop did not terminate within timeout after processing connection")
+		}
+
+		if !newH2ConnCalled {
+			t.Error("newHTTP2Connection was not called by handleTCPConnection (flag check)")
+		}
+		if acceptedNetConn != mockNetC {
+			t.Errorf("handleTCPConnection called with wrong net.Conn. Expected %p, got %p", mockNetC, acceptedNetConn)
+		}
+		if acceptCallCount != 2 {
+			t.Errorf("Expected mockListener.Accept to be called twice, got %d", acceptCallCount)
+		}
+
+		if err := mockNetC.WaitCloseCalled(200 * time.Millisecond); err != nil { // Slightly increased timeout
+			t.Errorf("Accepted mockNetC was not closed: %v", err)
+		}
+	})
+
+	t.Run("TerminatesOnStopAcceptingChannelClose", func(t *testing.T) {
+		lg := newMockLogger(nil)
+		s := newTestSrvForAcceptLoop(t, lg)
+		ml := newMockListener("127.0.0.1:8080")
+
+		acceptStarted := make(chan struct{})
+		ml.AcceptFunc = func() (net.Conn, error) {
+			close(acceptStarted)
+			<-s.stopAccepting
+			return nil, net.ErrClosed
+		}
+
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+
+		select {
+		case <-acceptStarted:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("mockListener.Accept was not called")
+		}
+
+		close(s.stopAccepting)
+
+		select {
+		case <-acceptLoopDone:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("acceptLoop did not terminate after s.stopAccepting was closed")
+		}
+	})
+
+	t.Run("HandlesTemporaryAcceptErrorAndRetries", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s := newTestSrvForAcceptLoop(t, lg)
+		ml := newMockListener("127.0.0.1:8080")
+
+		tempErr := &net.DNSError{Err: "temporary network glitch", IsTemporary: true}
+		acceptCallCount := 0
+		ml.AcceptFunc = func() (net.Conn, error) {
+			acceptCallCount++
+			if acceptCallCount == 1 {
+				return nil, tempErr
+			}
+			return nil, net.ErrClosed
+		}
+
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+
+		select {
+		case <-acceptLoopDone:
+		case <-time.After(1 * time.Second):
+			t.Fatal("acceptLoop did not terminate")
+		}
+
+		if acceptCallCount < 2 {
+			t.Errorf("Expected at least 2 calls to Accept (one for retry), got %d", acceptCallCount)
+		}
+		logs := logBuf.String()
+		if !strings.Contains(logs, "Accept error; retrying") || !strings.Contains(logs, tempErr.Error()) {
+			t.Errorf("Expected log message for retrying after temporary error, not found or incorrect. Logs: %s", logs)
+		}
+	})
+}
