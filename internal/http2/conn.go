@@ -518,6 +518,7 @@ func (c *Connection) getStream(id uint32) (*Stream, bool) {
 //
 // errCode: The HTTP/2 error code to use if an RST_STREAM needs to be sent or for logging the reason for removal.
 func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode ErrorCode) {
+	c.log.Debug("removeStream: Entered", logger.LogFields{"stream_id": id, "initiated_by_peer_arg": initiatedByPeer, "err_code_arg": errCode.String()})
 	var streamToClose *Stream
 	var found bool
 
@@ -525,6 +526,7 @@ func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode Error
 	streamToClose, found = c.streams[id]
 	if found {
 		delete(c.streams, id)
+		c.log.Debug("removeStream: Stream deleted from map", logger.LogFields{"stream_id": id})
 		if initiatedByPeer {
 			if c.concurrentStreamsInbound > 0 {
 				c.concurrentStreamsInbound--
@@ -1561,10 +1563,12 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 
 	// Stream found. Delegate to the stream to handle its state transition to Closed
 	// and to clean up its local resources (pipes, context, fcManager).
+	c.log.Debug("dispatchRSTStreamFrame: Calling stream.handleRSTStreamFrame", logger.LogFields{"stream_id": streamID})
 	stream.handleRSTStreamFrame(errorCode)
 
 	// After the stream has processed the RST_STREAM internally (is marked as closed and resources cleaned),
 	// remove it from the connection's active streams map and priority tree.
+	c.log.Debug("dispatchRSTStreamFrame: Calling c.removeClosedStream", logger.LogFields{"stream_id": streamID})
 	c.removeClosedStream(stream)
 
 	return nil
@@ -2620,7 +2624,7 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 		}
 		c.streamsMu.Unlock()
 
-		c.log.Debug("Serve (reader) loop exiting.", logger.LogFields{"final_error_for_close": err, "remote_addr": c.remoteAddrStr})
+		c.log.Debug("Serve (reader) loop exiting.", logger.LogFields{"error_to_return": err, "remote_addr": c.remoteAddrStr})
 
 		if c.readerDone != nil {
 			select {
@@ -2629,7 +2633,10 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				close(c.readerDone)
 			}
 		}
-		c.Close(err)
+		// DO NOT CALL c.Close(err) here. The caller of Serve (e.g. server.handleTCPConnection)
+		// is responsible for calling conn.Close() with the error returned by Serve.
+		// This Serve function's primary role is to read and dispatch frames.
+		// If it exits, it signals why, and the owner manages the Connection object's ultimate fate.
 	}()
 
 	// If this is a server-side connection, Serve is called *after* ServerHandshake has succeeded.

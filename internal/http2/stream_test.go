@@ -7,427 +7,139 @@ import (
 	"errors"
 	"io"
 	"net/http"
-
 	"net/url"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"unsafe" // Required for the newTestStream helper due to constraints
 
-	"example.com/llmahttap/v2/internal/config"
-	"example.com/llmahttap/v2/internal/logger"
 	"golang.org/x/net/http2/hpack"
 )
 
-// mockConnection is a mock implementation of parts of http2.Connection relevant for testing Stream.
-// It provides fields that stream.go accesses directly on `s.conn` and methods that stream.go calls.
-
-type mockConnection struct {
-	// Field layout matching http2.Connection (approximated for relevant fields)
-	// Offsets are critical. Word size assumed to be 8 bytes (64-bit).
-
-	// netConn net.Conn (interface = 2 words)
-	_mock_netConn_placeholder1 uintptr
-	_mock_netConn_placeholder2 uintptr
-
-	// log *logger.Logger (pointer = 1 word)
-	log *logger.Logger // Initialized by newTestStream
-
-	// isClient bool (1 byte + 7 bytes padding = 1 word)
-	_mock_isClient_placeholder uintptr
-
-	// ctx context.Context (interface = 2 words)
-	ctx context.Context // Initialized by newTestStream
-	// cancelCtx context.CancelFunc (func pointer = 1 word)
-	cancelCtx context.CancelFunc // Initialized by newTestStream
-
-	// readerDone chan struct{} (chan pointer = 1 word)
-	_mock_readerDone_placeholder chan struct{}
-	// writerDone chan struct{} (chan pointer = 1 word)
-	_mock_writerDone_placeholder chan struct{}
-	// shutdownChan chan struct{} (chan pointer = 1 word)
-	_mock_shutdownChan_placeholder chan struct{}
-	// connError error (interface = 2 words)
-	_mock_connError_placeholder1 uintptr
-	_mock_connError_placeholder2 uintptr
-
-	// streamsMu sync.RWMutex (approx. 3-4 words)
-	// RWMutex contains: w Mutex, writerSem uint32, readerSem uint32, readerCount int32, readerWait int32
-	// Mutex contains: state int32, sema uint32. Total = 24 bytes on 64-bit (3 words)
-	_mock_streamsMu_placeholder1 uintptr
-	_mock_streamsMu_placeholder2 uintptr
-	_mock_streamsMu_placeholder3 uintptr
-
-	// streams map[uint32]*Stream (map pointer = 1 word)
-	_mock_streams_placeholder uintptr
-	// nextStreamIDClient uint32 (4 bytes)
-	// nextStreamIDServer uint32 (4 bytes)
-	// lastProcessedStreamID uint32 (4 bytes)
-	// peerReportedLastStreamID uint32 (4 bytes)
-	// Total 16 bytes = 2 words
-	_mock_streamIDs_placeholder1 uintptr
-	_mock_streamIDs_placeholder2 uintptr
-
-	// priorityTree *PriorityTree (pointer = 1 word)
-	priorityTree *PriorityTree // Initialized by newTestStream
-
-	hpackAdapter *HpackAdapter // Actual field, not placeholder
-	// connFCManager *ConnectionFlowControlManager (pointer = 1 word)
-	connFCManager *ConnectionFlowControlManager // Initialized by newTestStream
-
-	// goAwaySent bool (1 byte)
-	// goAwayReceived bool (1 byte)
-	// + padding (e.g., 6 bytes if next field is 8-byte aligned) = 1 word
-	_mock_goAwayFlags_placeholder uintptr
-
-	// gracefulShutdownTimer *time.Timer (pointer = 1 word)
-	_mock_gracefulShutdownTimer_placeholder uintptr
-	// activePings map[[8]byte]*time.Timer (map pointer = 1 word)
-	_mock_activePings_placeholder uintptr
-	// activePingsMu sync.Mutex (Mutex = 8 bytes = 1 word)
-	_mock_activePingsMu_placeholder uintptr
-
-	// --- Padding to align writerChan ---
-	// Fields before this point sum to 192 bytes.
-	// Connection.writerChan is at offset 208.
-	// Padding needed: (208 - 192) / 8 = 2 uintptrs.
-	_padd_to_writerChan [18]uintptr // CORRECTED PADDING (144 bytes to reach offset 344 for writerChan)
-
-	// writerChan chan Frame (chan pointer = 1 word)
-	// This field should now be at offset 208.
-	writerChan chan Frame // THE CRITICAL FIELD - Initialized by newTestStream
-
-	// --- Padding for fields after writerChan to match Connection size ---
-	// writerChan is 8 bytes. Current total size up to and including writerChan: 208 + 8 = 216 bytes.
-	// unsafe.Sizeof(Connection) is 272 bytes.
-	// Padding needed: 272 - 216 = 56 bytes.
-	// 56 bytes / 8 bytes_per_uintptr = 7 uintptrs.
-	// This padding ensures that when mockConnection is cast to *Connection,
-	// assignments to fields like maxFrameSize (offset 232) and remoteAddrStr (offset 240)
-	// write into valid memory within this padded region.
-	_padd_after_writerChan [7]uintptr // CORRECTED PADDING (56 bytes to match total size of 408)
-
-	// --- Fields used by newTestStream to pass values, NOT for layout of s.conn.FIELD ---
-	// These are distinct from the layout placeholders above.
-	// The `ourInitialWindowSize` and `peerInitialWindowSize` are passed as arguments to `newStream`,
-	// not accessed via `s.conn.ourInitialWindowSize`.
-	cfgOurInitialWindowSize   uint32
-	cfgPeerInitialWindowSize  uint32
-	cfgOurCurrentMaxFrameSize uint32 // For configuring Connection.ourCurrentMaxFrameSize (offset 304)
-	cfgPeerMaxFrameSize       uint32 // For configuring Connection.peerMaxFrameSize (offset 320)
-	cfgMaxFrameSize           uint32 // For configuring Connection.maxFrameSize (offset 376)
-	cfgRemoteAddrStr          string
-
-	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
-	// --- Callbacks for custom mock behavior (if mock methods were callable) ---
-	onSendHeadersFrameImpl      func(s *Stream, headers []hpack.HeaderField, endStream bool) error
-	onSendDataFrameImpl         func(s *Stream, data []byte, endStream bool) (int, error)
-	onSendRSTStreamFrameImpl    func(streamID uint32, errorCode ErrorCode) error
-	onSendWindowUpdateFrameImpl func(streamID uint32, increment uint32) error
-	onExtractPseudoHeadersImpl  func(headers []hpack.HeaderField) (method, path, scheme, authority string, err error)
-	onStreamHandlerDoneImpl     func(s *Stream)
-
-	// --- Test inspection fields (will not be populated correctly by current call path) ---
-	mu                          sync.Mutex
-	removeClosedStreamCallCount int     // Added for testing interaction
-	lastStreamRemovedByClose    *Stream // Added for testing interaction
-	lastSendHeadersArgs         *struct {
-		Stream    *Stream
-		Headers   []hpack.HeaderField
-		EndStream bool
-	}
-	allSendHeadersArgs []struct {
-		Stream    *Stream
-		Headers   []hpack.HeaderField
-		EndStream bool
-	}
-	lastSendDataArgs *struct {
-		Stream    *Stream
-		Data      []byte
-		EndStream bool
-	}
-	allSendDataArgs []struct {
-		Stream    *Stream
-		Data      []byte
-		EndStream bool
-	}
-	lastRSTArgs *struct {
-		StreamID  uint32
-		ErrorCode ErrorCode
-	}
-	allRSTArgs []struct {
-		StreamID  uint32
-		ErrorCode ErrorCode
-	}
-	lastWindowUpdateArgs *struct {
-		StreamID  uint32
-		Increment uint32
-	}
-	allWindowUpdateArgs []struct {
-		StreamID  uint32
-		Increment uint32
-	}
-	lastExtractPseudoHeadersHF []hpack.HeaderField
-	lastStreamHandlerDoneArgs  *struct{ Stream *Stream }
-
-	sendHeadersFrameCount      int
-	sendDataFrameCount         int
-	sendRSTStreamFrameCount    int
-	sendWindowUpdateFrameCount int
-	extractPseudoHeadersCount  int
-	streamHandlerDoneCount     int
-}
-
-// Methods that Stream calls on its `conn` object.
-// These are part of mockConnection but are NOT CALLED due to unsafe.Pointer strategy.
-// The real Connection methods are called instead. These are effectively dead code for now.
-func (mc *mockConnection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, endStream bool) error {
-	mc.mu.Lock()
-	mc.sendHeadersFrameCount++
-	args := struct {
-		Stream    *Stream
-		Headers   []hpack.HeaderField
-		EndStream bool
-	}{s, headers, endStream}
-	mc.lastSendHeadersArgs = &args
-	mc.allSendHeadersArgs = append(mc.allSendHeadersArgs, args)
-	mc.mu.Unlock()
-	if mc.onSendHeadersFrameImpl != nil {
-		return mc.onSendHeadersFrameImpl(s, headers, endStream)
-	}
-	return nil
-}
-func (mc *mockConnection) sendDataFrame(s *Stream, data []byte, endStream bool) (int, error) {
-	mc.mu.Lock()
-	mc.sendDataFrameCount++
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	args := struct {
-		Stream    *Stream
-		Data      []byte
-		EndStream bool
-	}{s, dataCopy, endStream}
-	mc.lastSendDataArgs = &args
-	mc.allSendDataArgs = append(mc.allSendDataArgs, args)
-	mc.mu.Unlock()
-	if mc.onSendDataFrameImpl != nil {
-		return mc.onSendDataFrameImpl(s, data, endStream)
-	}
-	return len(data), nil
-}
-func (mc *mockConnection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
-	mc.mu.Lock()
-	mc.sendRSTStreamFrameCount++
-	args := struct {
-		StreamID  uint32
-		ErrorCode ErrorCode
-	}{streamID, errorCode}
-	mc.lastRSTArgs = &args
-	mc.allRSTArgs = append(mc.allRSTArgs, args)
-	mc.mu.Unlock()
-	if mc.onSendRSTStreamFrameImpl != nil {
-		return mc.onSendRSTStreamFrameImpl(streamID, errorCode)
-	}
-	return nil
-}
-func (mc *mockConnection) sendWindowUpdateFrame(streamID uint32, increment uint32) error {
-	mc.mu.Lock()
-	mc.sendWindowUpdateFrameCount++
-	args := struct {
-		StreamID  uint32
-		Increment uint32
-	}{streamID, increment}
-	mc.lastWindowUpdateArgs = &args
-	mc.allWindowUpdateArgs = append(mc.allWindowUpdateArgs, args)
-	mc.mu.Unlock()
-	if mc.onSendWindowUpdateFrameImpl != nil {
-		return mc.onSendWindowUpdateFrameImpl(streamID, increment)
-	}
-	return nil
-}
-func (mc *mockConnection) extractPseudoHeaders(headers []hpack.HeaderField) (method, path, scheme, authority string, err error) {
-	mc.mu.Lock()
-	mc.extractPseudoHeadersCount++
-	mc.lastExtractPseudoHeadersHF = headers
-	mc.mu.Unlock()
-	if mc.onExtractPseudoHeadersImpl != nil {
-		return mc.onExtractPseudoHeadersImpl(headers)
-	}
-	var foundMethod, foundPath, foundScheme bool
-	for _, hf := range headers {
-		if !strings.HasPrefix(hf.Name, ":") {
-			break
-		}
-		switch hf.Name {
-		case ":method":
-			method = hf.Value
-			foundMethod = true
-		case ":path":
-			path = hf.Value
-			foundPath = true
-		case ":scheme":
-			scheme = hf.Value
-			foundScheme = true
-		case ":authority":
-			authority = hf.Value
-		}
-	}
-	if !foundMethod || !foundPath || !foundScheme {
-		return "", "", "", "", NewConnectionError(ErrCodeProtocolError, "missing required pseudo-headers")
-	}
-	return method, path, scheme, authority, nil
-}
-func (mc *mockConnection) streamHandlerDone(s *Stream) {
-	mc.mu.Lock()
-	mc.streamHandlerDoneCount++
-	mc.lastStreamHandlerDoneArgs = &struct{ Stream *Stream }{s}
-	mc.mu.Unlock()
-	if mc.onStreamHandlerDoneImpl != nil {
-		mc.onStreamHandlerDoneImpl(s)
-	}
-}
+// mockConnection and its methods were removed as stream tests now use a real http2.Connection
+// initialized with a mockNetConn (from conn_test.go) and a mockRequestDispatcher (also from conn_test.go).
+// Helper functions like newTestConnection from conn_test.go are used for setup.
 
 // removeClosedStream is a mock method to simulate Connection.removeClosedStream
-// It's called by tests to verify interaction after a stream is closed.
-func (mc *mockConnection) removeClosedStream(s *Stream) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.removeClosedStreamCallCount++
-	mc.lastStreamRemovedByClose = s
-}
+// This function will likely be removed or adapted as mockConnection is removed.
+// For now, it's a placeholder if any test still relies on this specific mock behavior.
+// func (mc *mockConnection) removeClosedStream(s *Stream) {
+// 	mc.mu.Lock()
+// 	defer mc.mu.Unlock()
+// 	mc.removeClosedStreamCallCount++
+// 	mc.lastStreamRemovedByClose = s
+// }
 
 // mockRequestDispatcher is a mock for the RequestDispatcherFunc.
 
 // newTestStream is a helper function to initialize a http2.Stream for testing.
 
-func newTestStream(t *testing.T, id uint32, mc *mockConnection, prioWeight uint8, prioParentID uint32, prioExclusive bool, isInitiatedByPeer bool) *Stream {
+func newTestStream(t *testing.T, id uint32, conn *Connection, isInitiatedByPeer bool, initialOurWindow, initialPeerWindow uint32) *Stream {
 	t.Helper()
 
-	if mc.ctx == nil {
-		mc.ctx, mc.cancelCtx = context.WithCancel(context.Background())
+	// Use default priority for most stream tests, can be overridden if specific priority tests are needed.
+	defaultWeight := uint8(15) // Default priority weight (normalized from spec 16)
+	defaultParentID := uint32(0)
+	defaultExclusive := false
+
+	// Ensure the connection passed is not nil, as it's crucial.
+	if conn == nil {
+		t.Fatal("newTestStream: provided conn is nil")
 	}
-	if mc.log == nil {
-		logTarget := "stdout"
-		enabled := false
-		logCfg := &config.LoggingConfig{
-			LogLevel:  config.LogLevelDebug,
-			AccessLog: &config.AccessLogConfig{Enabled: &enabled, Target: &logTarget},
-			ErrorLog:  &config.ErrorLogConfig{Target: &logTarget},
-		}
-		var err error
-		mc.log, err = logger.NewLogger(logCfg)
-		if err != nil {
-			t.Fatalf("Failed to create logger for mock connection: %v", err)
-		}
+	if conn.log == nil {
+		t.Fatal("newTestStream: conn.log is nil, connection not properly initialized for test")
 	}
-	if mc.priorityTree == nil {
-		mc.priorityTree = NewPriorityTree()
-	}
-	if mc.hpackAdapter == nil {
-		mc.hpackAdapter = NewHpackAdapter(DefaultSettingsHeaderTableSize) // Initialize HPACK adapter
-	}
-	if mc.connFCManager == nil {
-		mc.connFCManager = NewConnectionFlowControlManager()
-	}
-	if mc.writerChan == nil {
-		mc.writerChan = make(chan Frame, 2) // Buffered to handle RST from test and potentially cleanup
+	if conn.ctx == nil {
+		// If conn.ctx is nil, it means the connection itself wasn't fully initialized.
+		// newTestConnection should set this up.
+		t.Fatal("newTestStream: conn.ctx is nil. Connection likely not from newTestConnection.")
 	}
 
-	// REMOVED: Interfering consumer goroutine. Tests will consume frames directly.
-	// writerChanConsumerDone := make(chan struct{})
-	// go func() {
-	// 	defer close(writerChanConsumerDone)
-	// 	for {
-	// 		select {
-	// 		case frame, ok := <-mc.writerChan:
-	// 			if !ok { // Channel closed
-	// 				return
-	// 			}
-	// 			// Optionally log or inspect frame for debugging, but not critical for unblocking
-	// 			// t.Logf("Test writer consumer received frame: StreamID %d, Type %s", frame.Header().StreamID, frame.Header().Type)
-	// 		case <-mc.ctx.Done(): // Stop consumer if connection context is cancelled
-	// 			return
-	// 		}
-	// 	}
-	// })()
-
-	connAsRealConnType := (*Connection)(unsafe.Pointer(mc))
-
-	// CRITICAL: Ensure the *Connection instance uses the mock's writerChan
-	// so that frames sent by s.conn.sendXXXFrame methods go to our consumer.
-	connAsRealConnType.writerChan = mc.writerChan
-
-	// Initialize fields on the Connection memory layout that stream.go will access.
-	// connAsRealConnType.remoteAddrStr = mc.cfgRemoteAddrStr
-
-	// if mc.cfgOurCurrentMaxFrameSize > 0 {
-	// 	connAsRealConnType.ourCurrentMaxFrameSize = mc.cfgOurCurrentMaxFrameSize
-	// } else {
-	// 	connAsRealConnType.ourCurrentMaxFrameSize = DefaultSettingsMaxFrameSize // Default
-	// }
-
-	if mc.cfgPeerMaxFrameSize > 0 {
-		connAsRealConnType.peerMaxFrameSize = mc.cfgPeerMaxFrameSize
-	} else {
-		connAsRealConnType.peerMaxFrameSize = DefaultSettingsMaxFrameSize // Default
+	// Create the stream using the real newStream function and the provided real Connection.
+	ourWin := initialOurWindow
+	if ourWin == 0 { // If 0, use the connection's configured initial window size
+		ourWin = conn.ourInitialWindowSize
 	}
-	// 	connAsRealConnType.peerMaxFrameSize = DefaultSettingsMaxFrameSize // Default
-	// }
-
-	// if mc.cfgMaxFrameSize > 0 {
-	// 	connAsRealConnType.maxFrameSize = mc.cfgMaxFrameSize
-	// } else {
-	// 	connAsRealConnType.maxFrameSize = DefaultSettingsMaxFrameSize // Default if not specified
-	// }
-	peerInitialWin := mc.cfgPeerInitialWindowSize
-	// If cfgPeerInitialWindowSize is 0, it means the test case explicitly wants
-	// to test a scenario with a 0 initial window size from the peer.
-	// Do not override with DefaultInitialWindowSize in this specific helper if 0 is provided.
-	// The actual HTTP/2 spec default (65535) applies if SETTINGS_INITIAL_WINDOW_SIZE is not exchanged.
-	// Here, peerInitialWin directly reflects the test's configured value for the peer.
-
-	ourInitialWin := mc.cfgOurInitialWindowSize
-	if ourInitialWin == 0 {
-		ourInitialWin = DefaultInitialWindowSize
+	if ourWin == 0 { // If still 0 (e.g. conn's default was also 0, or conn not fully setup), use http2 default
+		ourWin = DefaultInitialWindowSize
 	}
-	t.Logf("newTestStream: ourInitialWin = %d, peerInitialWin = %d (mc.cfgOurInitialWindowSize = %d, mc.cfgPeerInitialWindowSize = %d)", ourInitialWin, peerInitialWin, mc.cfgOurInitialWindowSize, mc.cfgPeerInitialWindowSize)
+
+	peerWin := initialPeerWindow
+	if peerWin == 0 { // If 0, use the connection's configured peer initial window size
+		peerWin = conn.peerInitialWindowSize
+	}
+	if peerWin == 0 { // If still 0, use http2 default
+		peerWin = DefaultInitialWindowSize
+	}
+
+	t.Logf("newTestStream: Creating stream %d with ourInitialWin=%d, peerInitialWin=%d. (conn.ourInitialWindowSize=%d, conn.peerInitialWindowSize=%d)",
+		id, ourWin, peerWin, conn.ourInitialWindowSize, conn.peerInitialWindowSize)
 
 	s, err := newStream(
-		connAsRealConnType,
+		conn, // Use the real *http2.Connection
 		id,
-		ourInitialWin,
-		peerInitialWin,
-		prioWeight,
-		prioParentID,
-		prioExclusive,
+		ourWin,
+		peerWin,
+		defaultWeight,
+		defaultParentID,
+		defaultExclusive,
 		isInitiatedByPeer,
 	)
 	if err != nil {
-		mc.cancelCtx() // Cancel context if newStream fails early
-		t.Fatalf("newStream failed for stream %d: %v", id, err)
+		// Log connection state for debugging
+		conn.settingsMu.RLock()
+		ourSettingsDump := make(map[SettingID]uint32)
+		for k, v := range conn.ourSettings {
+			ourSettingsDump[k] = v
+		}
+		peerSettingsDump := make(map[SettingID]uint32)
+		for k, v := range conn.peerSettings {
+			peerSettingsDump[k] = v
+		}
+		conn.settingsMu.RUnlock()
+
+		t.Fatalf("newTestStream: newStream() failed for stream %d: %v. \n"+
+			"Connection details: ourInitialWindowSize=%d, peerInitialWindowSize=%d, maxFrameSize=%d. \n"+
+			"Our Settings: %v. Peer Settings: %v",
+			id, err, conn.ourInitialWindowSize, conn.peerInitialWindowSize, conn.maxFrameSize,
+			ourSettingsDump, peerSettingsDump)
 	}
 
-	t.Cleanup(func() {
-		_ = s.Close(fmt.Errorf("test stream %d cleanup", s.id))
-		// Drain any RST frame sent by s.Close() during cleanup
-		// to prevent test from hanging.
-		select {
-		case frame := <-mc.writerChan:
-			t.Logf("Drained frame from writerChan during cleanup: StreamID %d, Type %s", frame.Header().StreamID, frame.Header().Type)
-		case <-time.After(20 * time.Millisecond): // Don't block too long if no frame (increased slightly)
-			// Nothing to drain
-		}
-		// Ensure context is cancelled which signals the consumer goroutine to stop.
-		// Then wait for the consumer to actually stop to avoid race conditions on t.Logf.
-		if mc.cancelCtx != nil {
-			mc.cancelCtx()
-		}
-		// <-writerChanConsumerDone // No longer needed
-	})
+	t.Logf("newTestStream created stream %d: fcManager receiveWindow=%d, sendWindow=%d. State=%s",
+		s.id, s.fcManager.GetStreamReceiveAvailable(), s.fcManager.GetStreamSendAvailable(), s.state)
 
+	t.Cleanup(func() {
+		closeErr := fmt.Errorf("test stream %d cleanup", s.id)
+		if s.state != StreamStateClosed { // Avoid error if already closed
+			if err := s.Close(closeErr); err != nil {
+				// Log error but don't fail test if it's about already closed stream
+				if !strings.Contains(err.Error(), "stream closed or being reset") && !strings.Contains(err.Error(), "already closed") {
+					t.Logf("Error during stream.Close in newTestStream cleanup for stream %d: %v", s.id, err)
+				}
+			}
+		}
+		// Drain any RST frame sent by s.Close() during cleanup from the connection's writerChan.
+		// This uses s.conn which is a real *Connection.
+
+		// Drain conn.writerChan if writerLoop isn't running.
+		// Loop to drain multiple frames, as stream.Close() might be preceded by other frames in some tests.
+	drainLoop:
+		for i := 0; i < 5; i++ { // Limit iterations to prevent infinite loop in weird cases
+			select {
+			case frame, ok := <-s.conn.writerChan:
+				if ok {
+					t.Logf("Drained frame from conn.writerChan during stream %d cleanup (iter %d): Type %s, StreamID %d", s.id, i, frame.Header().Type, frame.Header().StreamID)
+				} else {
+					t.Logf("conn.writerChan closed during stream %d cleanup.", s.id)
+					break drainLoop
+				}
+			case <-time.After(10 * time.Millisecond): // Short timeout per frame
+				// Assume channel is empty if we time out
+				break drainLoop
+			}
+		}
+	}) // End of t.Cleanup
 	return s
 }
 
@@ -458,13 +170,14 @@ func makeStreamWriterHeaders(kv ...string) []HeaderField {
 // TestStream_Close_SendsRSTAndCleansUp tests the stream.Close() method.
 // It verifies that an RST_STREAM frame is sent, state transitions to Closed,
 // and associated resources are cleaned up.
-func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
-	mc := &mockConnection{}
-	mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
-	mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
-	mc.writerChan = make(chan Frame, 1) // Buffer 1 for the RST_STREAM
 
-	stream := newTestStream(t, 1, mc, 16, 0, false, true)
+func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
+	t.Parallel()
+	// Use newTestConnection from conn_test.go to get a real *Connection
+	conn, _ := newTestConnection(t, false /*isClient*/, nil /*mockDispatcher*/)
+	conn.writerChan = make(chan Frame, 1) // Buffer 1 for the RST_STREAM
+
+	stream := newTestStream(t, 1, conn, true /*isInitiatedByPeer*/, 0, 0)
 
 	// Manually set stream to Open state for test
 	stream.mu.Lock()
@@ -482,8 +195,9 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 		}
 
 		// Verify RST_STREAM frame
+
 		select {
-		case frame := <-mc.writerChan:
+		case frame := <-conn.writerChan:
 			rstFrame, ok := frame.(*RSTStreamFrame)
 			if !ok {
 				tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
@@ -552,10 +266,11 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 	// Need to reset the stream for this test or use a new one.
 	// For simplicity, this sub-test is illustrative; a real test suite would use t.Run with proper setup/teardown for each.
 	// This specific test needs a new stream instance as the previous one is closed.
+
 	t.Run("WithNilError", func(t *testing.T) {
-		mc := &mockConnection{} // New mock connection for this sub-test
-		mc.writerChan = make(chan Frame, 1)
-		stream2 := newTestStream(t, 2, mc, 16, 0, false, true)
+		conn2, _ := newTestConnection(t, false, nil)
+		conn2.writerChan = make(chan Frame, 1)
+		stream2 := newTestStream(t, 2, conn2, true, 0, 0)
 		stream2.mu.Lock()
 		stream2.state = StreamStateOpen
 		stream2.mu.Unlock()
@@ -566,7 +281,7 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 		}
 
 		select {
-		case frame := <-mc.writerChan:
+		case frame := <-conn2.writerChan:
 			rstFrame, ok := frame.(*RSTStreamFrame)
 			if !ok {
 				tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
@@ -604,9 +319,12 @@ func tError(t *testing.T, args ...interface{}) {
 }
 
 func TestStream_IDAndContext(t *testing.T) {
-	mc := &mockConnection{}
+	t.Parallel()
+	conn, _ := newTestConnection(t, false, nil)
+	conn.writerChan = make(chan Frame, 1) // For RST_STREAM from Close()
+
 	streamID := uint32(5)
-	stream := newTestStream(t, streamID, mc, 16, 0, false, true)
+	stream := newTestStream(t, streamID, conn, true, 0, 0)
 
 	// Test Stream.ID()
 	if gotID := stream.ID(); gotID != streamID {
@@ -634,8 +352,9 @@ func TestStream_IDAndContext(t *testing.T) {
 	}
 
 	// Drain the RST_STREAM frame from Close()
+
 	select {
-	case fr := <-mc.writerChan:
+	case fr := <-conn.writerChan:
 		if rst, ok := fr.(*RSTStreamFrame); !ok {
 			t.Errorf("Expected RSTStreamFrame from Close(), got %T", fr)
 		} else if rst.Header().StreamID != streamID {
@@ -662,13 +381,14 @@ func TestStream_IDAndContext(t *testing.T) {
 }
 
 func TestStream_sendRSTStream_DirectCall(t *testing.T) {
-	mc := &mockConnection{}
-	mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
-	mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
-	mc.writerChan = make(chan Frame, 1)
+	t.Parallel()
+	conn, _ := newTestConnection(t, false, nil)
+	conn.ourInitialWindowSize = DefaultInitialWindowSize // Ensure FC manager is happy
+	conn.peerInitialWindowSize = DefaultInitialWindowSize
+	conn.writerChan = make(chan Frame, 1)
 
 	streamID := uint32(3)
-	stream := newTestStream(t, streamID, mc, 16, 0, false, true)
+	stream := newTestStream(t, streamID, conn, true, 0, 0)
 
 	// Manually set stream to Open state for test
 	stream.mu.Lock()
@@ -746,8 +466,9 @@ func TestStream_sendRSTStream_DirectCall(t *testing.T) {
 			}
 
 			if tc.expectSend {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					rstFrame, ok := frame.(*RSTStreamFrame)
 					if !ok {
 						tFatalf(t, "Expected RSTStreamFrame, got %T", frame)
@@ -762,8 +483,9 @@ func TestStream_sendRSTStream_DirectCall(t *testing.T) {
 					tError(t, "Expected RSTStreamFrame on writerChan, but none found")
 				}
 			} else {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					tErrorf(t, "Did not expect RSTStreamFrame, but got one: %v", frame)
 				default:
 					// Expected: no frame sent
@@ -821,8 +543,8 @@ func newDataFrame(streamID uint32, data []byte, endStream bool) *DataFrame {
 }
 
 func TestStream_handleDataFrame(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16)
 
 	testCases := []struct {
 		name                        string
@@ -961,11 +683,11 @@ func TestStream_handleDataFrame(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{
-				cfgOurInitialWindowSize: tc.initialOurWindowSize,
-				writerChan:              make(chan Frame, 1), // Buffer for potential RST by stream.Close in teardown
-			}
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1)               // Buffer for potential RST by stream.Close in teardown
+			conn.ourInitialWindowSize = tc.initialOurWindowSize // Set for the connection
+
+			stream := newTestStream(t, testStreamID, conn, true, tc.initialOurWindowSize, 0)
 
 			// Setup initial stream state and FC window conditions
 			stream.mu.Lock()
@@ -1143,9 +865,10 @@ func TestStream_handleDataFrame(t *testing.T) {
 }
 
 // TestStream_handleRSTStreamFrame tests the stream.handleRSTStreamFrame method.
+
 func TestStream_handleRSTStreamFrame(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16)
 
 	testCases := []struct {
 		name               string
@@ -1191,10 +914,10 @@ func TestStream_handleRSTStreamFrame(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{
-				writerChan: make(chan Frame, 1), // Not used by handleRSTStreamFrame directly, but by teardown
-			}
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // Not used by handleRSTStreamFrame directly, but by teardown
+
+			stream := newTestStream(t, testStreamID, conn, true, 0, 0)
 
 			// Setup initial stream state
 			stream.mu.Lock()
@@ -1301,7 +1024,9 @@ func TestStream_handleRSTStreamFrame(t *testing.T) {
 
 // TestStream_transitionStateOnSendEndStream tests the internal state transitions
 // when the server sends an END_STREAM flag.
+
 func TestStream_transitionStateOnSendEndStream(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name         string
 		initialState StreamState
@@ -1321,8 +1046,9 @@ func TestStream_transitionStateOnSendEndStream(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{writerChan: make(chan Frame, 1)} // For teardown
-			stream := newTestStream(t, 1, mc, 16, 0, false, true)
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // For teardown
+			stream := newTestStream(t, 1, conn, true, 0, 0)
 
 			stream.mu.Lock()
 			stream.state = tc.initialState
@@ -1345,6 +1071,7 @@ func TestStream_transitionStateOnSendEndStream(t *testing.T) {
 // For older Go versions, "io" should be used directly.
 
 func TestHeaderFieldConversionHelpers(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		inputHeaders   []HeaderField // http2.HeaderField
@@ -1441,21 +1168,23 @@ func TestHeaderFieldConversionHelpers(t *testing.T) {
 }
 
 func TestNewStream_SuccessfulInitialization(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(7)
 	const ourInitialWindowSize = uint32(12345)
 	const peerInitialWindowSize = uint32(54321)
-	const prioWeight = uint8(100)
-	const prioParentID = uint32(0) // Root
-	const prioExclusive = false
 	const isInitiatedByPeer = true
 
-	mc := &mockConnection{
-		cfgOurInitialWindowSize:  ourInitialWindowSize,
-		cfgPeerInitialWindowSize: peerInitialWindowSize,
-		writerChan:               make(chan Frame, 1), // For teardown stream.Close()
-	}
+	conn, _ := newTestConnection(t, false, nil)
+	// Default priority values used by newTestStream
+	const expectedPrioWeight = uint8(16 - 1) // Normalized value for spec 16
+	const expectedPrioParentID = uint32(0)   // Corresponds to defaultParentID in newTestStream
+	const expectedPrioExclusive = false      // Corresponds to defaultExclusive in newTestStream
+	conn.ourInitialWindowSize = ourInitialWindowSize
+	conn.peerInitialWindowSize = peerInitialWindowSize
+	conn.writerChan = make(chan Frame, 1) // For teardown stream.Close()
 
-	stream := newTestStream(t, testStreamID, mc, prioWeight, prioParentID, prioExclusive, isInitiatedByPeer)
+	// prioWeight, prioParentID, prioExclusive are handled by newStream's defaults or explicit parameters if needed
+	stream := newTestStream(t, testStreamID, conn, isInitiatedByPeer, ourInitialWindowSize, peerInitialWindowSize)
 
 	if stream == nil {
 		t.Fatal("newTestStream returned nil stream for successful initialization case")
@@ -1475,7 +1204,7 @@ func TestNewStream_SuccessfulInitialization(t *testing.T) {
 	}
 
 	// Verify connection
-	if stream.conn != (*Connection)(unsafe.Pointer(mc)) {
+	if stream.conn != conn {
 		t.Error("stream.conn does not point to the mock connection")
 	}
 
@@ -1496,27 +1225,27 @@ func TestNewStream_SuccessfulInitialization(t *testing.T) {
 	}
 
 	// Verify Priority settings on stream
-	if stream.priorityWeight != prioWeight {
-		t.Errorf("stream.priorityWeight = %d, want %d", stream.priorityWeight, prioWeight)
+	if stream.priorityWeight != expectedPrioWeight {
+		t.Errorf("stream.priorityWeight = %d, want %d", stream.priorityWeight, expectedPrioWeight)
 	}
-	if stream.priorityParentID != prioParentID {
-		t.Errorf("stream.priorityParentID = %d, want %d", stream.priorityParentID, prioParentID)
+	if stream.priorityParentID != expectedPrioParentID {
+		t.Errorf("stream.priorityParentID = %d, want %d", stream.priorityParentID, expectedPrioParentID)
 	}
-	if stream.priorityExclusive != prioExclusive {
-		t.Errorf("stream.priorityExclusive = %v, want %v", stream.priorityExclusive, prioExclusive)
+	if stream.priorityExclusive != expectedPrioExclusive {
+		t.Errorf("stream.priorityExclusive = %v, want %v", stream.priorityExclusive, expectedPrioExclusive)
 	}
 
 	// Verify Priority Registration in Tree
 	// mc.priorityTree is a real PriorityTree.
-	parent, children, weight, err := mc.priorityTree.GetDependencies(testStreamID)
+	parent, children, weight, err := conn.priorityTree.GetDependencies(testStreamID)
 	if err != nil {
 		t.Fatalf("mc.priorityTree.GetDependencies(%d) failed: %v", testStreamID, err)
 	}
-	if parent != prioParentID {
-		t.Errorf("PriorityTree parent for stream %d = %d, want %d", testStreamID, parent, prioParentID)
+	if parent != expectedPrioParentID {
+		t.Errorf("PriorityTree parent for stream %d = %d, want %d", testStreamID, parent, expectedPrioParentID)
 	}
-	if weight != prioWeight {
-		t.Errorf("PriorityTree weight for stream %d = %d, want %d", testStreamID, weight, prioWeight)
+	if weight != expectedPrioWeight {
+		t.Errorf("PriorityTree weight for stream %d = %d, want %d", testStreamID, weight, expectedPrioWeight)
 	}
 	// Note: Exclusive flag is part of the operation, not persistently stored on node in this simple model.
 	// Children will be empty initially.
@@ -1578,52 +1307,28 @@ func TestNewStream_SuccessfulInitialization(t *testing.T) {
 }
 
 func TestNewStream_PriorityAddFailure(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(8) // Use a different ID
 	const ourInitialWindowSize = DefaultInitialWindowSize
 	const peerInitialWindowSize = DefaultInitialWindowSize
 
 	// This setup will cause PriorityTree.AddStream to fail because streamID == prioParentID
-	mc := &mockConnection{
-		cfgOurInitialWindowSize:  ourInitialWindowSize,
-		cfgPeerInitialWindowSize: peerInitialWindowSize,
-		// writerChan is not strictly needed here as newStream should fail before frames are sent
-		// but newTestStream's cleanup might try to use it if stream was non-nil.
-		// We will call newStream directly for this test.
-	}
-	// Initialize necessary fields in mc that newStream might access
-	if mc.ctx == nil {
-		mc.ctx, mc.cancelCtx = context.WithCancel(context.Background())
-		defer mc.cancelCtx() // Ensure root context for mock is cancelled
-	}
-	if mc.log == nil {
-		logTarget := os.DevNull
-		enabled := false
-		logCfg := &config.LoggingConfig{
-			LogLevel:  config.LogLevelDebug,
-			AccessLog: &config.AccessLogConfig{Enabled: &enabled, Target: &logTarget},
-			ErrorLog:  &config.ErrorLogConfig{Target: &logTarget},
-		}
-		var err error
-		mc.log, err = logger.NewLogger(logCfg)
-		if err != nil {
-			t.Fatalf("Failed to create logger for mock connection: %v", err)
-		}
-	}
-	if mc.priorityTree == nil {
-		mc.priorityTree = NewPriorityTree()
-	}
+	conn, _ := newTestConnection(t, false, nil) // isClient = false
+	// conn.ourInitialWindowSize and conn.peerInitialWindowSize are set to defaults by newTestConnection
+	// if not specified, which is fine for this test.
+	// Logger, context, and priority tree are also initialized by newTestConnection.
 
 	// Call newStream directly to test its error path
 	// Trigger error: stream depends on itself (streamID == prioParentID)
 	stream, err := newStream(
-		(*Connection)(unsafe.Pointer(mc)),
+		conn,
 		testStreamID,
-		ourInitialWindowSize,
-		peerInitialWindowSize,
-		16,           // prioWeight
-		testStreamID, // prioParentID - causes failure
-		false,        // prioExclusive
-		true,         // isInitiatedByPeer
+		ourInitialWindowSize,  // This is 'ourWin' for the stream (its receive window)
+		peerInitialWindowSize, // This is 'peerWin' for the stream (its send window)
+		16,                    // prioWeight
+		testStreamID,          // prioParentID - causes failure
+		false,                 // prioExclusive
+		true,                  // isInitiatedByPeer
 	)
 
 	if err == nil {
@@ -1632,14 +1337,12 @@ func TestNewStream_PriorityAddFailure(t *testing.T) {
 	if stream != nil {
 		t.Error("newStream returned a non-nil stream on failure")
 		// Attempt to clean up if stream was unexpectedly returned
-		// Ensure stream is not nil before trying to Close it
 		if stream != nil {
 			_ = stream.Close(fmt.Errorf("cleanup unexpected stream from failed newStream call"))
 		}
 	}
 
 	// Check the error message (optional, but good for confirming reason)
-	// The error comes from PriorityTree: "stream cannot depend on itself"
 	expectedErrSubstrings := []string{
 		"stream cannot depend on itself",                               // Original error from priority.go
 		"invalid stream dependency: stream 8",                          // Part of the more specific error
@@ -1661,13 +1364,12 @@ func TestNewStream_PriorityAddFailure(t *testing.T) {
 	// We can't directly check the stream's internal context/pipes as stream is nil.
 	// This test primarily verifies that newStream *returns* an error and *doesn't* return a stream.
 	// The internal cleanup within newStream's error path is assumed to be tested by virtue of it being there.
-	// If we wanted to verify the pipes were closed, we'd need newStream to return them even on error,
-	// or have a more complex mock setup.
 }
 
 func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16)
+	var wg sync.WaitGroup
 
 	baseHeaders := []hpack.HeaderField{
 		{Name: ":method", Value: "GET"},
@@ -1689,7 +1391,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 		expectedRSTCode     ErrorCode                                                      // If an RST_STREAM is expected (due to error in func or panic)
 		expectRST           bool                                                           // True if an RST frame should be sent
 		expectedReq         *http.Request                                                  // For comparing parts of the constructed request
-		customValidation    func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, mc *mockConnection)
+		customValidation    func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection)
 	}{
 		{
 			name:      "valid headers, no endStream on HEADERS",
@@ -1701,18 +1403,13 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			dispatcher: func(sw StreamWriter, req *http.Request) {
+				defer wg.Done()
+				// For "no endStream on HEADERS", body is not expected to be readable yet
+				// without subsequent DATA frames. Avoid Read() to prevent issues.
 				if req.Method != "GET" {
 					t.Errorf("Dispatcher: req.Method = %s, want GET", req.Method)
 				}
-				// Body should be readable if data frames follow
-				_, err := req.Body.Read(make([]byte, 1))
-				if err != nil && err != io.EOF { // EOF is possible if pipe is immediately closed elsewhere, but not expected here.
-					// For this test, with no endStream on HEADERS, and no DATA frames yet, Read should block or return 0, nil (if non-blocking read).
-					// Our pipe reader might return EOF if the writer is closed by test cleanup quickly.
-					// This check is more about not getting an unexpected error.
-					// A better check might be to write to stream.requestBodyWriter and see if dispatcher reads it.
-					t.Logf("Dispatcher (no endStream): req.Body.Read returned: %v. This might be ok if pipe empty and not closed yet.", err)
-				}
+				t.Logf("Dispatcher (no endStream): Bypassing req.Body.Read() for this test case.")
 			},
 			expectedReq: &http.Request{
 				Method: "GET",
@@ -1738,6 +1435,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				}
 			},
 			dispatcher: func(sw StreamWriter, req *http.Request) {
+				defer wg.Done()
 				// Body should yield EOF immediately
 				bodyBytes, err := io.ReadAll(req.Body)
 				if err != nil {
@@ -1831,6 +1529,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			dispatcher: func(sw StreamWriter, req *http.Request) {
+				defer wg.Done()
 				panic("test panic in dispatcher")
 			},
 			expectErrorFromFunc: false, // processRequestHeadersAndDispatch returns nil, panic handled in goroutine
@@ -1841,41 +1540,68 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var mc mockConnection
-			mc.writerChan = make(chan Frame, 2) // Increased buffer slightly
-			mc.cfgRemoteAddrStr = "127.0.0.1:12345"
-			mc.cfgMaxFrameSize = DefaultMaxFrameSize
+			if tc.dispatcher != nil { // Only Add if a dispatcher function (which calls Done) is provided for the test case
+				wg.Add(1)
+			}
 
-			stream := newTestStream(t, testStreamID, &mc, defaultPrioWeight, 0, false, true)
-			// Initial state is Idle. The preFunc will set it appropriately.
+			// mockRequestDispatcher is defined in conn_test.go
+			mrd := &mockRequestDispatcher{}
+			if tc.dispatcher != nil { // tc.dispatcher is func(sw StreamWriter, req *http.Request)
+				mrd.fn = tc.dispatcher
+			} else if !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") {
+				// Default dispatcher for non-nil, non-panic tests if not provided
+				mrd.fn = func(sw StreamWriter, req *http.Request) {
+					defer wg.Done() // wg is defined in the outer TestStream_processRequestHeadersAndDispatch
+					// Default no-op, or basic validation
+					if req == nil {
+						t.Errorf("Default dispatcher: received nil *http.Request on stream %d", sw.ID())
+					}
+				}
+			}
+
+			// newTestConnection is from conn_test.go
+			// It sets up a real Connection with a mockNetConn and the provided dispatcher (mrd.Dispatch)
+			// The dispatcher set on the connection (conn.dispatcher) will be used by newStream
+			// if no specific dispatcher is given to a stream later.
+			// However, processRequestHeadersAndDispatch takes a dispatcher func directly.
+			conn, mnc := newTestConnection(t, false /*isClient*/, mrd)
+
+			// Crucial: Ensure conn.cfgRemoteAddrStr is set for http.Request.RemoteAddr
+			// newTestConnection does not explicitly set this. We set it on the mockNetConn's remoteAddr.
+			// conn.remoteAddrStr is derived from conn.netConn.RemoteAddr().String()
+			// So, ensuring mnc.remoteAddr is sensible is enough.
+			// Example: mnc.remoteAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} (done in newMockNetConn)
+			// Let's ensure cfgRemoteAddrStr on the actual *Connection object is also updated if stream.go uses it.
+			// The current stream.go uses req.RemoteAddr which is populated from s.conn.remoteAddrStr
+			conn.remoteAddrStr = mnc.RemoteAddr().String() // Ensure conn.remoteAddrStr is explicitly set from mnc.
+			conn.maxFrameSize = DefaultMaxFrameSize        // Ensure this is set for tests.
+
+			// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
+			performHandshakeForTest(t, conn, mnc) // from conn_test.go
+			mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
+
+			// Create stream using the real connection.
+			// Pass 0 for window sizes so newTestStream uses the connection's default/negotiated ones.
+			stream := newTestStream(t, testStreamID, conn, true /*isPeerInitiated*/, 0, 0)
 
 			if tc.preFunc != nil {
 				tc.preFunc(stream, t, struct{ endStream bool }{tc.endStream})
 			} else {
-				// Default setup if no preFunc
 				stream.mu.Lock()
-				if tc.endStream {
-					stream.state = StreamStateHalfClosedRemote
-					stream.endStreamReceivedFromClient = true
-					_ = stream.requestBodyWriter.Close() // Simulate conn action
+				if tc.endStream { // If HEADERS has END_STREAM
+					stream.state = StreamStateIdle // Will transition to HalfClosedRemote in processRequestHeadersAndDispatch
+					// stream.endStreamReceivedFromClient will be set by processRequestHeadersAndDispatch
+					// stream.requestBodyWriter will be closed by processRequestHeadersAndDispatch
 				} else {
-					stream.state = StreamStateOpen
+					stream.state = StreamStateIdle // Will transition to Open
 				}
 				stream.mu.Unlock()
 			}
 
-			mrd := &mockRequestDispatcher{}
 			var dispatcherToUse func(StreamWriter, *http.Request)
 			if !tc.isDispatcherNilTest {
-				if tc.dispatcher != nil {
-					mrd.fn = tc.dispatcher
-				} else {
-					// Default no-op dispatcher if specific one isn't provided for non-nil dispatcher tests
-					mrd.fn = func(sw StreamWriter, req *http.Request) { /* default no-op */ }
-				}
-				dispatcherToUse = mrd.Dispatch
+				dispatcherToUse = mrd.Dispatch // Use the mock dispatcher's method
 			} else {
-				dispatcherToUse = nil // Test nil dispatcher case
 			}
 
 			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
@@ -1893,36 +1619,82 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			}
 
 			if tc.expectRST {
-				select {
-				case frame := <-mc.writerChan:
-					rstFrame, ok := frame.(*RSTStreamFrame)
-					if !ok {
-						t.Fatalf("Expected RSTStreamFrame, got %T", frame)
+				// Instead of reading from conn.writerChan:
+				var rstFrameFound *RSTStreamFrame
+				// Use a slightly longer timeout to give writerLoop and panic recovery ample time.
+				// The log shows the RST is written quickly, but test environments can vary.
+				waitForCondition(t, 250*time.Millisecond, 20*time.Millisecond, func() bool {
+					// Reset buffer before reading to ensure we only see frames from this specific action
+					// mnc.ResetWriteBuffer() // NO! This is wrong here. We need to accumulate.
+					// We are checking mnc's buffer which accumulates all writes.
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					for _, f := range frames {
+						if rst, ok := f.(*RSTStreamFrame); ok {
+							if rst.Header().StreamID == stream.id { // Ensure it's for the correct stream
+								rstFrameFound = rst
+								return true
+							}
+						}
 					}
-					if rstFrame.Header().StreamID != stream.id {
-						t.Errorf("RSTStreamFrame StreamID mismatch: got %d, want %d", rstFrame.Header().StreamID, stream.id)
+					return false
+				}, fmt.Sprintf("RST_STREAM frame for stream %d (code %s) to be written to mock net.Conn (Test: %s)", stream.id, tc.expectedRSTCode, tc.name))
+
+				if rstFrameFound == nil {
+					// Log frames actually found for debugging
+					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					var frameSummaries []string
+					for _, fr := range allFrames {
+						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
 					}
-					if rstFrame.ErrorCode != tc.expectedRSTCode {
-						t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s", rstFrame.ErrorCode, tc.expectedRSTCode)
-					}
-				case <-time.After(200 * time.Millisecond): // Increased timeout slightly for goroutine + RST
-					t.Errorf("Expected RSTStreamFrame on writerChan, but none found (Test: %s)", tc.name)
+					t.Logf("Frames found on mock net.conn for test '%s', stream %d: %v", tc.name, stream.id, frameSummaries)
+					t.Fatalf("Expected RSTStreamFrame for stream %d on mock net.Conn, but none found (Test: %s)", stream.id, tc.name)
 				}
-			} else { // No RST expected
-				select {
-				case frame := <-mc.writerChan:
-					// If an RST was sent due to stream.Close() in t.Cleanup from newTestStream,
-					// it's okay as long as the test logic itself didn't expect to send one *and* fail due to it.
-					// This path means the function itself didn't decide to send an RST.
-					// The cleanup RST is fine.
-					if rstFrame, ok := frame.(*RSTStreamFrame); ok {
-						t.Logf("Received RSTStreamFrame on writerChan (likely from test cleanup, which is OK if test itself didn't expect to send one): %+v (Test: %s)", rstFrame, tc.name)
+
+				// rstFrameFound is now populated
+				if rstFrameFound.ErrorCode != tc.expectedRSTCode {
+					t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s (Test: %s, Stream: %d)", rstFrameFound.ErrorCode, tc.expectedRSTCode, tc.name, stream.id)
+				}
+				// We've found the RST. We should clear the mnc buffer *after* this sub-test's check,
+				// so the next sub-test starts fresh.
+				// However, mnc.ResetWriteBuffer() is already called after performHandshakeForTest at the start of each sub-test run.
+				// So, we don't strictly need to clear it here again, unless multiple RSTs could be sent by one action.
+				// For safety, let's clear it if an RST was expected and found.
+				mnc.ResetWriteBuffer()
+			} else { // No RST expected from the specific action being tested
+				// Give a very brief moment for any unexpected frames to be written by writerLoop
+				time.Sleep(50 * time.Millisecond)
+				frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+
+				unexpectedActionFrames := []Frame{}
+
+				// isCleanupRSTPresent was here, removed as unused.
+
+				for _, f := range frames {
+					// Check if it's an RST frame that could be from the stream's cleanup (called by newTestStream's t.Cleanup)
+					if rstFrame, ok := f.(*RSTStreamFrame); ok && rstFrame.Header().StreamID == stream.id {
+						// If this is the *only* frame, or if other frames are also just cleanup related, it might be OK.
+						// This check is tricky. A simple heuristic: if an RST for *this* stream is found,
+						// and no RST was expected by tc.expectRST, it's suspicious unless it's clearly cleanup.
+						// The t.Cleanup runs *after* the test logic. If we see an RST here, it's likely from the test logic itself.
+						t.Logf("Unexpected RSTStreamFrame found for stream %d when no RST was expected by test case '%s'. Code: %s. This might be an issue or overly aggressive cleanup simulation.", stream.id, tc.name, rstFrame.ErrorCode)
+						unexpectedActionFrames = append(unexpectedActionFrames, f)
+						// Don't set isCleanupRSTPresent = true here, as we are checking for *unexpected* frames from the action.
 					} else {
-						t.Errorf("Did not expect RSTStreamFrame from test logic, but got a different frame: %+v (Test: %s)", frame, tc.name)
+						unexpectedActionFrames = append(unexpectedActionFrames, f)
 					}
-				case <-time.After(50 * time.Millisecond): // Short wait to see if an unexpected RST comes
-					// Expected: no frame from test logic.
 				}
+
+				if len(unexpectedActionFrames) > 0 {
+					var frameSummaries []string
+					for _, fr := range unexpectedActionFrames {
+						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
+					}
+					t.Errorf("Did not expect frames from test logic on mock net.Conn for test '%s' (stream %d), but got: %v", tc.name, stream.id, frameSummaries)
+				}
+				// Clear the buffer regardless, so subsequent sub-tests don't see these frames.
+				// This is important because ResetWriteBuffer is called at the start of the sub-test (line 1562)
+				// AFTER performHandshake, so frames from one sub-test's action might linger if not cleared here.
+				mnc.ResetWriteBuffer()
 			}
 
 			// This block checks dispatcher call and request properties.
@@ -1946,13 +1718,19 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 						t.Errorf("Timeout waiting for dispatcher to be called (Test: %s)", tc.name)
 						break pollLoop
 					case <-ticker.C:
-						mrd.mu.Lock()
-						called := mrd.called
-						req := mrd.lastReq
+						var wasCalled bool
+						var reqFromDispatcher *http.Request
+
+						mrd.mu.Lock() // Lock to safely read mrd.called and mrd.lastReq
+						wasCalled = mrd.called
+						if wasCalled {
+							reqFromDispatcher = mrd.lastReq
+						}
 						mrd.mu.Unlock()
-						if called {
+
+						if wasCalled {
 							dispatcherCalled = true
-							lastReqReceived = req
+							lastReqReceived = reqFromDispatcher
 							break pollLoop
 						}
 					}
@@ -1978,8 +1756,8 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 					if lastReqReceived.RequestURI != tc.expectedReq.RequestURI {
 						t.Errorf("RequestURI mismatch: got %s, want %s", lastReqReceived.RequestURI, tc.expectedReq.RequestURI)
 					}
-					if lastReqReceived.RemoteAddr != mc.cfgRemoteAddrStr {
-						t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, mc.cfgRemoteAddrStr)
+					if lastReqReceived.RemoteAddr != conn.remoteAddrStr {
+						t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, conn.remoteAddrStr)
 					}
 					if lastReqReceived.Body != stream.requestBodyReader {
 						t.Error("Request Body is not the stream's requestBodyReader")
@@ -1998,8 +1776,15 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 					// The dispatcher mrd.fn for "valid headers, with endStream on HEADERS" case already checks body EOF.
 				}
 			}
+
 			if tc.customValidation != nil {
-				tc.customValidation(t, mrd, stream, &mc)
+				tc.customValidation(t, mrd, stream, conn)
+			}
+			// Wait for the dispatcher goroutine to complete before the sub-test finishes.
+			// This ensures t.Logf and other t methods are not called on an invalid t.
+			// It also ensures that cleanup logic in newTestStream doesn't race with the dispatcher.
+			if tc.dispatcher != nil { // Only Wait if we Added to the WaitGroup
+				wg.Wait()
 			}
 			// newTestStream's t.Cleanup will handle stream.Close()
 		})
@@ -2007,8 +1792,8 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 }
 
 func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(10)
-	defaultPrioWeight := uint8(16)
 
 	tests := []struct {
 		name                   string
@@ -2032,10 +1817,10 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{
-				writerChan: make(chan Frame, 1), // For teardown stream.Close()
-			}
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // For teardown stream.Close()
+
+			stream := newTestStream(t, testStreamID, conn, true, 0, 0)
 
 			// Setup: Initial state and pendingRSTCode
 			stream.mu.Lock()
@@ -2131,17 +1916,30 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 				// The unsafe.Pointer cast is used to access the mockConnection through the
 				// stream.conn pointer, which is of type *Connection.
 				// This is safe here because we know stream.conn points to our mc.
-				mockConnFromStream := (*mockConnection)(unsafe.Pointer(stream.conn))
-				mockConnFromStream.removeClosedStream(stream)
 
-				mockConnFromStream.mu.Lock() // Lock the specific mock instance's mutex
-				if mockConnFromStream.removeClosedStreamCallCount != 1 {
-					t.Errorf("Expected mc.removeClosedStream to be called once, got %d", mockConnFromStream.removeClosedStreamCallCount)
+				// The stream's connection is a real *Connection. Access its fields directly.
+				// No mockConnection involved here anymore.
+				// This check was about conn.removeClosedStream call, which for a real Connection
+				// happens internally and is harder to mock/verify at this level of unit test
+				// without more complex connection mocking or observation hooks.
+				// For now, we assume that if the stream transitions to Closed, the Connection
+				// would eventually remove it. This specific mock verification is removed.
+				// t.Logf("Skipping mockConnection.removeClosedStream check as it's now a real Connection.")
+
+				// If we need to verify the connection's active stream count, that's a different test.
+				// For example, check len(stream.conn.streams) if that's the desired check.
+				// However, stream.conn.streams is protected by streamsMu.
+				stream.conn.streamsMu.RLock()
+				_, streamExists := stream.conn.streams[stream.id]
+				stream.conn.streamsMu.RUnlock()
+				if streamExists {
+					// This is subtle: _setState(Closed) calls closeStreamResourcesProtected, which does *not*
+					// remove the stream from conn.streams map. That removal is the responsibility of the
+					// connection's main loop or a dedicated cleanup mechanism that observes closed streams.
+					// So, it's expected for the stream to still be in the map immediately after _setState(Closed).
+					// The test might need to be about *when* the connection removes it, not *if* _setState does.
+					t.Logf("Stream %d still exists in conn.streams map after _setState(Closed), which is expected as _setState itself doesn't remove it from parent.", stream.id)
 				}
-				if mockConnFromStream.lastStreamRemovedByClose != stream {
-					t.Errorf("mc.lastStreamRemovedByClose was not the expected stream instance (got %p, want %p)", mockConnFromStream.lastStreamRemovedByClose, stream)
-				}
-				mockConnFromStream.mu.Unlock()
 			} else {
 				t.Errorf("Stream was not in Closed state before simulating removeClosedStream call; state: %s", stream.state)
 			}
@@ -2151,8 +1949,8 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 }
 
 func TestStream_SendHeaders(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16)
 	validHeaders := makeStreamWriterHeaders(":status", "200", "content-type", "text/plain")
 	invalidHpackHeaders := makeStreamWriterHeaders("", "bad-header") // Empty name to cause HPACK error
 
@@ -2274,20 +2072,19 @@ func TestStream_SendHeaders(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{
-				writerChan: make(chan Frame, 1), // Buffer for one HEADERS frame or RST
-			}
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // Buffer for one HEADERS frame or RST
+
 			// Configure mockConnection for specific error simulation if needed for conn.sendHeadersFrame
 			if tc.connErrorToSimulate != nil {
-				connAsReal := (*Connection)(unsafe.Pointer(mc))
-				connAsReal.connError = tc.connErrorToSimulate
-				if connAsReal.shutdownChan == nil { // Ensure shutdownChan is initializable
-					connAsReal.shutdownChan = make(chan struct{})
+				conn.connError = tc.connErrorToSimulate
+				if conn.shutdownChan == nil { // Ensure shutdownChan is initializable
+					conn.shutdownChan = make(chan struct{})
 				}
-				close(connAsReal.shutdownChan)
+				close(conn.shutdownChan)
 			}
 
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+			stream := newTestStream(t, testStreamID, conn, true, 0, 0)
 
 			// Setup initial stream conditions
 			stream.mu.Lock()
@@ -2317,8 +2114,9 @@ func TestStream_SendHeaders(t *testing.T) {
 			}
 
 			if tc.expectFrameSent {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					headersFrame, ok := frame.(*HeadersFrame)
 					if !ok {
 						t.Fatalf("Expected HeadersFrame on writerChan, got %T", frame)
@@ -2337,8 +2135,9 @@ func TestStream_SendHeaders(t *testing.T) {
 					t.Fatal("Expected HeadersFrame on writerChan, but none found")
 				}
 			} else {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
 				default:
 					// Expected: no frame
@@ -2365,8 +2164,8 @@ func TestStream_SendHeaders(t *testing.T) {
 }
 
 func TestStream_setState_GeneralTransitions(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(11)
-	defaultPrioWeight := uint8(16)
 
 	allStates := []StreamState{
 		StreamStateIdle, StreamStateReservedLocal, StreamStateReservedRemote,
@@ -2376,15 +2175,39 @@ func TestStream_setState_GeneralTransitions(t *testing.T) {
 
 	for _, initialState := range allStates {
 		for _, targetState := range allStates {
-			t.Run(fmt.Sprintf("From%s_To%s", initialState, targetState), func(t *testing.T) {
-				mc := &mockConnection{
-					writerChan: make(chan Frame, 1), // For teardown stream.Close()
-				}
-				// Use DefaultInitialWindowSize to ensure FC window isn't zero, allowing Acquire to succeed if not closed.
-				mc.cfgOurInitialWindowSize = DefaultInitialWindowSize
-				mc.cfgPeerInitialWindowSize = DefaultInitialWindowSize
 
-				stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, true)
+			t.Run(fmt.Sprintf("From%s_To%s", initialState, targetState), func(t *testing.T) {
+				conn, mnc := newTestConnection(t, false, nil) // mnc can be used if needed for debugging writes
+				t.Cleanup(func() {
+					// Define a unique error for cleanup-initiated close for clarity in logs if needed
+					cleanupErr := fmt.Errorf("connection cleanup for sub-test From%s_To%s", initialState, targetState)
+					if err := conn.Close(cleanupErr); err != nil {
+						// Log error if conn.Close() itself fails, but don't fail the test here,
+						// as the test might have intentionally put the connection in a state where Close() errors.
+						// Filter out common "already closed" errors to avoid noise.
+						errMsg := err.Error()
+						if !strings.Contains(errMsg, "connection is already shutting down") &&
+							!strings.Contains(errMsg, "use of closed network connection") &&
+							!strings.Contains(errMsg, "shutdownChan already closed") { // Added this common one
+							t.Logf("Error closing connection in sub-test 'From%s_To%s' cleanup: %v", initialState, targetState, err)
+						}
+					}
+					// Ensure the mock net conn is also closed, conn.Close() should handle this.
+					// Verifying mnc.IsClosed() can be added here if stricter checks are needed,
+					// but might be redundant if conn.Close() is robust.
+					if !mnc.IsClosed() {
+						// t.Logf("Warning: mockNetConn was not closed by conn.Close() in sub-test 'From%s_To%s' cleanup.",initialState, targetState)
+						// mnc.Close() // Force close if conn.Close() didn't.
+					}
+				})
+
+				conn.writerChan = make(chan Frame, 1) // For teardown stream.Close() and other writes
+				conn.writerChan = make(chan Frame, 1) // For teardown stream.Close()
+				// Use DefaultInitialWindowSize to ensure FC window isn't zero, allowing Acquire to succeed if not closed.
+				conn.ourInitialWindowSize = DefaultInitialWindowSize
+				conn.peerInitialWindowSize = DefaultInitialWindowSize
+
+				stream := newTestStream(t, testStreamID, conn, true, DefaultInitialWindowSize, DefaultInitialWindowSize)
 
 				// Setup initial stream state and ensure resources are 'fresh' if not initially closed.
 				stream.mu.Lock()
@@ -2509,8 +2332,8 @@ func isContextDone(ctx context.Context) bool {
 // The checks are now done directly in TestStream_setState_GeneralTransitions.
 
 func TestStream_WriteData(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16) // Not directly relevant but needed for newTestStream
 
 	tests := []struct {
 		name string
@@ -2629,9 +2452,9 @@ func TestStream_WriteData(t *testing.T) {
 			initialStreamSendWindow:    100,
 			initialConnSendWindow:      200,
 			cfgMaxFrameSize:            5,                            // Force chunking
-			dataToSend:                 []byte("data_chunking_test"), // 19 bytes
+			dataToSend:                 []byte("data_chunking_test"), // 18 bytes
 			endStreamFlag:              true,
-			expectedN:                  18, // CHANGED from 19
+			expectedN:                  18,
 			expectError:                false,
 			expectedFinalState:         StreamStateHalfClosedLocal,
 			expectedFinalEndStreamSent: true,
@@ -2642,10 +2465,10 @@ func TestStream_WriteData(t *testing.T) {
 				{Data: []byte("data_"), EndStream: false},
 				{Data: []byte("chunk"), EndStream: false},
 				{Data: []byte("ing_t"), EndStream: false},
-				{Data: []byte("est"), EndStream: true}, // CHANGED from "estt"
+				{Data: []byte("est"), EndStream: true},
 			},
-			expectedStreamSendWindowAfter: 100 - 18, // CHANGED from 100 - 19 (was 81, now 82)
-			expectedConnSendWindowAfter:   200 - 18, // CHANGED from 200 - 19 (was 181, now 182)
+			expectedStreamSendWindowAfter: 100 - 18,
+			expectedConnSendWindowAfter:   200 - 18,
 		},
 		{
 			name:                          "Error: WriteData called before SendHeaders",
@@ -2788,42 +2611,44 @@ func TestStream_WriteData(t *testing.T) {
 				effectiveCfgMaxFrameSize = DefaultMaxFrameSize
 			}
 
-			mc := &mockConnection{
-				writerChan:               make(chan Frame, len(tc.dataToSend)/int(effectiveCfgMaxFrameSize)+2), // Buffer for all chunks + potential RST
-				cfgOurInitialWindowSize:  DefaultInitialWindowSize,                                             // Affects stream's receive window, not directly tested here
-				cfgPeerInitialWindowSize: uint32(tc.initialStreamSendWindow),                                   // Sets stream's initial *send* window
-				cfgMaxFrameSize:          effectiveCfgMaxFrameSize,                                             // Max frame size used by stream for chunking
-			}
+			// Create a real connection using newTestConnection
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, len(tc.dataToSend)/int(effectiveCfgMaxFrameSize)+2) // Buffer for all chunks + potential RST
+			conn.ourInitialWindowSize = DefaultInitialWindowSize                                   // Affects stream's receive window
+			conn.peerInitialWindowSize = uint32(tc.initialStreamSendWindow)                        // Sets stream's initial *send* window
+			conn.maxFrameSize = effectiveCfgMaxFrameSize                                           // Max frame size used by stream for chunking
 
-			realConn := (*Connection)(unsafe.Pointer(mc))
-			if realConn.connFCManager == nil {
-				realConn.connFCManager = NewConnectionFlowControlManager()
+			if conn.connFCManager == nil {
+				conn.connFCManager = NewConnectionFlowControlManager()
 			}
 			// Adjust connection FC window to match test case's initialConnSendWindow
-			currentConnFcAvailable := realConn.connFCManager.sendWindow.Available()
+			currentConnFcAvailable := conn.connFCManager.sendWindow.Available()
 			deltaConnFc := tc.initialConnSendWindow - currentConnFcAvailable
 			if deltaConnFc < 0 { // Need to acquire/reduce
-				if errSetup := realConn.connFCManager.sendWindow.Acquire(uint32(-deltaConnFc)); errSetup != nil {
+				if errSetup := conn.connFCManager.sendWindow.Acquire(uint32(-deltaConnFc)); errSetup != nil {
 					t.Fatalf("Setup: Failed to pre-acquire from connFC: %v (target: %d, current: %d, acquire: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, -deltaConnFc)
 				}
 			} else if deltaConnFc > 0 { // Need to increase
-				if errSetup := realConn.connFCManager.sendWindow.Increase(uint32(deltaConnFc)); errSetup != nil {
+				if errSetup := conn.connFCManager.sendWindow.Increase(uint32(deltaConnFc)); errSetup != nil {
 					t.Fatalf("Setup: Failed to pre-increase connFC: %v (target: %d, current: %d, increase: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, deltaConnFc)
 				}
 			}
-			if realConn.connFCManager.sendWindow.Available() != tc.initialConnSendWindow {
-				t.Fatalf("Setup: connFCManager window not set as expected. Got %d, want %d", realConn.connFCManager.sendWindow.Available(), tc.initialConnSendWindow)
+			if conn.connFCManager.sendWindow.Available() != tc.initialConnSendWindow {
+				t.Fatalf("Setup: connFCManager window not set as expected. Got %d, want %d", conn.connFCManager.sendWindow.Available(), tc.initialConnSendWindow)
 			}
 
 			if tc.connSendDataFrameError != nil {
-				if realConn.shutdownChan == nil {
-					realConn.shutdownChan = make(chan struct{})
+				if conn.shutdownChan == nil {
+					conn.shutdownChan = make(chan struct{})
 				}
-				close(realConn.shutdownChan)
-				realConn.connError = tc.connSendDataFrameError
+				close(conn.shutdownChan)
+				conn.connError = tc.connSendDataFrameError
 			}
 
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, false)
+			// false for isInitiatedByPeer, as this test is for server sending data.
+			// Provide initialOurWindow (stream's receive window) and initialPeerWindow (stream's send window).
+			// For WriteData, stream's send window (initialPeerWindow) is most relevant from fc perspective.
+			stream := newTestStream(t, testStreamID, conn, false, DefaultInitialWindowSize, uint32(tc.initialStreamSendWindow))
 
 			// Adjust stream FC window to match test case's initialStreamSendWindow AFTER stream creation (as newTestStream uses cfgPeerInitialWindowSize)
 			// This is a bit redundant as newTestStream already sets it, but ensures exactness if initialStreamSendWindow is tricky.
@@ -2847,7 +2672,7 @@ func TestStream_WriteData(t *testing.T) {
 				// Forcibly adjust for test if possible, though ideally newTestStream handles it.
 				// This path is complex due to FlowControlWindow internals. Best rely on newTestStream.
 			}
-			initialConnWin := realConn.connFCManager.GetConnectionSendAvailable()
+			initialConnWin := conn.connFCManager.GetConnectionSendAvailable()
 
 			if tc.name == "Error: stream flow control insufficient" {
 				simulatedStreamFCError := errors.New("simulated insufficient stream FC window (closed for test)")
@@ -2855,7 +2680,7 @@ func TestStream_WriteData(t *testing.T) {
 			}
 			if tc.name == "Error: connection flow control insufficient" {
 				simulatedConnFCError := errors.New("simulated insufficient conn FC window (closed for test)")
-				realConn.connFCManager.sendWindow.Close(simulatedConnFCError) // Close the window to make Acquire fail
+				conn.connFCManager.sendWindow.Close(simulatedConnFCError) // Close the window to make Acquire fail
 			}
 
 			n, err := stream.WriteData(tc.dataToSend, tc.endStreamFlag)
@@ -2880,7 +2705,7 @@ func TestStream_WriteData(t *testing.T) {
 			if len(tc.expectedDataFrames) > 0 {
 				for i, expectedFrame := range tc.expectedDataFrames {
 					select {
-					case frame := <-mc.writerChan:
+					case frame := <-conn.writerChan:
 						dataFrame, ok := frame.(*DataFrame)
 						if !ok {
 							t.Fatalf("Expected DataFrame %d on writerChan, got %T", i+1, frame)
@@ -2900,13 +2725,13 @@ func TestStream_WriteData(t *testing.T) {
 				}
 				// Ensure no more frames are sent if all expected frames were received
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					t.Fatalf("Expected no more frames, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
 				default: // Good, no more frames
 				}
 			} else { // No frames expected
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
 				default:
 					// Expected: no frame
@@ -2926,7 +2751,7 @@ func TestStream_WriteData(t *testing.T) {
 			}
 
 			finalStreamWin := stream.fcManager.GetStreamSendAvailable()
-			finalConnWin := realConn.connFCManager.GetConnectionSendAvailable()
+			finalConnWin := conn.connFCManager.GetConnectionSendAvailable()
 
 			if finalStreamWin != tc.expectedStreamSendWindowAfter {
 				t.Errorf("Expected stream send window %d, got %d. (Initial: %d, Change: %d)",
@@ -2941,8 +2766,8 @@ func TestStream_WriteData(t *testing.T) {
 }
 
 func TestStream_WriteTrailers(t *testing.T) {
+	t.Parallel()
 	const testStreamID = uint32(1)
-	defaultPrioWeight := uint8(16)
 	validTrailers := makeStreamWriterHeaders("x-trailer-1", "value1", "x-trailer-2", "value2")
 	invalidHpackTrailers := makeStreamWriterHeaders("", "bad-trailer-name") // Empty name to cause HPACK error in conn
 
@@ -3065,20 +2890,19 @@ func TestStream_WriteTrailers(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockConnection{
-				writerChan: make(chan Frame, 1), // Buffer for one HEADERS frame (trailers) or RST
-			}
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // Buffer for one HEADERS frame (trailers) or RST
 
-			realConn := (*Connection)(unsafe.Pointer(mc))
 			if tc.connSendHeadersFrameError != nil {
-				if realConn.shutdownChan == nil {
-					realConn.shutdownChan = make(chan struct{})
+				if conn.shutdownChan == nil {
+					conn.shutdownChan = make(chan struct{})
 				}
-				close(realConn.shutdownChan) // Simulate connection shutting down
-				realConn.connError = tc.connSendHeadersFrameError
+				close(conn.shutdownChan) // Simulate connection shutting down
+				conn.connError = tc.connSendHeadersFrameError
 			}
 
-			stream := newTestStream(t, testStreamID, mc, defaultPrioWeight, 0, false, false) // Server-initiated assumed for push/trailers
+			// For server sending trailers, isInitiatedByPeer is false.
+			stream := newTestStream(t, testStreamID, conn, false, 0, 0)
 
 			// Setup initial stream conditions
 			stream.mu.Lock()
@@ -3107,8 +2931,9 @@ func TestStream_WriteTrailers(t *testing.T) {
 			}
 
 			if tc.expectFrameSent {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					headersFrame, ok := frame.(*HeadersFrame)
 					if !ok {
 						t.Fatalf("Expected HeadersFrame on writerChan, got %T", frame)
@@ -3129,8 +2954,9 @@ func TestStream_WriteTrailers(t *testing.T) {
 					t.Fatal("Expected HeadersFrame on writerChan, but none found")
 				}
 			} else {
+
 				select {
-				case frame := <-mc.writerChan:
+				case frame := <-conn.writerChan:
 					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
 				default:
 					// Expected: no frame

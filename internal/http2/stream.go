@@ -355,6 +355,7 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 			return 0, NewStreamError(s.id, ErrCodeInternalError, "stream already ended by a previous write with endStream=true")
 		}
 		// s.state checks already done above, assuming it hasn't changed to closed by a concurrent RST *after* initial unlock.
+
 		// A truly robust check would re-verify s.state here, but that adds complexity for a very racy condition.
 		// If state changed, sendDataFrame might fail or be ignored.
 		s.mu.Unlock() // Unlock for the sendDataFrame call
@@ -388,6 +389,7 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 	// However, the spec says *payload* is limited. A 0-length payload is fine.
 	// This check is more about chunking logic. Using DefaultMaxFrameSize as lower bound for chunking if not set.
 
+	s.conn.log.Debug("Stream.WriteData: Max frame payload size for chunking determined", logger.LogFields{"stream_id": s.id, "max_frame_payload_size": maxFramePayloadSize, "initial_data_len": totalBytesToWrite})
 	for dataOffset < totalBytesToWrite {
 		chunkLen := totalBytesToWrite - dataOffset
 		if chunkLen > int(maxFramePayloadSize) {
@@ -759,36 +761,26 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	if dispatcher == nil {
 		s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Dispatcher is nil, cannot proceed.", logger.LogFields{"stream_id": s.id})
-		// This is an internal server error. The stream should be reset.
 		_ = s.sendRSTStream(ErrCodeInternalError)
 		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil")
 	}
 
-	// Store received headers (for potential handler access, though http.Request will be primary)
-	// Store received headers (for potential handler access, though http.Request will be primary)
-	// The state transitions (Idle -> Open/HalfClosedRemote) are now fully handled by the caller (conn.handleIncomingCompleteHeaders)
-	// before this method is invoked. This method can trust the state it's called in.
 	s.mu.Lock()
-	s.requestHeaders = headers // These are hpack.HeaderField
+	s.requestHeaders = headers
 	s.mu.Unlock()
 
-	// Construct http.Request from headers
-	// This is a simplified construction. A full one would handle cookies, content-length, etc.
-	// and more robust pseudo-header validation (though conn.extractPseudoHeaders does a lot).
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
 	if pseudoErr != nil {
 		s.conn.log.Error("Failed to extract pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
-		_ = s.sendRSTStream(ErrCodeProtocolError) // This is a protocol error
+		_ = s.sendRSTStream(ErrCodeProtocolError)
 		return pseudoErr
 	}
 
 	reqURL := &url.URL{
 		Scheme: pseudoScheme,
-		Host:   pseudoAuthority, // :authority or Host header
-		Path:   pseudoPath,      // Includes query string
+		Host:   pseudoAuthority,
+		Path:   pseudoPath,
 	}
-	// Query string is part of pseudoPath, http.Request.URL.RawQuery will be parsed from it by net/http if needed
-	// or we can parse it here:
 	if idx := strings.Index(pseudoPath, "?"); idx != -1 {
 		reqURL.Path = pseudoPath[:idx]
 		reqURL.RawQuery = pseudoPath[idx+1:]
@@ -796,52 +788,51 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	httpHeaders := make(http.Header)
 	for _, hf := range headers {
-		if !strings.HasPrefix(hf.Name, ":") { // Don't include pseudo-headers in http.Header
+		if !strings.HasPrefix(hf.Name, ":") {
 			httpHeaders.Add(hf.Name, hf.Value)
 		}
 	}
 
-	// Create the http.Request object
 	req := &http.Request{
 		Method:     pseudoMethod,
 		URL:        reqURL,
-		Proto:      "HTTP/2.0", // Or ProtoMajor/ProtoMinor if needed
+		Proto:      "HTTP/2.0",
 		ProtoMajor: 2,
 		ProtoMinor: 0,
 		Header:     httpHeaders,
-		Body:       s.requestBodyReader, // Pipe reader for DATA frames
-		Host:       pseudoAuthority,     // :authority or Host
+		Body:       s.requestBodyReader,
+		Host:       pseudoAuthority,
 		RemoteAddr: s.conn.remoteAddrStr,
-		RequestURI: pseudoPath, // Original :path value
-		// TLS, TransferEncoding, ContentLength would be set if applicable
-		// For ContentLength, it's derived from DATA frames or absence of END_STREAM on HEADERS.
-		// The http.Request.Body (our s.requestBodyReader) will handle this.
-		// If endStream was true on HEADERS and no DATA frames, Body will yield EOF immediately.
+		RequestURI: pseudoPath,
 	}
-	req = req.WithContext(s.ctx) // Associate stream's context with the request
+	req = req.WithContext(s.ctx)
 
-	// Dispatch to the handler. The handler is responsible for calling s.SendHeaders, s.WriteData, etc.
 	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
 
-	// The dispatcher function is expected to be non-blocking itself (i.e., it should
-	// spawn goroutines for long-running handler logic).
-	// The stream remains active for the handler to write response.
+	// Experimental: Signal before dispatching
+	// In a real scenario, this channel would be part of the Stream or Connection for testability.
+	// For this test, we'll assume the test has a way to access this signal if it were a real feature.
+	// Since we can't easily pass a channel from the test into here without wider refactoring,
+	// this change primarily adds logging. The test will still rely on mrd.called.
+	s.conn.log.Debug("Stream: PRE-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
+
 	go func() {
+		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-PANIC-DEFER", logger.LogFields{"stream_id": s.id})
 		defer func() {
+			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PANIC-DEFER EXECUTING", logger.LogFields{"stream_id": s.id})
 			if r := recover(); r != nil {
 				s.conn.log.Error("Panic in request handler goroutine", logger.LogFields{"stream_id": s.id, "panic": r, "stack": string(debug.Stack())})
-				// Ensure stream is closed if handler panics
 				_ = s.sendRSTStream(ErrCodeInternalError)
 			}
-			// Ensure the stream is properly closed if the handler finishes but doesn't explicitly end the stream response.
-			// This is complex: if handler returns, and server hasn't sent END_STREAM, what should happen?
-			// Usually, handler is responsible for completing the response. If it returns without error
-			// AND without closing the stream from server-side, it's ambiguous.
-			// For now, assume handler completes the stream or errors.
-			s.conn.streamHandlerDone(s) // Notify connection that this stream's handler work is done.
+			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-HANDLER-DONE", logger.LogFields{"stream_id": s.id})
+			s.conn.streamHandlerDone(s)
+			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - POST-HANDLER-DONE", logger.LogFields{"stream_id": s.id})
 		}()
+		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-DISPATCHER-CALL", logger.LogFields{"stream_id": s.id})
 		dispatcher(s, req)
+		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - POST-DISPATCHER-CALL", logger.LogFields{"stream_id": s.id})
 	}()
+	s.conn.log.Debug("Stream: POST-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
 
 	return nil
 }
