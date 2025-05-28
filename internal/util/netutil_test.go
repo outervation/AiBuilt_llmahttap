@@ -14,6 +14,23 @@ import (
 
 // createTestTCPListener creates a TCP listener for testing.
 // If addr is empty or ":0", it listens on a random available port on localhost.
+
+// createTestTCPListener creates a TCP listener for testing.
+// If addr is empty or ":0", it listens on a random available port on localhost.
+// It returns the listener and the address string it's listening on.
+// The caller is responsible for closing the listener.
+func createTestTCPListener(t *testing.T, addr string) (net.Listener, string) {
+	t.Helper()
+	if addr == "" {
+		addr = "127.0.0.1:0" // Default to localhost random port
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to create TCP listener at %s: %v", addr, err)
+	}
+	return ln, ln.Addr().String()
+}
+
 // It returns the listener and the address string it's listening on.
 // The caller is responsible for closing the listener.
 
