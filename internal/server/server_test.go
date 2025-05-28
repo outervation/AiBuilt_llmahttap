@@ -2118,7 +2118,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("HandshakeFailure_ClosesConnection", func(t *testing.T) {
+	t.Run("HandshakeFailure_PrefaceReadError", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
 		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
