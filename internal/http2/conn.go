@@ -14,7 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http" // For http.Request, used by RequestDispatcherFunc
-	"os"       // ADDED: For os.Stdout.Sync()
+
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +182,8 @@ func NewConnection(
 		peerReportedLastStreamID: 0xffffffff, // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
 	}
 
+	lg.Debug("NewConnection: Post-initialization. Dumping conn.ourSettings before applyOurSettings", logger.LogFields{"conn_ourSettingsDump_before_apply": fmt.Sprintf("%#v", conn.ourSettings)})
+
 	// Initialize client/server stream ID counters
 	if isClientSide {
 		conn.nextStreamIDClient = 1
@@ -213,6 +215,7 @@ func NewConnection(
 		conn.ourSettings[SettingMaxConcurrentStreams] = DefaultServerMaxConcurrentStreams
 		conn.ourSettings[SettingMaxHeaderListSize] = DefaultServerMaxHeaderListSize
 
+		conn.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize // Explicitly set for server
 		// For server, SettingMaxFrameSize is NOT set by default here.
 		// If srvSettingsOverride provides it, that will be used.
 		// If neither, applyOurSettings will see it's missing, log "not found", and apply DefaultSettingsMaxFrameSize.
@@ -223,6 +226,12 @@ func NewConnection(
 		for id, val := range srvSettingsOverride {
 			conn.ourSettings[id] = val
 		}
+	}
+
+	// Force SETTINGS_MAX_HEADER_LIST_SIZE for testing curl behavior
+	if !isClientSide {
+		conn.log.Debug("NewConnection: Forcing SETTINGS_MAX_HEADER_LIST_SIZE to 1MB for testing.", logger.LogFields{})
+		conn.ourSettings[SettingMaxHeaderListSize] = 1 << 20 // 1MB
 	}
 
 	// Apply initial settings to derive operational values
@@ -1222,8 +1231,6 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		// Delegate to the stream to process headers and call the dispatcher function.
 		// The dispatcher *func* (c.dispatcher) is passed to the stream's processing method.
 		// stream.go's processRequestHeadersAndDispatch will need to be updated to accept this dispatcher.
-		fmt.Printf("CONN_DEBUG: newStream pointer before calling processRequestHeadersAndDispatch: %p, ID: %d\n", newStream, newStream.id)
-		os.Stdout.Sync()
 
 		c.log.Debug("Conn: Attempting to call newStream.processRequestHeadersAndDispatch", logger.LogFields{"stream_id": newStream.id, "newStream_is_nil": newStream == nil, "dispatcher_is_nil": c.dispatcher == nil})
 
@@ -2475,9 +2482,57 @@ func (c *Connection) ServerHandshake() error {
 	c.log.Debug("ServerHandshake: Entered", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
 	// 1. Read and validate client connection preface
+
 	c.log.Debug("ServerHandshake: Attempting to read client connection preface.", logger.LogFields{"remote_addr": c.remoteAddrStr})
-	prefaceBytes := make([]byte, len(ClientPreface))
-	n, err := io.ReadFull(c.netConn, prefaceBytes)
+	// Add a short read deadline for the preface
+	prefaceReadDeadline := time.Now().Add(5 * time.Second) // Increased timeout for preface to 5s for robust testing
+	if errDeadlineSet := c.netConn.SetReadDeadline(prefaceReadDeadline); errDeadlineSet != nil {
+		c.log.Error("ServerHandshake: Failed to set read deadline for preface", logger.LogFields{"remote_addr": c.remoteAddrStr, "error": errDeadlineSet})
+		// This is a problem with the connection itself, probably should be fatal for handshake
+		return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to set read deadline for preface", errDeadlineSet)
+	}
+
+	var prefaceBytes []byte
+	var n int
+	var err error
+
+	// Diagnostic preface read was removed as it was causing issues.
+
+	prefaceBytes = make([]byte, len(ClientPreface))
+	n, err = io.ReadFull(c.netConn, prefaceBytes)
+
+	// Log after the main ReadFull attempt
+	c.log.Debug("ServerHandshake: io.ReadFull for preface returned.", logger.LogFields{"remote_addr": c.remoteAddrStr, "bytes_read_n": n, "error_val": fmt.Sprintf("%v", err)})
+
+	// Example of keeping a simpler one-byte diagnostic if ReadFull fails with EOF and 0 bytes read.
+	if errors.Is(err, io.EOF) && n == 0 {
+		c.log.Debug("ServerHandshake: io.ReadFull got EOF with 0 bytes. Attempting single byte read for diagnostics.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		singleByte := make([]byte, 1)
+		// Use a short, separate deadline for this diagnostic read, if desired, or rely on existing one if still set.
+		// For simplicity, not adding a new deadline for this diagnostic read here.
+		n1, err1 := c.netConn.Read(singleByte) // This read happens *after* the ReadFull EOF
+		c.log.Debug("ServerHandshake: Diagnostic single byte read attempt after ReadFull EOF", logger.LogFields{
+			"remote_addr":    c.remoteAddrStr,
+			"bytes_read_n1":  n1,
+			"byte_hex":       hex.EncodeToString(singleByte[:n1]),
+			"error_val_err1": fmt.Sprintf("%v", err1),
+		})
+		// This diagnostic doesn't change 'n' or 'err' from the main ReadFull attempt.
+		// 'err' from ReadFull is still the primary error for the handshake.
+	}
+
+	// Clear the read deadline immediately after the read attempt(s)
+	if errClearDeadline := c.netConn.SetReadDeadline(time.Time{}); errClearDeadline != nil {
+		// Log this, but the error from ReadFull (if any) is more critical.
+		// If ReadFull succeeded, but clearing deadline fails, it might affect subsequent reads.
+		c.log.Warn("ServerHandshake: Failed to clear read deadline after preface read", logger.LogFields{"remote_addr": c.remoteAddrStr, "error": errClearDeadline})
+		if err == nil { // If ReadFull was fine, but clearing deadline failed, this is now the primary issue.
+			// This could leave the connection in a bad state for subsequent reads.
+			return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to clear read deadline post preface", errClearDeadline)
+		}
+	}
+	c.log.Debug("ServerHandshake: io.ReadFull for preface returned.", logger.LogFields{"remote_addr": c.remoteAddrStr, "bytes_read_n": n, "error_val": fmt.Sprintf("%v", err)})
+
 	if err != nil {
 		c.log.Error("Failed to read client connection preface", logger.LogFields{"remote_addr": c.remoteAddrStr, "bytes_read": n, "error": err})
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

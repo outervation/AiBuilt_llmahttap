@@ -166,6 +166,9 @@ func SetupServer() *testutil.ServerInstance {
 	// Any timeout is likely due to a bug in the server causing it not to send the desired response
 	// NOT due to this line.
 	// Again, DO NOT REMOVE THIS! It's vital for debugging the server"
+	// If this is removed, then no logs are shown in the case of a timeout,
+	// because a timeout causes the test runtime to panic and the cleanup doesn't run,
+	// so app logs aren't printed.
 	testutil.StartingPollingAndPrintingBuffer(serverInstance.LogBuffer)
 
 	return serverInstance
@@ -210,191 +213,198 @@ func TestPlaceholder(t *testing.T) {
 // TestDefaultErrorResponses verifies the server's default error response generation.
 
 func TestDefaultErrorResponses(t *testing.T) {
-	t.Skip("Skipping this broken integration test until component unit tests are done; TODO: fix this once unit tests are implemented and paassing")
-	serverInstance := SetupServer()
-	defer func() {
-		TeardownServer(serverInstance)
-	}()
-	if serverInstance == nil {
-		t.Fatal("Server instance is nil, setup in TestMain failed.")
+	serverInstanceForDefaultErrors := SetupServer() // Use a fresh server instance for this test suite
+	if serverInstanceForDefaultErrors == nil {
+		t.Fatal("Server instance is nil, setup failed for TestDefaultErrorResponses.")
 	}
+	defer TeardownServer(serverInstanceForDefaultErrors) // Ensure teardown
 
-	testCases := []struct {
-		name             string
-		request          testutil.TestRequest
-		expectedStatus   int
-		expectedJSONMsg  string
-		expectedHTMLText string // Substring to find in HTML body
-	}{
-		// 404 Not Found Cases
-		{
-			name: "404_AcceptJSON_NoRoute",
-			request: testutil.TestRequest{
-				Method:  "GET",
-				Path:    "/this-route-does-not-exist-for-sure",
-				Headers: http.Header{"Accept": []string{"application/json"}},
-			},
-			expectedStatus:  404,
-			expectedJSONMsg: "Not Found",
-		},
-		{
-			name: "404_AcceptHTML_NoRoute",
-			request: testutil.TestRequest{
-				Method:  "GET",
-				Path:    "/this-route-does-not-exist-either",
-				Headers: http.Header{"Accept": []string{"text/html"}},
-			},
-			expectedStatus:   404,
-			expectedHTMLText: "<h1>Not Found</h1>",
-		},
-		{
-			name: "404_NoAcceptHeader_NoRoute",
-			request: testutil.TestRequest{
-				Method: "GET",
-				Path:   "/yet-another-nonexistent-route",
-			},
-			expectedStatus:   404,
-			expectedHTMLText: "<h1>Not Found</h1>",
-		},
-		{
-			name: "404_AcceptWildcard_NoRoute",
-			request: testutil.TestRequest{
-				Method:  "GET",
-				Path:    "/nonexistent-route-accept-star",
-				Headers: http.Header{"Accept": []string{"*/*"}},
-			},
-			expectedStatus:   404,
-			expectedHTMLText: "<h1>Not Found</h1>", // Expect HTML for */* when JSON not specified
-		},
-		// 405 Method Not Allowed Cases (using StaticFileServer route)
-		{
-			name: "405_AcceptJSON_StaticFileRoute_PUT",
-			request: testutil.TestRequest{
-				Method:  "PUT",
-				Path:    "/static-for-405/somefile.txt",
-				Headers: http.Header{"Accept": []string{"application/json"}},
-				Body:    []byte("test body"),
-			},
-			expectedStatus:  405,
-			expectedJSONMsg: "Method Not Allowed",
-		},
-		{
-			name: "405_AcceptHTML_StaticFileRoute_DELETE",
-			request: testutil.TestRequest{
-				Method:  "DELETE",
-				Path:    "/static-for-405/someotherfile.txt",
-				Headers: http.Header{"Accept": []string{"text/html"}},
-			},
-			expectedStatus:   405,
-			expectedHTMLText: "<h1>Method Not Allowed</h1>",
-		},
-		{
-			name: "405_NoAcceptHeader_StaticFileRoute_PATCH",
-			request: testutil.TestRequest{
-				Method: "PATCH",
-				Path:   "/static-for-405/another.txt",
-				Body:   []byte("patch data"),
-			},
-			expectedStatus:   405,
-			expectedHTMLText: "<h1>Method Not Allowed</h1>",
-		},
-		{
-			name: "405_AcceptWildcard_StaticFileRoute_POST", // POST is also not allowed by StaticFileServer
-			request: testutil.TestRequest{
-				Method:  "POST",
-				Path:    "/static-for-405/file-accept-star.dat",
-				Headers: http.Header{"Accept": []string{"*/*"}},
-				Body:    []byte("post body"),
-			},
-			expectedStatus:   405,
-			expectedHTMLText: "<h1>Method Not Allowed</h1>", // Expect HTML for */*
-		},
+	t.Logf("TestDefaultErrorResponses: Server is running at: %s", serverInstanceForDefaultErrors.Address)
+
+	// Define a temporary document root and a file for 405 tests with StaticFileServer
+	tmpDocRoot405, cleanupDocRoot405, err := setupTempFilesForRoutingTest(t, map[string]string{
+		"somefile.txt": "content for 405 test",
+	})
+	if err != nil {
+		t.Fatalf("Failed to set up temp files for 405 test: %v", err)
 	}
+	defer cleanupDocRoot405()
 
-	for _, tc := range testCases {
-		tc := tc // capture range variable
-		t.Run(tc.name, func(st *testing.T) {
-			// The E2ETestDefinition here is minimal, just wrapping the single tc.Request and tc.Expected
-			// This structure is used by the testutil.Assert... functions and the runner logic below.
-			expectedResp := testutil.ExpectedResponse{
-				StatusCode: tc.expectedStatus,
-				BodyMatcher: selectBodyMatcher(
-					tc.request.Headers.Get("Accept"),
-					tc.expectedStatus,
-					tc.expectedJSONMsg,
-					tc.expectedHTMLText,
-				),
-				Headers: selectHeaderMatcher(
-					tc.request.Headers.Get("Accept"),
-				),
-			}
+	// Specific config for this test: ensure StaticFileServer is routed for /static-for-405/
+	staticFsCfg405 := config.StaticFileServerConfig{DocumentRoot: tmpDocRoot405}
+	staticFsHandlerCfg405JSON, _ := json.Marshal(staticFsCfg405)
 
-			runners := []testutil.TestRunner{
-				testutil.NewGoNetHTTPClient(),
-				testutil.NewCurlHTTPClient(curlPath),
-			}
-
-			for _, runner := range runners {
-				runner := runner // capture range variable
-				st.Run(fmt.Sprintf("Client_%s", runner.Type()), func(ct *testing.T) {
-					ct.Cleanup(func() {
-						if ct.Failed() {
-							logs := serverInstance.SafeGetLogs()
-							ct.Logf("BEGIN Server logs for client %s, case %s (on failure):\n%s\nEND Server logs", runner.Type(), tc.name, logs)
-						}
-					})
-
-					actualResp, execErr := runner.Run(serverInstance, &tc.request)
-
-					if execErr != nil {
-						ct.Fatalf("Unexpected error during request: %v. Server logs might provide clues.", execErr)
-					}
-
-					testutil.AssertStatusCode(ct, expectedResp, *actualResp)
-
-					if expectedResp.Headers != nil {
-						for headerName, expectedValue := range expectedResp.Headers {
-							testutil.AssertHeaderEquals(ct, actualResp.Headers, headerName, expectedValue)
-						}
-					}
-					if expectedResp.BodyMatcher != nil {
-						match, desc := expectedResp.BodyMatcher.Match(actualResp.Body)
-						if !match {
-							ct.Errorf("Response body mismatch: %s", desc)
-						}
-					}
-				})
-			}
-		})
-	}
-
-}
-
-// Helper to select appropriate body matcher for default error responses
-func selectBodyMatcher(acceptHeader string, expectedStatus int, expectedJSONMsg, expectedHTMLText string) testutil.BodyMatcher {
-	if strings.Contains(acceptHeader, "application/json") {
-		if expectedJSONMsg != "" {
-			expectedFullJSON := map[string]interface{}{
-				"error": map[string]interface{}{
-					"status_code": float64(expectedStatus),
-					"message":     expectedJSONMsg,
+	logEnabledTrue := true
+	currentListenAddr := "127.0.0.1:0" // Use a dynamic port, StartTestServer will pick one
+	serverCfgForDefaultErrors := config.Config{
+		Server: &config.ServerConfig{Address: &currentListenAddr},
+		Logging: &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+		},
+		Routing: &config.RoutingConfig{
+			Routes: []config.Route{
+				{
+					PathPattern:   "/static-for-405/",
+					MatchType:     config.MatchTypePrefix,
+					HandlerType:   "StaticFileServer",
+					HandlerConfig: staticFsHandlerCfg405JSON,
 				},
-			}
-			return &testutil.JSONFieldsBodyMatcher{ExpectedFields: expectedFullJSON}
-		}
+				// No other routes needed, /this-route-does-not-exist will naturally 404
+			},
+		},
 	}
-	if expectedHTMLText != "" {
-		return &testutil.StringContainsBodyMatcher{Substring: expectedHTMLText}
-	}
-	return nil
-}
 
-// Helper to select Content-Type header matcher for default error responses
-func selectHeaderMatcher(acceptHeader string) testutil.HeaderMatcher {
-	if strings.Contains(acceptHeader, "application/json") {
-		return testutil.HeaderMatcher{"Content-Type": "application/json; charset=utf-8"}
+	// Determine server binary path (copied from TestRouting_MatchingLogic)
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("Failed to get current file path for TestDefaultErrorResponses")
 	}
-	return testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"}
+	e2eDir := filepath.Dir(currentFile)
+	projectRoot := filepath.Join(e2eDir, "..")
+	serverBinaryPath := filepath.Join(projectRoot, "server")
+	if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
+		t.Fatalf("Server binary for TestDefaultErrorResponses not found at %s.", serverBinaryPath)
+	}
+
+	// E2ETestDefinition for the default error response tests
+	errorTestDef := testutil.E2ETestDefinition{
+		Name:                "DefaultErrorResponses",
+		ServerBinaryPath:    serverBinaryPath,
+		ServerConfigData:    serverCfgForDefaultErrors,
+		ServerConfigFormat:  "json",
+		ServerConfigArgName: "-config",
+		ServerListenAddress: currentListenAddr, // Pass the :0 address
+		CurlPath:            curlPath,          // Use globally determined curl path
+		TestCases: []testutil.E2ETestCase{
+			// 404 Not Found Cases
+			{
+				Name: "404_AcceptJSON_NoRoute",
+				Request: testutil.TestRequest{
+					Method:  "GET",
+					Path:    "/this-route-does-not-exist-for-sure",
+					Headers: http.Header{"Accept": []string{"application/json"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 404,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "application/json; charset=utf-8"},
+					BodyMatcher: &testutil.JSONFieldsBodyMatcher{ExpectedFields: map[string]interface{}{
+						"error": map[string]interface{}{"status_code": 404.0, "message": "Not Found"},
+					}},
+				},
+			},
+			{
+				Name: "404_AcceptHTML_NoRoute",
+				Request: testutil.TestRequest{
+					Method:  "GET",
+					Path:    "/this-route-does-not-exist-either",
+					Headers: http.Header{"Accept": []string{"text/html"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 404,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					},
+				},
+			},
+			{
+				Name: "404_NoAcceptHeader_NoRoute",
+				Request: testutil.TestRequest{
+					Method: "GET",
+					Path:   "/yet-another-nonexistent-route",
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 404,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					},
+				},
+			},
+			{
+				Name: "404_AcceptWildcard_NoRoute",
+				Request: testutil.TestRequest{
+					Method:  "GET",
+					Path:    "/nonexistent-route-accept-star",
+					Headers: http.Header{"Accept": []string{"*/*"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 404,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"}, // Default to HTML for */*
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					},
+				},
+			},
+			// 405 Method Not Allowed Cases (using StaticFileServer route)
+			{
+				Name: "405_AcceptJSON_StaticFileRoute_PUT",
+				Request: testutil.TestRequest{
+					Method:  "PUT",
+					Path:    "/static-for-405/somefile.txt",
+					Headers: http.Header{"Accept": []string{"application/json"}},
+					Body:    []byte("test body"),
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "application/json; charset=utf-8"},
+					BodyMatcher: &testutil.JSONFieldsBodyMatcher{ExpectedFields: map[string]interface{}{
+						"error": map[string]interface{}{"status_code": 405.0, "message": "Method Not Allowed"},
+					}},
+				},
+			},
+			{
+				Name: "405_AcceptHTML_StaticFileRoute_DELETE",
+				Request: testutil.TestRequest{
+					Method:  "DELETE",
+					Path:    "/static-for-405/someotherfile.txt",
+					Headers: http.Header{"Accept": []string{"text/html"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Method Not Allowed</h1><p>The method is not allowed for the requested resource.</p>",
+					},
+				},
+			},
+			{
+				Name: "405_NoAcceptHeader_StaticFileRoute_PATCH",
+				Request: testutil.TestRequest{
+					Method: "PATCH",
+					Path:   "/static-for-405/another.txt",
+					Body:   []byte("patch data"),
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Method Not Allowed</h1><p>The method is not allowed for the requested resource.</p>",
+					},
+				},
+			},
+			{
+				Name: "405_AcceptWildcard_StaticFileRoute_POST", // POST is also not allowed by StaticFileServer
+				Request: testutil.TestRequest{
+					Method:  "POST",
+					Path:    "/static-for-405/file-accept-star.dat",
+					Headers: http.Header{"Accept": []string{"*/*"}},
+					Body:    []byte("post body"),
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"}, // Default to HTML for */*
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Method Not Allowed</h1><p>The method is not allowed for the requested resource.</p>",
+					},
+				},
+			},
+		},
+	}
+
+	testutil.RunE2ETest(t, errorTestDef)
 }
 
 func TestRouting_Basic(t *testing.T) {
@@ -448,7 +458,6 @@ func setupTempFilesForRoutingTest(t *testing.T, fileMap map[string]string) (docR
 }
 
 func TestRouting_MatchingLogic(t *testing.T) {
-	t.Skip("Skipping this broken integration test until component unit tests are done; TODO: fix this once unit tests are implemented and paassing")
 	// Get server binary path
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {

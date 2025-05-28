@@ -752,12 +752,7 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // and dispatches it via the provided router.
 
 func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
-	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{
-		"stream_id":         s.id,
-		"num_headers_arg":   len(headers),
-		"end_stream_arg":    endStream,
-		"dispatcher_is_nil": dispatcher == nil,
-	})
+	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
 	if dispatcher == nil {
 		s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Dispatcher is nil, cannot proceed.", logger.LogFields{"stream_id": s.id})
@@ -809,19 +804,19 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
 
-	// Experimental: Signal before dispatching
-	// In a real scenario, this channel would be part of the Stream or Connection for testability.
-	// For this test, we'll assume the test has a way to access this signal if it were a real feature.
-	// Since we can't easily pass a channel from the test into here without wider refactoring,
-	// this change primarily adds logging. The test will still rely on mrd.called.
 	s.conn.log.Debug("Stream: PRE-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
-
 	go func() {
 		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-PANIC-DEFER", logger.LogFields{"stream_id": s.id})
 		defer func() {
 			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PANIC-DEFER EXECUTING", logger.LogFields{"stream_id": s.id})
 			if r := recover(); r != nil {
-				s.conn.log.Error("Panic in request handler goroutine", logger.LogFields{"stream_id": s.id, "panic": r, "stack": string(debug.Stack())})
+				s.conn.log.Error("Panic in stream handler goroutine", logger.LogFields{
+					"stream_id": s.id,
+					"panic_val": fmt.Sprintf("%v", r), // Use fmt.Sprintf for potentially complex panic values
+					"stack":     string(debug.Stack()),
+				})
+				// Try to send RST_STREAM if the stream/connection might still be partly alive.
+				// This is a best-effort.
 				_ = s.sendRSTStream(ErrCodeInternalError)
 			}
 			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-HANDLER-DONE", logger.LogFields{"stream_id": s.id})
@@ -833,7 +828,6 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - POST-DISPATCHER-CALL", logger.LogFields{"stream_id": s.id})
 	}()
 	s.conn.log.Debug("Stream: POST-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
-
 	return nil
 }
 

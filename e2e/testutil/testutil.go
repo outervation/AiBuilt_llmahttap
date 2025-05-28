@@ -277,8 +277,8 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 		lastDialErr = dialErr
 		if dialErr == nil {
 			conn.Close()
-			// Add a small delay to allow server goroutines to spin up further
-			time.Sleep(200 * time.Millisecond)
+
+			// time.Sleep(750 * time.Millisecond) // Removed this sleep
 			break // Server is ready
 		}
 
