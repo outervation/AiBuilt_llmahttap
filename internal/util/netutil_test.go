@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"errors"
+	"strings"
 	"time"
 )
 
@@ -460,5 +463,112 @@ func TestReadinessSignalingMechanism(t *testing.T) {
 		// If err is nil, it means EOF was received, which is success.
 	case <-time.After(3 * time.Second): // Slightly longer timeout for the overall check
 		t.Fatal("Timeout waiting for result from WaitForChildReadyPipeClose goroutine")
+	}
+}
+
+func TestGetChildWritePipeFD(t *testing.T) {
+	const testEnvVar = "TEST_CHILD_WRITE_PIPE_FD"
+
+	tests := []struct {
+		name            string
+		envValue        *string // Pointer to distinguish between not set and empty string
+		expectedFD      uintptr
+		expectError     bool
+		expectedErrorIs error  // Specific error to check with errors.Is
+		errorContains   string // Substring to check in error message
+	}{
+		{
+			name:            "EnvVarNotSet",
+			envValue:        nil, // Not set
+			expectError:     true,
+			expectedErrorIs: ErrPipeFDEnvVarNotSet,
+			errorContains:   "TEST_CHILD_WRITE_PIPE_FD",
+		},
+		{
+			name:        "ValidPositiveInteger",
+			envValue:    func() *string { s := "123"; return &s }(),
+			expectedFD:  123,
+			expectError: false,
+		},
+		{
+			name:        "ValidZero",
+			envValue:    func() *string { s := "0"; return &s }(),
+			expectedFD:  0,
+			expectError: false,
+		},
+		{
+			name:          "InvalidStringNotAnInteger",
+			envValue:      func() *string { s := "not-a-number"; return &s }(),
+			expectError:   true,
+			errorContains: "invalid integer value for FD",
+		},
+		{
+			name:          "NegativeIntegerString",
+			envValue:      func() *string { s := "-5"; return &s }(),
+			expectError:   true,
+			errorContains: "invalid negative FD value",
+		},
+		{
+			name:            "EmptyStringValue", // os.Getenv returns empty if var is set to empty
+			envValue:        func() *string { s := ""; return &s }(),
+			expectError:     true,
+			expectedErrorIs: ErrPipeFDEnvVarNotSet,
+			errorContains:   "pipe FD environment variable not set", // This is correct because fdStr == "" is checked first by GetChildWritePipeFD
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Get current value to restore, or ensure it's unset
+			originalValue, wasSet := os.LookupEnv(testEnvVar)
+
+			if tc.envValue == nil { // Unset the var for this test case
+				if err := os.Unsetenv(testEnvVar); err != nil {
+					t.Fatalf("Failed to unset env var %s for test: %v", testEnvVar, err)
+				}
+			} else { // Set the var for this test case
+				if err := os.Setenv(testEnvVar, *tc.envValue); err != nil {
+					t.Fatalf("Failed to set env var %s to %q for test: %v", testEnvVar, *tc.envValue, err)
+				}
+			}
+
+			// Defer restoration of the environment variable
+			defer func() {
+				if wasSet {
+					if err := os.Setenv(testEnvVar, originalValue); err != nil {
+						t.Logf("Error restoring env var %s to '%s': %v", testEnvVar, originalValue, err)
+					}
+				} else {
+					if err := os.Unsetenv(testEnvVar); err != nil {
+						t.Logf("Error unsetting env var %s after test: %v", testEnvVar, err)
+					}
+				}
+			}()
+
+			fd, err := GetChildWritePipeFD(testEnvVar)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorIs != nil {
+					if !errors.Is(err, tc.expectedErrorIs) {
+						t.Errorf("Expected error to be '%v', got '%v'", tc.expectedErrorIs, err)
+					}
+				}
+				if tc.errorContains != "" {
+					if !strings.Contains(err.Error(), tc.errorContains) {
+						t.Errorf("Expected error message to contain '%s', got '%s'", tc.errorContains, err.Error())
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+				if fd != tc.expectedFD {
+					t.Errorf("Expected FD %d, but got %d", tc.expectedFD, fd)
+				}
+			}
+		})
 	}
 }
