@@ -378,7 +378,8 @@ func (s *Server) dispatchRequest(stream http2.StreamWriter, req *http.Request) {
 // It stops accepting new connections, sends GOAWAY to active connections,
 // waits for them to finish, and then cleans up resources.
 func (s *Server) Shutdown(reason error) error {
-	s.log.Info("Shutdown initiated", logger.LogFields{"reason": reason})
+
+	s.log.Info("Shutdown initiated", logger.LogFields{"reason_msg": reason.Error()})
 
 	// 1. Signal shutdown initiation and stop accepting new connections
 	s.mu.Lock()
@@ -463,7 +464,7 @@ func (s *Server) Shutdown(reason error) error {
 	s.log.Info("Waiting for active connections to close", logger.LogFields{"timeout": gracefulTimeout.String()})
 
 	timeout := time.After(gracefulTimeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond) // Check more frequently
 	defer ticker.Stop()
 
 	for {
