@@ -797,7 +797,7 @@ func (l *Logger) CloseLogFiles() error {
 func (l *Logger) ReopenLogFiles() error {
 	l.errorLog.mu.Lock()
 	defer l.errorLog.mu.Unlock()
-	if l.errorLog != nil && config.IsFilePath(*l.errorLog.config.Target) {
+	if l.errorLog != nil && l.errorLog.config.Target != nil && config.IsFilePath(*l.errorLog.config.Target) {
 		if f, ok := l.errorLog.output.(*os.File); ok {
 			if f != os.Stdout && f != os.Stderr { // Don't try to reopen stdio
 				filePath := f.Name() // Get path from existing file
@@ -824,7 +824,7 @@ func (l *Logger) ReopenLogFiles() error {
 
 	l.accessLog.mu.Lock()
 	defer l.accessLog.mu.Unlock()
-	if l.accessLog != nil && config.IsFilePath(*l.accessLog.config.Target) {
+	if l.accessLog != nil && l.accessLog.config.Target != nil && config.IsFilePath(*l.accessLog.config.Target) {
 		if f, ok := l.accessLog.output.(*os.File); ok {
 			if f != os.Stdout && f != os.Stderr {
 				filePath := f.Name()

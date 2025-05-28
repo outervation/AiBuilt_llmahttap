@@ -878,7 +878,7 @@ func (f *UnknownFrame) PayloadLen() uint32 {
 func ReadFrame(r io.Reader) (Frame, error) {
 	fh, err := ReadFrameHeader(r)
 	if err != nil {
-		return nil, fmt.Errorf("reading frame header: %w", err)
+		return nil, err // Propagate raw error
 	}
 
 	var frame Frame

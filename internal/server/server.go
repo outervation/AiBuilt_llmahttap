@@ -113,7 +113,7 @@ func (s *Server) initializeListeners() error {
 		}
 		s.log.Info("Initializing server with inherited listener FDs", logger.LogFields{"fds": s.listenerFDs})
 
-		listeners := make([]net.Listener, len(s.listenerFDs))
+		listeners := make([]net.Listener, len(s.listenerFDs)) // Local slice
 		for i, fd := range s.listenerFDs {
 			listener, err := util.NewListenerFromFD(fd)
 			if err != nil {
@@ -145,8 +145,9 @@ func (s *Server) initializeListeners() error {
 			return fmt.Errorf("server listen address (server.address) is configured but is an empty string")
 		}
 		listenAddress = *s.cfg.Server.Address
-
+		s.log.Debug("Parent process: Attempting to create listener", logger.LogFields{"address": listenAddress})
 		listener, fd, err := util.CreateListenerAndGetFD(listenAddress)
+		s.log.Debug("Parent process: util.CreateListenerAndGetFD result", logger.LogFields{"address_passed": listenAddress, "error_returned": fmt.Sprintf("%v", err)})
 		if err != nil {
 			return fmt.Errorf("failed to create new listener on %s: %w", listenAddress, err)
 		}
