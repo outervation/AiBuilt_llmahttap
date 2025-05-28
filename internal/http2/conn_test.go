@@ -2522,3 +2522,144 @@ func TestConnection_HandlePingFrame_UnsolicitedAck(t *testing.T) {
 	}
 	closeErr = nil
 }
+
+func TestConnection_DispatchPriorityFrame(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                       string
+		setupFunc                  func(t *testing.T, conn *Connection) // Optional setup like creating streams
+		priorityFrame              *PriorityFrame
+		expectedError              bool
+		expectedConnectionError    *ConnectionError // If expectedError is true and it's a ConnectionError
+		expectedRSTStreamErrorCode ErrorCode        // If an RST_STREAM is expected
+		expectedRSTStreamID        uint32
+	}{
+		{
+			name: "Valid PRIORITY frame",
+			priorityFrame: &PriorityFrame{
+				FrameHeader:      FrameHeader{Type: FramePriority, StreamID: 1, Length: 5},
+				StreamDependency: 0,
+				Weight:           15, // Effective weight 16
+				Exclusive:        false,
+			},
+			expectedError: false,
+		},
+		{
+			name: "PRIORITY frame on stream 0",
+			priorityFrame: &PriorityFrame{
+				FrameHeader:      FrameHeader{Type: FramePriority, StreamID: 0, Length: 5},
+				StreamDependency: 1,
+				Weight:           15,
+			},
+			expectedError:           true,
+			expectedConnectionError: &ConnectionError{Code: ErrCodeProtocolError, Msg: "PRIORITY frame received on stream 0"},
+		},
+		{
+			name: "PRIORITY frame causing self-dependency",
+			setupFunc: func(t *testing.T, conn *Connection) {
+				// Ensure stream 1 exists in priority tree, or ProcessPriorityFrame will create it.
+				// If stream 1 did not exist and a PRIORITY frame tried to make it depend on itself,
+				// getOrCreateNodeNoLock in UpdatePriority would create it, then the self-dependency check would fail.
+			},
+			priorityFrame: &PriorityFrame{
+				FrameHeader:      FrameHeader{Type: FramePriority, StreamID: 1, Length: 5},
+				StreamDependency: 1, // Stream 1 depends on Stream 1
+				Weight:           15,
+				Exclusive:        false,
+			},
+			expectedError:              false, // dispatchPriorityFrame handles StreamError by sending RST and returning nil
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+			expectedRSTStreamID:        1,
+		},
+		// Note: A case for "PriorityTree.ProcessPriorityFrame returns a generic error" is harder to trigger
+		// reliably without specific knowledge of PriorityTree internal states that lead to non-StreamErrors.
+		// The current dispatchPriorityFrame logic handles StreamError vs. any other error from ProcessPriorityFrame.
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			var closeErr error = errors.New("test cleanup: " + tc.name)
+			defer func() { conn.Close(closeErr) }() // Ensure writerLoop and other resources are cleaned up
+
+			// performHandshakeForTest(t, conn, mnc) // Not strictly needed as PRIORITY can arrive any time
+			// mnc.ResetWriteBuffer()
+
+			if tc.setupFunc != nil {
+				tc.setupFunc(t, conn)
+			}
+
+			dispatchErr := conn.dispatchPriorityFrame(tc.priorityFrame)
+
+			if tc.expectedError {
+				if dispatchErr == nil {
+					t.Fatalf("Expected error from dispatchPriorityFrame, got nil")
+				}
+				if tc.expectedConnectionError != nil {
+					connErr, ok := dispatchErr.(*ConnectionError)
+					if !ok {
+						t.Fatalf("Expected *ConnectionError, got %T: %v", dispatchErr, dispatchErr)
+					}
+					if connErr.Code != tc.expectedConnectionError.Code {
+						t.Errorf("Expected ConnectionError code %s, got %s", tc.expectedConnectionError.Code, connErr.Code)
+					}
+					if tc.expectedConnectionError.Msg != "" && !strings.Contains(connErr.Msg, tc.expectedConnectionError.Msg) {
+						t.Errorf("ConnectionError message mismatch: got '%s', expected to contain '%s'", connErr.Msg, tc.expectedConnectionError.Msg)
+					}
+				}
+				// If it's an expected error, no RST should be sent by dispatchPriorityFrame itself,
+				// as connection error implies GOAWAY later.
+			} else { // No error expected from dispatchPriorityFrame
+				if dispatchErr != nil {
+					t.Fatalf("Expected no error from dispatchPriorityFrame, got %v", dispatchErr)
+				}
+			}
+
+			if tc.expectedRSTStreamErrorCode != 0 {
+				var rstFrame *RSTStreamFrame
+				foundRST := false
+				waitForCondition(t, 200*time.Millisecond, 10*time.Millisecond, func() bool {
+					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					for _, f := range frames {
+						if rf, ok := f.(*RSTStreamFrame); ok {
+							if rf.Header().StreamID == tc.expectedRSTStreamID {
+								rstFrame = rf
+								foundRST = true
+								return true
+							}
+						}
+					}
+					return false
+				}, fmt.Sprintf("RST_STREAM frame for stream %d with code %s", tc.expectedRSTStreamID, tc.expectedRSTStreamErrorCode))
+
+				if !foundRST {
+					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					t.Fatalf("Expected RST_STREAM frame for stream %d, none found. Frames on wire: %+v", tc.expectedRSTStreamID, allFrames)
+				}
+				if rstFrame.ErrorCode != tc.expectedRSTStreamErrorCode {
+					t.Errorf("RST_STREAM ErrorCode: got %s, want %s", rstFrame.ErrorCode, tc.expectedRSTStreamErrorCode)
+				}
+			} else if !tc.expectedError { // No RST expected AND no connection error expected
+				time.Sleep(50 * time.Millisecond) // Give writerLoop a moment
+				if mnc.GetWriteBufferLen() > 0 {
+					// Filter out PING ACKs if any default test setup sends them
+					unexpectedFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+					var actualUnexpectedFrames []Frame
+					for _, fr := range unexpectedFrames {
+						if pf, ok := fr.(*PingFrame); ok && (pf.Flags&FlagPingAck) != 0 {
+							continue
+						}
+						actualUnexpectedFrames = append(actualUnexpectedFrames, fr)
+					}
+					if len(actualUnexpectedFrames) > 0 {
+						t.Errorf("Unexpected frames written to connection: %+v", actualUnexpectedFrames)
+					}
+				}
+			}
+			closeErr = nil // Test logic passed for this subtest
+		})
+	}
+}
