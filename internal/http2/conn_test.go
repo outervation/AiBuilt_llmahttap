@@ -1949,27 +1949,13 @@ func newTestHpackEncoder(t *testing.T) *hpack.Encoder {
 	return hpack.NewEncoder(&hpackBuf)
 }
 
-func encodeHeadersForTest(t *testing.T, enc *hpack.Encoder, headers []hpack.HeaderField) []byte {
+func encodeHeadersForTest(t *testing.T, headers []hpack.HeaderField) []byte {
 	t.Helper()
 
-	// var buf bytes.Buffer // Unused
-	// Reset the encoder's buffer for each encoding operation if it's reused.
-	// Here, enc is created with a new buffer that it writes to, so we just need to read from it.
-	// The hpack.Encoder itself manages its internal buffer. We need to capture its output.
-
-	// The hpack.Encoder writes to the buffer given at its creation.
-	// To get the bytes, we need to make it write, then get buffer contents.
-	// This is a bit tricky as hpack.Encoder interface is write-based.
-	// A common pattern is to make a new Encoder for each test encoding or manage a single buffer carefully.
-	// Let's re-create a buffer and encoder for simplicity per call to ensure clean state,
-	// or ensure the encoder's internal buffer is accessible and reset.
-
-	// Simpler approach: create a new buffer for each encoding.
-	// The hpack.Encoder takes an io.Writer.
+	// This helper creates a fresh HPACK encoder for each call, ensuring stateless encoding
+	// of the provided headers. This is suitable for generating test input for the server's decoder.
 	var tempEncBuf bytes.Buffer
 	tempEncoder := hpack.NewEncoder(&tempEncBuf)
-	// Copy settings from the main test encoder if necessary (e.g., dynamic table size)
-	// For basic tests, default encoder settings are often fine.
 
 	for _, hf := range headers {
 		if err := tempEncoder.WriteField(hf); err != nil {
@@ -1992,7 +1978,6 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 
 	// testHpackEncoder is created once and used for all encodings in this test suite.
 	// It accumulates dynamic table state, which is good for testing HPACK.
-	testHpackEncoder := newTestHpackEncoder(t)
 
 	tests := []struct {
 		name                       string
@@ -2009,7 +1994,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		{
 			name: "Valid HEADERS, END_HEADERS",
 			framesToFeed: func(t *testing.T) [][]byte {
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				hpackPayload := encodeHeadersForTest(t, stdHeaders)
 				headersFrame := &HeadersFrame{
 					FrameHeader: FrameHeader{
 						Type:     FrameHeaders,
@@ -2027,8 +2012,8 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		{
 			name: "HEADERS + CONTINUATION, END_HEADERS on CONTINUATION",
 			framesToFeed: func(t *testing.T) [][]byte {
-				hpackPayload1 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[:2]) // :method, :scheme
-				hpackPayload2 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[2:]) // :path, :authority, user-agent
+				hpackPayload1 := encodeHeadersForTest(t, stdHeaders[:2]) // :method, :scheme
+				hpackPayload2 := encodeHeadersForTest(t, stdHeaders[2:]) // :path, :authority, user-agent
 
 				headersFrame := &HeadersFrame{ // END_HEADERS not set
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndStream, StreamID: 3, Length: uint32(len(hpackPayload1))},
@@ -2046,7 +2031,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		{
 			name: "HEADERS on stream 0",
 			framesToFeed: func(t *testing.T) [][]byte {
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				hpackPayload := encodeHeadersForTest(t, stdHeaders)
 				headersFrame := &HeadersFrame{
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders, StreamID: 0, Length: uint32(len(hpackPayload))},
 					HeaderBlockFragment: hpackPayload,
@@ -2060,7 +2045,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		{
 			name: "CONTINUATION without HEADERS",
 			framesToFeed: func(t *testing.T) [][]byte {
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, stdHeaders)
+				hpackPayload := encodeHeadersForTest(t, stdHeaders)
 				continuationFrame := &ContinuationFrame{
 					FrameHeader:         FrameHeader{Type: FrameContinuation, Flags: FlagContinuationEndHeaders, StreamID: 5, Length: uint32(len(hpackPayload))},
 					HeaderBlockFragment: hpackPayload,
@@ -2074,8 +2059,8 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		{
 			name: "CONTINUATION on wrong stream ID",
 			framesToFeed: func(t *testing.T) [][]byte {
-				hpackPayload1 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[:2])
-				hpackPayload2 := encodeHeadersForTest(t, testHpackEncoder, stdHeaders[2:])
+				hpackPayload1 := encodeHeadersForTest(t, stdHeaders[:2])
+				hpackPayload2 := encodeHeadersForTest(t, stdHeaders[2:])
 				headersFrame := &HeadersFrame{
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: 0 /* No END_HEADERS */, StreamID: 7, Length: uint32(len(hpackPayload1))},
 					HeaderBlockFragment: hpackPayload1,
@@ -2099,7 +2084,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
 					{Name: "a", Value: "aaaaaaaaaa"}, {Name: "b", Value: "bbbbbbbbbb"}, // These should push it over
 				}
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, largeHeaders)
+				hpackPayload := encodeHeadersForTest(t, largeHeaders)
 				if len(hpackPayload) <= 10 { // Ensure test condition is met
 					t.Logf("Warning: HPACK payload for MaxHeaderListSize (compressed) test is too small: %d bytes. Test may not be effective.", len(hpackPayload))
 				}
@@ -2124,7 +2109,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				twoHeaders := stdHeaders[:2] // :method:GET, :scheme:https
 				// Uncompressed: (len(":method")+len("GET")+32) + (len(":scheme")+len("https")+32)
 				// (7+3+32) + (7+5+32) = 42 + 44 = 86. This should exceed customMaxHeaderListSize of 50.
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, twoHeaders)
+				hpackPayload := encodeHeadersForTest(t, twoHeaders)
 				headersFrame := &HeadersFrame{
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 13, Length: uint32(len(hpackPayload))},
 					HeaderBlockFragment: hpackPayload,
@@ -2141,7 +2126,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				missingMethodHeaders := []hpack.HeaderField{
 					{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
 				}
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, missingMethodHeaders)
+				hpackPayload := encodeHeadersForTest(t, missingMethodHeaders)
 				headersFrame := &HeadersFrame{
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 15, Length: uint32(len(hpackPayload))},
 					HeaderBlockFragment: hpackPayload,
@@ -2163,7 +2148,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				invalidPathHeaders := []hpack.HeaderField{
 					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "no-slash"}, {Name: ":authority", Value: "example.com"},
 				}
-				hpackPayload := encodeHeadersForTest(t, testHpackEncoder, invalidPathHeaders)
+				hpackPayload := encodeHeadersForTest(t, invalidPathHeaders)
 				headersFrame := &HeadersFrame{
 					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 17, Length: uint32(len(hpackPayload))},
 					HeaderBlockFragment: hpackPayload,
