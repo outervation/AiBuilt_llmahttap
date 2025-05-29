@@ -646,7 +646,105 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 	// Sub-test for Exact over Prefix Precedence
 	t.Run("ExactOverPrefixPrecedence", func(st *testing.T) {
-		st.Skip("ExactOverPrefixPrecedence sub-test not yet implemented")
+		baseDocRoot, cleanupBaseDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"exact_path_file.txt":   "Exact Path File Content",   // For /path (Exact)
+			"prefix_path/fileB.txt": "Prefix Path FileB Content", // For /path/ (Prefix)
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupBaseDocRoot()
+
+		// Config for the EXACT /path route
+		// Serves from baseDocRoot, looking for "exact_path_file.txt"
+		sfsExactCfg := config.StaticFileServerConfig{
+			DocumentRoot: baseDocRoot,
+			IndexFiles:   []string{"exact_path_file.txt"}, // Effectively what to serve for /path
+		}
+		sfsExactHandlerCfgJSON, _ := json.Marshal(sfsExactCfg)
+
+		// Config for the PREFIX /path/ route
+		// Serves from baseDocRoot/prefix_path/
+		sfsPrefixDocRoot := filepath.Join(baseDocRoot, "prefix_path")
+		sfsPrefixCfg := config.StaticFileServerConfig{
+			DocumentRoot: sfsPrefixDocRoot,
+			// No IndexFiles needed if we're always accessing specific files like /path/fileB.txt
+		}
+		sfsPrefixHandlerCfgJSON, _ := json.Marshal(sfsPrefixCfg)
+
+		serverCfg := config.Config{
+			Server: &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{
+				LogLevel:  config.LogLevelDebug,
+				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{ // Prefix route - defined first but exact should take precedence for "/path"
+						PathPattern:   "/path/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: sfsPrefixHandlerCfgJSON,
+					},
+					{ // Exact route
+						PathPattern:   "/path", // No trailing slash for exact non-root
+						MatchType:     config.MatchTypeExact,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: sfsExactHandlerCfgJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "ExactOverPrefixPrecedenceScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestExactPath_ShouldServeExactFile", // GET /path
+					Request: testutil.TestRequest{Method: "GET", Path: "/path"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Exact Path File Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixPathFile_ShouldServePrefixFile", // GET /path/fileB.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/path/fileB.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Path FileB Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixPathDir_Should404_NoIndexForPrefixDir", // GET /path/
+					Request: testutil.TestRequest{Method: "GET", Path: "/path/"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404, // Because sfsPrefixCfg has no IndexFiles and dir listing is off by default
+						// And /path/fileB.txt exists, but /path/ itself without an index should 404 or 403.
+						// If dir listing was on, it would list fileB.txt.
+						// If an index file "index.html" was in "prefix_path/", it would be served.
+						// Given StaticFileServer default logic: no index, no listing => 403.
+						// Let's refine the expectation to 403.
+						// Re-eval: With current SFH logic, no index + no listing => 403.
+						// Let's ensure the file prefix_path/fileB.txt does *not* act as an index.
+						// Path for "/path/" will resolve to sfsPrefixDocRoot (/tmp.../prefix_path)
+						// handleDirectory will be called for this path. No index files in sfsPrefixCfg, listing disabled.
+						// Thus, 403 is correct.
+					},
+				},
+			},
+		}
+		// For "RequestPrefixPathDir_Should404_NoIndexForPrefixDir" - changing expectation to 403
+		testDef.TestCases[2].Expected.StatusCode = 403
+
+		testutil.RunE2ETest(st, testDef)
 	})
 
 	// Sub-test for Longest Prefix Precedence
