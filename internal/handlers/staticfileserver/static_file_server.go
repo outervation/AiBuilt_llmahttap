@@ -377,13 +377,90 @@ func (sfs *StaticFileServer) handleOptions(resp http2.StreamWriter, req *http.Re
 }
 
 // handleDirectory is a stub implementation for handling directory requests.
-func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.Request, path string, fi os.FileInfo) {
-	sfs.log.Debug("StaticFileServer: handleDirectory called (stub)", logger.LogFields{
+
+func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.Request, dirPath string, dirFi os.FileInfo) {
+	sfs.log.Debug("StaticFileServer: handleDirectory called", logger.LogFields{
 		"stream_id": resp.ID(),
-		"path":      path,
+		"dirPath":   dirPath,
+		"webPath":   req.URL.Path, // webPath is the original request path for this directory
 	})
-	// Placeholder: Send a 501 Not Implemented for now
-	server.SendDefaultErrorResponse(resp, http.StatusNotImplemented, req, "Directory handling not yet implemented.", sfs.log)
+
+	// 1. Attempt to serve an IndexFile (Spec 2.3.3.2)
+	// sfs.cfg.IndexFiles is guaranteed to be non-empty by config.ParseAndValidateStaticFileServerConfig (defaults to ["index.html"])
+	for _, indexFileName := range sfs.cfg.IndexFiles {
+		indexPath := filepath.Join(dirPath, indexFileName)
+		indexFi, err := os.Stat(indexPath)
+
+		if err == nil && !indexFi.IsDir() { // Found an index file and it's a regular file
+			sfs.log.Info("StaticFileServer: Serving index file from directory", logger.LogFields{
+				"stream_id":       resp.ID(),
+				"dirPath":         dirPath,
+				"index_file":      indexFileName,
+				"index_file_path": indexPath,
+			})
+			// The 'req' passed to serveFile will have its original URL.Path (the directory path).
+			// serveFile uses req for Method and conditional headers (If-None-Match, If-Modified-Since),
+			// which should apply to the index file being served. This is acceptable.
+			sfs.serveFile(resp, req, indexPath, indexFi)
+			return
+		}
+		// If os.Stat fails (e.g., os.IsNotExist(err)) or if it's a directory, try next index file.
+	}
+
+	// 2. No IndexFile found. Check ServeDirectoryListing (Spec 2.2.3, 2.3.3.2)
+	// sfs.cfg.ServeDirectoryListing is guaranteed non-nil by config.ParseAndValidateStaticFileServerConfig
+	if *sfs.cfg.ServeDirectoryListing {
+		sfs.log.Info("StaticFileServer: No index file found, serving directory listing", logger.LogFields{
+			"stream_id": resp.ID(),
+			"dirPath":   dirPath,
+			"webPath":   req.URL.Path,
+		})
+
+		htmlBody, err := sfs.generateDirectoryListingHTML(dirPath, req.URL.Path)
+		if err != nil {
+			sfs.log.Error("StaticFileServer: Failed to generate directory listing HTML", logger.LogFields{
+				"stream_id": resp.ID(),
+				"dirPath":   dirPath,
+				"webPath":   req.URL.Path,
+				"error":     err.Error(),
+			})
+			server.SendDefaultErrorResponse(resp, http.StatusInternalServerError, req, "Error generating directory listing.", sfs.log)
+			return
+		}
+
+		headers := []http2.HeaderField{
+			{Name: ":status", Value: "200"},
+			{Name: "content-type", Value: "text/html; charset=utf-8"},
+			{Name: "content-length", Value: fmt.Sprintf("%d", len(htmlBody))},
+			// Consider "Cache-Control: no-cache" for directory listings if freshness is critical
+		}
+
+		if err := resp.SendHeaders(headers, false); err != nil { // endStream=false, body follows
+			sfs.log.Error("StaticFileServer: Failed to send directory listing headers", logger.LogFields{
+				"stream_id": resp.ID(),
+				"dirPath":   dirPath,
+				"error":     err.Error(),
+			})
+			return // Don't attempt to write body if headers failed
+		}
+
+		if _, err := resp.WriteData(htmlBody, true); err != nil { // endStream=true, this is the full body
+			sfs.log.Error("StaticFileServer: Failed to write directory listing body", logger.LogFields{
+				"stream_id": resp.ID(),
+				"dirPath":   dirPath,
+				"error":     err.Error(),
+			})
+			// Stream is likely broken; HTTP/2 layer will handle reset.
+		}
+		return
+	}
+
+	// 3. No IndexFile found and ServeDirectoryListing is false (Spec 2.3.3.2)
+	sfs.log.Info("StaticFileServer: No index file and directory listing disabled, sending 403 Forbidden", logger.LogFields{
+		"stream_id": resp.ID(),
+		"dirPath":   dirPath,
+	})
+	server.SendDefaultErrorResponse(resp, http.StatusForbidden, req, "Access to this directory is forbidden.", sfs.log)
 }
 
 // handleFile is a stub implementation for handling file requests.
