@@ -176,6 +176,10 @@ func (s *Server) StartAccepting() error {
 	copy(listeners, s.listeners)
 	s.mu.RUnlock()
 
+	// Log the actual listening address for test utilities
+	for _, listener := range listeners {
+		s.log.Info("Server listening on actual address", logger.LogFields{"address": listener.Addr().String()})
+	}
 	var wg sync.WaitGroup
 	for _, l := range listeners {
 		wg.Add(1)

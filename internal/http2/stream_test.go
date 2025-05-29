@@ -2007,7 +2007,7 @@ func TestStream_SendHeaders(t *testing.T) {
 			headersToSend:                 validHeaders,
 			endStreamToSend:               false,
 			expectError:                   true,
-			expectedErrorContains:         "stream closed or being reset",
+			expectedErrorContains:         "stream closed or resetting",
 			expectFrameSent:               false,
 			expectedFinalState:            StreamStateClosed,
 			expectedResponseHeadersSent:   false,
@@ -2020,7 +2020,7 @@ func TestStream_SendHeaders(t *testing.T) {
 			headersToSend:                 validHeaders,
 			endStreamToSend:               false,
 			expectError:                   true,
-			expectedErrorContains:         "stream closed or being reset",
+			expectedErrorContains:         "stream closed or resetting",
 			expectFrameSent:               false,
 			expectedFinalState:            StreamStateOpen, // State doesn't change by SendHeaders itself
 			expectedResponseHeadersSent:   false,
@@ -2802,15 +2802,16 @@ func TestStream_WriteTrailers(t *testing.T) {
 			expectedFinalEndStreamSent:   true,
 		},
 		{
-			name:                         "Success: send trailers when endStreamSentToClient was already true (e.g. after WriteData with endStream)",
+			name:                         "Error: send trailers when endStreamSentToClient was already true (e.g. after WriteData with endStream)",
 			initialState:                 StreamStateHalfClosedLocal, // Because server already sent END_STREAM
 			initialResponseHeadersSent:   true,
 			initialEndStreamSentToClient: true,
 			trailersToSend:               validTrailers,
-			expectError:                  false,
-			expectFrameSent:              true,
-			expectedFinalState:           StreamStateHalfClosedLocal, // Stays HalfClosedLocal, effectively re-confirming END_STREAM
-			expectedFinalEndStreamSent:   true,
+			expectError:                  true,
+			expectedErrorContains:        "cannot send trailers after stream already ended",
+			expectFrameSent:              false,
+			expectedFinalState:           StreamStateHalfClosedLocal, // State should not change
+			expectedFinalEndStreamSent:   true,                       // Remains true
 		},
 		{
 			name:                         "Success: send trailers from HalfClosedRemote state (client sent END_STREAM, server now sends trailers)",
@@ -2829,7 +2830,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 			initialResponseHeadersSent: false, // Key condition
 			trailersToSend:             validTrailers,
 			expectError:                true,
-			expectedErrorContains:      "SendHeaders must be called before WriteTrailers",
+			expectedErrorContains:      "cannot send trailers before headers",
 			expectFrameSent:            false,
 			expectedFinalState:         StreamStateOpen, // State unchanged
 			expectedFinalEndStreamSent: false,
@@ -2840,7 +2841,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 			initialResponseHeadersSent: true,              // Irrelevant as stream is closed
 			trailersToSend:             validTrailers,
 			expectError:                true,
-			expectedErrorContains:      "stream closed or being reset",
+			expectedErrorContains:      "stream closed or resetting",
 			expectFrameSent:            false,
 			expectedFinalState:         StreamStateClosed,
 			expectedFinalEndStreamSent: false, // Or initialEndStreamSentToClient if it was already set
@@ -2852,7 +2853,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 			initialPendingRSTCode:      func() *ErrorCode { e := ErrCodeCancel; return &e }(), // Key condition
 			trailersToSend:             validTrailers,
 			expectError:                true,
-			expectedErrorContains:      "stream closed or being reset",
+			expectedErrorContains:      "stream error on stream 1: stream closed or resetting (code STREAM_CLOSED, 5)",
 			expectFrameSent:            false,
 			expectedFinalState:         StreamStateOpen, // State unchanged by this call
 			expectedFinalEndStreamSent: false,

@@ -6,7 +6,7 @@ import (
 	"html"
 	"io"
 	"mime"
-	"net" // For net.Addr in directory listing example
+
 	"net/http"
 	"net/url"
 	"os"
@@ -54,64 +54,44 @@ func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Reque
 	s.logger.Debug("StaticFileServer.ServeHTTP2 called", logger.LogFields{
 		"stream_id": stream.ID(),
 		"method":    req.Method,
-		"path":      req.URL.Path,
+		"path":      req.URL.Path, // This is the path AS SEEN BY THE HANDLER
 	})
 
 	// Path Resolution and Security (Spec 2.3.1)
-	// The router passes the matched PathPattern via context.
 	matchedPathPatternVal := req.Context().Value(router.MatchedPathPatternKey{})
 	var matchedPathPattern string
 	if pattern, ok := matchedPathPatternVal.(string); ok {
 		matchedPathPattern = pattern
 	} else {
-		// This should not happen if router is correctly populating context.
-		// Log an error and fallback to treating req.URL.Path as potentially needing a leading / trim
-		// or assume it's relative if no pattern found. This is a defensive measure.
 		s.logger.Error("StaticFileServer: MatchedPathPattern not found or not a string in request context", logger.LogFields{
 			"path": req.URL.Path, "context_value": matchedPathPatternVal,
 		})
-		// Fallback: treat path as relative to doc root by stripping leading slash.
-		// This might be incorrect for complex routing but better than nothing.
-		// A more robust fallback might be to error out if pattern is crucial and missing.
-		// For now, we'll proceed with a simple relative path assumption for this error case.
-		// However, for prefix matches, `matchedPathPattern` is essential.
-		// If it's missing for a prefix route, it implies a setup error.
-		// The crucial logic relies on `matchedPathPattern` for prefix stripping.
-		// Let's assume for now that if it's missing, it's a root path or simple case.
-		// This will likely fail for prefixed routes if context is not passed.
-		// A better approach IF MatchedPathPattern is missing and NEEDED (e.g. for a prefix route):
-		// server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error resolving path.", s.logger)
-		// return
-		// For now, let path determination proceed; tests will reveal if this fallback is problematic.
+		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error resolving path.", s.logger)
+		return
 	}
-	s.logger.Debug("StaticFileServer: Path resolution details", logger.LogFields{
-		"req_url_path":         req.URL.Path,
+	s.logger.Debug("StaticFileServer: Path resolution details (handler perspective)", logger.LogFields{
+		"handler_req_url_path": req.URL.Path,
 		"matched_path_pattern": matchedPathPattern,
 	})
 
 	var subPath string
-	if matchedPathPattern != "" && strings.HasPrefix(req.URL.Path, matchedPathPattern) {
-		subPath = strings.TrimPrefix(req.URL.Path, matchedPathPattern)
+	// req.URL.Path is what the router passes to the handler.
+	// For prefix routes like "/static/", if request is "/static/foo.txt", router gives "foo.txt" to handler.
+	// If request is "/static/", router gives "/" to handler.
+	// For exact routes like "/exact", if request is "/exact", router gives "/" to handler.
+	if req.URL.Path == "/" {
+		subPath = "" // Targets DocumentRoot itself.
 	} else {
-		// If no matchedPathPattern or it doesn't prefix req.URL.Path (e.g. exact match on root "/"),
-		// use req.URL.Path directly but ensure it's relative.
-		subPath = req.URL.Path
-	}
-	// Ensure subPath is relative (remove leading slash if any, unless it's the only char)
-	if len(subPath) > 1 && subPath[0] == '/' {
-		subPath = subPath[1:]
-	} else if subPath == "/" { // Request for the "root" of the matched pattern
-		subPath = "" // Effectively targets the DocumentRoot itself for index/listing
+		subPath = strings.TrimPrefix(req.URL.Path, "/")
 	}
 
 	targetPath := filepath.Join(s.config.DocumentRoot, subPath)
 	s.logger.Debug("StaticFileServer: Path resolution result", logger.LogFields{
 		"document_root": s.config.DocumentRoot,
-		"sub_path":      subPath,
+		"sub_path_used": subPath, // This is filepath.Join's input, relative to DocumentRoot
 		"target_path":   targetPath,
 	})
 
-	// Canonicalize and security check
 	absDocRoot, err := filepath.Abs(s.config.DocumentRoot)
 	if err != nil {
 		s.logger.Error("StaticFileServer: Failed to get absolute path for DocumentRoot", logger.LogFields{"docRoot": s.config.DocumentRoot, "error": err})
@@ -121,23 +101,20 @@ func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Reque
 
 	absTargetPath, err := filepath.Abs(targetPath)
 	if err != nil {
-		// This can happen for malformed paths, possibly an attack attempt or client error.
 		s.logger.Warn("StaticFileServer: Error getting absolute target path", logger.LogFields{"targetPath": targetPath, "error": err})
 		server.SendDefaultErrorResponse(stream, http.StatusBadRequest, req, "Invalid request path.", s.logger)
 		return
 	}
 
-	if !strings.HasPrefix(absTargetPath, absDocRoot) && absTargetPath != absDocRoot { // Allow absTargetPath == absDocRoot for root access
+	if !strings.HasPrefix(absTargetPath, absDocRoot) && absTargetPath != absDocRoot {
 		s.logger.Warn("StaticFileServer: Directory traversal attempt or invalid path", logger.LogFields{
 			"abs_target_path": absTargetPath,
 			"abs_doc_root":    absDocRoot,
-			"requested_path":  req.URL.Path,
 		})
-		server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "", s.logger) // Spec 2.3.1 says 404
+		server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "", s.logger)
 		return
 	}
 
-	// Stat the resolved path
 	fileInfo, statErr := os.Stat(absTargetPath)
 	if statErr != nil {
 		if os.IsNotExist(statErr) {
@@ -153,25 +130,53 @@ func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Reque
 		return
 	}
 
+	// Construct the displayPath for use in HTML listings. This should reflect the original request path.
+	// The original full request path is available in req.Context() if the router passes it,
+	// or reconstruct it from matchedPathPattern and handler's req.URL.Path.
+	// For now, we construct displayPath based on how router *should* be setting handler's req.URL.Path.
+	var displayPath string
+	if matchedPathPattern == "/" && req.URL.Path == "/" { // Exact match on root "/"
+		displayPath = "/"
+	} else if matchedPathPattern == "/" { // Prefix match on root "/", handler path is "foo" or "dir/foo"
+		displayPath = "/" + strings.TrimPrefix(req.URL.Path, "/")
+	} else if strings.HasSuffix(matchedPathPattern, "/") && req.URL.Path == "/" { // Prefix match e.g. "/static/", request for "/static/" itself
+		displayPath = matchedPathPattern
+	} else if strings.HasSuffix(matchedPathPattern, "/") { // Prefix match e.g. "/static/", request for "/static/foo"
+		displayPath = matchedPathPattern + strings.TrimPrefix(req.URL.Path, "/")
+	} else { // Exact match e.g. "/login", handler path is "/"
+		displayPath = matchedPathPattern
+	}
+	// Ensure displayPath always starts with a slash unless it's just "/"
+	if !strings.HasPrefix(displayPath, "/") && displayPath != "" {
+		displayPath = "/" + displayPath
+	}
+	if displayPath != "/" { // Clean up trailing slash if not root
+		displayPath = strings.TrimSuffix(displayPath, "/")
+		// For directories, the display path in listing *should* end with /
+		if fileInfo.IsDir() && displayPath != "" {
+			displayPath += "/"
+		}
+	}
+
 	switch req.Method {
 	case http.MethodGet:
 		if fileInfo.IsDir() {
-			s.handleDirectory(stream, req, absTargetPath, fileInfo)
+			s.handleDirectory(stream, req, absTargetPath, fileInfo, displayPath)
 		} else {
 			s.handleFile(stream, req, absTargetPath, fileInfo)
 		}
 		return
 	case http.MethodHead:
 		if fileInfo.IsDir() {
-			s.handleDirectory(stream, req, absTargetPath, fileInfo)
+			s.handleDirectory(stream, req, absTargetPath, fileInfo, displayPath)
 		} else {
 			s.handleFile(stream, req, absTargetPath, fileInfo)
 		}
 		return
 	case http.MethodOptions:
-		s.logger.Info("StaticFileServer: OPTIONS request", logger.LogFields{"stream_id": stream.ID(), "path": req.URL.Path})
+		s.logger.Info("StaticFileServer: OPTIONS request", logger.LogFields{"stream_id": stream.ID(), "display_path": displayPath})
 		headers := []http2.HeaderField{
-			{Name: ":status", Value: "204"}, // Common practice for OPTIONS
+			{Name: ":status", Value: "204"},
 			{Name: "Allow", Value: "GET, HEAD, OPTIONS"},
 			{Name: "Content-Length", Value: "0"},
 		}
@@ -184,7 +189,7 @@ func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Reque
 		s.logger.Info("StaticFileServer: Method not allowed", logger.LogFields{
 			"stream_id": stream.ID(),
 			"method":    req.Method,
-			"path":      req.URL.Path,
+			"path":      displayPath, // Use displayPath for logging consistency
 		})
 
 		if req.Body != nil {
@@ -199,13 +204,13 @@ func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Reque
 				s.logger.Warn("StaticFileServer: Error closing request body on 405", logger.LogFields{"stream_id": stream.ID(), "error": errClose.Error()})
 			}
 		}
-		// SendDefaultErrorResponse will handle adding Allow header for 405 if not already done by generic mechanism
+		// Pass original req to SendDefaultErrorResponse for Accept header processing if needed by that function
 		server.SendDefaultErrorResponse(stream, http.StatusMethodNotAllowed, req, "", s.logger)
 		return
 	}
 }
 
-func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.Request, dirPath string, dirInfo os.FileInfo) {
+func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.Request, dirPath string, dirInfo os.FileInfo, displayPath string) {
 	indexFiles := s.config.IndexFiles
 	if len(indexFiles) == 0 {
 		indexFiles = []string{"index.html"} // Default from spec if not configured
@@ -216,8 +221,8 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 		indexInfo, statErr := os.Stat(indexPath)
 		if statErr == nil && !indexInfo.IsDir() {
 			// Found an index file. Serve it.
-			s.logger.Debug("StaticFileServer: Serving index file for directory", logger.LogFields{"dir": dirPath, "indexFile": indexFile})
-			s.handleFile(stream, req, indexPath, indexInfo)
+			s.logger.Debug("StaticFileServer: Serving index file for directory", logger.LogFields{"dir": dirPath, "indexFile": indexFile, "display_path": displayPath})
+			s.handleFile(stream, req, indexPath, indexInfo) // req is original reqForHandler
 			return
 		}
 	}
@@ -229,7 +234,22 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 	}
 
 	if serveListing {
-		s.logger.Debug("StaticFileServer: Generating directory listing", logger.LogFields{"dir": dirPath})
+		// For HEAD request on a directory that would list, send 200 OK and content-type text/html, but no body.
+		if req.Method == http.MethodHead {
+			s.logger.Debug("StaticFileServer: HEAD request for directory listing", logger.LogFields{"dir": dirPath, "display_path": displayPath})
+			headers := []http2.HeaderField{
+				{Name: ":status", Value: "200"},
+				{Name: "content-type", Value: "text/html; charset=utf-8"},
+				// Omitting Content-Length for HEAD on dynamic content like directory listing.
+			}
+			if err := stream.SendHeaders(headers, true); err != nil { // true: endStream for HEAD
+				s.logger.Error("StaticFileServer: Failed to send HEAD dir listing headers", logger.LogFields{"error": err})
+			}
+			return
+		}
+
+		// Actual GET request for directory listing
+		s.logger.Debug("StaticFileServer: Generating directory listing", logger.LogFields{"dir": dirPath, "display_path": displayPath})
 		entries, readDirErr := os.ReadDir(dirPath)
 		if readDirErr != nil {
 			s.logger.Error("StaticFileServer: Failed to read directory for listing", logger.LogFields{"dir": dirPath, "error": readDirErr})
@@ -238,24 +258,30 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 		}
 
 		var listingHTML strings.Builder
-		// Basic styling for readability
-		listingHTML.WriteString("<!DOCTYPE html><html><head><title>Index of " + html.EscapeString(req.URL.Path) + "</title>")
+		// Ensure displayPath for HTML content ends with a '/' if it's a directory path being listed
+		htmlDisplayPath := displayPath
+		if !strings.HasSuffix(htmlDisplayPath, "/") && htmlDisplayPath != "/" {
+			htmlDisplayPath += "/"
+		}
+		escapedDisplayPath := html.EscapeString(htmlDisplayPath)
+
+		listingHTML.WriteString("<!DOCTYPE html><html><head><title>Index of " + escapedDisplayPath + "</title>")
 		listingHTML.WriteString("<style>body { font-family: Arial, sans-serif; } table { border-collapse: collapse; margin-top: 1em; } ")
 		listingHTML.WriteString("th, td { padding: 0.25em 0.5em; border: 1px solid #ddd; text-align: left; } ")
 		listingHTML.WriteString("th { background-color: #f0f0f0; } tr:hover { background-color: #f9f9f9; } ")
 		listingHTML.WriteString("a { text-decoration: none; color: #007bff; } a:hover { text-decoration: underline; }</style>")
 		listingHTML.WriteString("</head><body>")
-		listingHTML.WriteString("<h1>Index of " + html.EscapeString(req.URL.Path) + "</h1>")
+		listingHTML.WriteString("<h1>Index of " + escapedDisplayPath + "</h1>")
 		listingHTML.WriteString("<table><tr><th>Name</th><th>Last Modified</th><th>Size</th></tr>")
 
-		// Parent directory link if not at the root of the listing context
-		if req.URL.Path != "/" && req.URL.Path != "" { // Check if not already at a root-like path for listing
+		// Parent directory link
+		if htmlDisplayPath != "/" { // Avoid showing "../" if already at root
 			listingHTML.WriteString("<tr><td><a href=\"../\">../</a></td><td>-</td><td>-</td></tr>")
 		}
 
 		for _, entry := range entries {
 			name := entry.Name()
-			info, err := entry.Info() // Get FileInfo for modtime and size
+			info, err := entry.Info()
 			modTimeStr := "-"
 			sizeStr := "-"
 
@@ -263,16 +289,22 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 				modTimeStr = info.ModTime().Format("2006-01-02 15:04")
 				if info.IsDir() {
 					sizeStr = "-"
-					name += "/" // Visual cue for directories
+					name += "/"
 				} else {
-					sizeStr = fmt.Sprintf("%d B", info.Size()) // Replaced humanize.Bytes with simple byte count
+					sizeStr = fmt.Sprintf("%d B", info.Size())
 				}
 			}
 			listingHTML.WriteString(fmt.Sprintf("<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%s</td></tr>",
 				url.PathEscape(name), html.EscapeString(name), modTimeStr, sizeStr))
 		}
 		listingHTML.WriteString("</table>")
-		listingHTML.WriteString(fmt.Sprintf("<hr><address>Server at %s Port %s</address>", req.Host, strings.Split(req.Context().Value(http.LocalAddrContextKey).(net.Addr).String(), ":")[1]))
+		// Use req.Host which should be :authority
+		host := req.Host
+		if host == "" && req.URL != nil {
+			host = req.URL.Host
+		}
+
+		listingHTML.WriteString(fmt.Sprintf("<hr><address>Server at %s</address>", html.EscapeString(host)))
 		listingHTML.WriteString("</body></html>")
 
 		bodyBytes := []byte(listingHTML.String())
@@ -292,8 +324,8 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 	}
 
 	// No IndexFiles found and ServeDirectoryListing is false (Spec 2.3.3.2)
-	s.logger.Info("StaticFileServer: Directory access forbidden (no index, no listing)", logger.LogFields{"dir": dirPath})
-	server.SendDefaultErrorResponse(stream, http.StatusForbidden, req, "", s.logger)
+	s.logger.Info("StaticFileServer: Directory access forbidden (no index, no listing)", logger.LogFields{"dir": dirPath, "display_path": displayPath})
+	server.SendDefaultErrorResponse(stream, http.StatusForbidden, req, "", s.logger) // Pass original req
 }
 
 func (s *StaticFileServer) getMimeType(filePath string) string {
@@ -307,9 +339,8 @@ func (s *StaticFileServer) getMimeType(filePath string) string {
 	// Fallback to Go's built-in detection
 	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
 		// Go's mime.TypeByExtension might return "type/subtype; charset=utf-8"
-		// We only want "type/subtype" part for Content-Type header usually.
-		// Charset can be added separately if needed or if server policy dictates.
-		return strings.Split(mimeType, ";")[0]
+		// We want to keep this full string.
+		return mimeType
 	}
 	// Default fallback
 	return "application/octet-stream"
@@ -358,15 +389,21 @@ func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Reque
 			return
 		}
 	} else {
+
 		ims := req.Header.Get("if-modified-since")
 		if ims != "" {
 			if t, err := http.ParseTime(ims); err == nil {
-				// If-Modified-Since is compared against the file's modification time.
-				// Use ModTime().Truncate(time.Second) to ensure consistent comparison
-				// as IMS header might not have sub-second precision.
-				if !fileInfo.ModTime().Truncate(time.Second).After(t.Truncate(time.Second)) {
-					s.logger.Debug("StaticFileServer: If-Modified-Since condition met", logger.LogFields{"path": filePath, "ims_time": ims, "file_mod_time": fileInfo.ModTime().UTC().Format(http.TimeFormat)})
+				// Ensure both times are UTC and truncated to the second for comparison
+				fileModTimeUTC := fileInfo.ModTime().UTC().Truncate(time.Second)
+				clientIMSTimeUTC := t.UTC().Truncate(time.Second) // t should already be UTC from ParseTime
+
+				// Condition for 304: file not modified since client's stated time.
+				// !fileModTimeUTC.After(clientIMSTimeUTC) means fileModTimeUTC <= clientIMSTimeUTC
+				if !fileModTimeUTC.After(clientIMSTimeUTC) {
+					s.logger.Debug("StaticFileServer: If-Modified-Since condition met (file not modified or modified at same time)", logger.LogFields{"path": filePath, "client_ims_time_utc": clientIMSTimeUTC.Format(http.TimeFormat), "file_mod_time_utc": fileModTimeUTC.Format(http.TimeFormat)})
 					statusHeaders := []http2.HeaderField{{Name: ":status", Value: "304"}}
+					// Must include ETag and other relevant cache headers on 304 if they would have been on 200.
+					// Content-Length MUST NOT be sent. Date should be.
 					for _, h := range headers {
 						if h.Name != ":status" && h.Name != "content-length" {
 							statusHeaders = append(statusHeaders, h)
@@ -374,12 +411,16 @@ func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Reque
 					}
 					statusHeaders = append(statusHeaders, http2.HeaderField{Name: "date", Value: time.Now().UTC().Format(http.TimeFormat)})
 
-					err := stream.SendHeaders(statusHeaders, true) // 304 has no body
-					if err != nil {
-						s.logger.Error("StaticFileServer: Error sending 304 Not Modified headers (If-Modified-Since)", logger.LogFields{"path": filePath, "error": err.Error()})
+					errSend := stream.SendHeaders(statusHeaders, true) // 304 has no body
+					if errSend != nil {
+						s.logger.Error("StaticFileServer: Error sending 304 Not Modified headers (If-Modified-Since)", logger.LogFields{"path": filePath, "error": errSend.Error()})
 					}
 					return
 				}
+			} else {
+				s.logger.Warn("StaticFileServer: Failed to parse If-Modified-Since header", logger.LogFields{"path": filePath, "ims_header": ims, "error": err.Error()})
+				// If the If-Modified-Since header is invalid, RFC 7232 says to ignore the field.
+				// So we proceed to serve the full response.
 			}
 		}
 	}

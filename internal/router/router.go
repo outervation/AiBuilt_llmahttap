@@ -1,7 +1,7 @@
 package router
 
 import (
-	"context" // Ensured context is imported
+	"context" // Added import
 	"fmt"
 	"net/http"
 	"sort"
@@ -11,7 +11,7 @@ import (
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/server"
-	"golang.org/x/net/http2/hpack" // Added import
+	"golang.org/x/net/http2/hpack"
 )
 
 // MatchedPathPatternKey is a context key for passing the matched PathPattern.
@@ -194,51 +194,95 @@ func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 // This method would be called by the HTTP/2 connection/server layer for each request stream.
 
 func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
-	// Log the incoming request details
-	r.mainLogger.Debug("Router: ServeHTTP received request", logger.LogFields{
-		"method": req.Method,
-		"path":   req.URL.Path,
-		"host":   req.Host,
-	})
+	// Add import for context if not already there (it should be)
+	// import "context"
 
-	routeInfo, err := r.FindRoute(req.URL.Path)
-	if err != nil {
-		// FindRoute itself logs detailed errors for handler creation failure.
-		// Here, we just ensure a generic 500 is sent if handler creation failed.
-		r.mainLogger.Error("Router: Error finding route or creating handler", logger.LogFields{"path": req.URL.Path, "error": err.Error()})
-		server.SendDefaultErrorResponse(s, http.StatusInternalServerError, req, "Error processing request.", r.mainLogger)
+	// Use the internal Match method which already logs creation errors and returns (route, handler, error)
+	matchedRouteConfig, handler, err := r.Match(req.URL.Path)
+
+	if err != nil { // Handler creation failed for a matched route
+		r.mainLogger.Error("Router: Handler creation failed for matched route", logger.LogFields{
+			"path":  req.URL.Path,
+			"error": err.Error(), // err comes from r.Match which wraps handlerRegistry.CreateHandler errors
+		})
+		server.SendDefaultErrorResponse(s, http.StatusInternalServerError, req, "Failed to instantiate handler", r.mainLogger)
 		return
 	}
 
-	if routeInfo == nil || routeInfo.Handler == nil {
-		// No route matched
-		r.mainLogger.Info("Router: No route matched", logger.LogFields{"path": req.URL.Path})
+	if matchedRouteConfig == nil || handler == nil { // No route matched
+		r.mainLogger.Debug("Router: No route matched", logger.LogFields{"path": req.URL.Path})
 		server.SendDefaultErrorResponse(s, http.StatusNotFound, req, "", r.mainLogger)
 		return
 	}
 
-	// Pass the matched PathPattern to the handler via context
-	// The HandlerConfig field of MatchedRouteInfo is actually the full config.Route object.
-	if routeInfo.HandlerConfig.PathPattern != "" {
-		newCtx := context.WithValue(req.Context(), MatchedPathPatternKey{}, routeInfo.HandlerConfig.PathPattern)
-		req = req.WithContext(newCtx)
-		r.mainLogger.Debug("Router: Added matched PathPattern to request context", logger.LogFields{
-			"path_pattern": routeInfo.HandlerConfig.PathPattern,
-			"uri_path":     req.URL.Path,
+	// Route matched, handler instantiated
+	r.mainLogger.Debug("Router: Matched route", logger.LogFields{
+		"request_path":  req.URL.Path,
+		"route_pattern": matchedRouteConfig.PathPattern,
+		"match_type":    matchedRouteConfig.MatchType,
+		"handler_type":  matchedRouteConfig.HandlerType,
+	})
+
+	// Prepare request for the handler
+	reqForHandler := req
+	ctxForHandler := req.Context()
+
+	// Add matched path pattern to context for the handler
+	ctxForHandler = context.WithValue(ctxForHandler, MatchedPathPatternKey{}, matchedRouteConfig.PathPattern)
+
+	if matchedRouteConfig.MatchType == config.MatchTypePrefix {
+		originalPath := req.URL.Path
+		// PathPattern for prefix matches must end with "/"
+		subPath := strings.TrimPrefix(originalPath, matchedRouteConfig.PathPattern)
+
+		// Create a shallow copy of the request to modify its URL
+		urlCopy := *req.URL // Create a copy of the URL struct
+		urlCopy.Path = subPath
+		if urlCopy.Path == "" { // Request for the prefix itself (e.g., /static/)
+			urlCopy.Path = "/" // Handler sees it as a request for its root
+		} else if !strings.HasPrefix(urlCopy.Path, "/") && subPath != "" {
+			// If subPath is "file.txt", it should become "/file.txt" for the handler
+			// so handler can treat its own root as "/".
+			urlCopy.Path = "/" + subPath
+		}
+		urlCopy.RawPath = "" // Clear RawPath to avoid inconsistency
+
+		// Create a new request with the modified URL and context
+		reqCopy := req.WithContext(ctxForHandler)
+		reqCopy.URL = &urlCopy
+		reqForHandler = reqCopy
+
+		r.mainLogger.Debug("Router: Dispatching to handler with modified path for prefix match", logger.LogFields{
+			"original_path": originalPath,
+			"handler_path":  urlCopy.Path,
+			"pattern":       matchedRouteConfig.PathPattern,
+		})
+	} else if matchedRouteConfig.MatchType == config.MatchTypeExact {
+		originalPath := req.URL.Path
+		urlCopy := *req.URL  // Create a copy of the URL struct
+		urlCopy.Path = "/"   // Key change: handler sees "/" as its base path
+		urlCopy.RawPath = "" // Clear RawPath to avoid inconsistency
+
+		// Create a new request with the modified URL and context
+		reqCopy := req.WithContext(ctxForHandler)
+		reqCopy.URL = &urlCopy
+		reqForHandler = reqCopy
+
+		r.mainLogger.Debug("Router: Dispatching to handler with modified path for exact match", logger.LogFields{
+			"original_path": originalPath,
+			"handler_path":  urlCopy.Path,
+			"pattern":       matchedRouteConfig.PathPattern,
+		})
+	} else {
+		// Fallback for other match types or if no special path handling is needed
+		// Just apply the context.
+		reqForHandler = req.WithContext(ctxForHandler)
+		r.mainLogger.Debug("Router: Dispatching to handler with original path (context enriched)", logger.LogFields{
+			"path":       req.URL.Path,
+			"pattern":    matchedRouteConfig.PathPattern,
+			"match_type": matchedRouteConfig.MatchType,
 		})
 	}
 
-	r.mainLogger.Debug("Router: Matched route, dispatching to handler", logger.LogFields{
-		"path":               req.URL.Path,
-		"matchedPathPattern": routeInfo.HandlerConfig.PathPattern,
-		"matchedMatchType":   routeInfo.HandlerConfig.MatchType,
-		"matchedHandlerType": routeInfo.HandlerConfig.HandlerType,
-		"handler_is_nil":     routeInfo.Handler == nil,
-	})
-
-	// Call the handler
-	// The handler is responsible for its own panic recovery if necessary.
-	// If the handler panics and doesn't recover, the server's global panic handler (if any) or Go runtime will handle it.
-	routeInfo.Handler.ServeHTTP2(s, req)
-	r.mainLogger.Debug("Router: Handler ServeHTTP2 completed", logger.LogFields{"path": req.URL.Path})
+	handler.ServeHTTP2(s, reqForHandler)
 }

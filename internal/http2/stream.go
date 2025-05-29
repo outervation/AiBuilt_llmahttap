@@ -219,42 +219,42 @@ func newStream(
 // SendHeaders sends response headers.
 func (s *Stream) SendHeaders(headers []HeaderField, endStream bool) error {
 	s.mu.Lock()
-	// defer s.mu.Unlock() // Unlock must be carefully managed due to calls to conn
+	defer s.mu.Unlock()
 
 	if s.responseHeadersSent {
-		s.mu.Unlock()
-		s.conn.log.Error("stream: SendHeaders called after headers already sent", logger.LogFields{"stream_id": s.id})
+		s.conn.log.Error("Stream: SendHeaders called after headers already sent", logger.LogFields{"stream_id": s.id})
 		return NewStreamError(s.id, ErrCodeInternalError, "headers already sent")
 	}
 	if s.state == StreamStateClosed || s.pendingRSTCode != nil {
-		s.mu.Unlock()
-		return NewStreamError(s.id, ErrCodeStreamClosed, "stream closed or being reset")
+		s.conn.log.Warn("Stream: SendHeaders called on closed or resetting stream", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+		return NewStreamError(s.id, ErrCodeStreamClosed, "stream closed or resetting")
 	}
-	if s.state == StreamStateHalfClosedLocal && s.endStreamSentToClient {
-		s.mu.Unlock()
+	if s.state == StreamStateHalfClosedLocal { // We've already sent END_STREAM
+		s.conn.log.Error("Stream: SendHeaders called on half-closed (local) stream where END_STREAM was already sent", logger.LogFields{"stream_id": s.id})
 		return NewStreamError(s.id, ErrCodeStreamClosed, "cannot send headers on half-closed (local) stream after END_STREAM")
 	}
-	s.mu.Unlock() // Unlock before calling conn method which might also lock
 
-	hpackHeaders := http2HeaderFieldsToHpackHeaderFields(headers)
-	s.conn.log.Debug("Stream: PRE-CALL conn.sendHeadersFrame", logger.LogFields{"stream_id": s.id, "s_conn_nil": s.conn == nil, "s_conn_log_nil": s.conn != nil && s.conn.log == nil, "num_headers": len(hpackHeaders), "end_stream": endStream})
+	// Convert to hpack.HeaderField and lowercase names
+	hpackHeaders := make([]hpack.HeaderField, len(headers))
+	for i, hf := range headers {
+		hpackHeaders[i] = hpack.HeaderField{Name: strings.ToLower(hf.Name), Value: hf.Value}
+	}
+
+	s.conn.log.Debug("Stream: PRE-CALL conn.sendHeadersFrame", logger.LogFields{"stream_id": s.id, "num_headers": len(hpackHeaders), "end_stream": endStream, "s.conn_nil": s.conn == nil, "s.conn_log_nil": s.conn != nil && s.conn.log == nil})
+
 	err := s.conn.sendHeadersFrame(s, hpackHeaders, endStream)
-
-	s.mu.Lock() // Re-lock to update stream state
-	defer s.mu.Unlock()
-
 	if err != nil {
-		// If sending headers failed, don't mark them as sent or update stream state based on send.
-		// The connection/sender should handle the error (e.g., RST or close connection).
+		s.conn.log.Error("Stream: conn.sendHeadersFrame failed", logger.LogFields{"stream_id": s.id, "error": err})
+		// If sendHeadersFrame itself fails, the stream/connection might be broken.
+		// The error from sendHeadersFrame might be a ConnectionError already.
 		return err
 	}
 
 	s.responseHeadersSent = true
 	if endStream {
-		s.endStreamSentToClient = true
-		s.transitionStateOnSendEndStream() // Update state based on sending END_STREAM
+		s.endStreamSentToClient = true // Set this before calling transition
+		s.transitionStateOnSendEndStream()
 	}
-
 	return nil
 }
 
@@ -519,37 +519,35 @@ func (s *Stream) sendRSTStream(errorCode ErrorCode) error {
 
 // WriteTrailers sends trailing headers after the response body.
 func (s *Stream) WriteTrailers(trailers []HeaderField) error {
-	s.mu.Lock() // Initial lock for checks
-	if !s.responseHeadersSent {
-		s.mu.Unlock()
-		s.conn.log.Error("stream: WriteTrailers called before SendHeaders", logger.LogFields{"stream_id": s.id})
-		return NewStreamError(s.id, ErrCodeInternalError, "SendHeaders must be called before WriteTrailers")
-	}
-	if s.state == StreamStateClosed || s.pendingRSTCode != nil {
-		s.mu.Unlock()
-		return NewStreamError(s.id, ErrCodeStreamClosed, "stream closed or being reset, cannot send trailers")
-	}
-	if s.endStreamSentToClient {
-		s.conn.log.Debug("stream: WriteTrailers called after END_STREAM already sent by server. This is okay, trailers are a new HEADERS frame.", logger.LogFields{"stream_id": s.id})
-	}
-
-	s.mu.Unlock() // Unlock before calling conn method
-
-	hpackTrailers := http2HeaderFieldsToHpackHeaderFields(trailers)
-	// The trailers frame itself will have END_STREAM set.
-	// The connection's sendHeadersFrame method must ensure END_STREAM is true for the frame carrying trailers.
-	err := s.conn.sendHeadersFrame(s, hpackTrailers, true)
-
-	s.mu.Lock() // Re-lock to update stream state
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if !s.responseHeadersSent {
+		return NewStreamError(s.id, ErrCodeInternalError, "cannot send trailers before headers")
+	}
+	if s.endStreamSentToClient {
+		return NewStreamError(s.id, ErrCodeStreamClosed, "cannot send trailers after stream already ended")
+	}
+	if s.state == StreamStateClosed || s.pendingRSTCode != nil {
+		return NewStreamError(s.id, ErrCodeStreamClosed, "stream closed or resetting")
+	}
+
+	// Convert to hpack.HeaderField and lowercase names
+	hpackTrailers := make([]hpack.HeaderField, len(trailers))
+	for i, hf := range trailers {
+		hpackTrailers[i] = hpack.HeaderField{Name: strings.ToLower(hf.Name), Value: hf.Value}
+	}
+
+	// Trailers imply end of stream.
+	// Use a HEADERS frame with END_STREAM set.
+	err := s.conn.sendHeadersFrame(s, hpackTrailers, true) // true for endStream
 	if err != nil {
+		s.conn.log.Error("Stream: conn.sendHeadersFrame for trailers failed", logger.LogFields{"stream_id": s.id, "error": err})
 		return err
 	}
 
-	s.endStreamSentToClient = true
-	s.transitionStateOnSendEndStream()
-
+	s.endStreamSentToClient = true     // Set this flag after successful queuing
+	s.transitionStateOnSendEndStream() // Mark stream as ended from our side
 	return nil
 }
 

@@ -491,7 +491,11 @@ func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualRespo
 	finalArgs = append(finalArgs, "--verbose") // More detailed output for debugging
 	// finalArgs = append(finalArgs, "--silent") // Replaced by --verbose for debugging
 	// finalArgs = append(finalArgs, "--show-error") // Verbose includes errors
-	finalArgs = append(finalArgs, "-X", request.Method)
+	if strings.ToUpper(request.Method) == "HEAD" {
+		finalArgs = append(finalArgs, "-I")
+	} else {
+		finalArgs = append(finalArgs, "-X", request.Method)
+	}
 	finalArgs = append(finalArgs, "--noproxy", "*") // Prevent accidental proxy usage
 
 	if request.Headers != nil {
@@ -1098,4 +1102,15 @@ func StartingPollingAndPrintingBuffer(buffer *bytes.Buffer) {
 			time.Sleep(pollingRate)
 		}
 	}()
+}
+
+// ToRawMessageBytes is a helper for E2E tests to convert a handler config struct
+// into json.RawMessage bytes.
+func ToRawMessageBytes(t *testing.T, v interface{}) []byte {
+	t.Helper()
+	bytes, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("Failed to marshal handler config to JSON: %v", err)
+	}
+	return bytes
 }

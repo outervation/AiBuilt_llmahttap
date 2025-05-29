@@ -826,3 +826,184 @@ func TestStaticFileServing_Basic(t *testing.T) {
 // TODO: TestHotReload_BinaryUpgrade (SIGHUP with new executable_path)
 // TODO: TestLargeFileTransfer_FlowControl
 // TODO: TestHandler_ErrorHandling (e.g. if a handler panics or returns error, 500 is generated)
+
+func TestStaticFileServing_BasicFileOperations(t *testing.T) {
+	// Create temp files for DocumentRoot
+	docRootFiles := map[string]string{
+		"file.txt":                     "Plain text file content.",
+		"page.html":                    "<html><body>HTML Page</body></html>",
+		"archive.veryobscureextension": "Some binary data for default MIME.",
+		"data.custominline":            "Content for inline custom MIME.",
+		"data.customjson":              "Content for JSON file custom MIME.",
+	}
+	docRoot, cleanupDocRoot, err := setupTempFiles(t, docRootFiles)
+	if err != nil {
+		t.Fatalf("Failed to set up temp files for DocumentRoot: %v", err)
+	}
+	defer cleanupDocRoot()
+
+	// Create temp JSON file for MimeTypesPath
+	// Spec 2.2.4: keys are extensions (including the leading dot)
+	mimeJSONContent := ` {
+		".customjson": "application/x-from-json-file"
+	}`
+	mimeJSONFile, err := os.CreateTemp("", "custom-mime-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp MIME JSON file: %v", err)
+	}
+	mimeJSONFilePath := mimeJSONFile.Name() // Get path before closing
+	if _, err := mimeJSONFile.WriteString(mimeJSONContent); err != nil {
+		mimeJSONFile.Close()
+		os.Remove(mimeJSONFilePath)
+		t.Fatalf("Failed to write to temp MIME JSON file: %v", err)
+	}
+	if err := mimeJSONFile.Close(); err != nil {
+		os.Remove(mimeJSONFilePath)
+		t.Fatalf("Failed to close temp MIME JSON file: %v", err)
+	}
+	defer os.Remove(mimeJSONFilePath) // Ensure cleanup
+
+	absoluteMimeJSONPath, err := filepath.Abs(mimeJSONFilePath)
+	if err != nil {
+		t.Fatalf("Failed to get absolute path for MIME JSON file: %v", err)
+	}
+
+	// StaticFileServer Handler Configuration
+	sfsHandlerConfig := config.StaticFileServerConfig{
+		DocumentRoot: docRoot,
+		MimeTypesMap: map[string]string{
+			".custominline": "application/x-custom-inline",
+		},
+		MimeTypesPath: &absoluteMimeJSONPath,
+	}
+	sfsHandlerConfigJSON := testutil.ToRawMessageBytes(t, sfsHandlerConfig)
+
+	// Server Configuration
+	serverCfg := map[string]interface{}{
+		"server": map[string]interface{}{
+			"address": "127.0.0.1:0", // Dynamic port
+		},
+		"logging": map[string]interface{}{
+			"log_level":  "DEBUG", // Keep logs minimal for this test, enable if debugging
+			"access_log": map[string]interface{}{"enabled": false},
+		},
+		"routing": map[string]interface{}{
+			"routes": []config.Route{
+				{
+					PathPattern:   "/files/", // Different prefix for this test
+					MatchType:     config.MatchTypePrefix,
+					HandlerType:   "StaticFileServer",
+					HandlerConfig: config.RawMessageWrapper(sfsHandlerConfigJSON),
+				},
+			},
+		},
+	}
+
+	testDefinition := testutil.E2ETestDefinition{
+		Name:                "StaticFileServing_BasicFileOperations",
+		ServerBinaryPath:    serverBinaryPath,
+		ServerConfigData:    serverCfg,
+		ServerConfigFormat:  "json",
+		ServerConfigArgName: "-config",
+		ServerListenAddress: "127.0.0.1:0",
+		CurlPath:            curlPath,
+		TestCases: []testutil.E2ETestCase{
+			// 1. GET File
+			{
+				Name:    "GET_File_Text",
+				Request: testutil.TestRequest{Method: "GET", Path: "/files/file.txt"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: http.StatusOK,
+					Headers: testutil.HeaderMatcher{
+						"content-type":   "text/plain; charset=utf-8",
+						"content-length": fmt.Sprintf("%d", len(docRootFiles["file.txt"])),
+						// ETag and Last-Modified presence are expected by spec 2.3.3.1
+						// but not strictly asserted here for exact values to avoid brittleness.
+						// Other tests (caching) might cover their behavior more deeply.
+					},
+					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte(docRootFiles["file.txt"])},
+				},
+			},
+			// 2. HEAD File
+			{
+				Name:    "HEAD_File_Text",
+				Request: testutil.TestRequest{Method: "HEAD", Path: "/files/file.txt"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: http.StatusOK,
+					Headers: testutil.HeaderMatcher{
+						"content-type":   "text/plain; charset=utf-8",
+						"content-length": fmt.Sprintf("%d", len(docRootFiles["file.txt"])),
+					},
+					ExpectNoBody: true,
+				},
+			},
+			// 3. OPTIONS File Path
+			{
+				Name:    "OPTIONS_File_Path",
+				Request: testutil.TestRequest{Method: "OPTIONS", Path: "/files/file.txt"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:   http.StatusNoContent, // Spec says 204 or 200. Test for 204.
+					Headers:      testutil.HeaderMatcher{"allow": "GET, HEAD, OPTIONS"},
+					ExpectNoBody: true,
+				},
+			},
+			// 4. Path Traversal Security
+			{
+				Name:     "GET_PathTraversal_Attempt",
+				Request:  testutil.TestRequest{Method: "GET", Path: "/files/../naughty.txt"},
+				Expected: testutil.ExpectedResponse{StatusCode: http.StatusNotFound},
+			},
+			// 5. File Not Found (within DocRoot)
+			{
+				Name:     "GET_FileNotFound_WithinDocRoot",
+				Request:  testutil.TestRequest{Method: "GET", Path: "/files/nonexistentfile.txt"},
+				Expected: testutil.ExpectedResponse{StatusCode: http.StatusNotFound},
+			},
+			// 6. Unsupported Method
+			{
+				Name:     "POST_File_UnsupportedMethod",
+				Request:  testutil.TestRequest{Method: "POST", Path: "/files/file.txt", Body: []byte("some data")},
+				Expected: testutil.ExpectedResponse{StatusCode: http.StatusMethodNotAllowed},
+			},
+			// 7. MIME Types
+			{
+				Name:    "GET_MIME_Default_OctetStream",
+				Request: testutil.TestRequest{Method: "GET", Path: "/files/archive.veryobscureextension"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "application/octet-stream"},
+					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte(docRootFiles["archive.veryobscureextension"])},
+				},
+			},
+			{
+				Name:    "GET_MIME_BuiltIn_HTML",
+				Request: testutil.TestRequest{Method: "GET", Path: "/files/page.html"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte(docRootFiles["page.html"])},
+				},
+			},
+			{
+				Name:    "GET_MIME_Custom_InlineMap",
+				Request: testutil.TestRequest{Method: "GET", Path: "/files/data.custominline"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "application/x-custom-inline"},
+					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte(docRootFiles["data.custominline"])},
+				},
+			},
+			{
+				Name:    "GET_MIME_Custom_JSONFile",
+				Request: testutil.TestRequest{Method: "GET", Path: "/files/data.customjson"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "application/x-from-json-file"},
+					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte(docRootFiles["data.customjson"])},
+				},
+			},
+		},
+	}
+
+	testutil.RunE2ETest(t, testDefinition)
+}
