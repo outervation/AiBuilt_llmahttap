@@ -550,7 +550,98 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 	// Sub-test for Prefix Match
 	t.Run("PrefixMatch", func(st *testing.T) {
-		st.Skip("PrefixMatch sub-test not yet implemented")
+		// Files are created *relative* to the 'docRoot' returned by setupTempFilesForRoutingTest.
+		// e.g., docRoot = /tmp/e2e-XYZ
+		// "prefix/index.html" -> /tmp/e2e-XYZ/prefix/index.html
+		baseDocRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"prefix/index.html":        "Prefix Match Index File Content",
+			"prefix/somefile.txt":      "Prefix Match Somefile Content",
+			"prefix/subdir/nested.txt": "Prefix Match Nested File Content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		// The StaticFileServer for the route "/prefix/" should serve files
+		// from the "prefix" subdirectory of our baseDocRoot.
+		actualSFSDocRoot := filepath.Join(baseDocRoot, "prefix")
+
+		staticFsCfg := config.StaticFileServerConfig{
+			DocumentRoot: actualSFSDocRoot, // Corrected DocumentRoot
+			IndexFiles:   []string{"index.html"},
+		}
+		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
+
+		serverCfg := config.Config{
+			Server: &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{
+				LogLevel:  config.LogLevelDebug,
+				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{
+						PathPattern:   "/prefix/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsHandlerCfgJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "PrefixMatchScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestPrefixSomefile", // GET /prefix/somefile.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/somefile.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Somefile Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixIndexViaSlash", // GET /prefix/
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Index File Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixNestedFile", // GET /prefix/subdir/nested.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/subdir/nested.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Nested File Content")},
+					},
+				},
+				{
+					Name:    "RequestOutsidePrefix_Should404",
+					Request: testutil.TestRequest{Method: "GET", Path: "/other/somefile.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404,
+					},
+				},
+				{
+					Name:    "RequestJustSlash_Should404_NoRootRoute",
+					Request: testutil.TestRequest{Method: "GET", Path: "/"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404,
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
 	})
 
 	// Sub-test for Exact over Prefix Precedence

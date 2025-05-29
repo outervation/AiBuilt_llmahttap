@@ -182,7 +182,7 @@ func newStream(
 		id:                          id,
 		state:                       StreamStateIdle,
 		conn:                        conn,
-		fcManager:                   NewStreamFlowControlManager(id, initialOurWindowSize, initialPeerWindowSize),
+		fcManager:                   NewStreamFlowControlManager(conn, id, initialOurWindowSize, initialPeerWindowSize),
 		priorityWeight:              prioWeight,
 		priorityParentID:            prioParentID,
 		priorityExclusive:           prioExclusive,
@@ -718,32 +718,35 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 
 	// 3. Handle END_STREAM flag
 	if frame.Header().Flags&FlagDataEndStream != 0 {
-		s.endStreamReceivedFromClient = true
 		s.conn.log.Debug("END_STREAM received on DATA frame", logger.LogFields{"stream_id": s.id})
-
-		// Close the writer part of the pipe to signal EOF to the handler.
-		// Do this before state transition.
-		if err := s.requestBodyWriter.Close(); err != nil {
-			// Log if closing the pipe writer fails, but proceed with state transition.
-			// This error is usually minor (e.g., "pipe already closed").
-			s.conn.log.Warn("Error closing requestBodyWriter after END_STREAM", logger.LogFields{"stream_id": s.id, "error": err.Error()})
+		s.endStreamReceivedFromClient = true
+		// Close the writer end of the pipe to signal EOF to the reader (handler).
+		if s.requestBodyWriter != nil {
+			if err := s.requestBodyWriter.Close(); err != nil {
+				s.conn.log.Warn("Error closing requestBodyWriter on END_STREAM", logger.LogFields{"stream_id": s.id, "error": err.Error()})
+				// Not fatal for connection, handler might get a pipe error.
+			}
 		}
 
-		switch s.state {
-		case StreamStateOpen:
+		// Determine new state based on current state and receiving END_STREAM
+		if s.state == StreamStateOpen {
 			s._setState(StreamStateHalfClosedRemote)
-		case StreamStateHalfClosedLocal:
-			s._setState(StreamStateClosed) // Both sides have sent END_STREAM
-		default:
+		} else if s.state == StreamStateHalfClosedLocal { // Server already sent END_STREAM
+			s._setState(StreamStateClosed)
+		} else {
 			// This implies an invalid state for receiving END_STREAM (e.g., already closed, reserved).
 			// The frame dispatch logic in conn.go should prevent this.
 			// If it happens, it's a protocol violation or internal state error.
+			// s.mu.Unlock() is not needed here because of the defer s.mu.Unlock() at the top of this locked section.
 			s.conn.log.Error("END_STREAM received in unexpected stream state",
 				logger.LogFields{"stream_id": s.id, "state": s.state.String()})
 			return NewStreamError(s.id, ErrCodeProtocolError, // Or StreamClosed if state was already terminal
-				fmt.Sprintf("END_STREAM received in unexpected state %s for stream %d", s.state, s.id))
+				fmt.Sprintf("END_STREAM received in unexpected state %s for stream %d", s.state.String(), s.id))
 		}
 	}
+
+	// The problematic call to s.fcManager.SendWindowUpdateIfNeeded(payloadLen) has been removed.
+	// The application layer will be responsible for signaling data consumption.
 	return nil
 }
 

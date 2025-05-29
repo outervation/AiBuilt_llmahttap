@@ -354,7 +354,7 @@ const testOurInitialWindowSize uint32 = 65535
 const testPeerInitialWindowSize uint32 = 32768
 
 func TestNewStreamFlowControlManager(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	require.NotNil(t, sfcm)
 	require.NotNil(t, sfcm.sendWindow)
 	assert.Equal(t, testStreamID, sfcm.streamID)
@@ -371,12 +371,12 @@ func TestNewStreamFlowControlManager(t *testing.T) {
 	assert.Equal(t, uint64(0), sfcm.totalBytesReceived)
 
 	// Test threshold adjustment for small initial size
-	sfcmSmall := NewStreamFlowControlManager(testStreamID, 1, 1)
+	sfcmSmall := NewStreamFlowControlManager(nil, testStreamID, 1, 1)
 	assert.Equal(t, uint32(1), sfcmSmall.windowUpdateThreshold, "Threshold should be 1 if initial size is 1")
 }
 
 func TestStreamFlowControlManager_AcquireSendSpace_Simple(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialSendWindow := sfcm.sendWindow.Available()
 
 	// Acquire less than available
@@ -391,7 +391,7 @@ func TestStreamFlowControlManager_AcquireSendSpace_Simple(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_AcquireSendSpace_BlocksAndUnblocks(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	// Exhaust the window
 	err := sfcm.AcquireSendSpace(testPeerInitialWindowSize)
 	require.NoError(t, err)
@@ -424,7 +424,7 @@ func TestStreamFlowControlManager_AcquireSendSpace_BlocksAndUnblocks(t *testing.
 }
 
 func TestStreamFlowControlManager_AcquireSendSpace_ErrorOnClosed(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	closeErr := fmt.Errorf("test close error")
 	sfcm.Close(closeErr)
 
@@ -434,7 +434,7 @@ func TestStreamFlowControlManager_AcquireSendSpace_ErrorOnClosed(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_AcquireSendSpace_ZeroAcquire(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialSendWindow := sfcm.sendWindow.Available()
 
 	err := sfcm.AcquireSendSpace(0)
@@ -443,7 +443,7 @@ func TestStreamFlowControlManager_AcquireSendSpace_ZeroAcquire(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_HandleWindowUpdateFromPeer(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialSendWindow := sfcm.sendWindow.Available()
 
 	err := sfcm.HandleWindowUpdateFromPeer(1000)
@@ -452,7 +452,7 @@ func TestStreamFlowControlManager_HandleWindowUpdateFromPeer(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_Overflow(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	sfcm.sendWindow.available = MaxWindowSize - 100 // Set near max
 
 	err := sfcm.HandleWindowUpdateFromPeer(200) // This will cause overflow
@@ -469,7 +469,7 @@ func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_Overflow(t *testing
 }
 
 func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_ZeroIncrementError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	err := sfcm.HandleWindowUpdateFromPeer(0)
 	require.Error(t, err)
 	streamErr, ok := err.(*StreamError)
@@ -494,7 +494,7 @@ func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_StreamIDZeroError(t
 }
 
 func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_Closed(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	sfcm.sendWindow.Close(fmt.Errorf("closed"))
 
 	err := sfcm.HandleWindowUpdateFromPeer(100)
@@ -503,7 +503,7 @@ func TestStreamFlowControlManager_HandleWindowUpdateFromPeer_Closed(t *testing.T
 }
 
 func TestStreamFlowControlManager_DataReceived(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialReceiveWindow := sfcm.GetStreamReceiveAvailable()
 	initialTotalReceived := sfcm.totalBytesReceived
 
@@ -521,7 +521,7 @@ func TestStreamFlowControlManager_DataReceived(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_DataReceived_FlowControlError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialReceiveWindow := sfcm.GetStreamReceiveAvailable()
 
 	// Try to receive more than available
@@ -538,7 +538,7 @@ func TestStreamFlowControlManager_DataReceived_FlowControlError(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_DataReceived_ZeroBytes(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialReceiveWindow := sfcm.GetStreamReceiveAvailable()
 	initialTotalReceived := sfcm.totalBytesReceived
 
@@ -549,7 +549,7 @@ func TestStreamFlowControlManager_DataReceived_ZeroBytes(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_ApplicationConsumedData_GeneratesUpdate(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	// Simulate some data received
 	require.NoError(t, sfcm.DataReceived(sfcm.windowUpdateThreshold*2))
 	initialReceiveWindow := sfcm.GetStreamReceiveAvailable()
@@ -571,7 +571,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_GeneratesUpdate(t *tes
 }
 
 func TestStreamFlowControlManager_ApplicationConsumedData_NoUpdateBelowThreshold(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	require.NoError(t, sfcm.DataReceived(sfcm.windowUpdateThreshold*2))
 
 	increment, err := sfcm.ApplicationConsumedData(sfcm.windowUpdateThreshold - 1)
@@ -580,7 +580,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_NoUpdateBelowThreshold
 }
 
 func TestStreamFlowControlManager_ApplicationConsumedData_ZeroConsumption(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialReceiveWindow := sfcm.GetStreamReceiveAvailable()
 	initialConsumedTotal := sfcm.bytesConsumedTotal
 
@@ -593,7 +593,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ZeroConsumption(t *tes
 
 func TestStreamFlowControlManager_ApplicationConsumedData_ErrorConditions(t *testing.T) {
 	t.Run("Exceeds MaxWindowSize for single increment", func(t *testing.T) {
-		sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+		sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 		_, err := sfcm.ApplicationConsumedData(MaxWindowSize + 1)
 		require.Error(t, err)
 		streamErr, ok := err.(*StreamError)
@@ -604,7 +604,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ErrorConditions(t *tes
 	})
 
 	t.Run("Calculated increment overflow MaxWindowSize", func(t *testing.T) {
-		sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+		sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 		sfcm.bytesConsumedTotal = uint64(10)
 		sfcm.lastWindowUpdateSentAt = 0
 		_, err := sfcm.ApplicationConsumedData(MaxWindowSize) // n is valid, but pending_increment = MaxWindowSize + 10
@@ -618,7 +618,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ErrorConditions(t *tes
 	})
 
 	t.Run("Receive window effective size overflow", func(t *testing.T) {
-		sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+		sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 		sfcm.currentReceiveWindowSize = MaxWindowSize - 50
 		_, err := sfcm.ApplicationConsumedData(100) // MaxWindowSize - 50 + 100 = MaxWindowSize + 50
 		require.Error(t, err)
@@ -632,7 +632,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ErrorConditions(t *tes
 }
 
 func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialSendAvail := sfcm.GetStreamSendAvailable() // Based on testPeerInitialWindowSize
 
 	newPeerInitial := testPeerInitialWindowSize + 1000
@@ -652,8 +652,8 @@ func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange(t *t
 }
 
 func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange_OverflowError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, 100) // Small initial peer window
-	sfcm.sendWindow.available = MaxWindowSize - 50                                   // Current available is high
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, 100)
+	sfcm.sendWindow.available = MaxWindowSize - 50 // Current available is high
 
 	// New peer setting that, when delta is applied, overflows available
 	// Old initial was 100. New initial is 200. Delta = 100.
@@ -667,7 +667,7 @@ func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange_Over
 }
 
 func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange_InvalidSettingValueError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	// Test with newPeerInitialSize > MaxWindowSize
 	err := sfcm.HandlePeerSettingsInitialWindowSizeChange(MaxWindowSize + 1)
 	require.Error(t, err)
@@ -679,7 +679,7 @@ func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange_Inva
 }
 
 func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialReceiveAvail := sfcm.GetStreamReceiveAvailable() // Based on testOurInitialWindowSize
 
 	newOurInitial := testOurInitialWindowSize + 1000
@@ -701,8 +701,8 @@ func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange(t *te
 }
 
 func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange_OverflowError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, 100, testPeerInitialWindowSize) // Small initial our window
-	sfcm.currentReceiveWindowSize = MaxWindowSize - 50                                // Current available is high
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, 100, testPeerInitialWindowSize)
+	sfcm.currentReceiveWindowSize = MaxWindowSize - 50 // Current available is high
 
 	// New our setting that, when delta is applied, overflows available
 	// Old effective initial was 100. New initial is 200. Delta = 100.
@@ -717,7 +717,7 @@ func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange_Overf
 }
 
 func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange_InvalidSettingValueError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	// Test with newOurInitialSize > MaxWindowSize
 	err := sfcm.HandleOurSettingsInitialWindowSizeChange(MaxWindowSize + 1)
 	require.Error(t, err)
@@ -729,7 +729,7 @@ func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange_Inval
 }
 
 func TestStreamFlowControlManager_Close(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	initialSendAvail := sfcm.GetStreamSendAvailable()
 
 	var wg sync.WaitGroup
@@ -760,7 +760,7 @@ func TestStreamFlowControlManager_Close(t *testing.T) {
 }
 
 func TestStreamFlowControlManager_Getters(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, testOurInitialWindowSize, testPeerInitialWindowSize)
 	assert.Equal(t, int64(testPeerInitialWindowSize), sfcm.GetStreamSendAvailable())
 	assert.Equal(t, int64(testOurInitialWindowSize), sfcm.GetStreamReceiveAvailable())
 
@@ -1327,7 +1327,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ThresholdOne(t *testin
 	// This test specifically checks ApplicationConsumedData when windowUpdateThreshold is 1.
 	// This occurs when ourInitialWindowSize is 1.
 	const localStreamID uint32 = 99
-	sfcm := NewStreamFlowControlManager(localStreamID, 1 /* ourInitialWindowSize */, 1000 /* peerInitialWindowSize */)
+	sfcm := NewStreamFlowControlManager(nil, localStreamID, 1 /* ourInitialWindowSize */, 1000 /* peerInitialWindowSize */)
 	require.NotNil(t, sfcm)
 	assert.Equal(t, uint32(1), sfcm.windowUpdateThreshold, "Window update threshold should be 1 when ourInitialWindowSize is 1")
 

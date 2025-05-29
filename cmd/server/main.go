@@ -1,21 +1,21 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"time" // Added
-
-	"encoding/json"
-	"log"
+	"log" // Added
 	"os"
-	"path/filepath"
+	"path/filepath" // Added
+	"time"          // Added
+	// "os/signal" // Removed, unused in current main body
+	// "syscall"   // Removed, unused in current main body
 
 	"example.com/llmahttap/v2/internal/config"
+	"example.com/llmahttap/v2/internal/handlers/staticfile"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/router"
 	"example.com/llmahttap/v2/internal/server"
-
-	"example.com/llmahttap/v2/internal/handlers/staticfile" // Assumed to exist for StaticFileServer
 )
 
 var (

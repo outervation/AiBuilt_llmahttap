@@ -2,6 +2,8 @@ package http2
 
 import (
 	"fmt"
+
+	"example.com/llmahttap/v2/internal/logger"
 	"sync"
 	// ErrorCode constants like ErrorCodeFlowControlError are defined in errors.go
 	// and are accessible as they are in the same package.
@@ -460,8 +462,10 @@ func (cfcm *ConnectionFlowControlManager) GetConnectionReceiveAvailable() int64 
 }
 
 // StreamFlowControlManager manages send and receive flow control for a single HTTP/2 stream.
+
 type StreamFlowControlManager struct {
 	streamID uint32
+	conn     *Connection // Added Connection reference
 
 	// sendWindow governs how much data this endpoint can send on this stream.
 	// This window is initialized with the peer's SETTINGS_INITIAL_WINDOW_SIZE
@@ -477,7 +481,7 @@ type StreamFlowControlManager struct {
 	lastWindowUpdateSentAt            uint64 // bytesConsumedTotal when last stream WINDOW_UPDATE was sent.
 	windowUpdateThreshold             uint32 // Threshold to send WINDOW_UPDATE for this stream.
 
-	// logger *logger.Logger // Optional: for detailed logging
+	// logger *logger.Logger // Optional: for detailed logging - will use conn.log
 
 	// TODO: Add fields for closed state of the stream affecting flow control operations.
 }
@@ -486,7 +490,8 @@ type StreamFlowControlManager struct {
 // - streamID: The ID of the stream this manager is for.
 // - ourInitialWindowSize: This server's SETTINGS_INITIAL_WINDOW_SIZE. Used for our receive window for this stream.
 // - peerInitialWindowSize: The peer's SETTINGS_INITIAL_WINDOW_SIZE. Used for our send window for this stream.
-func NewStreamFlowControlManager(streamID uint32, ourInitialWindowSize, peerInitialWindowSize uint32) *StreamFlowControlManager {
+
+func NewStreamFlowControlManager(conn *Connection, streamID uint32, ourInitialWindowSize, peerInitialWindowSize uint32) *StreamFlowControlManager {
 	if ourInitialWindowSize > MaxWindowSize {
 		ourInitialWindowSize = MaxWindowSize // Defensive, should be validated by settings handler
 	}
@@ -495,6 +500,7 @@ func NewStreamFlowControlManager(streamID uint32, ourInitialWindowSize, peerInit
 	}
 
 	sfcm := &StreamFlowControlManager{
+		conn:                              conn, // Store connection
 		streamID:                          streamID,
 		sendWindow:                        NewFlowControlWindow(peerInitialWindowSize, false, streamID),
 		currentReceiveWindowSize:          int64(ourInitialWindowSize),
@@ -710,4 +716,48 @@ func (sfcm *StreamFlowControlManager) GetStreamReceiveAvailable() int64 {
 	sfcm.receiveWindowMu.Lock()
 	defer sfcm.receiveWindowMu.Unlock()
 	return sfcm.currentReceiveWindowSize
+}
+
+// SendWindowUpdateIfNeeded is called after data has been received on the stream (accounted by DataReceived)
+// AND the application has consumed some amount of that data. It checks if a WINDOW_UPDATE
+// frame should be sent to the peer for this stream.
+// 'n' is the amount of data *consumed by the application* for this stream since the last check,
+// or that is now ready to be advertised as consumed.
+// This method reuses the logic of ApplicationConsumedData to determine the increment
+// and then calls the connection's method to send the actual WINDOW_UPDATE frame.
+
+func (sfcm *StreamFlowControlManager) SendWindowUpdateIfNeeded(n uint32) error {
+	if n == 0 {
+		return nil
+	}
+
+	// This method now assumes sfcm.conn is valid and sfcm.conn.log is available.
+	if sfcm.conn == nil || sfcm.conn.log == nil {
+		// This should not happen if constructors are correct.
+		// Return an internal error or panic, as logging itself would be an issue.
+		return NewStreamError(sfcm.streamID, ErrCodeInternalError, "internal error: StreamFlowControlManager has nil connection or logger")
+	}
+
+	incrementToReturn, err := sfcm.ApplicationConsumedData(n)
+	if err != nil {
+		return err // Propagate error from ApplicationConsumedData
+	}
+
+	if incrementToReturn > 0 {
+		// The method is on SFCM, which now has `sfcm.conn`.
+		// It can call the connection's method to send the frame.
+		if sendErr := sfcm.conn.sendWindowUpdateFrame(sfcm.streamID, incrementToReturn); sendErr != nil {
+			sfcm.conn.log.Error("StreamFlowControlManager: Failed to send WINDOW_UPDATE frame via connection", logger.LogFields{
+				"stream_id": sfcm.streamID,
+				"increment": incrementToReturn,
+				"error":     sendErr.Error(),
+			})
+			return sendErr // Propagate send error
+		}
+		sfcm.conn.log.Debug("StreamFlowControlManager: Successfully sent WINDOW_UPDATE frame", logger.LogFields{
+			"stream_id": sfcm.streamID,
+			"increment": incrementToReturn,
+		})
+	}
+	return nil
 }

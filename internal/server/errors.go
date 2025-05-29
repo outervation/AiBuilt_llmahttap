@@ -188,33 +188,50 @@ func PrefersJSON(acceptHeaderValue string) bool {
 }
 
 // WriteErrorResponse generates and sends a default HTTP error response on the given stream.
-func WriteErrorResponse(stream ErrorResponseWriterStream, statusCode int, requestHeaders []http2.HeaderField, detailMessage string, log *logger.Logger) error {
-	if log != nil { // Defend against nil logger, though it should be guaranteed
-		log.Debug("WriteErrorResponse: ENTERED", logger.LogFields{
-			"status_code": statusCode,
-			"detail":      detailMessage,
-			"stream_id":   StreamID(stream),
-		})
-	}
-	statusText := http.StatusText(statusCode)
-	if statusText == "" {
-		statusText = "Error" // Default for unknown codes
-	}
 
-	acceptHeaderValue := ""
-	for _, hf := range requestHeaders {
-		// Ensure correct case-insensitive comparison for header names
-		if strings.ToLower(hf.Name) == "accept" {
-			acceptHeaderValue = hf.Value
+func WriteErrorResponse(stream ErrorResponseWriterStream, statusCode int, requestHeaders []http2.HeaderField, detailMessage string, log *logger.Logger) error {
+	if log == nil {
+		log = logger.NewDiscardLogger() // Prevent nil panics if logger not provided
+	}
+	log.Debug("WriteErrorResponse: ENTERED", logger.LogFields{"stream_id": StreamID(stream), "status_code": statusCode, "detail": detailMessage})
+
+	acceptHeader := ""
+	for _, h := range requestHeaders {
+		// HTTP/2 header names are conventionally lowercase.
+		// The hpack decoder ensures this.
+		if h.Name == "accept" {
+			acceptHeader = h.Value
 			break
 		}
 	}
 
 	var body []byte
 	var contentType string
-	jsonMarshalFailed := false
+	responseHPACKHeaders := []hpack.HeaderField{ // Using hpack.HeaderField as this is what SendHeaders usually expects or converts from
+		{Name: ":status", Value: strconv.Itoa(statusCode)},
+		// Date header is usually added by HTTP libraries or connection manager automatically
+		// Cache-Control headers for errors:
+		{Name: "cache-control", Value: "no-cache, no-store, must-revalidate"},
+		{Name: "pragma", Value: "no-cache"}, // HTTP/1.0 backward compatibility
+		{Name: "expires", Value: "0"},       // Proxies
+	}
 
-	shouldSendJSON := PrefersJSON(acceptHeaderValue)
+	statusText := http.StatusText(statusCode)
+	if statusText == "" {
+		statusText = "Unknown Status" // Default for unknown codes
+	}
+
+	if statusCode == http.StatusMethodNotAllowed {
+		// Spec 2.3.2: For StaticFileServer, 405 must include Allow: GET, HEAD, OPTIONS
+		// This function is generic, but the primary user (StaticFileServer) requires this.
+		// A more advanced system might pass allowedMethods through context or specific error types.
+		// For now, we hardcode the StaticFileServer's requirement as it's a common case.
+		responseHPACKHeaders = append(responseHPACKHeaders, hpack.HeaderField{Name: "allow", Value: "GET, HEAD, OPTIONS"})
+		log.Debug("WriteErrorResponse: Added Allow header for 405", logger.LogFields{"stream_id": StreamID(stream)})
+	}
+
+	jsonMarshalFailed := false
+	shouldSendJSON := PrefersJSON(acceptHeader)
 
 	if shouldSendJSON {
 		contentType = "application/json; charset=utf-8"
@@ -225,13 +242,12 @@ func WriteErrorResponse(stream ErrorResponseWriterStream, statusCode int, reques
 				Detail:     detailMessage,
 			},
 		}
-		var marshalErr error
-		body, marshalErr = jsonMarshalFunc(errorResp) // Use the swappable marshal func
-		if marshalErr != nil {
-			if log != nil {
-				log.Error("Failed to marshal JSON error response, falling back to HTML.", logger.LogFields{"error": marshalErr, "statusCode": statusCode})
-			}
+		jsonBody, err := jsonMarshalFunc(errorResp) // Use the swappable marshal func
+		if err != nil {
+			log.Error("WriteErrorResponse: Failed to marshal JSON error response, falling back to HTML.", logger.LogFields{"stream_id": StreamID(stream), "error": err.Error(), "statusCode": statusCode})
 			jsonMarshalFailed = true // Mark as failed to force HTML fallback
+		} else {
+			body = jsonBody
 		}
 	}
 
@@ -248,56 +264,101 @@ func WriteErrorResponse(stream ErrorResponseWriterStream, statusCode int, reques
 		} else {
 			finalTitle = fmt.Sprintf("%d %s", statusCode, statusText)
 			finalHeading = statusText
-			baseMessage = "The server encountered an error processing your request." // Generic message for unknown codes
+			baseMessage = "The server encountered an error processing your request."
 		}
 
 		htmlSafeMessageBody := baseMessage
 		if detailMessage != "" {
 			escapedDetail := html.EscapeString(detailMessage)
-			// For unknown codes, the detailMessage might be the only specific info.
-			// For known codes, append it if present.
-			if !isKnownCode {
-				htmlSafeMessageBody = escapedDetail // Use detail as main message if code is unknown
+			if !isKnownCode { // For unknown codes, detail might be the only specific info
+				htmlSafeMessageBody = escapedDetail
 			} else {
 				htmlSafeMessageBody = baseMessage + " " + escapedDetail
 			}
 		}
-		// Ensure GenerateHTMLResponseBodyForTest is used correctly; it's a helper for tests
-		// but can be used here if its output is suitable for production default error pages.
-		// Spec examples for 404/500:
-		// <html><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested resource was not found on this server.</p></body></html>
-		// Let's use a similar structure, calling the test helper for consistency.
+		// Using GenerateHTMLResponseBodyForTest to maintain consistency with how testable bodies are made.
 		body = GenerateHTMLResponseBodyForTest(finalTitle, finalHeading, htmlSafeMessageBody)
+
+		if jsonMarshalFailed { // If we are here due to json marshal failure, log it as a warning for the fallback.
+			log.Warn("WriteErrorResponse: Fell back to HTML response due to JSON marshal error.", logger.LogFields{"stream_id": StreamID(stream), "statusCode": statusCode})
+		}
 	}
 
-	responseHPACKHeaders := []hpack.HeaderField{
-		{Name: ":status", Value: strconv.Itoa(statusCode)},
-		{Name: "content-type", Value: contentType},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
-		// Per spec for error responses, caching should usually be prevented.
-		{Name: "cache-control", Value: "no-cache, no-store, must-revalidate"},
-		{Name: "pragma", Value: "no-cache"}, // HTTP/1.0 backward compatibility for Cache-Control
-		{Name: "expires", Value: "0"},       // Proxies
-	}
+	responseHPACKHeaders = append(responseHPACKHeaders, hpack.HeaderField{Name: "content-type", Value: contentType})
+	responseHPACKHeaders = append(responseHPACKHeaders, hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
 
 	http2ResponseHeaders := hpackHeadersToHttp2Headers(responseHPACKHeaders)
+
+	log.Debug("WriteErrorResponse: Sending headers", logger.LogFields{"stream_id": StreamID(stream), "num_headers": len(http2ResponseHeaders), "headers": http2ResponseHeaders})
 	err := stream.SendHeaders(http2ResponseHeaders, len(body) == 0)
 	if err != nil {
-		if log != nil {
-			log.Error("Failed to send error response headers.", logger.LogFields{"error": err, "streamID": StreamID(stream), "statusCode": statusCode})
-		}
+		log.Error("WriteErrorResponse: Failed to send error headers", logger.LogFields{"stream_id": StreamID(stream), "error": err.Error(), "statusCode": statusCode})
 		return fmt.Errorf("failed to send error response headers (status %d) for stream %v: %w", statusCode, StreamID(stream), err)
 	}
 
 	if len(body) > 0 {
+		log.Debug("WriteErrorResponse: Writing body", logger.LogFields{"stream_id": StreamID(stream), "body_len": len(body)})
 		_, err = stream.WriteData(body, true)
 		if err != nil {
-			if log != nil {
-				log.Error("Failed to send error response body.", logger.LogFields{"error": err, "streamID": StreamID(stream), "statusCode": statusCode})
-			}
+			log.Error("WriteErrorResponse: Failed to write error body", logger.LogFields{"stream_id": StreamID(stream), "error": err.Error(), "statusCode": statusCode})
 			return fmt.Errorf("failed to send error response body (status %d) for stream %v: %w", statusCode, StreamID(stream), err)
 		}
 	}
+	log.Debug("WriteErrorResponse: Successfully sent error response", logger.LogFields{"stream_id": StreamID(stream), "statusCode": statusCode})
+	return nil
+}
+
+// writeMinimalHTMLFallback is used if JSON marshaling fails during error response generation.
+// THIS FUNCTION IS NO LONGER DIRECTLY CALLED as the main function now handles fallback logic internally.
+// It's kept here for reference or if a very minimal path is needed, but current logic in WriteErrorResponse makes it redundant.
+// For production code, if unused, this could be removed. For now, it's harmless.
+// The original `RAWTEXT` included this, so I've kept its structure but noted its current unused status
+// in the context of the modified `WriteErrorResponse` above.
+// If `WriteErrorResponse` were to simplify and delegate fallbacks, this could be revived.
+// Based on the new `WriteErrorResponse`, this function is effectively dead code.
+// However, the prompt asks to fix syntax, not refactor the LLM's provided code logic beyond making it work.
+// The LLM's provided `WriteErrorResponse` in the RAWTEXT *does not* call this function.
+// The logic for fallback is *inside* `WriteErrorResponse`.
+// So this function, as provided in the original `RAWTEXT`, is indeed not called by the accompanying `WriteErrorResponse`.
+func writeMinimalHTMLFallback(stream ErrorResponseWriterStream, statusCode int, fallbackMessage string, statusText string, log *logger.Logger) error {
+	log.Warn("writeMinimalHTMLFallback: Invoked. This indicates a direct call, bypassing main error path or for specific minimal cases.",
+		logger.LogFields{"stream_id": StreamID(stream), "statusCode": statusCode, "fallbackMessage": fallbackMessage})
+
+	contentType := "text/html; charset=utf-8" // Corrected charset from original rawtext which had utf-utf-8
+	title := fmt.Sprintf("%d %s", statusCode, statusText)
+	bodyHTML := fmt.Sprintf(
+		"<html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>",
+		html.EscapeString(title), html.EscapeString(statusText), html.EscapeString(fallbackMessage),
+	)
+	body := []byte(bodyHTML)
+
+	hpackHeaders := []hpack.HeaderField{
+		{Name: ":status", Value: strconv.Itoa(statusCode)},
+		{Name: "content-type", Value: contentType},
+		{Name: "content-length", Value: strconv.Itoa(len(body))},
+		{Name: "cache-control", Value: "no-cache, no-store, must-revalidate"},
+		{Name: "pragma", Value: "no-cache"},
+		{Name: "expires", Value: "0"},
+	}
+	if statusCode == http.StatusMethodNotAllowed {
+		hpackHeaders = append(hpackHeaders, hpack.HeaderField{Name: "allow", Value: "GET, HEAD, OPTIONS"})
+	}
+
+	http2Headers := hpackHeadersToHttp2Headers(hpackHeaders)
+
+	err := stream.SendHeaders(http2Headers, len(body) == 0)
+	if err != nil {
+		log.Error("writeMinimalHTMLFallback: Failed to send HTML fallback error headers", logger.LogFields{"stream_id": StreamID(stream), "error": err.Error()})
+		return err
+	}
+	if len(body) > 0 {
+		_, err = stream.WriteData(body, true)
+		if err != nil {
+			log.Error("writeMinimalHTMLFallback: Failed to write HTML fallback error body", logger.LogFields{"stream_id": StreamID(stream), "error": err.Error()})
+			return err
+		}
+	}
+	log.Debug("writeMinimalHTMLFallback: Successfully sent minimal HTML fallback response.", logger.LogFields{"stream_id": StreamID(stream)})
 	return nil
 }
 

@@ -345,6 +345,19 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 			s.log.Debug("HTTP/2 connection Serve() exited", logger.LogFields{"remote_addr": remoteAddr, "reason": err})
 		}
 	}
+
+	// If conn.Serve() returned io.EOF, it means the client closed the connection.
+	// This can happen immediately after sending a request that might result in an error response from our server (e.g., 405).
+	// If we proceed to close the h2conn immediately, our error response might not get a chance to be written
+	// if the handler was still processing or queueing it.
+	// Adding a small delay here is a pragmatic attempt to give in-flight handler responses a window to be queued
+	// before the connection's writer goroutine is fully shut down by h2conn.Close().
+	if errors.Is(err, io.EOF) {
+		s.log.Debug("handleTCPConnection: conn.Serve() returned io.EOF. Delaying before final h2conn.Close() to allow in-flight responses.",
+			logger.LogFields{"remote_addr": remoteAddr, "delay_ms": 50})
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// Ensure connection is fully closed; Serve might return before Close is fully effective or if it wasn't called from within.
 	h2conn.Close(err) // Pass the error from Serve to Close.
 }

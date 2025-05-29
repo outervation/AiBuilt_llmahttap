@@ -1,18 +1,22 @@
 package router
 
 import (
+	"context" // Ensured context is imported
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 
-	"golang.org/x/net/http2/hpack"
-
 	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/server"
+	"golang.org/x/net/http2/hpack" // Added import
 )
+
+// MatchedPathPatternKey is a context key for passing the matched PathPattern.
+// It's an empty struct as it's only used as a key.
+type MatchedPathPatternKey struct{}
 
 // Router holds the routing table and dispatches requests.
 // It is responsible for matching incoming request paths against configured routes
@@ -188,58 +192,53 @@ func (r *Router) FindRoute(path string) (*MatchedRouteInfo, error) {
 // If no route matches, it sends a 404 Not Found response.
 // If a handler is found but fails to be created, it sends a 500 Internal Server Error response.
 // This method would be called by the HTTP/2 connection/server layer for each request stream.
+
 func (r *Router) ServeHTTP(s server.ResponseWriterStream, req *http.Request) {
-	r.mainLogger.Debug("Router.ServeHTTP: ENTERED", logger.LogFields{
-		"method":   req.Method,
-		"uri":      req.RequestURI,
-		"path":     req.URL.Path,
-		"streamID": s.ID(),
+	// Log the incoming request details
+	r.mainLogger.Debug("Router: ServeHTTP received request", logger.LogFields{
+		"method": req.Method,
+		"path":   req.URL.Path,
+		"host":   req.Host,
 	})
-	// Path is extracted from :path pseudo-header, typically available in req.URL.Path
-	// For HTTP/2, the :path pseudo-header includes the query string.
-	// The routing is based on the path component only.
-	requestPath := req.URL.Path
 
-	matchedInfo, err := r.FindRoute(requestPath)
-
-	if err != nil { // Error during handler creation
-		r.mainLogger.Error("Handler creation failed for request", logger.LogFields{ // Use r.mainLogger
-			"path":   requestPath,
-			"stream": s.ID(),
-			"error":  err.Error(),
-		})
-		// Send 500 Internal Server Error
-		// Pass req.Header as hpack.HeaderField for Accept header inspection
-		var headers []http2.HeaderField
-		for k, vv := range req.Header {
-			for _, v := range vv {
-				headers = append(headers, http2.HeaderField{Name: strings.ToLower(k), Value: v})
-			}
-		}
-		// This uses the server's default error response mechanism.
-		// Ensure the logger is not nil, though it should be guaranteed by NewRouter.
-		server.WriteErrorResponse(s, http.StatusInternalServerError, headers, "Failed to initialize request handler.", r.mainLogger)
+	routeInfo, err := r.FindRoute(req.URL.Path)
+	if err != nil {
+		// FindRoute itself logs detailed errors for handler creation failure.
+		// Here, we just ensure a generic 500 is sent if handler creation failed.
+		r.mainLogger.Error("Router: Error finding route or creating handler", logger.LogFields{"path": req.URL.Path, "error": err.Error()})
+		server.SendDefaultErrorResponse(s, http.StatusInternalServerError, req, "Error processing request.", r.mainLogger)
 		return
 	}
 
-	if matchedInfo == nil { // No route matched
-		r.mainLogger.Info("No route matched for request", logger.LogFields{ // Use r.mainLogger.Info
-			"path":   requestPath,
-			"stream": s.ID(),
-		})
-		var headers []http2.HeaderField
-		for k, vv := range req.Header {
-			for _, v := range vv {
-				headers = append(headers, http2.HeaderField{Name: strings.ToLower(k), Value: v})
-			}
-		}
-		server.WriteErrorResponse(s, http.StatusNotFound, headers, "The requested resource was not found.", r.mainLogger)
+	if routeInfo == nil || routeInfo.Handler == nil {
+		// No route matched
+		r.mainLogger.Info("Router: No route matched", logger.LogFields{"path": req.URL.Path})
+		server.SendDefaultErrorResponse(s, http.StatusNotFound, req, "", r.mainLogger)
 		return
 	}
 
-	// A handler was successfully found and created.
-	// The HandlerConfig specific to this handler is available in matchedInfo.HandlerConfig.HandlerConfig
-	// The http2.Handler interface's ServeHTTP2 method expects the stream and the request.
-	// The handler itself should have received its config during creation via the factory.
-	matchedInfo.Handler.ServeHTTP2(s, req) // s is already server.ResponseWriterStream
+	// Pass the matched PathPattern to the handler via context
+	// The HandlerConfig field of MatchedRouteInfo is actually the full config.Route object.
+	if routeInfo.HandlerConfig.PathPattern != "" {
+		newCtx := context.WithValue(req.Context(), MatchedPathPatternKey{}, routeInfo.HandlerConfig.PathPattern)
+		req = req.WithContext(newCtx)
+		r.mainLogger.Debug("Router: Added matched PathPattern to request context", logger.LogFields{
+			"path_pattern": routeInfo.HandlerConfig.PathPattern,
+			"uri_path":     req.URL.Path,
+		})
+	}
+
+	r.mainLogger.Debug("Router: Matched route, dispatching to handler", logger.LogFields{
+		"path":               req.URL.Path,
+		"matchedPathPattern": routeInfo.HandlerConfig.PathPattern,
+		"matchedMatchType":   routeInfo.HandlerConfig.MatchType,
+		"matchedHandlerType": routeInfo.HandlerConfig.HandlerType,
+		"handler_is_nil":     routeInfo.Handler == nil,
+	})
+
+	// Call the handler
+	// The handler is responsible for its own panic recovery if necessary.
+	// If the handler panics and doesn't recover, the server's global panic handler (if any) or Go runtime will handle it.
+	routeInfo.Handler.ServeHTTP2(s, req)
+	r.mainLogger.Debug("Router: Handler ServeHTTP2 completed", logger.LogFields{"path": req.URL.Path})
 }

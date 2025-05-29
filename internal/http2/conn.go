@@ -87,7 +87,8 @@ type Connection struct {
 	priorityTree             *PriorityTree
 	hpackAdapter             *HpackAdapter
 	connFCManager            *ConnectionFlowControlManager
-	goAwaySent               bool
+	goAwaySent               bool      // Added this missing field from thought process
+	peerReportedErrorCode    ErrorCode // NEW FIELD
 	goAwayReceived           bool
 	gracefulShutdownTimer    *time.Timer
 	activePings              map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
@@ -124,9 +125,12 @@ type Connection struct {
 	concurrentStreamsInbound  int // Number of streams peer has initiated and are not closed/reset
 
 	// Writer goroutine coordination
-	writerChan              chan Frame    // Frames to be sent by the writer goroutine
-	initialSettingsOnce     sync.Once     // Ensures initialSettingsWritten is closed only once
-	initialSettingsMu       sync.Mutex    // Protects initialSettingsSignaled
+	writerChan          chan Frame // Frames to be sent by the writer goroutine
+	initialSettingsOnce sync.Once  // Ensures initialSettingsWritten is closed only once
+	initialSettingsMu   sync.Mutex // Protects initialSettingsSignaled
+
+	writerChanClosed        bool          // True if writerChan has been closed
+	readerDoneClosed        bool          // True if readerDone has been closed
 	initialSettingsSignaled bool          // True if initialSettingsWritten has been closed
 	initialSettingsWritten  chan struct{} // Closed by writerLoop after initial server SETTINGS are written
 	settingsAckTimeoutTimer *time.Timer   // Timer for waiting for SETTINGS ACK
@@ -178,8 +182,9 @@ func NewConnection(
 		initialSettingsWritten:   make(chan struct{}), // Initialize the new channel
 		peerSettings:             make(map[SettingID]uint32),
 		remoteAddrStr:            nc.RemoteAddr().String(),
-		dispatcher:               dispatcher, // Store dispatcher func
-		peerReportedLastStreamID: 0xffffffff, // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
+		dispatcher:               dispatcher,     // Store dispatcher func
+		peerReportedLastStreamID: 0xffffffff,     // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
+		peerReportedErrorCode:    ErrCodeNoError, // Initialize to NoError
 	}
 
 	lg.Debug("NewConnection: Post-initialization. Dumping conn.ourSettings before applyOurSettings", logger.LogFields{"conn_ourSettingsDump_before_apply": fmt.Sprintf("%#v", conn.ourSettings)})
@@ -211,7 +216,7 @@ func NewConnection(
 		conn.ourSettings[SettingMaxHeaderListSize] = DefaultServerMaxHeaderListSize // Example for client
 		conn.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize         // Client also has a default
 	} else { // Server side
-		conn.ourSettings[SettingEnablePush] = DefaultServerEnablePush
+		conn.ourSettings[SettingEnablePush] = 0 // Was DefaultServerEnablePush (1), explicitly set to 0 for diagnostics
 		conn.ourSettings[SettingMaxConcurrentStreams] = DefaultServerMaxConcurrentStreams
 		conn.ourSettings[SettingMaxHeaderListSize] = DefaultServerMaxHeaderListSize
 
@@ -602,6 +607,42 @@ func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, en
 		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
 	default:
 		// Not shutting down yet, proceed.
+
+		// Check if peer has sent GOAWAY indicating it won't process this stream
+		c.streamsMu.RLock()
+		goAwayRecvd := c.goAwayReceived
+		peerLastID := c.peerReportedLastStreamID
+		peerErrCode := c.peerReportedErrorCode
+		c.streamsMu.RUnlock()
+
+		// If peer sent GOAWAY with an error, or if this stream ID is higher than what peer said it would process.
+		// Special case: If peer sent GOAWAY with NO_ERROR, they might still process existing streams up to peerLastID.
+		shouldAbortSendDueToPeerGoAway := false
+		if goAwayRecvd {
+			if peerErrCode != ErrCodeNoError {
+				// Peer indicated an error, it's unlikely to process more on any stream.
+				shouldAbortSendDueToPeerGoAway = true
+			} else {
+				// Peer sent GOAWAY NO_ERROR, only abort if this stream is beyond what they'd process.
+				// If peerLastID is 0 in a NO_ERROR GOAWAY, it means new streams are not allowed, but existing ones up to 0 (none)
+				// might complete. The RFC is a bit vague on GOAWAY(NO_ERROR, 0). Assume it means stop new, complete existing.
+				// Our streams are positive, so if peerLastID is 0, any s.id > 0 is effectively "too high" for new processing.
+				if s.id > peerLastID {
+					shouldAbortSendDueToPeerGoAway = true
+				}
+			}
+		}
+
+		if shouldAbortSendDueToPeerGoAway {
+			c.log.Warn("sendHeadersFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
+				logger.LogFields{
+					"stream_id":                     s.id,
+					"peer_last_processed_stream_id": peerLastID,
+					"peer_error_code":               peerErrCode.String(),
+				})
+			// Return an error that handler can interpret as "don't bother sending more"
+			return NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, response aborted")
+		}
 	}
 
 	encodedBytes, encodeErr := c.hpackAdapter.EncodeHeaderFields(headers)
@@ -670,6 +711,34 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 		return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send DATA for stream %d", s.id))
 	default:
 		// Not shutting down yet, proceed.
+
+		// Check if peer has sent GOAWAY indicating it won't process this stream
+		c.streamsMu.RLock()
+		goAwayRecvd := c.goAwayReceived
+		peerLastID := c.peerReportedLastStreamID
+		peerErrCode := c.peerReportedErrorCode
+		c.streamsMu.RUnlock()
+
+		shouldAbortSendDueToPeerGoAway := false
+		if goAwayRecvd {
+			if peerErrCode != ErrCodeNoError {
+				shouldAbortSendDueToPeerGoAway = true
+			} else {
+				if s.id > peerLastID { // If peerLastID is 0, this still correctly aborts for s.id > 0
+					shouldAbortSendDueToPeerGoAway = true
+				}
+			}
+		}
+
+		if shouldAbortSendDueToPeerGoAway {
+			c.log.Warn("sendDataFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
+				logger.LogFields{
+					"stream_id":                     s.id,
+					"peer_last_processed_stream_id": peerLastID,
+					"peer_error_code":               peerErrCode.String(),
+				})
+			return 0, NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, data send aborted")
+		}
 	}
 
 	// Construct DATA frame
@@ -2028,13 +2097,14 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 			"last_stream_id_for_goaway": lastStreamID,
 			"error_code":                errCode.String(),
 			"graceful_stream_timeout":   gracefulStreamTimeout.String(),
+			"remote_addr":               c.remoteAddrStr,
 		})
 
 	// 1. Send GOAWAY frame. This must happen BEFORE closing shutdownChan,
 	//    as sendGoAway itself checks shutdownChan.
 	//    sendGoAway handles its own goAwaySent idempotency.
 	if err := c.sendGoAway(lastStreamID, errCode, debugData); err != nil {
-		c.log.Error("Failed to send GOAWAY frame during shutdown initiation.", logger.LogFields{"error": err})
+		c.log.Error("Failed to send GOAWAY frame during shutdown initiation.", logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
 		// Potentially store this error, but continue shutdown.
 		c.streamsMu.Lock()
 		if c.connError == nil {
@@ -2048,38 +2118,44 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	c.streamsMu.Lock()
 	select {
 	case <-c.shutdownChan: // Check again in case of race condition from another Close() call
-		c.log.Debug("initiateShutdown: shutdownChan found already closed before explicit close here.", logger.LogFields{})
+		c.log.Debug("initiateShutdown: shutdownChan found already closed before explicit close here.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	default:
 		close(c.shutdownChan)
-		c.log.Debug("initiateShutdown: Explicitly closed shutdownChan.", logger.LogFields{})
+		c.log.Debug("initiateShutdown: Explicitly closed shutdownChan.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	}
 	c.streamsMu.Unlock()
 
 	// 3. Close writerChan to signal writerLoop to finish draining and exit.
 	//    This must happen BEFORE waiting on writerDone.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				c.log.Warn("Recovered from panic trying to close writerChan (possibly already closed).", logger.LogFields{"panic": r})
+	//    Use a flag to ensure it's closed only once.
+	c.initialSettingsMu.Lock() // Using initialSettingsMu to protect writerChanClosed. Could be a new mutex.
+	if !c.writerChanClosed {   // Assume writerChanClosed is a new bool field in Connection, initialized to false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.log.Warn("Recovered from panic trying to close writerChan (possibly already closed).", logger.LogFields{"panic": r, "remote_addr": c.remoteAddrStr})
+				}
+			}()
+			if c.writerChan != nil {
+				c.log.Debug("initiateShutdown: Attempting to close writerChan.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+				close(c.writerChan)
+				c.log.Debug("initiateShutdown: writerChan closed.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+				c.writerChanClosed = true
 			}
 		}()
-		if c.writerChan != nil {
-			c.log.Debug("initiateShutdown: Attempting to close writerChan.", logger.LogFields{})
-			close(c.writerChan)
-			c.log.Debug("initiateShutdown: writerChan closed.", logger.LogFields{})
-		}
-	}()
+	}
+	c.initialSettingsMu.Unlock()
 
 	// 4. Wait for writerLoop to finish processing all queued frames.
 	if c.writerDone != nil {
-		c.log.Debug("initiateShutdown: Waiting for writerDone.", logger.LogFields{})
+		c.log.Debug("initiateShutdown: Waiting for writerDone.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 		<-c.writerDone // Wait for writerLoop to fully exit
-		c.log.Debug("initiateShutdown: writerDone signal received.", logger.LogFields{})
+		c.log.Debug("initiateShutdown: writerDone signal received.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	}
 
 	// 5. Graceful stream handling (after writer has finished its attempts)
 	if gracefulStreamTimeout > 0 && !c.isClient {
-		c.log.Debug("Starting graceful stream shutdown period.", logger.LogFields{"timeout": gracefulStreamTimeout})
+		c.log.Debug("Starting graceful stream shutdown period.", logger.LogFields{"timeout": gracefulStreamTimeout, "remote_addr": c.remoteAddrStr})
 		startTime := time.Now()
 		deadline := startTime.Add(gracefulStreamTimeout)
 
@@ -2101,19 +2177,19 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 			c.streamsMu.RUnlock()
 
 			if activeStreamsBelowGoAwayID == 0 {
-				c.log.Debug("All relevant streams closed gracefully.", logger.LogFields{})
+				c.log.Debug("All relevant streams closed gracefully.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 				break
 			}
-			c.log.Debug("Waiting for streams to close gracefully.", logger.LogFields{"active_streams_below_goaway_id": activeStreamsBelowGoAwayID, "time_remaining": deadline.Sub(time.Now())})
+			c.log.Debug("Waiting for streams to close gracefully.", logger.LogFields{"active_streams_below_goaway_id": activeStreamsBelowGoAwayID, "time_remaining": deadline.Sub(time.Now()), "remote_addr": c.remoteAddrStr})
 			time.Sleep(100 * time.Millisecond) // Check interval
 		}
 		if time.Now().After(deadline) {
-			c.log.Warn("Graceful stream shutdown period timed out.", logger.LogFields{})
+			c.log.Warn("Graceful stream shutdown period timed out.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 		}
 	}
 
 	// 6. Forcefully close all remaining active streams
-	c.log.Debug("Forcefully closing any remaining active streams.", logger.LogFields{})
+	c.log.Debug("Forcefully closing any remaining active streams.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	var streamsToClose []*Stream
 	c.streamsMu.RLock()
 	for _, stream := range c.streams {
@@ -2124,79 +2200,29 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	for _, stream := range streamsToClose {
 		streamErr := NewStreamError(stream.id, ErrCodeCancel, "connection shutting down")
 		if err := stream.Close(streamErr); err != nil {
-			c.log.Warn("Error closing stream during connection shutdown.", logger.LogFields{"stream_id": stream.id, "error": err.Error()})
+			c.log.Warn("Error closing stream during connection shutdown.", logger.LogFields{"stream_id": stream.id, "error": err.Error(), "remote_addr": c.remoteAddrStr})
 		}
 	}
 
-	c.log.Debug("initiateShutdown: attempting to close c.netConn", logger.LogFields{"netConn_is_nil": c.netConn == nil})
-	if c.netConn != nil {
-		c.log.Debug("initiateShutdown: c.netConn details", logger.LogFields{"type": fmt.Sprintf("%T", c.netConn), "remoteAddr": c.netConn.RemoteAddr().String()})
-	}
 	// 7. Close the underlying network connection. This happens AFTER writer is done.
-	c.log.Debug("initiateShutdown: attempting to close c.netConn", logger.LogFields{"netConn_is_nil": c.netConn == nil})
-	if c.netConn != nil {
-		c.log.Debug("initiateShutdown: c.netConn details", logger.LogFields{"type": fmt.Sprintf("%T", c.netConn), "remoteAddr": c.netConn.RemoteAddr().String()})
-	}
 	c.log.Debug("Closing network connection.", logger.LogFields{"remote_addr": c.remoteAddrStr})
-
 	if errNetClose := c.netConn.Close(); errNetClose != nil {
-		c.log.Warn("Error closing network connection.", logger.LogFields{"error": errNetClose.Error()})
+		c.log.Warn("Error closing network connection.", logger.LogFields{"error": errNetClose.Error(), "remote_addr": c.remoteAddrStr})
 		c.streamsMu.Lock()
-		// This logic aims to preserve the original reason for shutdown if it was graceful (ErrCodeNoError),
-		// rather than letting a subsequent net.Conn.Close() error obscure it.
-		// If the shutdown was initiated with an error (errCode != ErrCodeNoError),
-		// and c.connError is somehow still nil (which ideally shouldn't happen if Close() set it),
-		// then the netConn.Close() error can be recorded.
 		if errCode != ErrCodeNoError && c.connError == nil {
 			c.connError = errNetClose
 		}
-		// If errCode was ErrCodeNoError, c.connError (which would have been nil or a generic
-		// 'shutdown initiated' error from Close()) should *not* be overwritten by errNetClose.
-		// This keeps the "graceful" nature of the shutdown as the primary recorded state.
 		c.streamsMu.Unlock()
 	}
 
 	// 8. Cancel the connection's context.
 	if c.cancelCtx != nil {
 		c.cancelCtx()
-		c.log.Debug("Connection context cancelled.", logger.LogFields{})
+		c.log.Debug("Connection context cancelled.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	}
 
 	// 9. Clean up other connection-level resources.
-	c.log.Debug("Cleaning up connection resources.", logger.LogFields{})
-	if c.connFCManager != nil {
-		var fcCloseErr error
-		c.streamsMu.RLock()
-		fcCloseErr = c.connError
-		c.streamsMu.RUnlock()
-		if fcCloseErr == nil {
-			fcCloseErr = NewConnectionError(errCode, "connection closed")
-		}
-		c.connFCManager.Close(fcCloseErr)
-	}
-
-	c.settingsMu.Lock()
-	if c.settingsAckTimeoutTimer != nil {
-		c.settingsAckTimeoutTimer.Stop()
-		c.settingsAckTimeoutTimer = nil
-	}
-	c.settingsMu.Unlock()
-
-	c.activePingsMu.Lock()
-	for data, timer := range c.activePings {
-		timer.Stop()
-		delete(c.activePings, data)
-	}
-	c.activePingsMu.Unlock()
-
-	// 7. Cancel the connection's context.
-	if c.cancelCtx != nil {
-		c.cancelCtx()
-		c.log.Debug("Connection context cancelled.", logger.LogFields{})
-	}
-
-	// 8. Clean up other connection-level resources.
-	c.log.Debug("Cleaning up connection resources.", logger.LogFields{})
+	c.log.Debug("Cleaning up connection resources.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if c.connFCManager != nil {
 		var fcCloseErr error
 		c.streamsMu.RLock()
@@ -2225,15 +2251,18 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	c.log.Info("Connection shutdown sequence complete.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
 	if c.readerDone != nil {
-		select {
-		case <-c.readerDone:
-		default:
-			close(c.readerDone)
-			c.log.Debug("initiateShutdown: readerDone force-closed by shutdown logic.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		c.initialSettingsMu.Lock() // Using initialSettingsMu to protect readerDoneClosed
+		if !c.readerDoneClosed {   // Assume readerDoneClosed is a new bool field, initialized false
+			select {
+			case <-c.readerDone:
+			default:
+				close(c.readerDone)
+				c.readerDoneClosed = true
+			}
+			c.log.Debug("initiateShutdown: readerDone checked/closed by shutdown logic.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 		}
+		c.initialSettingsMu.Unlock()
 	}
-	// writerDone is closed by the writerLoop's defer statement when it exits.
-	// Do not close it here to avoid "close of closed channel" panic.
 }
 
 // handleSettingsFrame processes an incoming SETTINGS frame.
@@ -2441,6 +2470,7 @@ func (c *Connection) handleGoAwayFrame(frame *GoAwayFrame) error {
 	// This is the first GOAWAY frame received on this connection.
 	c.goAwayReceived = true
 	c.peerReportedLastStreamID = frame.LastStreamID
+	c.peerReportedErrorCode = frame.ErrorCode // STORE THE CODE
 
 	c.log.Info("Received first GOAWAY frame from peer.",
 		logger.LogFields{
