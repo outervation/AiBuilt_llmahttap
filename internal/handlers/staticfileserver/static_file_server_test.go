@@ -18,6 +18,7 @@ import (
 	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
+	"example.com/llmahttap/v2/internal/router" // Added import
 )
 
 // mockStreamWriter is a mock implementation of http2.StreamWriter for testing.
@@ -262,5 +263,189 @@ func TestStaticFileServer_InitialSetup(t *testing.T) {
 	}
 	if sfs.cfg.DocumentRoot != docRoot {
 		t.Errorf("Expected DocumentRoot %s, got %s", docRoot, sfs.cfg.DocumentRoot)
+	}
+}
+
+func TestStaticFileServer_ServeHTTP2_RegularFiles(t *testing.T) {
+	testFiles := []fileSpec{
+		{Path: "hello.txt", Content: "Hello, World!"},
+		{Path: "empty.txt", Content: ""},
+		{Path: "image.png", Content: "fake png data"}, // Content doesn't matter, extension does for MIME
+	}
+
+	docRoot, cleanup := setupTestDocumentRoot(t, testFiles)
+	defer cleanup()
+
+	trueVal := true
+	sfsConfig := config.StaticFileServerConfig{
+		DocumentRoot:          docRoot,
+		IndexFiles:            []string{"index.html"}, // Not relevant for direct file access
+		ServeDirectoryListing: &trueVal,
+		// Use default MIME types for this test
+	}
+
+	testLogger := logger.NewTestLogger(new(bytes.Buffer)) // Capture logs if needed
+	sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+	// Expected values for hello.txt
+	helloTxtFileInfo, err := os.Stat(filepath.Join(docRoot, "hello.txt"))
+	if err != nil {
+		t.Fatalf("Failed to stat hello.txt: %v", err)
+	}
+	expectedHelloETag := generateETag(helloTxtFileInfo)
+	expectedHelloLastMod := helloTxtFileInfo.ModTime().UTC().Format(http.TimeFormat)
+
+	// Expected values for empty.txt
+	emptyTxtFileInfo, err := os.Stat(filepath.Join(docRoot, "empty.txt"))
+	if err != nil {
+		t.Fatalf("Failed to stat empty.txt: %v", err)
+	}
+	expectedEmptyETag := generateETag(emptyTxtFileInfo)
+	expectedEmptyLastMod := emptyTxtFileInfo.ModTime().UTC().Format(http.TimeFormat)
+
+	tests := []struct {
+		name                  string
+		method                string
+		path                  string
+		matchedRoutePattern   string // Simulates what router would pass in context
+		expectedStatus        string
+		expectedContentType   string
+		expectedContent       string
+		expectedContentLength string
+		expectedETag          string
+		expectedLastModified  string
+		expectEmptyBody       bool
+	}{
+		{
+			name:                  "GET non-empty file hello.txt",
+			method:                http.MethodGet,
+			path:                  "/files/hello.txt",
+			matchedRoutePattern:   "/files/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/plain; charset=utf-8", // Default for .txt via mime.TypeByExtension
+			expectedContent:       "Hello, World!",
+			expectedContentLength: fmt.Sprintf("%d", len("Hello, World!")),
+			expectedETag:          expectedHelloETag,
+			expectedLastModified:  expectedHelloLastMod,
+			expectEmptyBody:       false,
+		},
+		{
+			name:                  "HEAD non-empty file hello.txt",
+			method:                http.MethodHead,
+			path:                  "/files/hello.txt",
+			matchedRoutePattern:   "/files/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/plain; charset=utf-8",
+			expectedContentLength: fmt.Sprintf("%d", len("Hello, World!")),
+			expectedETag:          expectedHelloETag,
+			expectedLastModified:  expectedHelloLastMod,
+			expectEmptyBody:       true,
+		},
+		{
+			name:                  "GET empty file empty.txt",
+			method:                http.MethodGet,
+			path:                  "/data/empty.txt",
+			matchedRoutePattern:   "/data/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/plain; charset=utf-8",
+			expectedContent:       "",
+			expectedContentLength: "0",
+			expectedETag:          expectedEmptyETag,
+			expectedLastModified:  expectedEmptyLastMod,
+			expectEmptyBody:       false, // Body is empty, but not because it's HEAD
+		},
+		{
+			name:                  "HEAD empty file empty.txt",
+			method:                http.MethodHead,
+			path:                  "/data/empty.txt",
+			matchedRoutePattern:   "/data/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/plain; charset=utf-8",
+			expectedContentLength: "0",
+			expectedETag:          expectedEmptyETag,
+			expectedLastModified:  expectedEmptyLastMod,
+			expectEmptyBody:       true,
+		},
+		{
+			name:                  "GET image.png",
+			method:                http.MethodGet,
+			path:                  "/static/image.png",
+			matchedRoutePattern:   "/static/",
+			expectedStatus:        "200",
+			expectedContentType:   "image/png", // Default for .png via mime.TypeByExtension
+			expectedContent:       "fake png data",
+			expectedContentLength: fmt.Sprintf("%d", len("fake png data")),
+			// ETag and LastMod will be dynamic, so just check for presence and format.
+			expectEmptyBody: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockWriter := newMockStreamWriter(t, 1)
+			// Set the matched path pattern in the context
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			req := newTestRequest(t, tc.method, tc.path, nil, nil)
+			req = req.WithContext(ctx) // Ensure request also has the context
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s", tc.expectedStatus, status)
+				t.Logf("Response headers: %#v", mockWriter.headers)
+				t.Logf("Response body: %s", string(mockWriter.getResponseBody()))
+			}
+
+			if contentType := mockWriter.getResponseHeader("content-type"); contentType != tc.expectedContentType {
+				t.Errorf("Expected Content-Type %s, got %s", tc.expectedContentType, contentType)
+			}
+			if contentLength := mockWriter.getResponseHeader("content-length"); contentLength != tc.expectedContentLength {
+				t.Errorf("Expected Content-Length %s, got %s", tc.expectedContentLength, contentLength)
+			}
+
+			// ETag check
+			etag := mockWriter.getResponseHeader("etag")
+			if tc.expectedETag != "" { // If specific ETag is expected
+				if etag != tc.expectedETag {
+					t.Errorf("Expected ETag %s, got %s", tc.expectedETag, etag)
+				}
+			} else { // Generic check for presence and format
+				if etag == "" {
+					t.Error("Expected ETag header, but it was missing")
+				} else if !strings.HasPrefix(etag, "\"") || !strings.HasSuffix(etag, "\"") {
+					t.Errorf("Expected ETag to be quoted, got %s", etag)
+				}
+			}
+
+			// Last-Modified check
+			lastModified := mockWriter.getResponseHeader("last-modified")
+			if tc.expectedLastModified != "" { // If specific Last-Modified is expected
+				if lastModified != tc.expectedLastModified {
+					t.Errorf("Expected Last-Modified %s, got %s", tc.expectedLastModified, lastModified)
+				}
+			} else { // Generic check for presence and format
+				if lastModified == "" {
+					t.Error("Expected Last-Modified header, but it was missing")
+				} else {
+					_, err := http.ParseTime(lastModified)
+					if err != nil {
+						t.Errorf("Last-Modified header is not in a valid format: %s, error: %v", lastModified, err)
+					}
+				}
+			}
+
+			body := mockWriter.getResponseBody()
+			if tc.expectEmptyBody {
+				if len(body) != 0 {
+					t.Errorf("Expected empty body for HEAD request, got %d bytes: %s", len(body), string(body))
+				}
+			} else {
+				if string(body) != tc.expectedContent {
+					t.Errorf("Expected body\n%s\nbut got\n%s", tc.expectedContent, string(body))
+				}
+			}
+		})
 	}
 }
