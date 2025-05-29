@@ -315,27 +315,39 @@ func TestMimeTypeResolver_GetMimeType(t *testing.T) {
 		filePath string
 		expected string
 	}{
-		{"custom from file", "archive.customfile", "application/x-custom-file"},
-		{"custom from file (mixed case ext)", "document.UPPEREXT", "text/upper"}, // Filename ext is lowercased for lookup
-		{"custom from inline map", "data.custominline", "application/x-custom-inline"},
-		{"custom from inline map (mixed case ext config)", "info.mixedcase", "text/mixed"},
+		// Precedence 1: Custom Mappings (from MimeTypeResolver's customMimeTypes, loaded from file or inline config)
+		{"P1 custom from file: .customfile", "archive.customfile", "application/x-custom-file"},
+		{"P1 custom from file: .UPPEREXT (mixed case in config, lowercase in filename)", "document.upperext", "text/upper"},
+		{"P1 custom from file: .UPPEREXT (mixed case in config, uppercase in filename)", "DOCUMENT.UPPEREXT", "text/upper"},
+		{"P1 custom from inline map: .custominline", "data.custominline", "application/x-custom-inline"},
+		{"P1 custom from inline map: .MixedCase (mixed case in config, lowercase in filename)", "info.mixedcase", "text/mixed"},
+		{"P1 custom from inline map: .MixedCase (mixed case in config, uppercase in filename)", "INFO.MIXEDCASE", "text/mixed"},
 
-		{"go type - html", "index.html", "text/html; charset=utf-8"},
-		{"go type - css", "style.css", "text/css; charset=utf-8"},
-		{"go type - js", "script.js", "text/javascript; charset=utf-8"},
-		{"go type - jpg", "image.jpg", "image/jpeg"},
-		{"go type - png", "graphic.png", "image/png"},
-		{"go type - json", "data.json", "application/json"}, // Adjusted expectation
+		// Precedence 2: Go's mime.TypeByExtension
+		{"P2 Go's mime: .html", "index.html", "text/html; charset=utf-8"},
+		{"P2 Go's mime: .html (uppercase filename)", "INDEX.HTML", "text/html; charset=utf-8"},
+		{"P2 Go's mime: .jpeg", "image.jpeg", "image/jpeg"},
+		{"P2 Go's mime: .jpg", "image.jpg", "image/jpeg"},
+		{"P2 Go's mime: .png", "graphic.png", "image/png"},
+		{"P2 Go's mime: .json", "data.json", "application/json"}, // stdlib mime.TypeByExtension(".json") is "application/json"
+		{"P2 Go's mime: .js", "script.js", "text/javascript; charset=utf-8"},
+		{"P2 Go's mime: .css", "style.css", "text/css; charset=utf-8"},
+		{"P2 Go's mime: .aac", "audio.aac", "audio/aac"},                                         // stdlib knows .aac
+		{"P2 Go's mime: .webp", "image.webp", "image/webp"},                                      // stdlib knows .webp
+		{"P2 Go's mime: .gz (from multi-dot file.tar.gz)", "archive.tar.gz", "application/gzip"}, // filepath.Ext -> .gz
 
-		{"built-in default - aac", "audio.aac", "audio/aac"},    // from staticfileserver.defaultMimeTypes
-		{"built-in default - webp", "image.webp", "image/webp"}, // from staticfileserver.defaultMimeTypes
+		// Precedence 3: Our package's defaultMimeTypes (when not in custom and not known by Go's mime.TypeByExtension)
+		// .azw: Go's mime.TypeByExtension(".azw") returns "", but it's in our defaultMimeTypes
+		{"P3 Our defaultMimeTypes: .azw", "ebook.azw", "application/vnd.amazon.ebook"},
+		// .xul: Go's mime.TypeByExtension(".xul") returns "", but it's in our defaultMimeTypes
+		{"P3 Our defaultMimeTypes: .xul", "app.xul", "application/vnd.mozilla.xul+xml"},
 
-		{"unknown extension", "file.unknownextension", "application/octet-stream"},
-		{"no extension", "filewithoutextension", "application/octet-stream"},
-		{"only dot in filename", ".", "application/octet-stream"}, // filepath.Ext(".") is "."
-
-		{"mixed case html in filename", "INDEX.HTML", "text/html; charset=utf-8"},
-		{"uppercase custom in filename", "ARCHIVE.CUSTOMFILE", "application/x-custom-file"},
+		// Precedence 4: Fallback to application/octet-stream
+		{"P4 Fallback: .unknownextension", "file.unknownextension", "application/octet-stream"},
+		{"P4 Fallback: no extension", "filewithoutextension", "application/octet-stream"},
+		{"P4 Fallback: only dot in filename", ".", "application/octet-stream"},               // filepath.Ext(".") is "."
+		{"P4 Fallback: filename ends with dot", "archive.tar.", "application/octet-stream"},  // filepath.Ext("archive.tar.") is "."
+		{"P4 Fallback: hidden file no specific type", ".bashrc", "application/octet-stream"}, // filepath.Ext(".bashrc") is ".bashrc", assume not known
 	}
 
 	for _, tt := range tests {
