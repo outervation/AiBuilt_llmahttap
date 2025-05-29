@@ -1250,3 +1250,113 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestServerLifecycle_BasicStartup(t *testing.T) {
+	// Determine server binary path
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("Failed to get current file path for TestServerLifecycle_BasicStartup")
+	}
+	e2eDir := filepath.Dir(currentFile)
+	projectRoot := filepath.Join(e2eDir, "..")
+	serverBinaryPath := filepath.Join(projectRoot, "server")
+
+	if envPath := os.Getenv("TEST_SERVER_BINARY"); envPath != "" {
+		serverBinaryPath = envPath
+	}
+
+	if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
+		t.Fatalf("Server binary for TestServerLifecycle_BasicStartup not found at %s. Ensure it's built (e.g., 'go build -o server ./cmd/server' from project root).", serverBinaryPath)
+	}
+	t.Logf("TestServerLifecycle_BasicStartup using server binary path: %s", serverBinaryPath)
+
+	currentCurlPath := os.Getenv("CURL_PATH")
+	if currentCurlPath == "" {
+		currentCurlPath = "curl" // Default to "curl" if not set
+	}
+
+	defaultListenAddress := "127.0.0.1:0" // Dynamic port
+	serverConfigArgName := "-config"
+
+	serverCfg := map[string]interface{}{
+		"server": map[string]interface{}{
+			"address": defaultListenAddress,
+		},
+		"logging": map[string]interface{}{
+			"log_level": "DEBUG", // Keep level low to see potential startup errors
+			"access_log": map[string]interface{}{
+				"enabled": false, // Disable access logs for this simple test
+			},
+			"error_log": map[string]interface{}{
+				"target": "stderr", // Log errors to stderr for capture
+			},
+		},
+		"routing": map[string]interface{}{
+			"routes": []config.Route{}, // No routes, so any request should 404
+		},
+	}
+
+	testDef := testutil.E2ETestDefinition{
+		Name:                "ServerLifecycle_BasicStartup",
+		ServerBinaryPath:    serverBinaryPath,
+		ServerConfigData:    serverCfg,
+		ServerConfigFormat:  "json",
+		ServerConfigArgName: serverConfigArgName,
+		ServerListenAddress: defaultListenAddress,
+		CurlPath:            currentCurlPath,
+		TestCases: []testutil.E2ETestCase{
+			{
+				Name: "GET_NonExistentPath_AcceptJSON_Should404",
+				Request: testutil.TestRequest{
+					Method:  "GET",
+					Path:    "/health_check_nonexistent_json",
+					Headers: http.Header{"Accept": []string{"application/json"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: http.StatusNotFound,
+					BodyMatcher: &testutil.JSONFieldsBodyMatcher{
+						ExpectedFields: map[string]interface{}{
+							"error": map[string]interface{}{
+								"status_code": float64(http.StatusNotFound), // JSON numbers are float64
+								"message":     "Not Found",
+							},
+						},
+					},
+					Headers: testutil.HeaderMatcher{"content-type": "application/json; charset=utf-8"},
+				},
+			},
+			{
+				Name: "GET_NonExistentPath_NoAcceptHeader_Should404_HTML",
+				Request: testutil.TestRequest{
+					Method: "GET",
+					Path:   "/health_check_nonexistent_html",
+					// No Accept header, defaults to HTML
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: http.StatusNotFound,
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					},
+					Headers: testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+				},
+			},
+			{
+				Name: "GET_NonExistentPath_AcceptHTML_Should404_HTML",
+				Request: testutil.TestRequest{
+					Method:  "GET",
+					Path:    "/health_check_nonexistent_explicit_html",
+					Headers: http.Header{"Accept": []string{"text/html"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: http.StatusNotFound,
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					},
+					Headers: testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+				},
+			},
+		},
+	}
+
+	testutil.RunE2ETest(t, testDef)
+}
