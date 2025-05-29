@@ -1140,3 +1140,85 @@ func escapeJSONString(s string) string {
 	s = strings.ReplaceAll(s, `"`, `\"`) // Escape double quotes
 	return s
 }
+
+func TestStaticFileServer_ServeHTTP2_OptionsRequests(t *testing.T) {
+	docRoot, cleanup := setupTestDocumentRoot(t, []fileSpec{
+		{Path: "somefile.txt", Content: "content"},
+	})
+	defer cleanup()
+
+	sfsConfig := config.StaticFileServerConfig{
+		DocumentRoot: docRoot,
+	}
+
+	testLogger := logger.NewTestLogger(new(bytes.Buffer))
+	sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+	tests := []struct {
+		name                string
+		path                string
+		matchedRoutePattern string
+		expectedStatus      string
+		expectedAllowHeader string
+	}{
+		{
+			name:                "OPTIONS request for existing resource",
+			path:                "/files/somefile.txt",
+			matchedRoutePattern: "/files/",
+			expectedStatus:      "204",
+			expectedAllowHeader: "GET, HEAD, OPTIONS",
+		},
+		{
+			name:                "OPTIONS request for non-existent resource path",
+			path:                "/files/nonexistent.txt",
+			matchedRoutePattern: "/files/", // Path resolution happens before method check, but for OPTIONS, it's generic
+			expectedStatus:      "204",
+			expectedAllowHeader: "GET, HEAD, OPTIONS",
+		},
+		{
+			name:                "OPTIONS request for directory path",
+			path:                "/files/",
+			matchedRoutePattern: "/files/",
+			expectedStatus:      "204",
+			expectedAllowHeader: "GET, HEAD, OPTIONS",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			req := newTestRequest(t, http.MethodOptions, tc.path, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s", tc.expectedStatus, status)
+			}
+
+			allowHeader := mockWriter.getResponseHeader("allow")
+			if allowHeader != tc.expectedAllowHeader {
+				t.Errorf("Expected Allow header '%s', got '%s'", tc.expectedAllowHeader, allowHeader)
+			}
+
+			// Per spec 2.3.2, for 204, there should be no body.
+			// The SFS implementation also sets Content-Length: 0
+			contentLength := mockWriter.getResponseHeader("content-length")
+			if contentLength != "0" {
+				t.Errorf("Expected Content-Length '0' for 204 response, got '%s'", contentLength)
+			}
+
+			body := mockWriter.getResponseBody()
+			if len(body) != 0 {
+				t.Errorf("Expected empty body for OPTIONS request (204), got %d bytes: %s", len(body), string(body))
+			}
+
+			if mockWriter.ended != true {
+				t.Error("Expected stream to be ended for OPTIONS request")
+			}
+		})
+	}
+}
