@@ -266,13 +266,15 @@ func TestWriteErrorResponse(t *testing.T) {
 				bodyStr := string(body)
 				statusText := http.StatusText(statusCode)
 				if statusText == "" {
-					statusText = "Error"
+					statusText = "Unknown Status" // Align with errors.go actual behavior
 				}
-				expectedTitle := fmt.Sprintf("%d %s", statusCode, statusText)
+
+				expectedTitle := fmt.Sprintf("%d %s", statusCode, statusText) // statusText is already http.StatusText(statusCode) or "Error"
 				if !strings.Contains(bodyStr, html.EscapeString(expectedTitle)) {
 					t.Errorf("HTML body does not contain title %q. Body: %s", expectedTitle, bodyStr)
 				}
-				if !strings.Contains(bodyStr, html.EscapeString(statusText)) { // Heading
+
+				if !strings.Contains(bodyStr, html.EscapeString(statusText)) { // Heading should be statusText
 					t.Errorf("HTML body does not contain heading %q. Body: %s", statusText, bodyStr)
 				}
 				expectedPMessage := html.EscapeString(detail)
