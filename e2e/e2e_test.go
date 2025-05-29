@@ -475,8 +475,254 @@ func TestStaticFileServer_BasicFileOperations(t *testing.T) {
 
 // TestStaticFileServer_DirectoryListing is a placeholder.
 func TestStaticFileServer_DirectoryListing(t *testing.T) {
-	t.Parallel()
-	t.Skip("TestStaticFileServer_DirectoryListing not yet implemented")
+	t.Parallel() // Main test can be parallel
+
+	if serverBinaryMissing {
+		t.Skipf("Skipping E2E test: server binary not found or not executable at '%s'", serverBinaryPath)
+	}
+
+	// Helper function to create a base config for static file tests focusing on directory operations
+	getBaseDirTestConfig := func(st *testing.T, docRoot string, indexFiles []string, serveListing *bool) *config.Config {
+		st.Helper()
+		staticHandlerCfg := config.StaticFileServerConfig{
+			DocumentRoot:          docRoot,
+			IndexFiles:            indexFiles,
+			ServeDirectoryListing: serveListing,
+		}
+		return &config.Config{
+			Server: &config.ServerConfig{
+				Address: strPtr("127.0.0.1:0"),
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{
+						PathPattern:   "/static/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: testutil.ToRawMessageWrapper(st, staticHandlerCfg),
+					},
+				},
+			},
+			Logging: &config.LoggingConfig{
+				LogLevel:  config.LogLevelError, // Keep logs quieter for these tests
+				AccessLog: &config.AccessLogConfig{Enabled: boolPtr(false)},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stderr")}, // So testutil can capture it if server fails
+			},
+		}
+	}
+
+	// Sub-test 1: Default Index File (`index.html`)
+	t.Run("DefaultIndexFile", func(st *testing.T) {
+		st.Parallel()
+		docRoot, cleanupDocRoot, err := setupTempFiles(st, map[string]string{
+			"index.html": "Default Index Page Content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to set up temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		// Explicitly set IndexFiles to default or let server default it. Spec 2.2.2 defaults to ["index.html"].
+		// ServeDirectoryListing default is false (Spec 2.2.3).
+		cfg := getBaseDirTestConfig(st, docRoot, nil /* defaults to ["index.html"] */, nil /* defaults to false */)
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "Static_DefaultIndexFile",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    cfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: "-config",
+			ServerListenAddress: *cfg.Server.Address,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "GET /static/ (serves index.html)",
+					Request: testutil.TestRequest{Method: "GET", Path: "/static/"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  http.StatusOK,
+						Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Default Index Page Content")},
+					},
+				},
+			},
+			CurlPath: defaultCurlPath,
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test 2: Custom Index File (`custom.html` takes precedence)
+	t.Run("CustomIndexFile", func(st *testing.T) {
+		st.Parallel()
+		docRoot, cleanupDocRoot, err := setupTempFiles(st, map[string]string{
+			"custom.html": "Custom Page Served",
+			"index.html":  "Default Index, Should Not Be Served",
+		})
+		if err != nil {
+			st.Fatalf("Failed to set up temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		cfg := getBaseDirTestConfig(st, docRoot, []string{"custom.html", "index.html"}, boolPtr(false))
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "Static_CustomIndexFile",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    cfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: "-config",
+			ServerListenAddress: *cfg.Server.Address,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "GET /static/ (serves custom.html)",
+					Request: testutil.TestRequest{Method: "GET", Path: "/static/"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  http.StatusOK,
+						Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Custom Page Served")},
+					},
+				},
+			},
+			CurlPath: defaultCurlPath,
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test 3: Directory Listing Enabled (No Index Files Match)
+	t.Run("ListingEnabledNoIndex", func(st *testing.T) {
+		st.Parallel()
+		docRoot, cleanupDocRoot, err := setupTempFiles(st, map[string]string{
+			"file1.txt":         "content of file1",
+			"another_dir/":      "", // Just creating the directory
+			"another_dir/f2.md": "content of f2",
+		})
+		if err != nil {
+			st.Fatalf("Failed to set up temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		// No matching index files, ServeDirectoryListing = true
+		cfg := getBaseDirTestConfig(st, docRoot, []string{"nonexistent.idx"}, boolPtr(true))
+
+		testCases := []testutil.E2ETestCase{
+			{
+				Name:    "GET /static/ (serves listing)",
+				Request: testutil.TestRequest{Method: "GET", Path: "/static/"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{Substring: "<a href=\"file1.txt\">file1.txt</a>"},
+				},
+			},
+			{
+				Name:    "GET /static/ (listing contains another_dir)",
+				Request: testutil.TestRequest{Method: "GET", Path: "/static/"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					BodyMatcher: &testutil.StringContainsBodyMatcher{Substring: "<a href=\"another_dir/\">another_dir/</a>"},
+				},
+			},
+			{
+				Name:    "GET /static/another_dir/ (serves listing for subdir)",
+				Request: testutil.TestRequest{Method: "GET", Path: "/static/another_dir/"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{Substring: "<a href=\"f2.md\">f2.md</a>"},
+				},
+			},
+			{
+				Name:    "GET /static/another_dir/ (listing contains parent link)",
+				Request: testutil.TestRequest{Method: "GET", Path: "/static/another_dir/"},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:  http.StatusOK,
+					BodyMatcher: &testutil.StringContainsBodyMatcher{Substring: "<a href=\"../\">../</a>"},
+				},
+			},
+			{
+				Name: "HEAD /static/ (for directory listing)",
+				Request: testutil.TestRequest{
+					Method: "HEAD",
+					Path:   "/static/",
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode:   http.StatusOK,
+					Headers:      testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+					ExpectNoBody: true,
+				},
+			},
+		}
+		testDef := testutil.E2ETestDefinition{
+			Name:                "Static_ListingEnabledNoIndex",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    cfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: "-config",
+			ServerListenAddress: *cfg.Server.Address,
+			TestCases:           testCases,
+			CurlPath:            defaultCurlPath,
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test 4: Directory Listing Disabled (No Index Files Match, 403 Forbidden)
+	t.Run("ListingDisabledForbidden", func(st *testing.T) {
+		st.Parallel()
+		docRoot, cleanupDocRoot, err := setupTempFiles(st, map[string]string{
+			"somefile.txt": "content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to set up temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		// No matching index files, ServeDirectoryListing = false (explicitly or default)
+		cfg := getBaseDirTestConfig(st, docRoot, []string{"nonexistent.idx"}, boolPtr(false))
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "Static_ListingDisabledForbidden",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    cfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: "-config",
+			ServerListenAddress: *cfg.Server.Address,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name: "GET /static/ (expect 403 JSON)",
+					Request: testutil.TestRequest{
+						Method:  "GET",
+						Path:    "/static/",
+						Headers: http.Header{"Accept": []string{"application/json"}},
+					},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: http.StatusForbidden,
+						Headers:    testutil.HeaderMatcher{"content-type": "application/json; charset=utf-8"},
+						BodyMatcher: &testutil.JSONFieldsBodyMatcher{
+							ExpectedFields: map[string]interface{}{
+								"error": map[string]interface{}{
+									"status_code": 403.0, // JSON numbers are float64
+									"message":     "Forbidden",
+								},
+							},
+						},
+					},
+				},
+				{
+					Name: "GET /static/ (expect 403 HTML)",
+					Request: testutil.TestRequest{
+						Method:  "GET",
+						Path:    "/static/",
+						Headers: http.Header{"Accept": []string{"text/html"}},
+					},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  http.StatusForbidden,
+						Headers:     testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+						BodyMatcher: &testutil.StringContainsBodyMatcher{Substring: "<h1>Forbidden</h1>"},
+					},
+				},
+			},
+			CurlPath: defaultCurlPath,
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
 }
 
 // TestStaticFileServer_IndexFiles is a placeholder.
