@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
 	"testing"
+	"time"
 
 	"example.com/llmahttap/v2/e2e/testutil"
 	"example.com/llmahttap/v2/internal/config"
@@ -485,9 +487,198 @@ func TestStaticFileServer_IndexFiles(t *testing.T) {
 }
 
 // TestStaticFileServer_ConditionalRequests is a placeholder.
+
 func TestStaticFileServer_ConditionalRequests(t *testing.T) {
 	t.Parallel()
-	t.Skip("TestStaticFileServer_ConditionalRequests not yet implemented (debugging 304 timeout)")
+
+	if serverBinaryMissing {
+		t.Skipf("Skipping E2E test: server binary not found or not executable at '%s'", serverBinaryPath)
+	}
+
+	fileName := "cacheable_file.txt"
+	fileContent := "This is some content that can be cached."
+	docRoot, cleanupDocRoot, err := setupTempFiles(t, map[string]string{
+		fileName: fileContent,
+	})
+	if err != nil {
+		t.Fatalf("Failed to set up temp files: %v", err)
+	}
+	defer cleanupDocRoot()
+
+	cfg := &config.Config{
+		Server: &config.ServerConfig{
+			Address: strPtr("127.0.0.1:0"),
+		},
+		Routing: &config.RoutingConfig{
+			Routes: []config.Route{
+				{
+					PathPattern: "/static/",
+					MatchType:   config.MatchTypePrefix,
+					HandlerType: "StaticFileServer",
+					HandlerConfig: testutil.ToRawMessageWrapper(t, config.StaticFileServerConfig{
+						DocumentRoot:          docRoot,
+						ServeDirectoryListing: boolPtr(false),
+					}),
+				},
+			},
+		},
+		Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: boolPtr(false)}},
+	}
+
+	configFile, cleanupCfgFile, errCfgFile := testutil.WriteTempConfig(cfg, "json")
+	if errCfgFile != nil {
+		t.Fatalf("Failed to write temp config for conditional requests test: %v", errCfgFile)
+	}
+	defer cleanupCfgFile()
+
+	server, err := testutil.StartTestServer(serverBinaryPath, configFile, "-config", *cfg.Server.Address)
+	if err != nil {
+		logStr := ""
+		if server != nil { // server might be nil if StartTestServer fails very early
+			logStr = server.SafeGetLogs()
+		}
+		t.Fatalf("Failed to start server for conditional requests test: %v. Logs: %s", err, logStr)
+	}
+	defer server.Stop()
+
+	clients := []struct {
+		name   string
+		client testutil.TestRunner
+	}{
+		{"GoHTTPClient", testutil.NewGoNetHTTPClient()},
+		{"CurlClient", testutil.NewCurlHTTPClient(defaultCurlPath)},
+	}
+
+	filePathInServer := "/static/" + fileName
+
+	for _, c := range clients {
+		t.Run(c.name, func(st *testing.T) {
+			st.Helper()
+			st.Cleanup(func() {
+				if st.Failed() {
+					logs := server.SafeGetLogs()
+					st.Logf("BEGIN Server logs for client %s, case ConditionalRequests (on failure):\n%s\nEND Server logs", c.name, logs)
+				}
+			})
+
+			// 1. Initial GET to fetch ETag and Last-Modified
+			initialReq := testutil.TestRequest{Method: "GET", Path: filePathInServer}
+			actualResp1, err1 := c.client.Run(server, &initialReq)
+
+			if err1 != nil {
+				st.Fatalf("Initial GET request failed: %v", err1)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusOK}, *actualResp1)
+			initialETag := actualResp1.Headers.Get("Etag")
+			initialLastModified := actualResp1.Headers.Get("Last-Modified")
+			if initialETag == "" {
+				st.Fatalf("Initial GET response missing ETag header. Headers: %v", actualResp1.Headers)
+			}
+			if initialLastModified == "" {
+				st.Fatalf("Initial GET response missing Last-Modified header. Headers: %v", actualResp1.Headers)
+			}
+			st.Logf("Initial GET for %s: ETag='%s', Last-Modified='%s'", filePathInServer, initialETag, initialLastModified)
+
+			// 2. If-None-Match: Matching ETag should return 304
+			reqIfNoneMatchHit := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{"If-None-Match": []string{initialETag}},
+			}
+			actualRespINMHit, errINMHit := c.client.Run(server, &reqIfNoneMatchHit)
+			if errINMHit != nil {
+				st.Fatalf("GET with If-None-Match (hit) failed: %v", errINMHit)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusNotModified}, *actualRespINMHit)
+			st.Logf("If-None-Match (Hit): Status %d OK", actualRespINMHit.StatusCode)
+
+			// 3. If-None-Match: Non-matching ETag should return 200
+			reqIfNoneMatchMiss := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{"If-None-Match": []string{`"non-matching-etag-value"`}},
+			}
+			actualRespINMMiss, errINMMiss := c.client.Run(server, &reqIfNoneMatchMiss)
+			if errINMMiss != nil {
+				st.Fatalf("GET with If-None-Match (miss) failed: %v", errINMMiss)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusOK}, *actualRespINMMiss)
+			testutil.AssertBodyEquals(st, []byte(fileContent), actualRespINMMiss.Body)
+			st.Logf("If-None-Match (Miss): Status %d OK", actualRespINMMiss.StatusCode)
+
+			// 4. If-Modified-Since: Matching Last-Modified should return 304
+			reqIfModSinceHit := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{"If-Modified-Since": []string{initialLastModified}},
+			}
+			actualRespIMSHit, errIMSHit := c.client.Run(server, &reqIfModSinceHit)
+
+			if errIMSHit != nil {
+				st.Fatalf("GET with If-Modified-Since (hit) failed: %v", errIMSHit)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusNotModified}, *actualRespIMSHit)
+			st.Logf("If-Modified-Since (Hit): Status %d OK", actualRespIMSHit.StatusCode)
+
+			// 5. If-Modified-Since: Older date (file is newer) should return 200
+			pastTime := time.Now().Add(-24 * time.Hour).UTC().Format(http.TimeFormat) // A day ago
+			reqIfModSinceMiss := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{"If-Modified-Since": []string{pastTime}},
+			}
+			actualRespIMSMiss, errIMSMiss := c.client.Run(server, &reqIfModSinceMiss)
+			if errIMSMiss != nil {
+				st.Fatalf("GET with If-Modified-Since (miss - file newer) failed: %v", errIMSMiss)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusOK}, *actualRespIMSMiss)
+			testutil.AssertBodyEquals(st, []byte(fileContent), actualRespIMSMiss.Body)
+			st.Logf("If-Modified-Since (Miss - file newer): Status %d OK", actualRespIMSMiss.StatusCode)
+
+			// 6. Precedence: If-None-Match (match) and If-Modified-Since (indicates modified) -> 304
+			//    (If-None-Match takes precedence)
+			reqPrecedence1 := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{
+					"If-None-Match":     []string{initialETag}, // This will match
+					"If-Modified-Since": []string{pastTime},    // This alone would yield 200
+				},
+			}
+			actualRespPrec1, errPrec1 := c.client.Run(server, &reqPrecedence1)
+			if errPrec1 != nil {
+				st.Fatalf("GET with If-None-Match (hit) and If-Modified-Since (miss) failed: %v", errPrec1)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusNotModified}, *actualRespPrec1)
+			st.Logf("Precedence Test 1 (INM match, IMS miss): Status %d OK", actualRespPrec1.StatusCode)
+
+			// Scenario 7a: INM (no match), IMS (match) -> 304
+			reqPrecedence2a := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{
+					"If-None-Match":     []string{`"non-matching-etag-value"`}, // This will NOT match
+					"If-Modified-Since": []string{initialLastModified},         // This alone would yield 304
+				},
+			}
+			actualRespPrec2a, errPrec2a := c.client.Run(server, &reqPrecedence2a)
+			if errPrec2a != nil {
+				st.Fatalf("GET with If-None-Match (miss) and If-Modified-Since (hit) failed: %v", errPrec2a)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusNotModified}, *actualRespPrec2a)
+			st.Logf("Precedence Test 2a (INM miss, IMS hit): Status %d OK", actualRespPrec2a.StatusCode)
+
+			// Scenario 7b: INM (no match), IMS (no match / file newer) -> 200
+			reqPrecedence2b := testutil.TestRequest{
+				Method: "GET", Path: filePathInServer,
+				Headers: http.Header{
+					"If-None-Match":     []string{`"non-matching-etag-value"`}, // This will NOT match
+					"If-Modified-Since": []string{pastTime},                    // This alone would yield 200
+				},
+			}
+			actualRespPrec2b, errPrec2b := c.client.Run(server, &reqPrecedence2b)
+			if errPrec2b != nil {
+				st.Fatalf("GET with If-None-Match (miss) and If-Modified-Since (miss) failed: %v", errPrec2b)
+			}
+			testutil.AssertStatusCode(st, testutil.ExpectedResponse{StatusCode: http.StatusOK}, *actualRespPrec2b)
+			testutil.AssertBodyEquals(st, []byte(fileContent), actualRespPrec2b.Body)
+			st.Logf("Precedence Test 2b (INM miss, IMS miss): Status %d OK", actualRespPrec2b.StatusCode)
+		})
+	}
 }
 
 // TestStaticFileServer_MimeTypes is a placeholder.
