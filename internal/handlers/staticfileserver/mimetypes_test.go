@@ -393,31 +393,37 @@ func TestResolveMimeType(t *testing.T) {
 		customUserMappings map[string]string
 		expected           string
 	}{
-		{"custom mapping", ".custom", customUserMappings, "application/x-custom"},
-		{"custom mapping - mixed case ext input", ".MIXED", customUserMappings, "text/mixed-case"},
-		{"custom mapping - not found", ".foo", customUserMappings, "application/octet-stream"}, // .foo not in custom, default, or Go's (assumed)
-
-		{"default mapping - txt", ".txt", nil, "text/plain; charset=utf-8"},
-		{"default mapping - webp", ".webp", customUserMappings, "image/webp"}, // .webp not in custom for this test
-
-		{"go's mime - jpeg", ".jpeg", nil, "image/jpeg"},
-
-		{"unknown extension", ".unknown", nil, "application/octet-stream"},
-		{"empty extension", "", nil, "application/octet-stream"},
-		{"only dot extension", ".", nil, "application/octet-stream"},
-
+		// Rule 1: customUserMappings take precedence
+		{"R1 custom mapping - direct hit", ".custom", customUserMappings, "application/x-custom"},
+		{"R1 custom mapping - mixed case input ext", ".MIXED", customUserMappings, "text/mixed-case"},    // input ext to ResolveMimeType is case-insensitive for lookup
+		{"R1 custom mapping - behavior with nil custom map", ".custom", nil, "application/octet-stream"}, // Assumes .custom is not in defaultMimeTypes or Go's mime
 		{
-			name:               "precedence: custom overrides default",
-			extension:          ".txt",
+			name:               "R1 precedence - custom overrides default and Go's mime",
+			extension:          ".txt", // .txt is in defaultMimeTypes and Go's mime
 			customUserMappings: map[string]string{".txt": "text/custom-plain"},
 			expected:           "text/custom-plain",
 		},
-		{
-			name:               "precedence: default considered if custom nil",
-			extension:          ".avif", // In our default list
-			customUserMappings: nil,
-			expected:           "image/avif",
-		},
+
+		// Rule 2: package's defaultMimeTypes (when custom is nil or misses)
+		{"R2 default mapping - txt (custom nil)", ".txt", nil, "text/plain; charset=utf-8"},
+		{"R2 default mapping - webp (custom active but misses .webp)", ".webp", customUserMappings, "image/webp"}, // .webp not in the specific customUserMappings map for this test suite
+		{"R2 default mapping - avif (custom nil)", ".avif", nil, "image/avif"},                                    // .avif is in defaultMimeTypes
+		// Test case to show that if an extension is in defaultMimeTypes, it's picked before Go's mime.TypeByExtension
+		{"R2 default mapping (jpeg is also in Go's mime, but defaultMimeTypes has precedence)", ".jpeg", nil, "image/jpeg"}, // .jpeg is in defaultMimeTypes
+
+		// Rule 3: Go's mime.TypeByExtension (when custom is nil/miss, and defaultMimeTypes misses)
+		{"R3 Go's mime exclusive - pem (custom nil, defaultMimeTypes miss)", ".pem", nil, "application/x-x509-ca-cert"}, // .pem not in defaultMimeTypes
+
+		// Rule 4: Fallback to application/octet-stream
+		{"R4 Fallback - unknown extension (custom nil)", ".unknown", nil, "application/octet-stream"},
+		{"R4 Fallback - unknown extension (custom active but misses)", ".unknownext", customUserMappings, "application/octet-stream"},
+		{"R4 Fallback - .foo (custom active but misses)", ".foo", customUserMappings, "application/octet-stream"}, // .foo not in customUserMappings, defaultMimeTypes, or Go's mime (assumed for test)
+
+		// Edge cases for extension format
+		{"Edge - empty extension (custom nil)", "", nil, "application/octet-stream"},
+		{"Edge - empty extension (custom active)", "", customUserMappings, "application/octet-stream"},
+		{"Edge - only dot extension (custom nil)", ".", nil, "application/octet-stream"},
+		{"Edge - only dot extension (custom active)", ".", customUserMappings, "application/octet-stream"},
 	}
 
 	for _, tt := range tests {
