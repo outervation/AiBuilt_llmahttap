@@ -1,2 +1,8 @@
 The netutil functions defined for `internal/util/netutil.go` will be POSIX-specific due to their reliance on concepts like FD_CLOEXEC and passing file descriptors across exec. If Windows support were ever a future requirement (though the current spec focuses on POSIX), these functions would need platform-specific implementations or stubs, likely managed with Go build tags (e.g., in files like `netutil_posix.go`, `netutil_windows.go`).
 The `ImplementCurlHTTPClient` task will be complex, particularly parsing `curl` output reliably. Suggestion: use `curl` options to write headers and body to separate temporary files (e.g., `curl -D header_file -o body_file ...`) and then parse these files. Standard `curl` exit codes and `-w '%{http_code}'` can get status. This approach is generally more robust than parsing combined stdout/stderr from `curl -v` or `curl -i`.
+StaticFileServer Test Plan Note:
+Task_SFS_LoggingIntegration: An important aspect of testing the StaticFileServer is to verify its logging behavior. This is not listed as a separate, standalone task for a dedicated test function. Instead, each test case (e.g., for path errors, file serving, directory listing) should *also* incorporate checks for relevant log messages. This involves:
+1.  Using a test logger (e.g., `logger.NewTestLogger` writing to a `bytes.Buffer`).
+2.  After an operation, asserting that expected log messages (with correct levels and contextual fields like stream_id, path, error) are present in the buffer.
+3.  Asserting that no unexpected error/critical logs appear for successful operations.
+This ensures that the logging requirements of the StaticFileServer are met alongside its functional requirements.
