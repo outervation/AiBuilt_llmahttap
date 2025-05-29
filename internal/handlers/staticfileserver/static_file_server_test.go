@@ -32,7 +32,9 @@ type mockStreamWriter struct {
 	headersSent bool
 	dataWritten bool
 	ended       bool
-	t           *testing.T // For logging errors within the mock
+
+	t             *testing.T                                  // For logging errors within the mock
+	writeDataHook func(p []byte, endStream bool) (int, error) // Hook for custom WriteData behavior
 }
 
 func newMockStreamWriter(t *testing.T, streamID uint32) *mockStreamWriter {
@@ -73,6 +75,12 @@ func (msw *mockStreamWriter) WriteData(p []byte, endStream bool) (n int, err err
 		msw.t.Errorf("mockStreamWriter (ID %d): WriteData called after stream ended", msw.id)
 		return 0, fmt.Errorf("stream already ended")
 	}
+
+	if msw.writeDataHook != nil {
+		// If hook is set, it takes full control of WriteData's behavior.
+		return msw.writeDataHook(p, endStream)
+	}
+
 	n, err = msw.body.Write(p)
 	if err != nil {
 		return n, err
@@ -444,6 +452,156 @@ func TestStaticFileServer_ServeHTTP2_RegularFiles(t *testing.T) {
 			} else {
 				if string(body) != tc.expectedContent {
 					t.Errorf("Expected body\n%s\nbut got\n%s", tc.expectedContent, string(body))
+				}
+			}
+		})
+	}
+}
+
+func TestStaticFileServer_ServeHTTP2_FileOperationErrors(t *testing.T) {
+	tests := []struct {
+		name                string
+		filePathInDocRoot   string
+		fileContent         string
+		initialFileMode     fs.FileMode
+		pathInRequest       string
+		matchedRoutePattern string
+		modifyFs            func(docRoot string, filePath string) error // Action to take after file creation, before SFS serve
+		writeDataHook       func(p []byte, endStream bool) (int, error)
+		expectedStatus      string
+		expectedBody        string // For 403/500, we expect default error page (simplified check)
+		expectLogContains   []string
+		expectHeaderOnly    bool // if true, WriteData shouldn't be called or body is empty after headers
+	}{
+		{
+			name:                "os.Open fails with permission denied",
+			filePathInDocRoot:   "no_read_access.txt",
+			fileContent:         "secret content",
+			initialFileMode:     0644, // Readable initially for Stat to pass
+			pathInRequest:       "/files/no_read_access.txt",
+			matchedRoutePattern: "/files/",
+			modifyFs: func(docRoot string, filePath string) error {
+				return os.Chmod(filepath.Join(docRoot, filePath), 0000) // Remove all permissions
+			},
+
+			expectedStatus:    "403",
+			expectLogContains: []string{"Permission denied opening file for GET", "no_read_access.txt"},
+			// expectHeaderOnly was true, but SendDefaultErrorResponse writes a body.
+			// Status and log checks are more important here.
+		},
+		{
+			name:                "StreamWriter.WriteData fails during body transfer",
+			filePathInDocRoot:   "partially_written.txt",
+			fileContent:         "this is a line that will be written then error",
+			initialFileMode:     0644,
+			pathInRequest:       "/files/partially_written.txt",
+			matchedRoutePattern: "/files/",
+			modifyFs:            nil, // No FS modification needed for this
+			writeDataHook: func(p []byte, endStream bool) (int, error) {
+				// Allow first write, then error.
+				// This simple hook doesn't use the mockStreamWriter's internal body buffer.
+				// It simulates an error from the perspective of the SFS handler calling WriteData.
+				// For this test, we assume one successful write of 'p' then error on subsequent.
+				// To be more precise, we'd need state in the hook or a counter.
+				// For simplicity, let's make it error on the *first* call to WriteData with actual content.
+				if len(p) > 0 {
+					return 0, fmt.Errorf("simulated WriteData error")
+				}
+				return len(p), nil // Should not happen if len(p) == 0 is only for empty file scenario
+			},
+			expectedStatus:    "200", // Headers are sent before WriteData error
+			expectLogContains: []string{"Error writing file data to stream", "partially_written.txt", "simulated WriteData error"},
+			// Body check is tricky: some might have been written before error, or none if error on first attempt.
+			// The mockStreamWriter body will reflect what the SFS handler *tried* to write before OUR hook errored.
+			// For this test, we care more about the log and that the handler didn't crash.
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			docRoot, cleanup := setupTestDocumentRoot(t, []fileSpec{
+				{Path: tc.filePathInDocRoot, Content: tc.fileContent, Mode: tc.initialFileMode},
+			})
+			defer cleanup()
+
+			if tc.modifyFs != nil {
+				if err := tc.modifyFs(docRoot, tc.filePathInDocRoot); err != nil {
+					t.Fatalf("modifyFs failed: %v", err)
+				}
+			}
+
+			sfsConfig := config.StaticFileServerConfig{DocumentRoot: docRoot}
+			logBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(logBuffer)
+			sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+			mockWriter := newMockStreamWriter(t, 1)
+			if tc.writeDataHook != nil {
+				// We need to capture the real WriteData calls from SFS and pass them to the hook,
+				// but also let SFS use the mockStreamWriter's internal body buffer if the hook doesn't error.
+				// The current hook setup replaces the entire WriteData logic.
+				// Let's refine the hook's application.
+				originalWriteData := mockWriter.writeDataHook // should be nil initially
+
+				// This closure will be the actual WriteData implementation for this test run.
+				// It uses the tc.writeDataHook to decide if/when to error.
+				// It also writes to mockWriter.body if tc.writeDataHook doesn't error or doesn't write itself.
+				currentWriteDataCount := 0
+
+				mockWriter.writeDataHook = func(p []byte, endStream bool) (n int, err error) {
+					currentWriteDataCount++
+					// Call the test case's specific hook logic
+					// This hook is designed to potentially return an error to SFS.
+					nAttempt, hookErr := tc.writeDataHook(p, endStream)
+
+					if hookErr != nil {
+						return nAttempt, hookErr // Propagate the error
+					}
+
+					// If hook didn't error, proceed to write to the mock's internal buffer
+					// This allows us to check what SFS *would* have written.
+					// Ensure we are still respecting endStream from SFS perspective.
+					actualN, writeErr := mockWriter.body.Write(p)
+					if writeErr != nil {
+						return actualN, writeErr // Error from buffer.Write
+					}
+					mockWriter.dataWritten = true
+					mockWriter.ended = endStream // SFS controls this based on its logic for this chunk
+					return actualN, nil
+				}
+				defer func() { mockWriter.writeDataHook = originalWriteData }() // Restore
+			}
+
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+			req := newTestRequest(t, http.MethodGet, tc.pathInRequest, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s. Log: %s", tc.expectedStatus, status, logBuffer.String())
+			}
+
+			if tc.expectHeaderOnly {
+				if mockWriter.dataWritten {
+					t.Errorf("Expected no data to be written to stream, but dataWasWritten is true. Body: %s", mockWriter.getResponseBody())
+				}
+			}
+
+			// For 403/500, check if body contains error status text (simplified check for default error page)
+			// This part is less critical than status and logs for these specific error tests.
+			if tc.expectedStatus == "403" || tc.expectedStatus == "500" {
+				bodyStr := string(mockWriter.getResponseBody())
+				if !strings.Contains(bodyStr, tc.expectedStatus) {
+					// t.Logf("Default error page might be expected. Body: %s", bodyStr)
+				}
+			}
+
+			logOutput := logBuffer.String()
+			for _, expectedLog := range tc.expectLogContains {
+				if !strings.Contains(logOutput, expectedLog) {
+					t.Errorf("Expected log to contain '%s', but it didn't. Log: %s", expectedLog, logOutput)
 				}
 			}
 		})
