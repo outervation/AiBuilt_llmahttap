@@ -5,6 +5,7 @@ import (
 	"fmt"
 	// "html" // Potentially for directory listing
 	// "io"   // Potentially for serving file content
+	"io" // Potentially for serving file content
 	"net/http"
 	"os"
 	"path/filepath"
@@ -382,11 +383,164 @@ func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.
 }
 
 // handleFile is a stub implementation for handling file requests.
+
 func (sfs *StaticFileServer) handleFile(resp http2.StreamWriter, req *http.Request, path string, fi os.FileInfo) {
-	sfs.log.Debug("StaticFileServer: handleFile called (stub)", logger.LogFields{
+	sfs.log.Debug("StaticFileServer: handleFile dispatching to serveFile", logger.LogFields{
 		"stream_id": resp.ID(),
 		"path":      path,
+		"method":    req.Method,
+		"is_dir":    fi.IsDir(), // Should be false if logic is correct upstream
 	})
-	// Placeholder: Send a 501 Not Implemented for now
-	server.SendDefaultErrorResponse(resp, http.StatusNotImplemented, req, "File serving not yet implemented.", sfs.log)
+
+	// This check is a safeguard. Callers of handleFile (like ServeHTTP2)
+	// should ensure 'fi' is not a directory.
+	if fi.IsDir() {
+		sfs.log.Error("StaticFileServer: handleFile called with a directory, which is a logic error.", logger.LogFields{
+			"stream_id": resp.ID(),
+			"path":      path,
+		})
+		server.SendDefaultErrorResponse(resp, http.StatusInternalServerError, req, "Internal server error: unexpected resource type.", sfs.log)
+		return
+	}
+
+	sfs.serveFile(resp, req, path, fi)
+}
+
+// serveFile handles the serving of a regular file, including conditional requests,
+// header generation, and streaming content for GET requests.
+func (sfs *StaticFileServer) serveFile(resp http2.StreamWriter, req *http.Request, filePath string, fileInfo os.FileInfo) {
+	etag := generateETag(fileInfo)
+	lastModified := fileInfo.ModTime().UTC() // Ensure UTC for consistent formatting
+
+	// Check for conditional requests (If-None-Match, If-Modified-Since)
+	if checkConditionalRequests(req, fileInfo, etag) {
+		headers := []http2.HeaderField{
+			{Name: ":status", Value: "304"},
+			{Name: "etag", Value: etag},
+			{Name: "last-modified", Value: lastModified.Format(http.TimeFormat)},
+			// Date header will be added by the server/connection layer
+		}
+		sfs.log.Debug("StaticFileServer: Sending 304 Not Modified", logger.LogFields{
+			"stream_id": resp.ID(), "path": filePath, "etag": etag,
+		})
+		if err := resp.SendHeaders(headers, true); err != nil { // true because no body for 304
+			sfs.log.Error("StaticFileServer: Failed to send 304 headers", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+			})
+		}
+		return
+	}
+
+	// Not a 304, so prepare to send the full response (200 OK)
+	contentType := sfs.mimeResolver.GetMimeType(filePath)
+	contentLengthStr := fmt.Sprintf("%d", fileInfo.Size())
+
+	responseHeaders := []http2.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-type", Value: contentType},
+		{Name: "content-length", Value: contentLengthStr},
+		{Name: "last-modified", Value: lastModified.Format(http.TimeFormat)},
+		{Name: "etag", Value: etag},
+		// Consider adding "Accept-Ranges: bytes" if range requests were supported.
+	}
+
+	// Handle HEAD request: send headers only, then return
+	if req.Method == http.MethodHead {
+		sfs.log.Debug("StaticFileServer: Sending HEAD response", logger.LogFields{
+			"stream_id": resp.ID(), "path": filePath, "content_type": contentType, "content_length": contentLengthStr,
+		})
+		if err := resp.SendHeaders(responseHeaders, true); err != nil { // true because no body for HEAD
+			sfs.log.Error("StaticFileServer: Failed to send HEAD headers", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+			})
+		}
+		return
+	}
+
+	// Handle GET request
+	// If file is empty, send headers with endStream=true and no body.
+	if fileInfo.Size() == 0 {
+		sfs.log.Debug("StaticFileServer: Sending GET response for empty file", logger.LogFields{
+			"stream_id": resp.ID(), "path": filePath,
+		})
+		if err := resp.SendHeaders(responseHeaders, true); err != nil { // true because no body
+			sfs.log.Error("StaticFileServer: Failed to send headers for empty file", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+			})
+		}
+		return
+	}
+
+	// File has content, open it for reading.
+	file, err := os.Open(filePath)
+	if err != nil {
+		// Stat succeeded, but Open failed. This could be a permissions issue that
+		// Stat didn't catch, or a race condition, or the file type changed.
+		if os.IsPermission(err) {
+			sfs.log.Warn("StaticFileServer: Permission denied opening file for GET", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+			})
+			server.SendDefaultErrorResponse(resp, http.StatusForbidden, req, "Access denied while opening file.", sfs.log)
+		} else {
+			sfs.log.Error("StaticFileServer: Failed to open file for GET", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+			})
+			server.SendDefaultErrorResponse(resp, http.StatusInternalServerError, req, "Error reading file.", sfs.log)
+		}
+		return
+	}
+	defer file.Close()
+
+	// Send headers (endStream=false as data will follow)
+	if err := resp.SendHeaders(responseHeaders, false); err != nil {
+		sfs.log.Error("StaticFileServer: Failed to send GET headers before body", logger.LogFields{
+			"stream_id": resp.ID(), "path": filePath, "error": err.Error(),
+		})
+		// Don't attempt to send body if headers failed
+		return
+	}
+
+	sfs.log.Debug("StaticFileServer: Sending GET response with body", logger.LogFields{
+		"stream_id": resp.ID(), "path": filePath, "size": fileInfo.Size(),
+	})
+
+	// Stream file content
+	buffer := make([]byte, 32*1024) // 32KB buffer for reading
+	for {
+		bytesRead, readErr := file.Read(buffer)
+
+		// Handle read errors first, other than EOF
+		if readErr != nil && readErr != io.EOF {
+			sfs.log.Error("StaticFileServer: Error reading file content", logger.LogFields{
+				"stream_id": resp.ID(), "path": filePath, "error": readErr.Error(),
+			})
+			// Headers (200 OK) have already been sent.
+			// The stream will likely be reset by the HTTP/2 layer with INTERNAL_ERROR.
+			// No further error response can be sent on this stream.
+			return
+		}
+
+		// If bytes were read, send them
+		if bytesRead > 0 {
+			// isLastChunk is true if this read operation also encountered EOF.
+			isLastChunk := (readErr == io.EOF)
+			_, writeErr := resp.WriteData(buffer[:bytesRead], isLastChunk)
+			if writeErr != nil {
+				sfs.log.Error("StaticFileServer: Error writing file data to stream", logger.LogFields{
+					"stream_id": resp.ID(), "path": filePath, "error": writeErr.Error(),
+				})
+				// Stream is likely broken. HTTP/2 layer should handle reset.
+				return
+			}
+		}
+
+		// If EOF was encountered (either with bytesRead > 0 or bytesRead == 0), we're done.
+		if readErr == io.EOF {
+			break
+		}
+	}
+
+	sfs.log.Debug("StaticFileServer: Finished streaming file", logger.LogFields{
+		"stream_id": resp.ID(), "path": filePath,
+	})
 }
