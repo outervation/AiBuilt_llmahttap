@@ -367,7 +367,7 @@ func (sfs *StaticFileServer) handleGetHead(resp http2.StreamWriter, req *http.Re
 
 // handleOptions is a stub implementation for handling OPTIONS requests.
 func (sfs *StaticFileServer) handleOptions(resp http2.StreamWriter, req *http.Request) {
-	sfs.log.Debug("StaticFileServer: handleOptions called (stub)", logger.LogFields{
+	sfs.log.Debug("StaticFileServer: handleOptions called", logger.LogFields{
 		"stream_id": resp.ID(),
 		"path":      req.URL.Path,
 	})
