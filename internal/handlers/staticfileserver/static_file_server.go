@@ -264,7 +264,7 @@ func (sfs *StaticFileServer) ServeHTTP2(resp http2.StreamWriter, req *http.Reque
 
 	// File vs. Directory Handling (2.3.3)
 	if fileInfo.IsDir() {
-		sfs.handleDirectory(resp, req, canonicalPath, fileInfo)
+		sfs.handleDirectory(resp, req, canonicalPath, fileInfo, req.URL.Path) // Pass req.URL.Path as webPath
 	} else {
 		sfs.handleFile(resp, req, canonicalPath, fileInfo)
 	}
@@ -378,11 +378,11 @@ func (sfs *StaticFileServer) handleOptions(resp http2.StreamWriter, req *http.Re
 
 // handleDirectory is a stub implementation for handling directory requests.
 
-func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.Request, dirPath string, dirFi os.FileInfo) {
+func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.Request, dirPath string, dirFi os.FileInfo, webPath string) {
 	sfs.log.Debug("StaticFileServer: handleDirectory called", logger.LogFields{
 		"stream_id": resp.ID(),
 		"dirPath":   dirPath,
-		"webPath":   req.URL.Path, // webPath is the original request path for this directory
+		"webPath":   webPath, // Use the webPath parameter
 	})
 
 	// 1. Attempt to serve an IndexFile (Spec 2.3.3.2)
@@ -413,15 +413,15 @@ func (sfs *StaticFileServer) handleDirectory(resp http2.StreamWriter, req *http.
 		sfs.log.Info("StaticFileServer: No index file found, serving directory listing", logger.LogFields{
 			"stream_id": resp.ID(),
 			"dirPath":   dirPath,
-			"webPath":   req.URL.Path,
+			"webPath":   webPath, // Use the webPath parameter
 		})
 
-		htmlBody, err := sfs.generateDirectoryListingHTML(dirPath, req.URL.Path)
+		htmlBody, err := sfs.generateDirectoryListingHTML(dirPath, webPath) // Pass webPath parameter
 		if err != nil {
 			sfs.log.Error("StaticFileServer: Failed to generate directory listing HTML", logger.LogFields{
 				"stream_id": resp.ID(),
 				"dirPath":   dirPath,
-				"webPath":   req.URL.Path,
+				"webPath":   webPath, // Use the webPath parameter
 				"error":     err.Error(),
 			})
 			server.SendDefaultErrorResponse(resp, http.StatusInternalServerError, req, "Error generating directory listing.", sfs.log)
