@@ -417,7 +417,7 @@ func TestRouter_ServeHTTP(t *testing.T) {
 	}{
 		{"not found", "/notfound", http.StatusNotFound, ""},
 		{"handler creation error", "/servererror", http.StatusInternalServerError, ""},
-		{"found and served", "/found", http.StatusOK, "/"},
+		{"found and served", "/found", http.StatusOK, "/found"},
 	}
 
 	for _, tt := range tests {

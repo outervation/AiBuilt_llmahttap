@@ -51,162 +51,122 @@ func New(cfg *config.StaticFileServerConfig, lg *logger.Logger) (server.Handler,
 // This is a placeholder implementation.
 
 func (s *StaticFileServer) ServeHTTP2(stream http2.StreamWriter, req *http.Request) {
+	// Log entry point for debugging
 	s.logger.Debug("StaticFileServer.ServeHTTP2 called", logger.LogFields{
-		"stream_id": stream.ID(),
 		"method":    req.Method,
-		"path":      req.URL.Path, // This is the path AS SEEN BY THE HANDLER
+		"path":      req.URL.Path, // This is the path *as seen by the handler* (e.g. relative to prefix)
+		"stream_id": stream.ID(),
 	})
 
-	// Path Resolution and Security (Spec 2.3.1)
-	matchedPathPatternVal := req.Context().Value(router.MatchedPathPatternKey{})
-	var matchedPathPattern string
-	if pattern, ok := matchedPathPatternVal.(string); ok {
-		matchedPathPattern = pattern
-	} else {
-		s.logger.Error("StaticFileServer: MatchedPathPattern not found or not a string in request context", logger.LogFields{
-			"path": req.URL.Path, "context_value": matchedPathPatternVal,
+	// Retrieve the matched route configuration from the context.
+	// The router stores the full config.Route struct.
+	routeConfigValue := req.Context().Value(router.MatchedPathPatternKey{})
+	if routeConfigValue == nil {
+		s.logger.Error("StaticFileServer: MatchedPathPatternKey not found in request context", logger.LogFields{
+			"path": req.URL.Path, "stream_id": stream.ID(),
 		})
-		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error resolving path.", s.logger)
+		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error: missing route context.", s.logger)
 		return
 	}
-	s.logger.Debug("StaticFileServer: Path resolution details (handler perspective)", logger.LogFields{
-		"handler_req_url_path": req.URL.Path,
-		"matched_path_pattern": matchedPathPattern,
-	})
 
-	var subPath string
-	// req.URL.Path is what the router passes to the handler.
-	// For prefix routes like "/static/", if request is "/static/foo.txt", router gives "foo.txt" to handler.
-	// If request is "/static/", router gives "/" to handler.
-	// For exact routes like "/exact", if request is "/exact", router gives "/" to handler.
-	if req.URL.Path == "/" {
-		subPath = "" // Targets DocumentRoot itself.
-	} else {
-		subPath = strings.TrimPrefix(req.URL.Path, "/")
+	_, ok := routeConfigValue.(config.Route) // matchedRoute was unused, assign to _
+	if !ok {
+		s.logger.Error("StaticFileServer: MatchedPathPatternKey in context is not of type config.Route", logger.LogFields{
+			"path":               req.URL.Path,
+			"context_value_type": fmt.Sprintf("%T", routeConfigValue),
+			"stream_id":          stream.ID(),
+		})
+		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error: invalid route context type.", s.logger)
+		return
 	}
 
-	targetPath := filepath.Join(s.config.DocumentRoot, subPath)
-	s.logger.Debug("StaticFileServer: Path resolution result", logger.LogFields{
-		"document_root": s.config.DocumentRoot,
-		"sub_path_used": subPath, // This is filepath.Join's input, relative to DocumentRoot
-		"target_path":   targetPath,
-	})
+	// The request path received by the handler (req.URL.Path) has already been
+	// adjusted by the router.
+	// - For Prefix matches (e.g., route "/static/", request "/static/foo.txt"), req.URL.Path is "/foo.txt".
+	// - For Exact matches (e.g., route "/file.txt", request "/file.txt"), req.URL.Path is "/file.txt".
+	// - For Exact root match (route "/", request "/"), req.URL.Path is "/".
+	//
+	// The StaticFileServer's DocumentRoot is absolute. We need to form the
+	// full filesystem path by joining DocumentRoot with the handler's relative path.
+	// Important: req.URL.Path is already relative (or the specific file for exact match).
+	// We must prevent path traversal attacks. filepath.Join cleans paths, but we also
+	// need to ensure the final path is still within DocumentRoot.
 
+	// Trim leading "/" from req.URL.Path because filepath.Join treats path components
+	// starting with "/" as absolute paths on some systems if the first argument is empty,
+	// which shouldn't be the case here as DocumentRoot is absolute.
+	// However, to be safe and consistent:
+	relativePath := strings.TrimPrefix(req.URL.Path, "/")
+	targetPath := filepath.Join(s.config.DocumentRoot, relativePath)
+
+	// Security Check: Canonicalize and ensure path is within DocumentRoot
 	absDocRoot, err := filepath.Abs(s.config.DocumentRoot)
 	if err != nil {
-		s.logger.Error("StaticFileServer: Failed to get absolute path for DocumentRoot", logger.LogFields{"docRoot": s.config.DocumentRoot, "error": err})
-		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Invalid server configuration.", s.logger)
+		s.logger.Error("StaticFileServer: Failed to get absolute path for DocumentRoot", logger.LogFields{"doc_root": s.config.DocumentRoot, "error": err, "stream_id": stream.ID()})
+		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Server configuration error resolving paths.", s.logger)
 		return
 	}
 
 	absTargetPath, err := filepath.Abs(targetPath)
 	if err != nil {
-		s.logger.Warn("StaticFileServer: Error getting absolute target path", logger.LogFields{"targetPath": targetPath, "error": err})
-		server.SendDefaultErrorResponse(stream, http.StatusBadRequest, req, "Invalid request path.", s.logger)
+		s.logger.Error("StaticFileServer: Failed to get absolute path for target", logger.LogFields{"target_path": targetPath, "error": err, "stream_id": stream.ID()})
+		server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Error resolving requested path.", s.logger)
 		return
 	}
 
-	if !strings.HasPrefix(absTargetPath, absDocRoot) && absTargetPath != absDocRoot {
-		s.logger.Warn("StaticFileServer: Directory traversal attempt or invalid path", logger.LogFields{
-			"abs_target_path": absTargetPath,
-			"abs_doc_root":    absDocRoot,
+	if !strings.HasPrefix(absTargetPath, absDocRoot) {
+		s.logger.Warn("StaticFileServer: Path traversal attempt detected or resolved path outside DocumentRoot", logger.LogFields{
+			"requested_path": req.URL.Path,
+			"doc_root":       absDocRoot,
+			"target_path":    absTargetPath,
+			"stream_id":      stream.ID(),
 		})
-		server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "", s.logger)
+		server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "Requested resource not found (security).", s.logger) // Return 404 to avoid leaking info
 		return
 	}
 
-	fileInfo, statErr := os.Stat(absTargetPath)
-	if statErr != nil {
-		if os.IsNotExist(statErr) {
-			s.logger.Info("StaticFileServer: File or directory not found", logger.LogFields{"path": absTargetPath, "stat_error": statErr.Error()})
-			server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "", s.logger)
-		} else if os.IsPermission(statErr) {
-			s.logger.Warn("StaticFileServer: Permission denied accessing path", logger.LogFields{"path": absTargetPath, "error": statErr})
-			server.SendDefaultErrorResponse(stream, http.StatusForbidden, req, "", s.logger)
+	// At this point, absTargetPath is the canonical, validated path to the resource.
+	fileInfo, err := os.Stat(absTargetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			server.SendDefaultErrorResponse(stream, http.StatusNotFound, req, "The requested resource was not found.", s.logger)
+		} else if os.IsPermission(err) {
+			server.SendDefaultErrorResponse(stream, http.StatusForbidden, req, "Access to the requested resource is forbidden.", s.logger)
 		} else {
-			s.logger.Error("StaticFileServer: Error stating file/directory", logger.LogFields{"path": absTargetPath, "error": statErr})
-			server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Error accessing resource.", s.logger)
+			s.logger.Error("StaticFileServer: Error stating file", logger.LogFields{"path": absTargetPath, "error": err, "stream_id": stream.ID()})
+			server.SendDefaultErrorResponse(stream, http.StatusInternalServerError, req, "Error accessing the requested resource.", s.logger)
 		}
 		return
 	}
 
-	// Construct the displayPath for use in HTML listings. This should reflect the original request path.
-	// The original full request path is available in req.Context() if the router passes it,
-	// or reconstruct it from matchedPathPattern and handler's req.URL.Path.
-	// For now, we construct displayPath based on how router *should* be setting handler's req.URL.Path.
-	var displayPath string
-	if matchedPathPattern == "/" && req.URL.Path == "/" { // Exact match on root "/"
-		displayPath = "/"
-	} else if matchedPathPattern == "/" { // Prefix match on root "/", handler path is "foo" or "dir/foo"
-		displayPath = "/" + strings.TrimPrefix(req.URL.Path, "/")
-	} else if strings.HasSuffix(matchedPathPattern, "/") && req.URL.Path == "/" { // Prefix match e.g. "/static/", request for "/static/" itself
-		displayPath = matchedPathPattern
-	} else if strings.HasSuffix(matchedPathPattern, "/") { // Prefix match e.g. "/static/", request for "/static/foo"
-		displayPath = matchedPathPattern + strings.TrimPrefix(req.URL.Path, "/")
-	} else { // Exact match e.g. "/login", handler path is "/"
-		displayPath = matchedPathPattern
-	}
-	// Ensure displayPath always starts with a slash unless it's just "/"
-	if !strings.HasPrefix(displayPath, "/") && displayPath != "" {
-		displayPath = "/" + displayPath
-	}
-	if displayPath != "/" { // Clean up trailing slash if not root
-		displayPath = strings.TrimSuffix(displayPath, "/")
-		// For directories, the display path in listing *should* end with /
-		if fileInfo.IsDir() && displayPath != "" {
-			displayPath += "/"
-		}
-	}
-
+	// Handle request method
 	switch req.Method {
-	case http.MethodGet:
+	case http.MethodGet, http.MethodHead:
 		if fileInfo.IsDir() {
-			s.handleDirectory(stream, req, absTargetPath, fileInfo, displayPath)
+			// The displayPath for directory listing links should be the path as seen by the user/browser.
+			// req.URL.Path is the path *within* the current handler's scope.
+			// For example, if route is "/static/" and request is "/static/foo/", handler's req.URL.Path is "/foo/".
+			// Links in the listing for "/static/foo/" should be relative to "/static/foo/".
+			// So, using req.URL.Path as the base for displayPath seems correct here.
+			s.handleDirectory(stream, req, absTargetPath, fileInfo, req.URL.Path)
 		} else {
 			s.handleFile(stream, req, absTargetPath, fileInfo)
 		}
-		return
-	case http.MethodHead:
-		if fileInfo.IsDir() {
-			s.handleDirectory(stream, req, absTargetPath, fileInfo, displayPath)
-		} else {
-			s.handleFile(stream, req, absTargetPath, fileInfo)
-		}
-		return
 	case http.MethodOptions:
-		s.logger.Info("StaticFileServer: OPTIONS request", logger.LogFields{"stream_id": stream.ID(), "display_path": displayPath})
+		// Spec 2.3.2: SHOULD also support OPTIONS requests, responding with an HTTP 204 No Content (or 200 OK)
+		// and an Allow: GET, HEAD, OPTIONS header.
 		headers := []http2.HeaderField{
-			{Name: ":status", Value: "204"},
-			{Name: "Allow", Value: "GET, HEAD, OPTIONS"},
-			{Name: "Content-Length", Value: "0"},
+			{Name: ":status", Value: strconv.Itoa(http.StatusNoContent)},
+			{Name: "allow", Value: "GET, HEAD, OPTIONS"},
+			{Name: "content-length", Value: "0"}, // Required for 204 by some clients/proxies.
 		}
-		err := stream.SendHeaders(headers, true)
-		if err != nil {
-			s.logger.Error("StaticFileServer: failed to send OPTIONS response", logger.LogFields{"stream_id": stream.ID(), "error": err.Error()})
+		if err := stream.SendHeaders(headers, true); err != nil {
+			s.logger.Error("StaticFileServer: Error sending OPTIONS response headers", logger.LogFields{"path": absTargetPath, "error": err, "stream_id": stream.ID()})
+			// Don't try to send another error response if SendHeaders fails, connection might be broken.
 		}
-		return
 	default:
-		s.logger.Info("StaticFileServer: Method not allowed", logger.LogFields{
-			"stream_id": stream.ID(),
-			"method":    req.Method,
-			"path":      displayPath, // Use displayPath for logging consistency
-		})
-
-		if req.Body != nil {
-			const maxBodyDrainBytes = 32 * 1024
-			limitedReader := io.LimitReader(req.Body, maxBodyDrainBytes)
-			_, copyErr := io.Copy(io.Discard, limitedReader)
-			if copyErr != nil && copyErr != io.EOF {
-				s.logger.Warn("StaticFileServer: Error draining request body on 405", logger.LogFields{"stream_id": stream.ID(), "error": copyErr.Error()})
-			}
-			errClose := req.Body.Close()
-			if errClose != nil {
-				s.logger.Warn("StaticFileServer: Error closing request body on 405", logger.LogFields{"stream_id": stream.ID(), "error": errClose.Error()})
-			}
-		}
-		// Pass original req to SendDefaultErrorResponse for Accept header processing if needed by that function
-		server.SendDefaultErrorResponse(stream, http.StatusMethodNotAllowed, req, "", s.logger)
-		return
+		// Spec 2.3.2: Other methods SHOULD result in an HTTP 405 Method Not Allowed response
+		server.SendDefaultErrorResponse(stream, http.StatusMethodNotAllowed, req, "Method not allowed for this resource.", s.logger)
 	}
 }
 
@@ -349,16 +309,12 @@ func (s *StaticFileServer) getMimeType(filePath string) string {
 func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Request, filePath string, fileInfo os.FileInfo) {
 	s.logger.Debug("StaticFileServer: handleFile enter", logger.LogFields{"path": filePath, "method": req.Method, "file_size": fileInfo.Size()})
 
-	// --- DIAGNOSTIC SIMPLIFICATION REMOVED ---
-
-	// Original handleFile logic (partially commented out for now, kept for reference if diag fails)
 	// Set common headers
 	headers := []http2.HeaderField{
 		{Name: ":status", Value: "200"},
 		{Name: "content-type", Value: s.getMimeType(filePath)},
 		{Name: "content-length", Value: strconv.FormatInt(fileInfo.Size(), 10)},
 		{Name: "last-modified", Value: fileInfo.ModTime().UTC().Format(http.TimeFormat)},
-		// TODO: Add ETag header (spec 2.3.3.1)
 	}
 	// Placeholder ETag
 	etag := fmt.Sprintf("\"%x-%x\"", fileInfo.Size(), fileInfo.ModTime().UnixNano())
@@ -366,112 +322,94 @@ func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Reque
 
 	// Conditional GET handling (If-None-Match, If-Modified-Since)
 	// Spec 2.3.5: If both If-None-Match and If-Modified-Since are present, If-None-Match takes precedence.
-	ifnm := req.Header.Get("if-none-match")
-	if ifnm != "" {
-		// For simplicity, direct string comparison. Real ETag parsing can be more complex (weak ETags, list of ETags).
-		if ifnm == etag || ifnm == "*" { // "*" matches any ETag
-			s.logger.Debug("StaticFileServer: ETag match for If-None-Match", logger.LogFields{"path": filePath, "client_etag": ifnm, "server_etag": etag})
-			statusHeaders := []http2.HeaderField{{Name: ":status", Value: "304"}}
-			// Must include ETag and other relevant cache headers on 304 if they would have been on 200.
-			// Content-Length MUST NOT be sent. Date should be.
-			for _, h := range headers {
-				// Filter out :status, content-length from original 200 headers. Keep others like ETag, Last-Modified.
-				if h.Name != ":status" && h.Name != "content-length" {
-					statusHeaders = append(statusHeaders, h)
-				}
-			}
-			statusHeaders = append(statusHeaders, http2.HeaderField{Name: "date", Value: time.Now().UTC().Format(http.TimeFormat)})
-
-			err := stream.SendHeaders(statusHeaders, true) // 304 has no body
+	if clientETag := req.Header.Get("If-None-Match"); clientETag != "" {
+		s.logger.Debug("StaticFileServer: Checking If-None-Match", logger.LogFields{
+			"path":        filePath,
+			"client_etag": clientETag,
+			"server_etag": etag,
+			"stream_id":   stream.ID(),
+		})
+		if clientETag == etag {
+			s.logger.Info("StaticFileServer: If-None-Match match, sending 304 Not Modified", logger.LogFields{"path": filePath, "etag": etag, "stream_id": stream.ID()})
+			err := stream.SendHeaders([]http2.HeaderField{{Name: ":status", Value: "304"}}, true)
 			if err != nil {
-				s.logger.Error("StaticFileServer: Error sending 304 Not Modified headers (If-None-Match)", logger.LogFields{"path": filePath, "error": err.Error()})
+				s.logger.Error("StaticFileServer: Failed to send 304 headers for If-None-Match", logger.LogFields{"path": filePath, "error": err.Error(), "stream_id": stream.ID()})
+				// Don't send 500 here, as the error might be a connection issue, just log.
 			}
-			return
+			return // Conditional request handled
 		}
-	} else {
+	}
 
-		ims := req.Header.Get("if-modified-since")
-		if ims != "" {
-			if t, err := http.ParseTime(ims); err == nil {
-				// Ensure both times are UTC and truncated to the second for comparison
-				fileModTimeUTC := fileInfo.ModTime().UTC().Truncate(time.Second)
-				clientIMSTimeUTC := t.UTC().Truncate(time.Second) // t should already be UTC from ParseTime
+	ifModSinceStr := req.Header.Get("If-Modified-Since")
+	s.logger.Debug("StaticFileServer: Checking If-Modified-Since", logger.LogFields{
+		"path":               filePath,
+		"if_modified_since":  ifModSinceStr,
+		"file_last_modified": fileInfo.ModTime().UTC().Format(http.TimeFormat),
+		"file_etag":          etag, // Log ETag for context
+		"stream_id":          stream.ID(),
+	})
 
-				// Condition for 304: file not modified since client's stated time.
-				// !fileModTimeUTC.After(clientIMSTimeUTC) means fileModTimeUTC <= clientIMSTimeUTC
-				if !fileModTimeUTC.After(clientIMSTimeUTC) {
-					s.logger.Debug("StaticFileServer: If-Modified-Since condition met (file not modified or modified at same time)", logger.LogFields{"path": filePath, "client_ims_time_utc": clientIMSTimeUTC.Format(http.TimeFormat), "file_mod_time_utc": fileModTimeUTC.Format(http.TimeFormat)})
-					statusHeaders := []http2.HeaderField{{Name: ":status", Value: "304"}}
-					// Must include ETag and other relevant cache headers on 304 if they would have been on 200.
-					// Content-Length MUST NOT be sent. Date should be.
-					for _, h := range headers {
-						if h.Name != ":status" && h.Name != "content-length" {
-							statusHeaders = append(statusHeaders, h)
-						}
-					}
-					statusHeaders = append(statusHeaders, http2.HeaderField{Name: "date", Value: time.Now().UTC().Format(http.TimeFormat)})
+	if ifModSinceStr != "" {
+		ifModSinceTime, err := http.ParseTime(ifModSinceStr)
+		if err != nil {
+			s.logger.Warn("StaticFileServer: Could not parse If-Modified-Since header", logger.LogFields{"path": filePath, "value": ifModSinceStr, "error": err.Error(), "stream_id": stream.ID()})
+			// Invalid date format, proceed to serve the full content
+		} else {
+			// Truncate file's mod time to seconds for comparison, as If-Modified-Since typically has second precision.
+			modTime := fileInfo.ModTime().UTC().Truncate(time.Second)
+			ifModSinceTime = ifModSinceTime.UTC().Truncate(time.Second) // Ensure comparison is also UTC and truncated
 
-					errSend := stream.SendHeaders(statusHeaders, true) // 304 has no body
-					if errSend != nil {
-						s.logger.Error("StaticFileServer: Error sending 304 Not Modified headers (If-Modified-Since)", logger.LogFields{"path": filePath, "error": errSend.Error()})
-					}
-					return
+			s.logger.Debug("StaticFileServer: Parsed If-Modified-Since times", logger.LogFields{
+				"path":                       filePath,
+				"client_if_modified_since":   ifModSinceTime.Format(http.TimeFormat),
+				"server_file_mod_time_trunc": modTime.Format(http.TimeFormat),
+				"comparison_result":          modTime.Compare(ifModSinceTime), // -1 if modTime < ifModSinceTime, 0 if ==, 1 if >
+				"modTime_before_or_equal":    !modTime.After(ifModSinceTime),
+				"stream_id":                  stream.ID(),
+			})
+
+			// If the file has not been modified since the time specified by the client.
+			// The comparison should be fileModTime <= ifModSinceTime.
+			// !modTime.After(ifModSinceTime) is equivalent to modTime.Before(ifModSinceTime) || modTime.Equal(ifModSinceTime)
+			if !modTime.After(ifModSinceTime) {
+				s.logger.Info("StaticFileServer: If-Modified-Since match, sending 304 Not Modified", logger.LogFields{"path": filePath, "file_mod_time": modTime.Format(http.TimeFormat), "client_if_mod_since": ifModSinceTime.Format(http.TimeFormat), "stream_id": stream.ID()})
+				errSend := stream.SendHeaders([]http2.HeaderField{{Name: ":status", Value: "304"}}, true)
+				if errSend != nil {
+					s.logger.Error("StaticFileServer: Failed to send 304 headers for If-Modified-Since", logger.LogFields{"path": filePath, "error": errSend.Error(), "stream_id": stream.ID()})
 				}
+				return // Conditional request handled
 			} else {
-				s.logger.Warn("StaticFileServer: Failed to parse If-Modified-Since header", logger.LogFields{"path": filePath, "ims_header": ims, "error": err.Error()})
-				// If the If-Modified-Since header is invalid, RFC 7232 says to ignore the field.
-				// So we proceed to serve the full response.
+				s.logger.Debug("StaticFileServer: If-Modified-Since - resource HAS been modified, serving full content", logger.LogFields{"path": filePath, "stream_id": stream.ID()})
 			}
 		}
 	}
 
-	// Send initial headers (status 200 OK)
-	// For HEAD request, endStream is true here. For GET, it's false if there's a body.
 	endStreamForHeaders := (req.Method == http.MethodHead) || (fileInfo.Size() == 0 && req.Method == http.MethodGet)
 	if err := stream.SendHeaders(headers, endStreamForHeaders); err != nil {
 		s.logger.Error("StaticFileServer: Error sending file headers", logger.LogFields{"path": filePath, "error": err.Error()})
-		// Don't attempt to send a default error if SendHeaders itself failed, stream is likely broken.
 		return
 	}
 
-	// For GET requests with content, send the file body.
 	if req.Method == http.MethodGet && fileInfo.Size() > 0 {
 		file, err := os.Open(filePath)
 		if err != nil {
 			s.logger.Error("StaticFileServer: Error opening file for GET", logger.LogFields{"path": filePath, "error": err.Error()})
-			// Headers already sent, so we can't send a 403/500 status easily.
-			// The connection will likely be RST_STREAM'd by the client if data doesn't arrive,
-			// or we could try to RST_STREAM from here if stream provides such a method.
-			// For now, just log and return. The stream will hang from client PoV.
-			// TODO: A robust solution would involve stream.Reset(errorCode)
 			return
 		}
 		defer file.Close()
 
-		// Use a buffer for io.Copy (or manual loop)
-		// buf := make([]byte, 32*1024) // Or use a sync.Pool
-		// For HTTP/2, DATA frames will be chunked by stream.WriteData anyway based on MaxFrameSize.
-		// The loop below handles sending chunks and respecting flow control.
-
-		// Manual read loop to control WriteData and endStream flag precisely
-		buf := make([]byte, 32*1024) // Max typical frame size. Our WriteData will chunk further if needed.
+		buf := make([]byte, 32*1024)
 		var writtenBytes int64
 		for {
 			nr, er := file.Read(buf)
 			if nr > 0 {
 				writtenBytes += int64(nr)
-				// Determine if this is the last chunk based on file size or EOF
-				// isLastChunk should be true only for the very final WriteData call.
 				isLastChunk := (er == io.EOF) || (writtenBytes == fileInfo.Size())
-
-				s.logger.Debug("StaticFileServer: Writing data chunk", logger.LogFields{"path": filePath, "bytes_in_chunk": nr, "total_written_so_far": writtenBytes, "file_size": fileInfo.Size(), "is_last_chunk_flag": isLastChunk, "read_error": er})
-
+				s.logger.Debug("StaticFileServer: Writing data chunk", logger.LogFields{"path": filePath, "bytes_in_chunk": nr, "total_written_so_far": writtenBytes, "file_size": fileInfo.Size(), "is_last_chunk_flag": isLastChunk, "read_error_obj": er})
 				_, ew := stream.WriteData(buf[0:nr], isLastChunk)
 				if ew != nil {
 					s.logger.Error("StaticFileServer: Error writing file data to stream", logger.LogFields{"path": filePath, "error": ew.Error()})
-					// Error during data write. Headers are sent. Client will see truncated body.
-					// Stream might be reset by lower layers.
-					return // Stop sending
+					return
 				}
 			}
 			if er == io.EOF {
@@ -479,16 +417,14 @@ func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Reque
 				if writtenBytes != fileInfo.Size() {
 					s.logger.Warn("StaticFileServer: EOF reached but bytes written does not match file size", logger.LogFields{"path": filePath, "written": writtenBytes, "expected_size": fileInfo.Size()})
 				}
-				break // EOF, successfully read and sent all.
+				break
 			}
 			if er != nil {
 				s.logger.Error("StaticFileServer: Error reading file", logger.LogFields{"path": filePath, "error": er.Error()})
-				// Error during file read. Headers are sent. Client might see truncated body.
-				return // Stop sending
+				return
 			}
 		}
 		s.logger.Debug("StaticFileServer: Finished sending file body", logger.LogFields{"path": filePath, "total_bytes_sent": writtenBytes})
-
 	} else if req.Method == http.MethodHead {
 		s.logger.Debug("StaticFileServer: HEAD request, body omitted.", logger.LogFields{"path": filePath})
 	}

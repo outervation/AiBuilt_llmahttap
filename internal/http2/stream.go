@@ -218,43 +218,77 @@ func newStream(
 
 // SendHeaders sends response headers.
 func (s *Stream) SendHeaders(headers []HeaderField, endStream bool) error {
+	s.conn.log.Debug("Stream.SendHeaders: Entered", logger.LogFields{
+		"stream_id":      s.id,
+		"num_headers":    len(headers),
+		"end_stream_arg": endStream,
+	})
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// defer s.mu.Unlock() // Defer moved to ensure it covers all paths correctly
 
 	if s.responseHeadersSent {
 		s.conn.log.Error("Stream: SendHeaders called after headers already sent", logger.LogFields{"stream_id": s.id})
+		s.mu.Unlock()
 		return NewStreamError(s.id, ErrCodeInternalError, "headers already sent")
 	}
 	if s.state == StreamStateClosed || s.pendingRSTCode != nil {
 		s.conn.log.Warn("Stream: SendHeaders called on closed or resetting stream", logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+		s.mu.Unlock()
 		return NewStreamError(s.id, ErrCodeStreamClosed, "stream closed or resetting")
 	}
 	if s.state == StreamStateHalfClosedLocal { // We've already sent END_STREAM
 		s.conn.log.Error("Stream: SendHeaders called on half-closed (local) stream where END_STREAM was already sent", logger.LogFields{"stream_id": s.id})
+		s.mu.Unlock()
 		return NewStreamError(s.id, ErrCodeStreamClosed, "cannot send headers on half-closed (local) stream after END_STREAM")
 	}
 
 	// Convert to hpack.HeaderField and lowercase names
 	hpackHeaders := make([]hpack.HeaderField, len(headers))
+	statusCode := ""
 	for i, hf := range headers {
-		hpackHeaders[i] = hpack.HeaderField{Name: strings.ToLower(hf.Name), Value: hf.Value}
+		lowerName := strings.ToLower(hf.Name)
+		hpackHeaders[i] = hpack.HeaderField{Name: lowerName, Value: hf.Value}
+		if lowerName == ":status" {
+			statusCode = hf.Value
+		}
 	}
 
-	s.conn.log.Debug("Stream: PRE-CALL conn.sendHeadersFrame", logger.LogFields{"stream_id": s.id, "num_headers": len(hpackHeaders), "end_stream": endStream, "s.conn_nil": s.conn == nil, "s.conn_log_nil": s.conn != nil && s.conn.log == nil})
+	s.conn.log.Debug("Stream.SendHeaders: Prepared HPACK headers", logger.LogFields{
+		"stream_id":   s.id,
+		"status_code": statusCode,
+		"num_headers": len(hpackHeaders),
+		"end_stream":  endStream,
+	})
+	s.mu.Unlock() // Unlock before calling conn.sendHeadersFrame which might block or call back
 
+	s.conn.log.Debug("Stream: PRE-CALL conn.sendHeadersFrame", logger.LogFields{"stream_id": s.id, "num_headers": len(hpackHeaders), "end_stream": endStream, "s.conn_nil": s.conn == nil, "s.conn_log_nil": s.conn != nil && s.conn.log == nil})
 	err := s.conn.sendHeadersFrame(s, hpackHeaders, endStream)
+
+	s.mu.Lock()         // Re-lock for state updates
+	defer s.mu.Unlock() // Ensure unlock for all subsequent paths
+
 	if err != nil {
 		s.conn.log.Error("Stream: conn.sendHeadersFrame failed", logger.LogFields{"stream_id": s.id, "error": err})
-		// If sendHeadersFrame itself fails, the stream/connection might be broken.
-		// The error from sendHeadersFrame might be a ConnectionError already.
 		return err
 	}
 
 	s.responseHeadersSent = true
+	s.conn.log.Debug("Stream.SendHeaders: responseHeadersSent set to true.", logger.LogFields{"stream_id": s.id, "status_code_sent": statusCode})
+
 	if endStream {
-		s.endStreamSentToClient = true // Set this before calling transition
-		s.transitionStateOnSendEndStream()
+		if !s.endStreamSentToClient { // Check before setting, to avoid issues if called multiple times with endStream=true (though guarded by responseHeadersSent)
+			s.endStreamSentToClient = true
+			s.conn.log.Debug("Stream.SendHeaders: endStreamSentToClient set to true. Transitioning state.", logger.LogFields{"stream_id": s.id, "current_state_before_transition": s.state.String()})
+			s.transitionStateOnSendEndStream()
+			s.conn.log.Debug("Stream.SendHeaders: State after transition.", logger.LogFields{"stream_id": s.id, "new_state": s.state.String()})
+		} else {
+			s.conn.log.Debug("Stream.SendHeaders: endStream=true in arg, but endStreamSentToClient was already true.", logger.LogFields{"stream_id": s.id})
+		}
+	} else {
+		s.conn.log.Debug("Stream.SendHeaders: endStream=false in arg, no state transition for stream end here.", logger.LogFields{"stream_id": s.id})
 	}
+	s.conn.log.Debug("Stream.SendHeaders: Exiting successfully.", logger.LogFields{"stream_id": s.id, "final_state": s.state.String(), "final_endStreamSentToClient": s.endStreamSentToClient})
 	return nil
 }
 

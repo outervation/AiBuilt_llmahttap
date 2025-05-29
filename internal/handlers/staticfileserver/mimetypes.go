@@ -112,9 +112,20 @@ func NewMimeTypeResolver(sfsConfig *config.StaticFileServerConfig, mainConfigFil
 		customMimeTypes: make(map[string]string),
 	}
 
+	if sfsConfig == nil {
+		// No custom types to load if config is nil.
+		// sfsConfig.ResolvedMimeTypes will not be set, which is fine.
+		return resolver, nil
+	}
+
 	// 1. Load from inline map first (lower precedence)
+	// Note: Spec implies inline map keys should also be valid extensions.
+	// For now, trusting config loader or higher level validation for inline map format.
+	// If strictness is needed here, add validation similar to file loading.
 	if sfsConfig.MimeTypesMap != nil {
 		for ext, mimeType := range sfsConfig.MimeTypesMap {
+			// Basic validation for inline types could be added here if needed:
+			// if !strings.HasPrefix(ext, ".") || mimeType == "" { ... return error ... }
 			resolver.customMimeTypes[strings.ToLower(ext)] = mimeType
 		}
 	}
@@ -144,16 +155,28 @@ func NewMimeTypeResolver(sfsConfig *config.StaticFileServerConfig, mainConfigFil
 			}
 		}
 		for ext, mimeType := range fileMimeTypes {
-			resolver.customMimeTypes[strings.ToLower(ext)] = mimeType
+			lExt := strings.ToLower(ext)
+			if !strings.HasPrefix(ext, ".") { // Validate original `ext` before lowercasing for error message clarity
+				return nil, &config.ConfigError{
+					FilePath: mimePath,
+					Message:  fmt.Sprintf("invalid extension %q in custom MIME types file: must start with a '.'", ext),
+				}
+			}
+			if mimeType == "" {
+				return nil, &config.ConfigError{
+					FilePath: mimePath,
+					Message:  fmt.Sprintf("empty MIME type for extension %q in custom MIME types file", ext),
+				}
+			}
+			resolver.customMimeTypes[lExt] = mimeType
 		}
 	}
 
-	// Store the resolved types back in the config for potential reference or logging, though StaticFileServer will use the resolver.
+	// Store the resolved types back in the config for potential reference or logging.
 	// This field `ResolvedMimeTypes` in `StaticFileServerConfig` is marked as `json:"-" toml:"-"`,
 	// so it's for internal use post-config-parsing.
-	if sfsConfig != nil {
-		sfsConfig.ResolvedMimeTypes = resolver.customMimeTypes
-	}
+	// sfsConfig is guaranteed non-nil here due to the early return.
+	sfsConfig.ResolvedMimeTypes = resolver.customMimeTypes
 
 	return resolver, nil
 }

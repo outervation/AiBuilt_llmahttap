@@ -191,20 +191,28 @@ func (h *HpackAdapter) SetMaxEncoderDynamicTableSize(size uint32) {
 
 // Encode encodes a list of header fields using HPACK.
 // The encoded bytes are returned as a new slice.
-func (h *HpackAdapter) Encode(headers []hpack.HeaderField) []byte {
+func (h *HpackAdapter) Encode(headers []hpack.HeaderField) ([]byte, error) {
 	if h.encoder == nil {
-		// This case should ideally not be reached if NewHpackAdapter is always used.
-		// Consider logging an error or returning an error if the API allowed.
-		return nil
+		return nil, errors.New("hpack: HpackAdapter.encoder not initialized")
 	}
 	h.encodeBuf.Reset() // Reset internal buffer for this encoding operation
 	for _, hf := range headers {
-		h.encoder.WriteField(hf)
+		// Basic validation like in EncodeHeaderFields
+		if hf.Name == "" {
+			return nil, fmt.Errorf("hpack: invalid header field name: name is empty for Encode method (value: %q)", hf.Value)
+		}
+		// TODO: Further validation for valid characters in hf.Name as per RFC 7230 and HTTP/2 spec.
+
+		errSingle := h.encoder.WriteField(hf)
+		if errSingle != nil {
+			return nil, fmt.Errorf("hpack: HpackAdapter.encoder.WriteField failed for header field %q in Encode method: %w", hf.Name, errSingle)
+		}
 	}
 	// Return a copy of the encoded bytes, as the internal buffer will be reused.
+	// This is consistent with the original Encode's intent and safer.
 	encodedBytes := make([]byte, h.encodeBuf.Len())
 	copy(encodedBytes, h.encodeBuf.Bytes())
-	return encodedBytes
+	return encodedBytes, nil
 }
 
 // EncodeHeaderFields encodes a list of header fields using HPACK.

@@ -2045,8 +2045,8 @@ func TestStream_SendHeaders(t *testing.T) {
 			headersToSend:                 invalidHpackHeaders, // Triggers HPACK error in real conn.sendHeadersFrame
 			endStreamToSend:               false,
 			expectError:                   true,
-			expectedErrorContains:         "connection error: HPACK encoding error: hpack: invalid header field name: name is empty", // Error from hpack library, wrapped
-			expectFrameSent:               false,                                                                                     // Frame not successfully enqueued
+			expectedErrorContains:         "stream error on stream 1: HPACK encoding failed (malformed header from application): hpack: invalid header field name: name is empty for Encode method (value: \"bad-header\") (code PROTOCOL_ERROR, 1)", // Error from hpack library, wrapped
+			expectFrameSent:               false,                                                                                                                                                                                                     // Frame not successfully enqueued
 			expectedFinalState:            StreamStateOpen,
 			expectedResponseHeadersSent:   false, // Not successfully sent
 			expectedEndStreamSentToClient: false,
@@ -2864,7 +2864,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 			initialResponseHeadersSent: true,
 			trailersToSend:             invalidHpackTrailers, // Triggers HPACK error in real conn.sendHeadersFrame
 			expectError:                true,
-			expectedErrorContains:      "connection error: HPACK encoding error: hpack: invalid header field name: name is empty",
+			expectedErrorContains:      "stream error on stream 1: HPACK encoding failed (malformed header from application): hpack: invalid header field name: name is empty for Encode method (value: \"bad-trailer-name\") (code PROTOCOL_ERROR, 1)",
 			expectFrameSent:            false,
 			expectedFinalState:         StreamStateOpen, // State doesn't change on conn send error
 			expectedFinalEndStreamSent: false,           // Not successfully sent

@@ -596,96 +596,78 @@ func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode Error
 // This is a stub implementation.
 
 func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, endStream bool) error {
-	c.log.Debug("sendHeadersFrame: Preparing to send HEADERS",
-		logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
+	c.log.Debug("Connection.sendHeadersFrame: Entered", logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
 
-	// Check 1: Is connection already known to be shutting down? (Non-blocking)
-	select {
-	case <-c.shutdownChan:
-		c.log.Warn("sendHeadersFrame: Connection already shutting down (pre-check), cannot send HEADERS frame.",
-			logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
-	default:
-		// Not shutting down yet, proceed.
-
-		// Check if peer has sent GOAWAY indicating it won't process this stream
-		c.streamsMu.RLock()
-		goAwayRecvd := c.goAwayReceived
-		peerLastID := c.peerReportedLastStreamID
-		peerErrCode := c.peerReportedErrorCode
-		c.streamsMu.RUnlock()
-
-		// If peer sent GOAWAY with an error, or if this stream ID is higher than what peer said it would process.
-		// Special case: If peer sent GOAWAY with NO_ERROR, they might still process existing streams up to peerLastID.
-		shouldAbortSendDueToPeerGoAway := false
-		if goAwayRecvd {
-			if peerErrCode != ErrCodeNoError {
-				// Peer indicated an error, it's unlikely to process more on any stream.
-				shouldAbortSendDueToPeerGoAway = true
-			} else {
-				// Peer sent GOAWAY NO_ERROR, only abort if this stream is beyond what they'd process.
-				// If peerLastID is 0 in a NO_ERROR GOAWAY, it means new streams are not allowed, but existing ones up to 0 (none)
-				// might complete. The RFC is a bit vague on GOAWAY(NO_ERROR, 0). Assume it means stop new, complete existing.
-				// Our streams are positive, so if peerLastID is 0, any s.id > 0 is effectively "too high" for new processing.
-				if s.id > peerLastID {
-					shouldAbortSendDueToPeerGoAway = true
-				}
-			}
-		}
-
-		if shouldAbortSendDueToPeerGoAway {
-			c.log.Warn("sendHeadersFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
-				logger.LogFields{
-					"stream_id":                     s.id,
-					"peer_last_processed_stream_id": peerLastID,
-					"peer_error_code":               peerErrCode.String(),
-				})
-			// Return an error that handler can interpret as "don't bother sending more"
-			return NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, response aborted")
-		}
+	headerBlock, err := c.hpackAdapter.Encode(headers)
+	if err != nil {
+		c.log.Error("Connection.sendHeadersFrame: HPACK encoding failed", logger.LogFields{"stream_id": s.id, "error": err.Error()})
+		return NewStreamError(s.id, ErrCodeProtocolError, "HPACK encoding failed (malformed header from application): "+err.Error())
 	}
 
-	encodedBytes, encodeErr := c.hpackAdapter.EncodeHeaderFields(headers)
-	if encodeErr != nil {
-		c.log.Error("sendHeadersFrame: HPACK encoding failed", logger.LogFields{"stream_id": s.id, "error": encodeErr.Error()})
-		return NewConnectionError(ErrCodeCompressionError, "HPACK encoding error: "+encodeErr.Error())
+	// Frame splitting logic for HEADERS + CONTINUATION if headerBlock is too large for peerMaxFrameSize
+	// TODO: Implement header block fragmentation.
+	if uint32(len(headerBlock)) > c.peerMaxFrameSize && c.peerMaxFrameSize > 0 {
+		c.log.Error("Connection.sendHeadersFrame: Header block too large, fragmentation not yet implemented",
+			logger.LogFields{"stream_id": s.id, "header_block_size": len(headerBlock), "peer_max_frame_size": c.peerMaxFrameSize})
+		return NewStreamError(s.id, ErrCodeInternalError, "header block too large, fragmentation NYI")
 	}
 
-	c.settingsMu.RLock()
-	peerFrameSizeLimit := c.peerMaxFrameSize
-	c.settingsMu.RUnlock()
-
-	if uint32(len(encodedBytes)) > peerFrameSizeLimit {
-		errMsg := fmt.Sprintf("encoded header block size (%d) exceeds peer's MAX_FRAME_SIZE (%d)", len(encodedBytes), peerFrameSizeLimit)
-		c.log.Error("sendHeadersFrame: "+errMsg, logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeInternalError, errMsg)
-	}
-
-	var frameFlags Flags = FlagHeadersEndHeaders
-	if endStream {
-		frameFlags |= FlagHeadersEndStream
-	}
-
-	headersFrame := &HeadersFrame{
-		FrameHeader: FrameHeader{
-			Type:     FrameHeaders,
-			Flags:    frameFlags,
+	hf := &HeadersFrame{
+		FrameHeader: FrameHeader{ // Initialize embedded FrameHeader
 			StreamID: s.id,
-			Length:   uint32(len(encodedBytes)),
+			Type:     FrameHeaders, // Explicitly set Type
 		},
-		HeaderBlockFragment: encodedBytes,
+		// StreamDependency, Weight, Exclusive would be set if FlagHeadersPriority is present
+		HeaderBlockFragment: headerBlock,
 	}
 
-	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
+	// Determine flags
+	var flags Flags // Use the existing Flags type (from frame.go)
+	if endStream {
+		flags |= FlagHeadersEndStream
+	}
+	flags |= FlagHeadersEndHeaders // Always set for non-fragmented for now
+
+	// TODO: Add Priority flag logic if priority fields are set.
+	// This requires HeadersFrame to have StreamDependency, Weight, Exclusive fields
+	// and FlagHeadersPriority to be set on FrameHeader.Flags.
+	// For now, assume no priority info is being sent in this simplified path.
+	// Example of how it might look if priority fields were present on Stream 's':
+	// if s.priorityParentID != 0 { // Simplified check, actual logic might be more complex
+	// 	flags |= FlagHeadersPriority
+	// 	hf.StreamDependency = s.priorityParentID
+	//  hf.Weight = s.priorityWeight
+	//  hf.Exclusive = s.priorityExclusive
+	// }
+
+	hf.FrameHeader.Flags = flags // Directly set flags on FrameHeader
+	// Let WriteFrame calculate length. No hf.FrameHeader.SetLength() call here.
+
+	c.log.Debug("Connection.sendHeadersFrame: Queuing HEADERS frame", logger.LogFields{"stream_id": s.id, "frame_flags": flags, "header_block_len": len(hf.HeaderBlockFragment)})
+	// Check for shutdown or context cancellation FIRST (non-blocking)
 	select {
-	case c.writerChan <- headersFrame:
-		c.log.Debug("sendHeadersFrame: HEADERS frame queued",
-			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(encodedBytes)})
-		return nil
 	case <-c.shutdownChan:
-		c.log.Warn("sendHeadersFrame: Connection shutting down (during send attempt), cannot send HEADERS frame.",
-			logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send HEADERS for stream %d", s.id))
+		c.log.Warn("Connection.sendHeadersFrame: Shutdown already signaled (pre-check), cannot queue HEADERS frame", logger.LogFields{"stream_id": s.id})
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
+	case <-c.ctx.Done():
+		c.log.Warn("Connection.sendHeadersFrame: Context done (pre-check), cannot queue HEADERS frame", logger.LogFields{"stream_id": s.id, "error": c.ctx.Err()})
+		return c.ctx.Err()
+	default:
+		// Not shutting down or context cancelled yet, proceed to try queuing.
+	}
+
+	// Now attempt to queue, with shutdown/context check in select as fallback
+	select {
+	case c.writerChan <- hf:
+		c.log.Debug("Connection.sendHeadersFrame: HEADERS frame queued successfully", logger.LogFields{"stream_id": s.id})
+		return nil
+	case <-c.shutdownChan: // Fallback check if shutdown happened while trying to queue
+		c.log.Warn("Connection.sendHeadersFrame: Shutdown signaled while attempting to queue HEADERS frame", logger.LogFields{"stream_id": s.id})
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during queue attempt), cannot send HEADERS for stream %d", s.id))
+	case <-c.ctx.Done(): // Fallback check for context cancellation
+		c.log.Warn("Connection.sendHeadersFrame: Context done while attempting to queue HEADERS frame", logger.LogFields{"stream_id": s.id, "error": c.ctx.Err()})
+		return c.ctx.Err()
+		// No default here: if writerChan is full, we want to block until space or shutdown/context done.
 	}
 }
 
@@ -2063,7 +2045,14 @@ func (c *Connection) Close(err error) error {
 			logger.LogFields{"reader_ok": readerDoneOk, "writer_ok": writerDoneOk, "final_error": finalErrorToReturn, "remote_addr": c.remoteAddrStr})
 	}
 
-	c.log.Info("Connection.Close: Process complete.", logger.LogFields{"remote_addr": c.remoteAddrStr, "final_error": finalErrorToReturn})
+	c.log.Info("Connection.Close: Process complete. REALLY ABOUT TO RETURN.", logger.LogFields{"remote_addr": c.remoteAddrStr, "final_error": finalErrorToReturn, "is_shutdownChan_closed_now": func() bool {
+		select {
+		case <-c.shutdownChan:
+			return true
+		default:
+			return false
+		}
+	}()})
 	return finalErrorToReturn
 }
 
@@ -2854,12 +2843,12 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 
 // writerLoop is the main goroutine for writing frames to the connection.
 // It serializes access to the underlying net.Conn for writes.
+
 func (c *Connection) writerLoop() {
-	c.log.Debug("Writer loop starting.", logger.LogFields{"remote_addr": c.remoteAddrStr}) // Added log
+	c.log.Debug("Writer loop starting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	defer func() {
 		if c.writerDone != nil {
 			// Ensure writerDone is closed only once, even if panicking.
-			// A sync.Once could be used, or a check like this.
 			select {
 			case <-c.writerDone: // Already closed
 			default:
@@ -2907,7 +2896,8 @@ func (c *Connection) writerLoop() {
 			return
 
 		case frame, ok := <-c.writerChan:
-			if !ok { // writerChan was closed by initiateShutdown.
+			c.log.Debug("Connection.writerLoop: Received frame from writerChan", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": nil, "ok": ok}) // Frame type later
+			if !ok {
 				c.log.Info("Writer loop: writerChan closed. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 				return
 			}

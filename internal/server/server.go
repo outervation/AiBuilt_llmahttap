@@ -60,6 +60,7 @@ func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, or
 	if lg == nil {
 		return nil, fmt.Errorf("logger cannot be nil")
 	}
+
 	if router == nil {
 		return nil, fmt.Errorf("router cannot be nil")
 	}
@@ -84,6 +85,8 @@ func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, or
 
 	inheritedFDs, err := util.ParseInheritedListenerFDs(util.ListenFdsEnvKey)
 	if err != nil {
+
+		s.log.Debug("NewServer: Server struct initialized and basic fields populated", nil)
 		if os.Getenv(util.ListenFdsEnvKey) != "" {
 			return nil, fmt.Errorf("error parsing inherited listener FDs from %s: %w", util.ListenFdsEnvKey, err)
 		}
@@ -91,6 +94,7 @@ func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, or
 
 	if len(inheritedFDs) > 0 {
 		s.isChild = true
+
 		s.listenerFDs = inheritedFDs
 	}
 
@@ -263,6 +267,8 @@ func (s *Server) acceptLoop(l net.Listener) {
 		tempDelay = 0 // Reset delay on successful accept
 
 		// Check stopAccepting again *after* a successful accept, before spawning handler.
+
+		s.log.Debug("acceptLoop: Accepted new connection", logger.LogFields{"local_addr": l.Addr().String(), "remote_addr": conn.RemoteAddr().String()})
 		// This is a small window, but ensures we don't start new handlers if stop was just signaled.
 		select {
 		case <-s.stopAccepting:

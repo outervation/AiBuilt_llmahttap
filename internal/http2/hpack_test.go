@@ -780,14 +780,20 @@ func TestHpackAdapter_Encode_ReturnsCopy(t *testing.T) {
 	headers1 := []hpack.HeaderField{{Name: "h1", Value: "v1"}}
 	headers2 := []hpack.HeaderField{{Name: "h2", Value: "v2"}}
 
-	encoded1 := adapter.Encode(headers1) // This is the method that should return a copy
+	encoded1, err := adapter.Encode(headers1) // This is the method that should return a copy
+	if err != nil {
+		t.Fatalf("adapter.Encode(headers1) failed: %v", err)
+	}
 
 	// Store a copy for comparison (though it shouldn't be needed if Encode makes a copy)
 	encoded1Copy := make([]byte, len(encoded1))
 	copy(encoded1Copy, encoded1)
 
 	// Second encode operation. If encoded1 was a *copy*, its contents should NOT change.
-	_ = adapter.Encode(headers2)
+	_, err = adapter.Encode(headers2)
+	if err != nil {
+		t.Fatalf("adapter.Encode(headers2) failed: %v", err)
+	}
 
 	if !bytes.Equal(encoded1, encoded1Copy) {
 		t.Errorf("encoded1 (from Encode) changed after second encode, but Encode should return a copy. Original: %x, Now: %x", encoded1Copy, encoded1)
@@ -845,7 +851,16 @@ func TestHpackAdapter_EncodeMethod_Legacy(t *testing.T) {
 				adapter.encoder = nil
 			}
 
-			encodedBytes := adapter.Encode(tc.headersIn)
+			encodedBytes, errEnc := adapter.Encode(tc.headersIn)
+			if tc.expectNil {
+				if errEnc != nil && !strings.Contains(errEnc.Error(), "HpackAdapter.encoder not initialized") {
+					// If we expect nil output because encoder is nil, other errors are unexpected.
+					t.Errorf("Encode() with nil encoder returned unexpected error: %v", errEnc)
+				}
+				// The actual check for encodedBytes == nil is done after this block.
+			} else if errEnc != nil {
+				t.Fatalf("Encode() failed unexpectedly: %v", errEnc)
+			}
 
 			if tc.expectNil {
 				if encodedBytes != nil {
@@ -1736,7 +1751,16 @@ func TestHpackAdapter_SensitiveHeaders(t *testing.T) {
 
 		// First encoding
 		// Use Encode which returns a copy, to avoid slice aliasing issues with encodeBuf for hex dumps
-		encoded1 := adapter.Encode(headersWithSensitive)
+		// Use Encode which returns a copy, to avoid slice aliasing issues with encodeBuf for hex dumps
+		encoded1, errEncode1 := adapter.Encode(headersWithSensitive)
+		if errEncode1 != nil {
+			t.Fatalf("Encode (1st for sensitive) failed: %v", errEncode1)
+		}
+		// HpackAdapter.Encode returns nil if adapter.encoder is nil. newTestHpackAdapter should prevent this.
+		// It returns empty []byte for empty headers list, not nil.
+		if encoded1 == nil && len(headersWithSensitive) > 0 {
+			t.Fatal("Encode (1st for sensitive) returned nil unexpectedly for non-empty headers")
+		}
 		// HpackAdapter.Encode returns nil if adapter.encoder is nil. newTestHpackAdapter should prevent this.
 		// It returns empty []byte for empty headers list, not nil.
 		if encoded1 == nil && len(headersWithSensitive) > 0 {
@@ -1774,7 +1798,13 @@ func TestHpackAdapter_SensitiveHeaders(t *testing.T) {
 		}
 
 		// Second encoding of the same headers
-		encoded2 := adapter.Encode(headersWithSensitive) // Use Encode again
+		encoded2, errEncode2 := adapter.Encode(headersWithSensitive) // Use Encode again
+		if errEncode2 != nil {
+			t.Fatalf("Encode (2nd for sensitive) failed: %v", errEncode2)
+		}
+		if encoded2 == nil && len(headersWithSensitive) > 0 {
+			t.Fatal("Encode (2nd for sensitive) returned nil unexpectedly for non-empty headers")
+		}
 		if encoded2 == nil && len(headersWithSensitive) > 0 {
 			t.Fatal("Encode (2nd for sensitive) returned nil unexpectedly for non-empty headers")
 		}

@@ -1016,7 +1016,8 @@ func (m *JSONFieldsBodyMatcher) Match(body []byte) (bool, string) {
 // It polls the instance.LogBuffer for new log lines.
 
 func waitForServerAddressLog(instance *ServerInstance, timeout time.Duration, processExitChan <-chan error) (string, error) {
-	regex := regexp.MustCompile(`"msg":"Server listening on actual address".*?"address":"([^"]+)"`) // Regex to find address in JSON log
+	// Corrected Regex: Searches for "address" field within the "details" JSON object.
+	regex := regexp.MustCompile(`"msg":"Server listening on actual address"[^}]*"details":\s*\{[^}]*"address":\s*"([^"]+)"`)
 
 	// Use a shorter ticker interval for faster reaction to logs/exit.
 	// The overall timeout is governed by time.After(timeout).
@@ -1113,4 +1114,16 @@ func ToRawMessageBytes(t *testing.T, v interface{}) []byte {
 		t.Fatalf("Failed to marshal handler config to JSON: %v", err)
 	}
 	return bytes
+}
+
+// ToRawMessageWrapper is a test helper that converts a handler configuration
+// struct (like config.StaticFileServerConfig) into a config.RawMessageWrapper
+// by marshalling it to JSON.
+func ToRawMessageWrapper(t *testing.T, handlerCfg interface{}) config.RawMessageWrapper {
+	t.Helper()
+	jsonData, err := json.Marshal(handlerCfg)
+	if err != nil {
+		t.Fatalf("ToRawMessageWrapper: failed to marshal handler config to JSON: %v", err)
+	}
+	return config.RawMessageWrapper(jsonData)
 }
