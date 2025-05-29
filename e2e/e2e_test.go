@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -51,8 +52,8 @@ func SetupServer() *testutil.ServerInstance {
 		os.Exit(1)
 	}
 	e2eDir := filepath.Dir(currentFile)
-	projectRoot := filepath.Join(e2eDir, "..") // Assumes e2e is one level down from project root
-	serverBinary = filepath.Join(projectRoot, "server")
+	projectRoot := filepath.Join(e2eDir, "..")          // Assumes e2e is one level down from project root
+	serverBinary = filepath.Join(projectRoot, "server") // Changed build/server to server
 
 	curlPath = os.Getenv("CURL_PATH")
 	if curlPath == "" {
@@ -223,201 +224,186 @@ func TestPlaceholder(t *testing.T) {
 // TestDefaultErrorResponses verifies the server's default error response generation.
 
 func TestDefaultErrorResponses(t *testing.T) {
-	t.Skip("TestDefaultErrorResponses is skipped due to server EOF/empty reply issues preventing completion.")
-	// serverInstanceForDefaultErrors := SetupServer() // Use a fresh server instance for this test suite
-	// if serverInstanceForDefaultErrors == nil {
-	// 	t.Fatal("Server instance is nil, setup failed for TestDefaultErrorResponses.")
-	// }
-	// defer TeardownServer(serverInstanceForDefaultErrors) // Ensure teardown
-	//
-	// t.Logf("TestDefaultErrorResponses: Server is running at: %s", serverInstanceForDefaultErrors.Address)
-
-	// Determine server binary path (copied from TestRouting_ConfigValidationFailures)
+	// Determine server binary path relative to this test file
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
-		t.Fatal("Failed to get current file path for TestDefaultErrorResponses")
+		t.Fatalf("Failed to get current file path for TestDefaultErrorResponses")
 	}
 	e2eDir := filepath.Dir(currentFile)
-	projectRoot := filepath.Join(e2eDir, "..")
-	serverBinaryPath := filepath.Join(projectRoot, "server")
+	projectRoot := filepath.Join(e2eDir, "..")               // Assumes e2e is one level down from project root
+	serverBinaryPath := filepath.Join(projectRoot, "server") // Changed build/server to server
+
+	// Check if overridden by environment variable (primarily for local testing convenience if needed)
+	if envPath := os.Getenv("TEST_SERVER_BINARY"); envPath != "" {
+		serverBinaryPath = envPath
+	}
+
 	if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
-		t.Fatalf("Server binary for TestDefaultErrorResponses not found at %s.", serverBinaryPath)
+		t.Fatalf("Server binary for TestDefaultErrorResponses not found at %s. Ensure it's built.", serverBinaryPath)
 	}
-	t.Logf("TestDefaultErrorResponses using server binary: %s", serverBinaryPath)
 
-	// Define a temporary document root and a file for 405 tests with StaticFileServer
-	tmpDocRoot405, cleanupDocRoot405, err := setupTempFilesForRoutingTest(t, map[string]string{
-		"somefile.txt": "content for 405 test",
-	})
+	fileMap := map[string]string{
+		"index.html":   "Default Index Page",
+		"testfile.txt": "Test File Content for 405", // Ensure this file exists for 405 tests
+	}
+	docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(t, fileMap)
 	if err != nil {
-		t.Fatalf("Failed to set up temp files for 405 test: %v", err)
+		t.Fatalf("Failed to set up temp files for TestDefaultErrorResponses: %v", err)
 	}
-	defer cleanupDocRoot405()
+	defer cleanupDocRoot()
 
-	// Specific config for this test: ensure StaticFileServer is routed for /static-for-405/
-	staticFsCfg405 := config.StaticFileServerConfig{DocumentRoot: tmpDocRoot405}
-	staticFsHandlerCfg405JSON, _ := json.Marshal(staticFsCfg405)
+	staticHandlerConfig := map[string]interface{}{
+		"document_root": docRoot,
+	}
+	staticHandlerConfigJSON, _ := json.Marshal(staticHandlerConfig)
 
-	logEnabledTrue := true
-	currentListenAddr := "127.0.0.1:0" // Use a dynamic port, StartTestServer will pick one
-	serverCfgForDefaultErrors := config.Config{
-		Server: &config.ServerConfig{Address: &currentListenAddr},
-		Logging: &config.LoggingConfig{
-			LogLevel:  config.LogLevelDebug,
-			AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
-			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
-		},
-		Routing: &config.RoutingConfig{
-			Routes: []config.Route{
-				{
-					PathPattern:   "/static-for-405/",
-					MatchType:     config.MatchTypePrefix,
-					HandlerType:   "StaticFileServer",
-					HandlerConfig: staticFsHandlerCfg405JSON,
+	def := testutil.E2ETestDefinition{
+		Name:             "TestDefaultErrorResponses",
+		ServerBinaryPath: serverBinaryPath,
+		ServerConfigData: map[string]interface{}{
+			"server": map[string]interface{}{
+				"address": "127.0.0.1:0", // Dynamic port
+			},
+			"logging": map[string]interface{}{
+				"log_level": "DEBUG",
+				"access_log": map[string]interface{}{
+					"enabled": false,
 				},
-				// No other routes needed, /this-route-does-not-exist will naturally 404
+				"error_log": map[string]interface{}{
+					"target": "stderr", // Or a file for inspection, for now stderr is fine for test output
+				},
+			},
+			"routing": map[string]interface{}{
+				"routes": []config.Route{
+					{
+						PathPattern: "/nonexistent", MatchType: config.MatchTypeExact, HandlerType: "NonExistentHandler", // To trigger internal 404
+					},
+					{
+						PathPattern:   "/static-for-405/", // Note: prefix match means path needs to be under this
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: config.RawMessageWrapper(staticHandlerConfigJSON),
+					},
+				},
 			},
 		},
-	}
-
-	// E2ETestDefinition for the default error response tests
-	errorTestDef := testutil.E2ETestDefinition{
-		Name:                "DefaultErrorResponses",
-		ServerBinaryPath:    serverBinaryPath,
-		ServerConfigData:    serverCfgForDefaultErrors,
 		ServerConfigFormat:  "json",
 		ServerConfigArgName: "-config",
-		ServerListenAddress: currentListenAddr, // Pass the :0 address
-		CurlPath:            curlPath,          // Use globally determined curl path
+		ServerListenAddress: "127.0.0.1:0", // Configured listen address
 		TestCases: []testutil.E2ETestCase{
-			// 404 Not Found Cases (Request a URI path that matches no configured route)
+			// 404 Not Found
 			{
-				Name: "404_AcceptJSON_NoRoute",
+				Name: "404_NoAcceptHeader",
 				Request: testutil.TestRequest{
-					Method:  "GET",
-					Path:    "/this-route-does-not-exist-for-sure",
-					Headers: map[string][]string{"Accept": {"application/json"}},
+					Method: "GET", Path: "/does-not-exist",
 				},
 				Expected: testutil.ExpectedResponse{
 					StatusCode: 404,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "application/json; charset=utf-8"},
-					BodyMatcher: &testutil.JSONFieldsBodyMatcher{ExpectedFields: map[string]interface{}{
-						"error": map[string]interface{}{"status_code": 404.0, "message": "Not Found"},
-					}},
-				},
-			},
-			{
-				Name: "404_AcceptHTML_NoRoute",
-				Request: testutil.TestRequest{
-					Method:  "GET",
-					Path:    "/this-route-does-not-exist-either",
-					Headers: map[string][]string{"Accept": {"text/html"}},
-				},
-				Expected: testutil.ExpectedResponse{
-					StatusCode: 404,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
 					BodyMatcher: &testutil.StringContainsBodyMatcher{
 						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
 					},
+					Headers: testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
 				},
 			},
 			{
-				Name: "404_NoAcceptHeader_NoRoute", // Should default to HTML
+				Name: "404_AcceptJSON",
 				Request: testutil.TestRequest{
-					Method: "GET",
-					Path:   "/yet-another-nonexistent-route",
+					Method: "GET", Path: "/does-not-exist-either",
+					Headers: http.Header{"Accept": []string{"application/json"}},
 				},
 				Expected: testutil.ExpectedResponse{
 					StatusCode: 404,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
-					BodyMatcher: &testutil.StringContainsBodyMatcher{
-						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
+					BodyMatcher: &testutil.JSONFieldsBodyMatcher{
+						ExpectedFields: map[string]interface{}{
+							"error": map[string]interface{}{
+								"status_code": 404.0, // JSON numbers are float64
+								"message":     "Not Found",
+							},
+						},
 					},
+					Headers: testutil.HeaderMatcher{"content-type": "application/json; charset=utf-8"},
 				},
 			},
+			// 405 Method Not Allowed (targeting an *existing* resource via StaticFileServer)
 			{
-				Name: "404_AcceptWildcard_NoRoute", // Should default to HTML
+				Name: "405_NoAcceptHeader_StaticFileRoute_PATCH",
 				Request: testutil.TestRequest{
-					Method:  "GET",
-					Path:    "/nonexistent-route-accept-star",
-					Headers: map[string][]string{"Accept": {"*/*"}},
-				},
-				Expected: testutil.ExpectedResponse{
-					StatusCode: 404,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
-					BodyMatcher: &testutil.StringContainsBodyMatcher{
-						Substring: "<h1>Not Found</h1><p>The requested resource was not found on this server.</p>",
-					},
-				},
-			},
-			// 405 Method Not Allowed Cases (using StaticFileServer route)
-			// StaticFileServer should use default error responses as per spec 2.3.2 and Section 5.
-			{
-				Name: "405_AcceptJSON_StaticFileRoute_PUT",
-				Request: testutil.TestRequest{
-					Method:  "PUT",
-					Path:    "/static-for-405/somefile.txt",
-					Headers: map[string][]string{"Accept": {"application/json"}},
-					Body:    []byte("test body for PUT"),
+					Method: "PATCH", Path: "/static-for-405/testfile.txt", // Target existing file
 				},
 				Expected: testutil.ExpectedResponse{
 					StatusCode: 405,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "application/json; charset=utf-8"},
-					BodyMatcher: &testutil.JSONFieldsBodyMatcher{ExpectedFields: map[string]interface{}{
-						"error": map[string]interface{}{"status_code": 405.0, "message": "Method Not Allowed"},
-					}},
+					BodyMatcher: &testutil.StringContainsBodyMatcher{
+						Substring: "<h1>Method Not Allowed</h1><p>The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.</p>",
+					},
+					Headers: testutil.HeaderMatcher{
+						"content-type": "text/html; charset=utf-8",
+						"allow":        "GET, HEAD, OPTIONS", // Spec 2.3.2 and RFC 7231 6.5.5
+					},
+				},
+			},
+			{
+				Name: "405_AcceptJSON_StaticFileRoute_PUT",
+				Request: testutil.TestRequest{
+					Method: "PUT", Path: "/static-for-405/testfile.txt", // Target existing file
+					Headers: http.Header{"Accept": []string{"application/json, text/html;q=0.9"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					BodyMatcher: &testutil.JSONFieldsBodyMatcher{
+						ExpectedFields: map[string]interface{}{
+							"error": map[string]interface{}{
+								"status_code": 405.0,
+								"message":     "Method Not Allowed",
+							},
+						},
+					},
+					Headers: testutil.HeaderMatcher{
+						"content-type": "application/json; charset=utf-8",
+						"allow":        "GET, HEAD, OPTIONS",
+					},
+				},
+			},
+			{
+				Name: "405_AcceptWildcard_StaticFileRoute_POST",
+				Request: testutil.TestRequest{
+					Method: "POST", Path: "/static-for-405/testfile.txt", // Target existing file
+					Headers: http.Header{"Accept": []string{"*/*"}},
+				},
+				Expected: testutil.ExpectedResponse{
+					StatusCode: 405,
+					BodyMatcher: &testutil.StringContainsBodyMatcher{ // Default to HTML for */* if no other specific match
+						Substring: "<h1>Method Not Allowed</h1>",
+					},
+					Headers: testutil.HeaderMatcher{
+						"content-type": "text/html; charset=utf-8",
+						"allow":        "GET, HEAD, OPTIONS",
+					},
 				},
 			},
 			{
 				Name: "405_AcceptHTML_StaticFileRoute_DELETE",
 				Request: testutil.TestRequest{
-					Method:  "DELETE",
-					Path:    "/static-for-405/someotherfile.txt", // File doesn't need to exist for 405
-					Headers: map[string][]string{"Accept": {"text/html"}},
+					Method: "DELETE", Path: "/static-for-405/testfile.txt", // Target existing file
+					Headers: http.Header{"Accept": []string{"text/html"}},
 				},
 				Expected: testutil.ExpectedResponse{
 					StatusCode: 405,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
 					BodyMatcher: &testutil.StringContainsBodyMatcher{
-						Substring: "<h1>Method Not Allowed</h1><p>The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.</p>",
+						Substring: "<h1>Method Not Allowed</h1>",
+					},
+					Headers: testutil.HeaderMatcher{
+						"content-type": "text/html; charset=utf-8",
+						"allow":        "GET, HEAD, OPTIONS",
 					},
 				},
 			},
-			{
-				Name: "405_NoAcceptHeader_StaticFileRoute_PATCH", // Should default to HTML
-				Request: testutil.TestRequest{
-					Method: "PATCH",
-					Path:   "/static-for-405/another.txt",
-					Body:   []byte("patch data"),
-				},
-				Expected: testutil.ExpectedResponse{
-					StatusCode: 405,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
-					BodyMatcher: &testutil.StringContainsBodyMatcher{
-						Substring: "<h1>Method Not Allowed</h1><p>The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.</p>",
-					},
-				},
-			},
-			{
-				Name: "405_AcceptWildcard_StaticFileRoute_POST", // POST is also not allowed by StaticFileServer, should default to HTML
-				Request: testutil.TestRequest{
-					Method:  "POST",
-					Path:    "/static-for-405/file-accept-star.dat",
-					Headers: map[string][]string{"Accept": {"*/*"}},
-					Body:    []byte("post body data"),
-				},
-				Expected: testutil.ExpectedResponse{
-					StatusCode: 405,
-					Headers:    testutil.HeaderMatcher{"Content-Type": "text/html; charset=utf-8"},
-					BodyMatcher: &testutil.StringContainsBodyMatcher{
-						Substring: "<h1>Method Not Allowed</h1><p>The method specified in the Request-Line is not allowed for the resource identified by the Request-URI.</p>",
-					},
-				},
-			},
+			// 500 Internal Server Error (Hard to trigger reliably without specific handler code)
+			// For now, this will rely on the NonExistentHandler perhaps being misconfigured
+			// or if a handler panics (which our test harness aims to avoid for handlers).
+			// This is more of a placeholder for when such a trigger is available.
 		},
 	}
-
-	testutil.RunE2ETest(t, errorTestDef)
+	testutil.RunE2ETest(t, def)
 }
 
 func TestRouting_Basic(t *testing.T) {
@@ -478,10 +464,15 @@ func TestRouting_MatchingLogic(t *testing.T) {
 	}
 	e2eDir := filepath.Dir(currentFile)
 	projectRoot := filepath.Join(e2eDir, "..")
-	serverBinaryPath := filepath.Join(projectRoot, "server")
+	serverBinaryPath := filepath.Join(projectRoot, "server") // Changed build/server to server
+
+	// Check if overridden by environment variable
+	if envPath := os.Getenv("TEST_SERVER_BINARY"); envPath != "" {
+		serverBinaryPath = envPath
+	}
 
 	if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
-		t.Fatalf("Server binary for TestRouting_MatchingLogic not found at %s. Ensure it's built (e.g., 'go build -o server ./cmd/server' from project root).", serverBinaryPath)
+		t.Fatalf("Server binary for TestRouting_MatchingLogic not found at %s. Ensure it's built (e.g., 'go build -o build/server ./cmd/server' from project root).", serverBinaryPath)
 	}
 	t.Logf("TestRouting_MatchingLogic using server binary path: %s", serverBinaryPath)
 
@@ -506,7 +497,7 @@ func TestRouting_MatchingLogic(t *testing.T) {
 		}
 		defer cleanupDocRoot()
 
-		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
+		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot, IndexFiles: []string{"exact_file.txt"}}
 		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
 
 		serverCfg := config.Config{
@@ -851,7 +842,7 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 	}
 	e2eDirForValidationTest := filepath.Dir(currentFile)
 	projectRootForValidationTest := filepath.Join(e2eDirForValidationTest, "..")
-	validationTestServerBinaryPath := filepath.Join(projectRootForValidationTest, "server")
+	validationTestServerBinaryPath := filepath.Join(projectRootForValidationTest, "server") // Changed build/server to server
 
 	if _, err := os.Stat(validationTestServerBinaryPath); os.IsNotExist(err) {
 		t.Fatalf("Server binary for TestRouting_ConfigValidationFailures not found at %s. Ensure it's built (e.g., 'go build -o server ./cmd/server' from project root).", validationTestServerBinaryPath)
