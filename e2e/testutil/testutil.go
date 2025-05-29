@@ -4,17 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls" // Added import
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/textproto"
+
 	"os"
 	"os/exec"
-	// "path/filepath" // Removed unused import
-	"reflect" // Added to fix undefined: reflect error
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +24,6 @@ import (
 
 	"testing"
 
-	// "crypto/tls" // crypto/tls removed as unused
 	"example.com/llmahttap/v2/internal/config"
 	"github.com/BurntSushi/toml"
 	"golang.org/x/net/http2"
@@ -89,6 +89,7 @@ type ActualResponse struct {
 }
 
 // ServerInstance encapsulates details of a running test server.
+
 type ServerInstance struct {
 	Cmd           *exec.Cmd      // The command running the server process
 	Config        *config.Config // The configuration used by the server (can be nil if not parsed by test setup)
@@ -102,6 +103,13 @@ type ServerInstance struct {
 	CleanupFuncs  []func() error     // Functions to run to clean up (e.g., remove temp files)
 	cmdCtx        context.Context    // Context controlling the Cmd process
 	cancelCtx     context.CancelFunc // To cancel the server process context
+}
+
+// AddCleanupFunc adds a function to be called when the server instance is stopped.
+func (s *ServerInstance) AddCleanupFunc(f func() error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CleanupFuncs = append(s.CleanupFuncs, f)
 }
 
 // GetFreePort asks the kernel for a free open port that is ready to use.
@@ -172,6 +180,7 @@ func WriteTempConfig(configData interface{}, format string) (filePath string, cl
 // `serverConfigAddress` is the address string AS CONFIGURED for the server (e.g., "127.0.0.1:0").
 // `extraArgs` are any additional command-line arguments for the server.
 // The actual listening address will be parsed from server logs and stored in ServerInstance.Address.
+
 func StartTestServer(serverBinaryPath string, configFile string, configArgName string, serverConfigAddress string, extraArgs ...string) (*ServerInstance, error) {
 	if serverBinaryPath == "" {
 		return nil, fmt.Errorf("serverBinaryPath cannot be empty")
@@ -243,7 +252,7 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 		}
 		return nil
 	})
-	fmt.Println("Copying test server logs to logPipeReader")
+
 	go func() {
 		defer close(instance.logCopyDone)
 		io.Copy(instance.LogBuffer, instance.logPipeReader)
@@ -254,16 +263,19 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 		return nil, fmt.Errorf("failed to start server process '%s': %w. Logs captured:\n%s", serverBinaryPath, err, instance.LogBuffer.String())
 	}
 
-	fmt.Println("Waiting for server to log listening address")
-	// Wait for server to log its actual listening address
-	actualListenAddress, err := waitForServerAddressLog(instance, 5*time.Second)
-	if err != nil {
-		instance.Stop()
-		return nil, fmt.Errorf("server did not log listening address or timed out: %w. Logs captured:\n%s", err, instance.SafeGetLogs())
-	}
-	instance.Address = actualListenAddress // Set the parsed actual address
+	// Goroutine to watch for premature exit of the command
+	processExitChan := make(chan error, 1)
+	go func() {
+		processExitChan <- cmd.Wait()
+	}()
 
-	// Poll the actualListenAddress for readiness
+	actualListenAddress, err := waitForServerAddressLog(instance, 5*time.Second, processExitChan)
+	if err != nil {
+		instance.Stop() // ensure cleanup and process termination
+		return nil, fmt.Errorf("server did not log listening address or exited prematurely: %w. Logs captured:\n%s", err, instance.SafeGetLogs())
+	}
+	instance.Address = actualListenAddress
+
 	readyTimeout := 2 * time.Second
 	pollInterval := 250 * time.Millisecond
 	startTime := time.Now()
@@ -274,34 +286,25 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 			return nil, fmt.Errorf("server not ready at parsed address %s after %v. Last dial error: %v. Logs captured:\n%s", actualListenAddress, readyTimeout, lastDialErr, instance.SafeGetLogs())
 		}
 
+		select {
+		case exitErr := <-processExitChan:
+			instance.Stop()
+			if exitErr != nil {
+				return nil, fmt.Errorf("server process exited after logging address but before ready, error: %w. Logs:\n%s", exitErr, instance.SafeGetLogs())
+			}
+			return nil, fmt.Errorf("server process exited after logging address but before ready (nil error). Logs:\n%s", instance.SafeGetLogs())
+		default:
+		}
+
 		conn, dialErr := net.DialTimeout("tcp", actualListenAddress, pollInterval)
 		lastDialErr = dialErr
 		if dialErr == nil {
 			conn.Close()
-
-			// time.Sleep(750 * time.Millisecond) // Removed this sleep
-			break // Server is ready
-		}
-
-		// Check if the server process exited prematurely
-		select {
-		case <-instance.cmdCtx.Done(): // Use the stored context
-			instance.Stop()                // Ensure resources are cleaned up
-			exitErrVal := instance.Cmd.Err // Access field
-			return nil, fmt.Errorf("server process exited while waiting for readiness at %s. Last dial error: %v. ExitError: %v. Logs:\n%s",
-				actualListenAddress, lastDialErr, exitErrVal, instance.SafeGetLogs())
-		default:
+			break
 		}
 		time.Sleep(pollInterval)
 	}
 	return instance, nil
-}
-
-// AddCleanupFunc adds a function to be called when the server instance is stopped.
-func (s *ServerInstance) AddCleanupFunc(f func() error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.CleanupFuncs = append(s.CleanupFuncs, f)
 }
 
 // Stop terminates the server process.
@@ -1007,78 +1010,46 @@ func (m *JSONFieldsBodyMatcher) Match(body []byte) (bool, string) {
 
 // waitForServerAddressLog scans the server's log output for the listening address.
 // It polls the instance.LogBuffer for new log lines.
-func waitForServerAddressLog(instance *ServerInstance, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	var lastParseAttemptError error
 
-	for time.Now().Before(deadline) {
-		logs := instance.LogBuffer.String() // Get current snapshot of all logs
-		lines := strings.Split(logs, "\n")
+func waitForServerAddressLog(instance *ServerInstance, timeout time.Duration, processExitChan <-chan error) (string, error) {
+	regex := regexp.MustCompile(`"msg":"Server listening on actual address".*?"address":"([^"]+)"`) // Regex to find address in JSON log
 
-		for i := len(lines) - 1; i >= 0; i-- { // Scan from recent lines first
-			line := lines[i]
-			if line == "" {
-				continue
-			}
+	// Use a shorter ticker interval for faster reaction to logs/exit.
+	// The overall timeout is governed by time.After(timeout).
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
-			var logEntry struct {
-				Msg     string                 `json:"msg"`
-				Level   string                 `json:"level"`
-				Details map[string]interface{} `json:"details"`
-			}
+	// Setup a timeout for the entire wait operation
+	timeoutChan := time.After(timeout)
 
-			if err := json.Unmarshal([]byte(line), &logEntry); err == nil {
-				// Check for both possible log messages indicating a listener is active
-				isListenerLog := (logEntry.Msg == "Successfully created new listener" || logEntry.Msg == "Successfully created listener from inherited FD") &&
-					logEntry.Level == "INFO"
+	for {
+		select {
+		case <-timeoutChan:
+			return "", fmt.Errorf("timeout waiting for server to log its listening address after %v. Logs:\n%s", timeout, instance.SafeGetLogs())
 
-				if isListenerLog {
-					if addrRaw, ok := logEntry.Details["localAddr"]; ok { // Changed from "address" to "localAddr"
-						if addrStr, okStr := addrRaw.(string); okStr && addrStr != "" {
-							// Basic validation that it looks like a host:port
-							_, _, errValidate := net.SplitHostPort(addrStr)
-							if errValidate == nil {
-								return addrStr, nil // Successfully found and parsed
-							}
-							lastParseAttemptError = fmt.Errorf("parsed address '%s' from log ('%s') is invalid: %w", addrStr, line, errValidate)
-						}
-					}
+		case err, ok := <-processExitChan:
+			// If channel is closed (ok=false) or an error is received (err!=nil)
+			if !ok || err != nil {
+				errMsg := "server process exited prematurely"
+				if err != nil {
+					errMsg = fmt.Sprintf("%s with error: %v", errMsg, err)
+				} else {
+					errMsg = fmt.Sprintf("%s (nil error, channel closed)", errMsg)
 				}
-			} else {
-				// Store the first parsing error of a non-empty line as a hint, but don't spam.
-				// Avoid filling 'lastParseAttemptError' with generic unmarshal errors if a valid line is still possible.
-				// if lastParseAttemptError == nil && len(line) > 10 { // arbitrary length to avoid tiny junk lines
-				// lastParseAttemptError = fmt.Errorf("failed to parse log line: '%s', error: %w", line, err)
-				// }
+				return "", fmt.Errorf("%s. Logs:\n%s", errMsg, instance.SafeGetLogs())
 			}
-		}
+			// If err is nil and ok is true, it means Wait() returned nil (successful exit)
+			return "", fmt.Errorf("server process exited prematurely (Wait() returned nil) before logging address. Logs:\n%s", instance.SafeGetLogs())
 
-		// Check if server process exited
-		if instance.Cmd != nil && instance.Cmd.ProcessState != nil && instance.Cmd.ProcessState.Exited() {
-			return "", fmt.Errorf("server process exited (code: %d) while waiting for address log", instance.Cmd.ProcessState.ExitCode())
-		}
-		if instance.Cmd != nil && instance.cmdCtx != nil { // Check if cmdCtx is available
-			select {
-			case <-instance.cmdCtx.Done(): // Use the stored context
-				exitErrStr := "unknown (context canceled)"
-				if instance.Cmd.ProcessState != nil {
-					exitErrStr = instance.Cmd.ProcessState.String()
-				} else if instance.Cmd.Err != nil { // Access Err field
-					exitErrStr = instance.Cmd.Err.Error()
-				}
-				return "", fmt.Errorf("server process context done (likely exited: %s) while waiting for address log", exitErrStr)
-			default:
+		case <-ticker.C:
+			logContent := instance.LogBuffer.String() // Read current buffer content
+			matches := regex.FindStringSubmatch(logContent)
+			if len(matches) > 1 {
+				return matches[1], nil // Return the captured address
 			}
+			// No direct os.Signal(0) check here anymore, relying on processExitChan
 		}
-
-		time.Sleep(200 * time.Millisecond) // Poll interval
 	}
-
-	/* 1050 */
-	if lastParseAttemptError != nil {
-		return "", fmt.Errorf("timeout waiting for server address log. Last error during parsing attempt: %w. Full logs:\n%s", lastParseAttemptError, instance.SafeGetLogs())
-	}
-	return "", fmt.Errorf("timeout waiting for server address log (no listener success log line found or parsed correctly from available logs). Full logs:\n%s", instance.SafeGetLogs())
 }
 
 // SafeGetLogs returns the content of the LogBuffer, or a placeholder if the instance/buffer is nil.
