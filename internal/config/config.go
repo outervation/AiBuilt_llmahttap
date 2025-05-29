@@ -14,6 +14,33 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// ConfigError is a custom error type for configuration-related errors.
+type ConfigError struct {
+	FilePath string // The path to the config file or related file causing the error.
+	Message  string // A descriptive message about the error.
+	Err      error  // The underlying error, if any.
+}
+
+// Error implements the error interface for ConfigError.
+func (e *ConfigError) Error() string {
+	if e.FilePath != "" && e.Err != nil {
+		return fmt.Sprintf("config error in '%s': %s: %v", e.FilePath, e.Message, e.Err)
+	}
+	if e.FilePath != "" {
+		return fmt.Sprintf("config error in '%s': %s", e.FilePath, e.Message)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("config error: %s: %v", e.Message, e.Err)
+	}
+	return fmt.Sprintf("config error: %s", e.Message)
+}
+
+// Unwrap returns the underlying error for error unwrapping.
+// This allows errors.Is and errors.As to work with wrapped errors.
+func (e *ConfigError) Unwrap() error {
+	return e.Err
+}
+
 // Duration is a wrapper around time.Duration to allow for custom
 // unmarshalling from string values in configuration files.
 type Duration time.Duration
