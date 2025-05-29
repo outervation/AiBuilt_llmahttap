@@ -236,3 +236,43 @@ func LoadCustomMimeTypesFromFile(filePath string) (map[string]string, error) {
 
 	return customMimeTypes, nil
 }
+
+// ResolveMimeType determines the MIME type for a given file extension.
+// It follows a specific order of precedence:
+// 1. Checks the provided customUserMappings.
+// 2. Checks the package-level defaultMimeTypes map.
+// 3. Uses Go's mime.TypeByExtension.
+// 4. Defaults to application/octet-stream if no type is found.
+// The 'extension' argument should be the file extension including the leading dot (e.g., ".html").
+func ResolveMimeType(extension string, customUserMappings map[string]string) string {
+	if extension == "" {
+		return defaultOctetStreamMimeType
+	}
+
+	// Ensure extension is consistently cased (lowercase) for map lookups
+	ext := strings.ToLower(extension)
+
+	// 1. Check customUserMappings
+	if customUserMappings != nil {
+		if mimeType, ok := customUserMappings[ext]; ok {
+			return mimeType
+		}
+	}
+
+	// 2. Check package-level defaultMimeTypes map
+	if mimeType, ok := defaultMimeTypes[ext]; ok {
+		return mimeType
+	}
+
+	// 3. Use Go's mime.TypeByExtension
+	// This itself includes a fairly comprehensive set of common types.
+	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+		// mime.TypeByExtension might return "type/subtype;param=value".
+		// For Content-Type, this is generally acceptable.
+		// text/* types often include charset=utf-8, which is good.
+		return mimeType
+	}
+
+	// 4. Default to application/octet-stream
+	return defaultOctetStreamMimeType
+}
