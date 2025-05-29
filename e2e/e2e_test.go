@@ -749,7 +749,112 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 	// Sub-test for Longest Prefix Precedence
 	t.Run("LongestPrefixPrecedence", func(st *testing.T) {
-		st.Skip("LongestPrefixPrecedence sub-test not yet implemented")
+		baseDocRoot, cleanupBaseDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"api/generic.txt":      "API Generic Content",
+			"api/v1/specific.txt":  "API V1 Specific Content",
+			"api/v1/deep/deep.txt": "API V1 Deep Content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupBaseDocRoot()
+
+		// Config for /api/
+		sfsAPIDocRoot := filepath.Join(baseDocRoot, "api")
+		sfsAPICfg := config.StaticFileServerConfig{DocumentRoot: sfsAPIDocRoot}
+		sfsAPICfgJSON, _ := json.Marshal(sfsAPICfg)
+
+		// Config for /api/v1/
+		sfsAPIV1DocRoot := filepath.Join(baseDocRoot, "api", "v1")
+		sfsAPIV1Cfg := config.StaticFileServerConfig{DocumentRoot: sfsAPIV1DocRoot}
+		sfsAPIV1CfgJSON, _ := json.Marshal(sfsAPIV1Cfg)
+
+		// Config for /api/v1/deep/
+		sfsAPIV1DeepDocRoot := filepath.Join(baseDocRoot, "api", "v1", "deep")
+		sfsAPIV1DeepCfg := config.StaticFileServerConfig{DocumentRoot: sfsAPIV1DeepDocRoot}
+		sfsAPIV1DeepCfgJSON, _ := json.Marshal(sfsAPIV1DeepCfg)
+
+		serverCfg := config.Config{
+			Server: &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{
+				LogLevel:  config.LogLevelDebug,
+				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{ // Shorter prefix
+						PathPattern:   "/api/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: sfsAPICfgJSON,
+					},
+					{ // Longer prefix
+						PathPattern:   "/api/v1/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: sfsAPIV1CfgJSON,
+					},
+					{ // Even longer prefix
+						PathPattern:   "/api/v1/deep/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: sfsAPIV1DeepCfgJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "LongestPrefixPrecedenceScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestToShorterPrefixPath", // /api/generic.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/generic.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API Generic Content")},
+					},
+				},
+				{
+					Name:    "RequestToLongerPrefixPath", // /api/v1/specific.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/v1/specific.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API V1 Specific Content")},
+					},
+				},
+				{
+					Name:    "RequestToEvenLongerPrefixPath", // /api/v1/deep/deep.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/v1/deep/deep.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API V1 Deep Content")},
+					},
+				},
+				{
+					Name:    "RequestToNonExistentUnderShorterPrefix_Should404ByShorter", // /api/nonexistent.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/nonexistent.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404,
+					},
+				},
+				{
+					Name:    "RequestToNonExistentUnderLongerPrefix_Should404ByLonger", // /api/v1/nonexistent.txt
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/v1/nonexistent.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404,
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
 	})
 
 	// Sub-test for Root Path (/) Matching
