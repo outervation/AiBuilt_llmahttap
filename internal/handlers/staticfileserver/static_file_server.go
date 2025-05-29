@@ -5,9 +5,13 @@ import (
 	"fmt"
 	// "html" // Potentially for directory listing
 	// "io"   // Potentially for serving file content
+	"html"
 	"io" // Potentially for serving file content
 	"net/http"
 	"os"
+	"sort"
+
+	"github.com/dustin/go-humanize"
 	"path/filepath"
 	// "sort" // Potentially for directory listing
 	// "strconv" // Not used by current additions
@@ -543,4 +547,112 @@ func (sfs *StaticFileServer) serveFile(resp http2.StreamWriter, req *http.Reques
 	sfs.log.Debug("StaticFileServer: Finished streaming file", logger.LogFields{
 		"stream_id": resp.ID(), "path": filePath,
 	})
+}
+
+// generateDirectoryListingHTML creates an HTML page listing the contents of a directory.
+// dirPath is the absolute filesystem path to the directory.
+// webPath is the URL path that corresponds to this directory, used for link generation.
+func (sfs *StaticFileServer) generateDirectoryListingHTML(dirPath string, webPath string) ([]byte, error) {
+	sfs.log.Debug("Generating directory listing", logger.LogFields{"dirPath": dirPath, "webPath": webPath})
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		sfs.log.Error("Error reading directory for listing", logger.LogFields{"dirPath": dirPath, "error": err.Error()})
+		return nil, fmt.Errorf("could not read directory %s: %w", dirPath, err)
+	}
+
+	// Sort entries: directories first, then files, then by name.
+	sort.Slice(entries, func(i, j int) bool {
+		infoI, errI := entries[i].Info()
+		infoJ, errJ := entries[j].Info()
+
+		// Handle errors during Info() by treating them as non-directories and perhaps logging.
+		// For sorting, errors might push items to the end or treat them as files.
+		isDirI := false
+		if errI == nil {
+			isDirI = infoI.IsDir()
+		} else {
+			sfs.log.Warn("Error getting FileInfo for sorting directory entry", logger.LogFields{"entry": entries[i].Name(), "dirPath": dirPath, "error": errI.Error()})
+		}
+
+		isDirJ := false
+		if errJ == nil {
+			isDirJ = infoJ.IsDir()
+		} else {
+			sfs.log.Warn("Error getting FileInfo for sorting directory entry", logger.LogFields{"entry": entries[j].Name(), "dirPath": dirPath, "error": errJ.Error()})
+		}
+
+		if isDirI != isDirJ {
+			return isDirI // true if i is dir and j is not (dirs first)
+		}
+		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
+	})
+
+	var sb strings.Builder
+	escapedWebPath := html.EscapeString(webPath)
+	sb.WriteString(fmt.Sprintf("<html><head><title>Index of %s</title></head><body>", escapedWebPath))
+	sb.WriteString(fmt.Sprintf("<h1>Index of %s</h1><hr><pre>", escapedWebPath))
+
+	// Parent directory link, if not at the root of the served path
+	if webPath != "/" && webPath != "" { // webPath might be "" if it's the DocumentRoot itself matched by a "/" pattern.
+		// Ensure webPath ends with a slash for proper relative linking if it's not already root.
+		// However, links should be absolute from the current webPath.
+		parentWebPath := filepath.Dir(strings.TrimSuffix(webPath, "/"))
+		if parentWebPath == "." { // filepath.Dir of "/foo" is "/"
+			parentWebPath = "/"
+		}
+		if !strings.HasSuffix(parentWebPath, "/") && parentWebPath != "/" {
+			parentWebPath += "/"
+		}
+		sb.WriteString(fmt.Sprintf("<a href=\"%s\">../</a>\n", html.EscapeString(parentWebPath)))
+	}
+
+	for _, entry := range entries {
+		entryName := entry.Name()
+		escapedEntryName := html.EscapeString(entryName)
+
+		// Construct the link href ensuring it's relative to the current webPath
+		linkHref := escapedEntryName
+		if !strings.HasSuffix(escapedWebPath, "/") && escapedWebPath != "/" && escapedWebPath != "" {
+			// This case is tricky. If webPath is "/static" and entry is "foo", link should be "/static/foo"
+			// If webPath is "/static/" and entry is "foo", link should be "foo" (relative to /static/) or "/static/foo"
+			// Let's build absolute paths from the server root for simplicity in hrefs for now.
+			hrefWebPath := strings.TrimSuffix(webPath, "/") + "/" + escapedEntryName
+			linkHref = html.EscapeString(hrefWebPath)
+		} else if escapedWebPath == "/" {
+			linkHref = html.EscapeString("/" + escapedEntryName)
+		} else { // webPath ends with "/" or is empty (implicitly root)
+			linkHref = html.EscapeString(escapedWebPath + escapedEntryName)
+		}
+
+		fileInfo, err := entry.Info()
+		if err != nil {
+			sfs.log.Warn("Could not get info for directory entry, skipping in listing", logger.LogFields{"entry": entryName, "error": err.Error()})
+			sb.WriteString(fmt.Sprintf("%s - Error getting info\n", escapedEntryName))
+			continue
+		}
+
+		if fileInfo.IsDir() {
+			sb.WriteString(fmt.Sprintf("<a href=\"%s/\">%s/</a>", linkHref, escapedEntryName))
+			// Align size and date for directories similar to files, or leave blank
+			sb.WriteString(fmt.Sprintf("%40s %20s\n", "-", fileInfo.ModTime().Format("02-Jan-2006 15:04")))
+		} else {
+			sb.WriteString(fmt.Sprintf("<a href=\"%s\">%s</a>", linkHref, escapedEntryName))
+			// Right-align size and date. Pad name to a certain width.
+			// Name (variable) | ModTime (fixed) | Size (variable, right-aligned)
+			// Example from Apache: name.html             12-Oct-2023 10:00     1.2K
+			// Max name length for alignment might be around 50?
+			namePad := 50 - len(escapedEntryName)
+			if namePad < 1 {
+				namePad = 1
+			}
+			sb.WriteString(fmt.Sprintf("%*s %20s %10s\n",
+				namePad, "", // This creates padding after the name
+				fileInfo.ModTime().Format("02-Jan-2006 15:04"),
+				humanize.Bytes(uint64(fileInfo.Size()))))
+		}
+	}
+
+	sb.WriteString("</pre><hr></body></html>")
+	return []byte(sb.String()), nil
 }
