@@ -607,3 +607,217 @@ func TestStaticFileServer_ServeHTTP2_FileOperationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestStaticFileServer_MimeTypes(t *testing.T) {
+	baseFiles := []fileSpec{
+		{Path: "file.txt", Content: "text content"},
+		{Path: "image.png", Content: "png content"},
+		{Path: "archive.tar.gz", Content: "tarball"}, // Go's mime might get .gz, but .tar.gz is trickier, often needs custom
+		{Path: "document.pdf", Content: "pdf content"},
+		{Path: "unknown.ext123", Content: "unknown content"},
+		{Path: "file_no_ext", Content: "no extension"},
+		{Path: ".dotfile", Content: "a dotfile"}, // e.g. .htaccess, often text/plain or application/octet-stream
+		{Path: "custom.myext", Content: "custom extension content"},
+		{Path: "custom.otherext", Content: "other custom content"},
+		{Path: "file.customfromfile", Content: "custom from file content"},
+	}
+
+	// Create a temporary MIME types JSON file
+	customMimeFile, err := os.CreateTemp("", "custom-mimes-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp MIME file: %v", err)
+	}
+	defer os.Remove(customMimeFile.Name())
+	customMimeContent := `{
+		".customfromfile": "application/x-from-file",
+		".myext": "application/x-my-extension-override-from-file" 
+	}`
+	if _, err := customMimeFile.WriteString(customMimeContent); err != nil {
+		t.Fatalf("Failed to write to temp MIME file: %v", err)
+	}
+	if err := customMimeFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp MIME file: %v", err)
+	}
+	customMimeFilePath := customMimeFile.Name()
+
+	trueVal := true
+	sfsBaseConfig := config.StaticFileServerConfig{
+		IndexFiles:            []string{"index.html"},
+		ServeDirectoryListing: &trueVal,
+	}
+
+	tests := []struct {
+		name                string
+		sfsConfigModifier   func(cfg *config.StaticFileServerConfig) // Modifies sfsBaseConfig
+		filePathInDocRoot   string
+		expectedContentType string
+		matchedRoutePattern string
+	}{
+		// --- Default MIME types (relying on Go's mime.TypeByExtension and built-ins) ---
+		{
+			name:                "Default MIME for .txt",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   "file.txt",
+			expectedContentType: "text/plain; charset=utf-8",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "Default MIME for .png",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   "image.png",
+			expectedContentType: "image/png",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "Default MIME for .pdf",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   "document.pdf",
+			expectedContentType: "application/pdf",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:              "Default MIME for .tar.gz (Go might get application/x-gzip for .gz)",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot: "archive.tar.gz",
+			// Go's mime.TypeByExtension(".tar.gz") usually returns "", .gz might be application/x-gzip
+			// If no specific type, it falls back to application/octet-stream as per spec 2.2.4
+			// Let's assume it will fall back. If `mime` package is more clever, this might need adjustment.
+			// As of Go 1.21, mime.TypeByExtension(".tar.gz") returns "application/x-gzip" because it keys on final ext.
+			expectedContentType: "application/gzip",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "Default MIME for unknown extension",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   "unknown.ext123",
+			expectedContentType: "application/octet-stream",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "Default MIME for file with no extension",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   "file_no_ext",
+			expectedContentType: "application/octet-stream",
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "Default MIME for .dotfile",
+			sfsConfigModifier:   func(cfg *config.StaticFileServerConfig) {},
+			filePathInDocRoot:   ".dotfile", // mime.TypeByExtension(".dotfile") is usually ""
+			expectedContentType: "application/octet-stream",
+			matchedRoutePattern: "/files/",
+		},
+		// --- Custom MIME types via MimeTypesMap (inline) ---
+		{
+			name: "Custom MIME from MimeTypesMap for .myext",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {
+				cfg.MimeTypesMap = map[string]string{".myext": "text/x-custom-inline"}
+				cfg.MimeTypesPath = nil // Ensure path is not used
+			},
+			filePathInDocRoot:   "custom.myext",
+			expectedContentType: "text/x-custom-inline",
+			matchedRoutePattern: "/custom/",
+		},
+		{
+			name: "Custom MIME from MimeTypesMap for .otherext, .txt should remain default",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {
+				cfg.MimeTypesMap = map[string]string{".otherext": "application/x-other-custom"}
+				cfg.MimeTypesPath = nil
+			},
+			filePathInDocRoot:   "custom.otherext",
+			expectedContentType: "application/x-other-custom",
+			matchedRoutePattern: "/custom/",
+		},
+		{
+			name: "Custom MIME from MimeTypesMap - .txt check",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {
+				cfg.MimeTypesMap = map[string]string{".otherext": "application/x-other-custom"}
+				cfg.MimeTypesPath = nil
+			},
+			filePathInDocRoot:   "file.txt", // This should use default, not affected by MimeTypesMap
+			expectedContentType: "text/plain; charset=utf-8",
+			matchedRoutePattern: "/custom/",
+		},
+		// --- Custom MIME types via MimeTypesPath (file) ---
+		{
+			name: "Custom MIME from MimeTypesPath for .customfromfile",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {
+				cfg.MimeTypesPath = &customMimeFilePath
+				cfg.MimeTypesMap = nil // Ensure map is not used
+			},
+			filePathInDocRoot:   "file.customfromfile",
+			expectedContentType: "application/x-from-file",
+			matchedRoutePattern: "/custom-filebased/",
+		},
+		// --- MimeTypesPath (file) takes precedence over MimeTypesMap (inline) if both defined for same extension ---
+		// (This is because ParseAndValidateStaticFileServerConfig loads file then merges inline, inline would win if done naively)
+		// The current implementation in ParseAndValidateStaticFileServerConfig merges MimeTypesMap *into* types loaded from file.
+		// So, if an extension is in both, the MimeTypesMap (inline) value will overwrite the file value.
+		// Spec 2.2.4 doesn't explicitly state precedence between inline map and file path if *both* are specified.
+		// Let's test the current implemented behavior: inline map takes precedence.
+		{
+			name: "Custom MIME: Inline map (.myext) overrides file map (.myext also in file)",
+			sfsConfigModifier: func(cfg *config.StaticFileServerConfig) {
+				cfg.MimeTypesPath = &customMimeFilePath // .myext -> application/x-my-extension-override-from-file
+				cfg.MimeTypesMap = map[string]string{
+					".myext": "application/x-my-extension-inline-wins", // This should win
+				}
+				cfg.MimeTypesPath = nil // Ensure file path is not used, making config valid
+			},
+			filePathInDocRoot:   "custom.myext",
+			expectedContentType: "application/x-my-extension-inline-wins",
+			matchedRoutePattern: "/custom-mixed/",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			docRoot, cleanup := setupTestDocumentRoot(t, baseFiles)
+			defer cleanup()
+
+			currentSFSConfig := sfsBaseConfig // Start with a copy of the base
+			currentSFSConfig.DocumentRoot = docRoot
+			if tc.sfsConfigModifier != nil {
+				tc.sfsConfigModifier(&currentSFSConfig)
+			}
+
+			errorLogBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(errorLogBuffer)
+			// mainConfigFilePath is "" because MimeTypesPath is absolute due to os.CreateTemp
+			sfs := newTestStaticFileServer(t, currentSFSConfig, testLogger, "")
+
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			requestPath := strings.Replace(tc.filePathInDocRoot, ".", "_dot_", 1) // Simplistic way to make a URL component
+			requestPath = tc.matchedRoutePattern + requestPath                    // e.g. /files/file_dot_txt
+
+			// The SFS resolves path based on `req.URL.Path` and `matchedRoutePattern` to find `subPath`.
+			// So `req.URL.Path` should be what the user requests.
+			// Example: matched="/files/", req.URL.Path="/files/foo.txt" -> subPath="foo.txt"
+			// We need to construct req.URL.Path such that after stripping matchedRoutePattern, we get filePathInDocRoot
+			urlPathForRequest := tc.matchedRoutePattern + tc.filePathInDocRoot
+
+			req := newTestRequest(t, http.MethodGet, urlPathForRequest, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != "200" {
+				// Cast logger's ErrorLog to *bytes.Buffer to get its contents for debugging
+				var errorLogContent string
+				errorLogContent = errorLogBuffer.String()
+				t.Errorf("Expected status 200 for MIME type test, got %s. Log: %s", status, errorLogContent)
+				t.Logf("Response headers: %#v", mockWriter.headers)
+				t.Logf("Response body: %s", string(mockWriter.getResponseBody()))
+				return // Don't check content type if status is wrong
+			}
+
+			contentType := mockWriter.getResponseHeader("content-type")
+			if contentType != tc.expectedContentType {
+				t.Errorf("Expected Content-Type '%s', got '%s'", tc.expectedContentType, contentType)
+			}
+		})
+	}
+}
