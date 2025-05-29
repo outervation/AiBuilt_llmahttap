@@ -244,6 +244,27 @@ func TestNewMimeTypeResolver(t *testing.T) {
 			expectError:        true,
 			errorMsgContains:   "failed to parse custom MIME types JSON file",
 		},
+
+		{
+			name: "file map - invalid extension (no dot) in file",
+			sfsConfigSetup: func(t *testing.T) *config.StaticFileServerConfig {
+				p := createTempMimeFile(t, `{"nodot": "app/invalid"}`)
+				return &config.StaticFileServerConfig{MimeTypesPath: &p}
+			},
+			mainConfigFilePath: mainConfigPath,
+			expectError:        true,
+			errorMsgContains:   "invalid extension \"nodot\" in custom MIME types file: must start with a '.'",
+		},
+		{
+			name: "file map - empty mime type in file",
+			sfsConfigSetup: func(t *testing.T) *config.StaticFileServerConfig {
+				p := createTempMimeFile(t, `{".emptyval": ""}`)
+				return &config.StaticFileServerConfig{MimeTypesPath: &p}
+			},
+			mainConfigFilePath: mainConfigPath,
+			expectError:        true,
+			errorMsgContains:   "empty MIME type for extension \".emptyval\" in custom MIME types file",
+		},
 		{
 			name: "nil sfsConfig",
 			sfsConfigSetup: func(t *testing.T) *config.StaticFileServerConfig {
