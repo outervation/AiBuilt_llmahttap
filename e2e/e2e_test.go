@@ -471,366 +471,375 @@ func setupTempFilesForRoutingTest(t *testing.T, fileMap map[string]string) (docR
 }
 
 func TestRouting_MatchingLogic(t *testing.T) {
-	t.Skip("TestRouting_MatchingLogic is skipped as it requires a stable server and hits connection issues (timeouts, empty replies).")
-	// // Get server binary path
-	// _, currentFile, _, ok := runtime.Caller(0)
-	// if !ok {
-	// 	t.Fatal("Failed to get current file path for TestRouting_MatchingLogic")
-	// }
-	// e2eDir := filepath.Dir(currentFile)
-	// projectRoot := filepath.Join(e2eDir, "..")
-	// serverBinaryPath := filepath.Join(projectRoot, "server")
-	//
-	// if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
-	// 	t.Fatalf("Server binary for TestRouting_MatchingLogic not found at %s. Ensure it's built (e.g., 'go build -o server ./cmd/server' from project root).", serverBinaryPath)
-	// }
-	// t.Logf("TestRouting_MatchingLogic using server binary path: %s", serverBinaryPath)
-	//
-	// // Common listen address for test server instances
-	// defaultListenAddress := "127.0.0.1:0" // Dynamic port
-	// logEnabledTrue := true
-	// serverConfigArgName := "-config" // Standard argument name for config file
-	//
-	// // Sub-test for Exact Match
-	// t.Run("ExactMatch", func(st *testing.T) {
-	// 	docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
-	// 		"exact_file.txt": "Exact Match Test File Content",
-	// 	})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files: %v", err)
-	// 	}
-	// 	defer cleanupDocRoot()
-	//
-	// 	staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
-	// 	staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
-	//
-	// 	serverCfg := config.Config{
-	// 		Server: &config.ServerConfig{Address: &defaultListenAddress},
-	// 		Logging: &config.LoggingConfig{
-	// 			LogLevel:  config.LogLevelDebug,
-	// 			AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
-	// 			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
-	// 		},
-	// 		Routing: &config.RoutingConfig{
-	// 			Routes: []config.Route{
-	// 				{
-	// 					PathPattern:   "/exact_file.txt",
-	// 					MatchType:     config.MatchTypeExact,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsHandlerCfgJSON,
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	//
-	// 	testDef := testutil.E2ETestDefinition{
-	// 		Name:                "ExactMatchScenario",
-	// 		ServerBinaryPath:    serverBinaryPath,
-	// 		ServerConfigData:    serverCfg,
-	// 		ServerConfigFormat:  "json",
-	// 		ServerConfigArgName: serverConfigArgName,
-	// 		ServerListenAddress: defaultListenAddress,
-	// 		TestCases: []testutil.E2ETestCase{
-	// 			{
-	// 				Name:    "RequestExactFile",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/exact_file.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Exact Match Test File Content")},
-	// 				},
-	// 			},
-	// 			{
-	// 				Name:    "RequestExactFileWithSubpath_Should404",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/exact_file.txt/sub"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode: 404, // Exact match should not match subpaths
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	// 	testutil.RunE2ETest(st, testDef)
-	// })
-	//
-	// // Sub-test for Prefix Match
-	// t.Run("PrefixMatch", func(st *testing.T) {
-	// 	docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
-	// 		"somefile.txt":       "Prefix Match Somefile Content",
-	// 		"index.html":         "Prefix Match Index File Content", // For request to "/prefix/"
-	// 		"subdir/another.txt": "Prefix Match Another File in Subdir",
-	// 	})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files: %v", err)
-	// 	}
-	// 	defer cleanupDocRoot()
-	//
-	// 	staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
-	// 	staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
-	//
-	// 	serverCfg := config.Config{
-	// 		Server:  &config.ServerConfig{Address: &defaultListenAddress},
-	// 		Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
-	// 		Routing: &config.RoutingConfig{
-	// 			Routes: []config.Route{
-	// 				{
-	// 					PathPattern:   "/prefix/",
-	// 					MatchType:     config.MatchTypePrefix,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsHandlerCfgJSON,
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	//
-	// 	testDef := testutil.E2ETestDefinition{
-	// 		Name:                "PrefixMatchScenario",
-	// 		ServerBinaryPath:    serverBinaryPath,
-	// 		ServerConfigData:    serverCfg,
-	// 		ServerConfigFormat:  "json",
-	// 		ServerConfigArgName: serverConfigArgName,
-	// 		ServerListenAddress: defaultListenAddress,
-	// 		TestCases: []testutil.E2ETestCase{
-	// 			{
-	// 				Name:    "RequestPrefixFile",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/prefix/somefile.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Somefile Content")},
-	// 				},
-	// 			},
-	// 			{
-	// 				Name:    "RequestPrefixDirIndex",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/prefix/"}, // Should serve index.html from docRoot due to path mapping
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Index File Content")},
-	// 				},
-	// 			},
-	// 			{
-	// 				Name:    "RequestPrefixSubdirFile",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/prefix/subdir/another.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Another File in Subdir")},
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	// 	testutil.RunE2ETest(st, testDef)
-	// })
-	//
-	// // Sub-test for Exact over Prefix Precedence
-	// t.Run("ExactOverPrefixPrecedence", func(st *testing.T) {
-	// 	// Doc root for the exact match at /path
-	// 	docRootExact, cleanupDocRootExact, err := setupTempFilesForRoutingTest(st, map[string]string{"fileA.txt": "Content of fileA for Exact /path"})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files for exact path: %v", err)
-	// 	}
-	// 	defer cleanupDocRootExact()
-	//
-	// 	// Doc root for the prefix match at /path/ (conceptually, files within this are relative to /path/)
-	// 	docRootPrefix, cleanupDocRootPrefix, err := setupTempFilesForRoutingTest(st, map[string]string{"fileB.txt": "Content of fileB for Prefix /path/"})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files for prefix path: %v", err)
-	// 	}
-	// 	defer cleanupDocRootPrefix()
-	//
-	// 	staticFsCfgExact := config.StaticFileServerConfig{DocumentRoot: docRootExact, IndexFiles: []string{"fileA.txt"}} // Serve fileA.txt if /path is requested
-	// 	staticFsHandlerCfgExactJSON, _ := json.Marshal(staticFsCfgExact)
-	//
-	// 	staticFsCfgPrefix := config.StaticFileServerConfig{DocumentRoot: docRootPrefix}
-	// 	staticFsHandlerCfgPrefixJSON, _ := json.Marshal(staticFsCfgPrefix)
-	//
-	// 	serverCfg := config.Config{
-	// 		Server:  &config.ServerConfig{Address: &defaultListenAddress},
-	// 		Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
-	// 		Routing: &config.RoutingConfig{
-	// 			Routes: []config.Route{
-	// 				{ // Exact match for /path
-	// 					PathPattern:   "/path",
-	// 					MatchType:     config.MatchTypeExact,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsHandlerCfgExactJSON,
-	// 				},
-	// 				{ // Prefix match for /path/
-	// 					PathPattern:   "/path/",
-	// 					MatchType:     config.MatchTypePrefix,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsHandlerCfgPrefixJSON,
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	//
-	// 	testDef := testutil.E2ETestDefinition{
-	// 		Name:                "ExactOverPrefixScenario",
-	// 		ServerBinaryPath:    serverBinaryPath,
-	// 		ServerConfigData:    serverCfg,
-	// 		ServerConfigFormat:  "json",
-	// 		ServerConfigArgName: serverConfigArgName,
-	// 		ServerListenAddress: defaultListenAddress,
-	// 		TestCases: []testutil.E2ETestCase{
-	// 			{
-	// 				Name:    "RequestExactPath",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/path"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Content of fileA for Exact /path")},
-	// 				},
-	// 			},
-	// 			{
-	// 				Name:    "RequestPrefixPathFile",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/path/fileB.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Content of fileB for Prefix /path/")},
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	// 	testutil.RunE2ETest(st, testDef)
-	// })
-	//
-	// // Sub-test for Longest Prefix Precedence
-	// t.Run("LongestPrefixPrecedence", func(st *testing.T) {
-	// 	docRootAPIGeneric, cleanupAPIGeneric, err := setupTempFilesForRoutingTest(st, map[string]string{"test.txt": "API Generic Content"})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files for API generic: %v", err)
-	// 	}
-	// 	defer cleanupAPIGeneric()
-	//
-	// 	docRootAPIV1, cleanupAPIV1, err := setupTempFilesForRoutingTest(st, map[string]string{"test.txt": "API V1 Specific Content"})
-	// 	if err != nil {
-	// 		st.Fatalf("Failed to setup temp files for API V1: %v", err)
-	// 	}
-	// 	defer cleanupAPIV1()
-	//
-	// 	staticFsAPIGenericCfg := config.StaticFileServerConfig{DocumentRoot: docRootAPIGeneric}
-	// 	staticFsAPIGenericJSON, _ := json.Marshal(staticFsAPIGenericCfg)
-	//
-	// 	staticFsAPIV1Cfg := config.StaticFileServerConfig{DocumentRoot: docRootAPIV1}
-	// 	staticFsAPIV1JSON, _ := json.Marshal(staticFsAPIV1Cfg)
-	//
-	// 	serverCfg := config.Config{
-	// 		Server:  &config.ServerConfig{Address: &defaultListenAddress},
-	// 		Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
-	// 		Routing: &config.RoutingConfig{
-	// 			Routes: []config.Route{
-	// 				{ // Shorter prefix /api/
-	// 					PathPattern:   "/api/",
-	// 					MatchType:     config.MatchTypePrefix,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsAPIGenericJSON,
-	// 				},
-	// 				{ // Longer prefix /api/v1/
-	// 					PathPattern:   "/api/v1/",
-	// 					MatchType:     config.MatchTypePrefix,
-	// 					HandlerType:   "StaticFileServer",
-	// 					HandlerConfig: staticFsAPIV1JSON,
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	//
-	// 	testDef := testutil.E2ETestDefinition{
-	// 		Name:                "LongestPrefixScenario",
-	// 		ServerBinaryPath:    serverBinaryPath,
-	// 		ServerConfigData:    serverCfg,
-	// 		ServerConfigFormat:  "json",
-	// 		ServerConfigArgName: serverConfigArgName,
-	// 		ServerListenAddress: defaultListenAddress,
-	// 		TestCases: []testutil.E2ETestCase{
-	// 			{
-	// 				Name:    "RequestShortPrefix",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/api/test.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API Generic Content")},
-	// 				},
-	// 			},
-	// 			{
-	// 				Name:    "RequestLongPrefix",
-	// 				Request: testutil.TestRequest{Method: "GET", Path: "/api/v1/test.txt"},
-	// 				Expected: testutil.ExpectedResponse{
-	// 					StatusCode:  200,
-	// 					BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API V1 Specific Content")},
-	// 				},
-	// 			},
-	// 		},
-	// 	}
-	// 	testutil.RunE2ETest(st, testDef)
-	// })
-	//
-	// // Sub-test for Root Path (/) Matching
-	// t.Run("RootPathMatching", func(st *testing.T) {
-	// 	// Scenario 1: Exact match for "/"
-	// 	st.Run("ExactRoot", func(sst *testing.T) {
-	// 		docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(sst, map[string]string{
-	// 			"index.html": "Root Exact Match Index Content",
-	// 			"other.txt":  "Root Exact Other File (should not be served by this route)",
-	// 		})
-	// 		if err != nil {
-	// 			sst.Fatalf("Failed to setup temp files: %v", err)
-	// 		}
-	// 		defer cleanupDocRoot()
-	//
-	// 		// For an exact match on "/", StaticFileServer will look for index files in DocumentRoot
-	// 		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
-	// 		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
-	//
-	// 		serverCfg := config.Config{
-	// 			Server:  &config.ServerConfig{Address: &defaultListenAddress},
-	// 			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
-	// 			Routing: &config.RoutingConfig{Routes: []config.Route{
-	// 				{PathPattern: "/", MatchType: config.MatchTypeExact, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
-	// 			}},
-	// 		}
-	// 		testDef := testutil.E2ETestDefinition{
-	// 			Name: "RootExactScenario", ServerBinaryPath: serverBinaryPath, ServerConfigData: serverCfg, ServerConfigFormat: "json",
-	// 			ServerConfigArgName: serverConfigArgName, ServerListenAddress: defaultListenAddress,
-	// 			TestCases: []testutil.E2ETestCase{
-	// 				{Name: "RequestRootExact", Request: testutil.TestRequest{Method: "GET", Path: "/"},
-	// 					Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Exact Match Index Content")}}},
-	// 				{Name: "RequestOtherFileAtRootExact_Should404", Request: testutil.TestRequest{Method: "GET", Path: "/other.txt"},
-	// 					Expected: testutil.ExpectedResponse{StatusCode: 404}}, // Exact "/" won't match "/other.txt"
-	// 			},
-	// 		}
-	// 		testutil.RunE2ETest(sst, testDef)
-	// 	})
-	//
-	// 	// Scenario 2: Prefix match for "/"
-	// 	st.Run("PrefixRoot", func(sst *testing.T) {
-	// 		docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(sst, map[string]string{
-	// 			"index.html": "Root Prefix Match Index Content",
-	// 			"foo.txt":    "Root Prefix Foo File Content",
-	// 		})
-	// 		if err != nil {
-	// 			sst.Fatalf("Failed to setup temp files: %v", err)
-	// 		}
-	// 		defer cleanupDocRoot()
-	//
-	// 		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
-	// 		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
-	//
-	// 		serverCfg := config.Config{
-	// 			Server:  &config.ServerConfig{Address: &defaultListenAddress},
-	// 			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
-	// 			Routing: &config.RoutingConfig{Routes: []config.Route{
-	// 				{PathPattern: "/", MatchType: config.MatchTypePrefix, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
-	// 			}},
-	// 		}
-	// 		testDef := testutil.E2ETestDefinition{
-	// 			Name: "RootPrefixScenario", ServerBinaryPath: serverBinaryPath, ServerConfigData: serverCfg, ServerConfigFormat: "json",
-	// 			ServerConfigArgName: serverConfigArgName, ServerListenAddress: defaultListenAddress,
-	// 			TestCases: []testutil.E2ETestCase{
-	// 				{Name: "RequestRootPrefixIndex", Request: testutil.TestRequest{Method: "GET", Path: "/"},
-	// 					Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Match Index Content")}}},
-	// 				{Name: "RequestFooFileAtRootPrefix", Request: testutil.TestRequest{Method: "GET", Path: "/foo.txt"},
-	// 					Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Foo File Content")}}},
-	// 			},
-	// 		}
-	// 		testutil.RunE2ETest(sst, testDef)
-	// 	})
-	// })
+	// Get server binary path
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("Failed to get current file path for TestRouting_MatchingLogic")
+	}
+	e2eDir := filepath.Dir(currentFile)
+	projectRoot := filepath.Join(e2eDir, "..")
+	serverBinaryPath := filepath.Join(projectRoot, "server")
+
+	if _, err := os.Stat(serverBinaryPath); os.IsNotExist(err) {
+		t.Fatalf("Server binary for TestRouting_MatchingLogic not found at %s. Ensure it's built (e.g., 'go build -o server ./cmd/server' from project root).", serverBinaryPath)
+	}
+	t.Logf("TestRouting_MatchingLogic using server binary path: %s", serverBinaryPath)
+
+	// Determine curl path
+	currentCurlPath := os.Getenv("CURL_PATH")
+	if currentCurlPath == "" {
+		currentCurlPath = "curl" // Default to "curl" if not set
+	}
+
+	// Common listen address for test server instances
+	defaultListenAddress := "127.0.0.1:0" // Dynamic port
+	logEnabledTrue := true
+	serverConfigArgName := "-config" // Standard argument name for config file
+
+	// Sub-test for Exact Match
+	t.Run("ExactMatch", func(st *testing.T) {
+		docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"exact_file.txt": "Exact Match Test File Content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
+		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
+
+		serverCfg := config.Config{
+			Server: &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{
+				LogLevel:  config.LogLevelDebug,
+				AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+				ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{
+						PathPattern:   "/exact_file.txt",
+						MatchType:     config.MatchTypeExact,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsHandlerCfgJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "ExactMatchScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestExactFile",
+					Request: testutil.TestRequest{Method: "GET", Path: "/exact_file.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Exact Match Test File Content")},
+					},
+				},
+				{
+					Name:    "RequestExactFileWithSubpath_Should404",
+					Request: testutil.TestRequest{Method: "GET", Path: "/exact_file.txt/sub"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode: 404, // Exact match should not match subpaths
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test for Prefix Match
+	t.Run("PrefixMatch", func(st *testing.T) {
+		docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"somefile.txt":       "Prefix Match Somefile Content",
+			"index.html":         "Prefix Match Index File Content", // For request to "/prefix/"
+			"subdir/another.txt": "Prefix Match Another File in Subdir",
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupDocRoot()
+
+		staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
+		staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
+
+		serverCfg := config.Config{
+			Server:  &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{
+						PathPattern:   "/prefix/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsHandlerCfgJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "PrefixMatchScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestPrefixFile",
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/somefile.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Somefile Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixDirIndex",
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/"}, // Should serve index.html from docRoot due to path mapping
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Index File Content")},
+					},
+				},
+				{
+					Name:    "RequestPrefixSubdirFile",
+					Request: testutil.TestRequest{Method: "GET", Path: "/prefix/subdir/another.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Prefix Match Another File in Subdir")},
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test for Exact over Prefix Precedence
+	t.Run("ExactOverPrefixPrecedence", func(st *testing.T) {
+		// Doc root for the exact match at /path
+		docRootExact, cleanupDocRootExact, err := setupTempFilesForRoutingTest(st, map[string]string{"fileA.txt": "Content of fileA for Exact /path"})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files for exact path: %v", err)
+		}
+		defer cleanupDocRootExact()
+
+		// Doc root for the prefix match at /path/
+		docRootPrefix, cleanupDocRootPrefix, err := setupTempFilesForRoutingTest(st, map[string]string{"fileB.txt": "Content of fileB for Prefix /path/"})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files for prefix path: %v", err)
+		}
+		defer cleanupDocRootPrefix()
+
+		staticFsCfgExact := config.StaticFileServerConfig{DocumentRoot: docRootExact, IndexFiles: []string{"fileA.txt"}}
+		staticFsHandlerCfgExactJSON, _ := json.Marshal(staticFsCfgExact)
+
+		staticFsCfgPrefix := config.StaticFileServerConfig{DocumentRoot: docRootPrefix}
+		staticFsHandlerCfgPrefixJSON, _ := json.Marshal(staticFsCfgPrefix)
+
+		serverCfg := config.Config{
+			Server:  &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{ // Exact match for /path
+						PathPattern:   "/path",
+						MatchType:     config.MatchTypeExact,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsHandlerCfgExactJSON,
+					},
+					{ // Prefix match for /path/
+						PathPattern:   "/path/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsHandlerCfgPrefixJSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "ExactOverPrefixScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestExactPath",
+					Request: testutil.TestRequest{Method: "GET", Path: "/path"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Content of fileA for Exact /path")},
+					},
+				},
+				{
+					Name:    "RequestPrefixPathFile",
+					Request: testutil.TestRequest{Method: "GET", Path: "/path/fileB.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Content of fileB for Prefix /path/")},
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test for Longest Prefix Precedence
+	t.Run("LongestPrefixPrecedence", func(st *testing.T) {
+		docRootAPIGeneric, cleanupAPIGeneric, err := setupTempFilesForRoutingTest(st, map[string]string{"test.txt": "API Generic Content"})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files for API generic: %v", err)
+		}
+		defer cleanupAPIGeneric()
+
+		docRootAPIV1, cleanupAPIV1, err := setupTempFilesForRoutingTest(st, map[string]string{"test.txt": "API V1 Specific Content"})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files for API V1: %v", err)
+		}
+		defer cleanupAPIV1()
+
+		staticFsAPIGenericCfg := config.StaticFileServerConfig{DocumentRoot: docRootAPIGeneric}
+		staticFsAPIGenericJSON, _ := json.Marshal(staticFsAPIGenericCfg)
+
+		staticFsAPIV1Cfg := config.StaticFileServerConfig{DocumentRoot: docRootAPIV1}
+		staticFsAPIV1JSON, _ := json.Marshal(staticFsAPIV1Cfg)
+
+		serverCfg := config.Config{
+			Server:  &config.ServerConfig{Address: &defaultListenAddress},
+			Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{
+					{ // Shorter prefix /api/
+						PathPattern:   "/api/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsAPIGenericJSON,
+					},
+					{ // Longer prefix /api/v1/
+						PathPattern:   "/api/v1/",
+						MatchType:     config.MatchTypePrefix,
+						HandlerType:   "StaticFileServer",
+						HandlerConfig: staticFsAPIV1JSON,
+					},
+				},
+			},
+		}
+
+		testDef := testutil.E2ETestDefinition{
+			Name:                "LongestPrefixScenario",
+			ServerBinaryPath:    serverBinaryPath,
+			ServerConfigData:    serverCfg,
+			ServerConfigFormat:  "json",
+			ServerConfigArgName: serverConfigArgName,
+			ServerListenAddress: defaultListenAddress,
+			CurlPath:            currentCurlPath,
+			TestCases: []testutil.E2ETestCase{
+				{
+					Name:    "RequestShortPrefix",
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/test.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API Generic Content")},
+					},
+				},
+				{
+					Name:    "RequestLongPrefix",
+					Request: testutil.TestRequest{Method: "GET", Path: "/api/v1/test.txt"},
+					Expected: testutil.ExpectedResponse{
+						StatusCode:  200,
+						BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("API V1 Specific Content")},
+					},
+				},
+			},
+		}
+		testutil.RunE2ETest(st, testDef)
+	})
+
+	// Sub-test for Root Path (/) Matching
+	t.Run("RootPathMatching", func(st *testing.T) {
+		// Scenario 1: Exact match for "/"
+		st.Run("ExactRoot", func(sst *testing.T) {
+			docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(sst, map[string]string{
+				"index.html": "Root Exact Match Index Content",
+				"other.txt":  "Root Exact Other File (should not be served by this route)",
+			})
+			if err != nil {
+				sst.Fatalf("Failed to setup temp files: %v", err)
+			}
+			defer cleanupDocRoot()
+
+			// For an exact match on "/", StaticFileServer will look for index files in DocumentRoot
+			staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
+			staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
+
+			serverCfg := config.Config{
+				Server:  &config.ServerConfig{Address: &defaultListenAddress},
+				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
+				Routing: &config.RoutingConfig{Routes: []config.Route{
+					{PathPattern: "/", MatchType: config.MatchTypeExact, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
+				}},
+			}
+			testDef := testutil.E2ETestDefinition{
+				Name: "RootExactScenario", ServerBinaryPath: serverBinaryPath, ServerConfigData: serverCfg, ServerConfigFormat: "json",
+				ServerConfigArgName: serverConfigArgName, ServerListenAddress: defaultListenAddress, CurlPath: currentCurlPath,
+				TestCases: []testutil.E2ETestCase{
+					{Name: "RequestRootExact", Request: testutil.TestRequest{Method: "GET", Path: "/"},
+						Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Exact Match Index Content")}}},
+					{Name: "RequestOtherFileAtRootExact_Should404", Request: testutil.TestRequest{Method: "GET", Path: "/other.txt"},
+						Expected: testutil.ExpectedResponse{StatusCode: 404}}, // Exact "/" won't match "/other.txt"
+				},
+			}
+			testutil.RunE2ETest(sst, testDef)
+		})
+
+		// Scenario 2: Prefix match for "/"
+		st.Run("PrefixRoot", func(sst *testing.T) {
+			docRoot, cleanupDocRoot, err := setupTempFilesForRoutingTest(sst, map[string]string{
+				"index.html": "Root Prefix Match Index Content",
+				"foo.txt":    "Root Prefix Foo File Content",
+			})
+			if err != nil {
+				sst.Fatalf("Failed to setup temp files: %v", err)
+			}
+			defer cleanupDocRoot()
+
+			staticFsCfg := config.StaticFileServerConfig{DocumentRoot: docRoot}
+			staticFsHandlerCfgJSON, _ := json.Marshal(staticFsCfg)
+
+			serverCfg := config.Config{
+				Server:  &config.ServerConfig{Address: &defaultListenAddress},
+				Logging: &config.LoggingConfig{LogLevel: config.LogLevelDebug, AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"}, ErrorLog: &config.ErrorLogConfig{Target: strPtr("stdout")}},
+				Routing: &config.RoutingConfig{Routes: []config.Route{
+					{PathPattern: "/", MatchType: config.MatchTypePrefix, HandlerType: "StaticFileServer", HandlerConfig: staticFsHandlerCfgJSON},
+				}},
+			}
+			testDef := testutil.E2ETestDefinition{
+				Name: "RootPrefixScenario", ServerBinaryPath: serverBinaryPath, ServerConfigData: serverCfg, ServerConfigFormat: "json",
+				ServerConfigArgName: serverConfigArgName, ServerListenAddress: defaultListenAddress, CurlPath: currentCurlPath,
+				TestCases: []testutil.E2ETestCase{
+					{Name: "RequestRootPrefixIndex", Request: testutil.TestRequest{Method: "GET", Path: "/"},
+						Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Match Index Content")}}},
+					{Name: "RequestFooFileAtRootPrefix", Request: testutil.TestRequest{Method: "GET", Path: "/foo.txt"},
+						Expected: testutil.ExpectedResponse{StatusCode: 200, BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Foo File Content")}}},
+				},
+			}
+			testutil.RunE2ETest(sst, testDef)
+		})
+	})
 }
 
 func TestRouting_ConfigValidationFailures(t *testing.T) {

@@ -2,16 +2,16 @@ package server
 
 import (
 	"encoding/json"
-	"example.com/llmahttap/v2/internal/http2"
 	"fmt"
 	"html"
-	"mime"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
+	"example.com/llmahttap/v2/internal/http2" // For HeaderField type in function signatures
 	"example.com/llmahttap/v2/internal/logger"
-	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/http2/hpack" // For actual hpack.HeaderField used in hpackHeadersToHttp2Headers
 )
 
 // jsonMarshalFunc allows swapping out json.Marshal for testing.
@@ -98,130 +98,93 @@ func parseQValue(qStr string) float64 {
 // PrefersJSON checks if the client prefers application/json based on the Accept header.
 func PrefersJSON(acceptHeaderValue string) bool {
 	if acceptHeaderValue == "" {
-		return false
+		return false // Default to HTML
 	}
 
+	// Offers: store media types and their q-values
 	type offer struct {
-		mediaType  string
-		q          float64
-		isJson     bool
-		isHtml     bool
-		isAppStar  bool
-		isStarStar bool
+		mediaType string
+		q         float64
+		specific  bool // true if not wildcard type (e.g., application/json vs application/* or */*)
+		order     int  // original order in header
 	}
+	var offers []offer
 
-	rawOffers := strings.Split(acceptHeaderValue, ",")
-	parsedOffers := make([]offer, 0, len(rawOffers))
+	rawParts := strings.Split(acceptHeaderValue, ",")
+	for i, partStr := range rawParts {
+		partStr = strings.TrimSpace(partStr)
+		mediaType := partStr
+		qValue := 1.0 // Default q-value is 1.0
 
-	for _, partStr := range rawOffers {
-		trimmedPart := strings.TrimSpace(partStr)
-		if trimmedPart == "" {
-			continue
-		}
-		mediaType, params, err := mime.ParseMediaType(trimmedPart)
-		if err != nil {
-			continue
-		}
-		qVal := 1.0
-		if qStr, ok := params["q"]; ok {
-			qVal = parseQValue(qStr)
-		}
-		if qVal == 0.0 {
-			continue
-		}
-		lowerMediaType := strings.ToLower(mediaType)
-		parsedOffers = append(parsedOffers, offer{
-			mediaType:  lowerMediaType,
-			q:          qVal,
-			isJson:     lowerMediaType == "application/json",
-			isHtml:     lowerMediaType == "text/html",
-			isAppStar:  lowerMediaType == "application/*",
-			isStarStar: lowerMediaType == "*/*",
-		})
-	}
-
-	if len(parsedOffers) == 0 {
-		return false
-	}
-
-	ruleA_satisfied := false
-	if len(parsedOffers) > 0 {
-		firstOffer := parsedOffers[0]
-		if (firstOffer.isJson || firstOffer.isAppStar) && firstOffer.q > 0 {
-			ruleA_satisfied = true
-		}
-	}
-	if ruleA_satisfied {
-		return true
-	}
-
-	ruleC_satisfied := false
-	for _, o := range parsedOffers {
-		if o.isJson && o.q == 1.0 {
-			ruleC_satisfied = true
-			break
-		}
-	}
-	if ruleC_satisfied {
-		return true
-	}
-
-	ruleB_satisfied := false
-	starStarPresent := false
-	highestQExplicitAppJson := 0.0
-	highestQAppStar := 0.0
-	highestQStarStar := 0.0
-
-	for _, o := range parsedOffers {
-		if o.isStarStar {
-			starStarPresent = true
-			if o.q > highestQStarStar {
-				highestQStarStar = o.q
-			}
-		}
-		if o.isJson {
-			if o.q > highestQExplicitAppJson {
-				highestQExplicitAppJson = o.q
-			}
-		}
-		if o.isAppStar {
-			if o.q > highestQAppStar {
-				highestQAppStar = o.q
-			}
-		}
-	}
-
-	if starStarPresent {
-		effectiveQJsonForRuleB := 0.0
-		if highestQExplicitAppJson > effectiveQJsonForRuleB {
-			effectiveQJsonForRuleB = highestQExplicitAppJson
-		}
-		if highestQAppStar > effectiveQJsonForRuleB {
-			effectiveQJsonForRuleB = highestQAppStar
-		}
-		if highestQStarStar > effectiveQJsonForRuleB {
-			effectiveQJsonForRuleB = highestQStarStar
-		}
-
-		allOtherSpecificTypesNotHigher := true
-		for _, o := range parsedOffers {
-			if !o.isJson && !o.isAppStar && !o.isStarStar {
-				if o.q > effectiveQJsonForRuleB {
-					allOtherSpecificTypesNotHigher = false
-					break
+		if idx := strings.Index(partStr, ";"); idx != -1 {
+			mediaType = strings.TrimSpace(partStr[:idx])
+			// Look for q-value parameter
+			// A full parser would handle all parameters, but we only care about 'q'.
+			// Example: "text/html; q=0.8" or "text/html;level=1;q=0.8"
+			paramsStr := strings.TrimSpace(partStr[idx+1:])
+			paramParts := strings.Split(paramsStr, ";")
+			for _, param := range paramParts {
+				param = strings.TrimSpace(param)
+				if strings.HasPrefix(param, "q=") {
+					qStr := param[2:]
+					if q, err := strconv.ParseFloat(qStr, 64); err == nil {
+						if q >= 0 && q <= 1 { // q must be between 0 and 1
+							qValue = q
+						} else {
+							qValue = 0 // Invalid q is treated as 0 (effectively rejected unless it's the only option)
+						}
+					} else {
+						qValue = 0 // Parse error for q is also treated as 0
+					}
+					break // Found q, no need to check other params for this media type part
 				}
 			}
 		}
-		if allOtherSpecificTypesNotHigher {
-			ruleB_satisfied = true
+
+		// Per RFC 7231 Section 5.3.2: a sender that generates a media type with a qvalue of 0 MUST NOT generate that media type.
+		// A recipient that receives a media type with a qvalue of 0 MUST ignore that media type.
+		if qValue > 0 {
+			offers = append(offers, offer{
+				mediaType: strings.ToLower(mediaType), // Media types are case-insensitive
+				q:         qValue,
+				specific:  !strings.HasSuffix(mediaType, "/*") && mediaType != "*/*",
+				order:     i,
+			})
 		}
 	}
 
-	if ruleB_satisfied {
-		return true
+	if len(offers) == 0 { // All types had q=0 or header was malformed leading to no valid offers
+		return false // Default to HTML
 	}
 
-	return false
+	// Sort offers:
+	// 1. Higher q-value first.
+	// 2. More specific (application/json > application/* > */*).
+	//    Specificity: concrete > partial wildcard > full wildcard.
+	// 3. Original order in header (lower index first).
+	sort.Slice(offers, func(i, j int) bool {
+		if offers[i].q != offers[j].q {
+			return offers[i].q > offers[j].q // Higher q-value first
+		}
+		// Specificity: A specific type (specific:true) is preferred over a wildcard type (specific:false).
+		// application/json vs application/* : json is more specific
+		// application/* vs */* : application/* is more specific
+		if offers[i].specific != offers[j].specific {
+			return offers[i].specific // true (specific) comes before false (wildcard)
+		}
+		// If q-values and specificity are equal, prefer the one that appeared earlier in the header.
+		return offers[i].order < offers[j].order
+	})
+
+	// After sorting, the first element in `offers` is the most preferred type.
+	// We return true if this most preferred type is "application/json".
+	// This directly addresses the spec: "If the Accept header indicates a preference for application/json..."
+	// It correctly handles "Accept: */*" (results in HTML because */* is not application/json)
+	// and "Accept: application/json, */*" (results in JSON because application/json is more specific and thus preferred).
+	// It also covers "application/json is the first listed type with q > 0" and "q=1.0" by virtue of the sorting.
+	// The "no other type has higher q-value than application/json" for */* is effectively handled because
+	// if */* were to result in JSON, application/json would have to be the effective best match anyway.
+	return offers[0].mediaType == "application/json"
 }
 
 // WriteErrorResponse generates and sends a default HTTP error response on the given stream.

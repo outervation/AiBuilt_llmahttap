@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"time" // Added
 
 	"encoding/json"
 	"log"
@@ -41,7 +42,28 @@ func main() {
 	// 1. Load Configuration
 	cfg, err := config.LoadConfig(configFilePath)
 	if err != nil {
-		log.Fatalf("Failed to load configuration from %s: %v", configFilePath, err)
+		// Manually construct and print a JSON log entry to stderr
+		// to match the format expected by E2E tests for startup errors.
+		// This is used when the full logger hasn't been initialized due to config load failure.
+		errorLogEntry := struct {
+			Timestamp string `json:"ts"`
+			Level     string `json:"level"`
+			Msg       string `json:"msg"`
+			Source    string `json:"source,omitempty"` // Optional, but good for context
+		}{
+			Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), // Consistent format
+			Level:     "ERROR",
+			Msg:       fmt.Sprintf("Failed to load configuration from %s: %v", configFilePath, err),
+			Source:    "cmd/server/main.go:config_load_error", // Pinpoint the source
+		}
+		jsonErrorBytes, marshalErr := json.Marshal(errorLogEntry)
+		if marshalErr != nil {
+			// Fallback if JSON marshaling itself fails
+			fmt.Fprintf(os.Stderr, "CRITICAL: Failed to marshal startup error to JSON: %v. Original error: %v\n", marshalErr, err)
+		} else {
+			fmt.Fprintln(os.Stderr, string(jsonErrorBytes))
+		}
+		os.Exit(1) // Crucial: ensure the program exits
 	}
 
 	// 2. Initialize Logger

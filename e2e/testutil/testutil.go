@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls" // Added import
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ import (
 
 	"testing"
 
-	"crypto/tls"
+	// "crypto/tls" // crypto/tls removed as unused
 	"example.com/llmahttap/v2/internal/config"
 	"github.com/BurntSushi/toml"
 	"golang.org/x/net/http2"
@@ -629,22 +630,28 @@ type GoNetHTTPClient struct {
 
 // NewGoNetHTTPClient creates a new GoNetHTTPClient configured for HTTP/2 Cleartext (H2C).
 func NewGoNetHTTPClient() *GoNetHTTPClient {
+
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second, // Timeout for dialing connection
+		KeepAlive: 30 * time.Second,
+	}
+
 	transport := &http2.Transport{
 		AllowHTTP: true, // Allow non-HTTPS H2
+		// For H2C, we need to provide a custom dialer that performs a cleartext TCP connection.
+		// TLSClientConfig should be nil for H2C.
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
+			// If cfg is not nil, it implies TLS is expected. For pure H2C, cfg might be nil.
+			// However, http.Client might still populate it. The key is to ignore it for H2C.
+			return dialer.DialContext(ctx, network, addr)
 		},
-		// Ensure the TLSClientConfig is nil for H2C if not providing a custom DialTLS that handles schemes.
-		// For x/net/http2.Transport, if DialTLSContext is provided and AllowHTTP is true,
-		// it should correctly handle "http" scheme by calling DialTLSContext which then dials cleartext.
 		TLSClientConfig: nil,
 	}
 
 	return &GoNetHTTPClient{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Second, // Default timeout for requests
+			Timeout:   10 * time.Second, // Overall timeout for requests
 		},
 	}
 }

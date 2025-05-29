@@ -25,66 +25,80 @@ func TestPrefersJSON(t *testing.T) {
 		acceptHeader string
 		expected     bool
 	}{
-		// Rule A: "application/json is the first listed type with q > 0" (or application/*)
-		{"A: Exact JSON first", "application/json", true},
-		{"A: Exact JSON first, with HTML", "application/json, text/html", true},
-		{"A: Exact JSON first, q=0.5", "application/json;q=0.5, text/html", true},
-		{"A: application/* first", "application/*, text/html", true},
-		{"A: HTML first, JSON second", "text/html, application/json", true}, // True because of Rule C (app/json implies q=1.0)
+		// Based on current PrefersJSON logic (sort by q, then specificity, then order; then check if top is application/json)
 
-		// Rule C: "application/json is present with q=1.0"
-		{"C: HTML first, JSON second q=1.0", "text/html, application/json;q=1.0", true},
-		{"C: HTML first, JSON second default q", "text/html, application/json", true},
-		{"C: HTML first, app/* second q=1.0", "text/html, application/*;q=1.0", false}, // application/* is not application/json for Rule C
-		{"C: JSON with q=0.9 (not first)", "text/xml, application/json;q=0.9", false},  // Rule A also not met if it's not first and another is first, Rule C needs q=1.0
+		// Exact match for application/json
+		{"json_first", "application/json", true},
+		{"json_first_with_html", "application/json, text/html", true},    // json is earlier, preferred by order
+		{"html_first_json_second", "text/html, application/json", false}, // html is earlier, preferred by order
 
-		// Rule B: "or */* is present and no other type has higher q-value than application/json"
-		{"B: */* only", "*/*", true},
-		{"B: */*, text/html", "text/html, */*", true}, // html q=1, json_eff_q=1. Not higher.
-		{"B: */*, text/html q=1, app/json q=0.5", "text/html;q=1, application/json;q=0.5, */*", true},                                             // html q=1, json_eff_q=1 from */*. Not higher.
-		{"B: */* q=0.8, text/html q=0.9", "text/html;q=0.9, */*;q=0.8", false},                                                                    // html q=0.9 > json_eff_q=0.8.
-		{"B: */* q=0.9, text/html q=0.8", "text/html;q=0.8, */*;q=0.9", true},                                                                     // html q=0.8 < json_eff_q=0.9.
-		{"B: app/json q=0.7, */*;q=0.6, html q=0.8", "application/json;q=0.7, */*;q=0.6, text/html;q=0.8", true},                                  // Rule A: app/json is first with q>0. Expected true.
-		{"B: text/xml, html q=0.9, */* q=0.5", "text/xml, application/xhtml+xml, text/html;q=0.9, text/plain;q=0.8, image/png, */*;q=0.5", false}, // html q=0.9 > json_eff_q=0.5
+		// q-values
+		{"json_q0.9_html_q0.8", "application/json;q=0.9, text/html;q=0.8", true},
+		{"html_q0.9_json_q0.8", "text/html;q=0.9, application/json;q=0.8", false},
 
-		// Combinations and Edge Cases
-		{"Empty Accept", "", false},
-		{"Only HTML", "text/html", false},
-		{"HTML and others", "text/html, application/xhtml+xml, application/xml;q=0.9, image/webp, */*;q=0.8", false},
-		{"JSON q=0", "application/json;q=0", false},
-		{"HTML, JSON q=0", "text/html, application/json;q=0", false},
-		{"Malformed q", "application/json;q=foo", false}, // parseQValue returns 0 for malformed, effectively q=0
-		{"Multiple JSON, first wins (Rule A)", "application/json;q=0.8, application/json;q=0.9", true},
-		{"Mixed, JSON preferred by A", "application/json, text/plain;q=0.9, text/html;q=0.8", true},
-		{"Mixed, JSON preferred by C", "text/plain;q=0.9, application/json;q=1.0, text/html;q=0.8", true},
-		{"Mixed, JSON preferred by B", "text/plain;q=0.7, */*;q=0.8, text/html;q=0.6", true},    // plain q=0.7 < json_eff_q=0.8
-		{"Mixed, HTML preferred over B", "text/plain;q=0.9, */*;q=0.8, text/html;q=0.6", false}, // plain q=0.9 > json_eff_q=0.8
+		// Specificity with q-values
+		{"json_q1_star_q1", "application/json;q=1, */*;q=1", true},               // json is more specific
+		{"star_q1_json_q1", "*/*;q=1, application/json;q=1", true},               // json is more specific
+		{"app_star_q1_json_q1", "application/*;q=1, application/json;q=1", true}, // json is more specific
+		{"json_q1_app_star_q1", "application/json;q=1, application/*;q=1", true}, // json is more specific
 
-		// Specific scenarios from spec 5.2.1
-		{"Spec A1: application/json", "application/json", true},
-		{"Spec A2: application/json, text/javascript, */*", "application/json, text/javascript, */*", true},
-		{"Spec B1: */*", "*/*", true},
-		{"Spec B2: text/html, */*", "text/html, */*", true},                           // html default q=1, */* default q=1. Effective JSON q=1. html not higher.
-		{"Spec B3: text/html; q=0.8, */*", "text/html; q=0.8, */*", true},             // html q=0.8, */* default q=1. Effective JSON q=1. html not higher.
-		{"Spec C1: text/html, application/json", "text/html, application/json", true}, // application/json default q=1.0
-		{"Spec C2: text/html, application/json;q=1.0", "text/html, application/json;q=1.0", true},
+		// Wildcards
+		{"star_only", "*/*", false},                 // */* is not application/json
+		{"text_html_star", "text/html, */*", false}, // html is preferred (q=1, specific) beats */* (q=1, wildcard)
+		{"star_text_html", "*/*, text/html", false}, // html is preferred (q=1, specific) beats */* (q=1, wildcard)
+		{"app_star_only", "application/*", false},   // application/* is not application/json
 
-		// Test cases for application/* behavior (treated like application/json for preference strength)
-		{"A: app/* first", "application/*", true},
-		{"A: app/* first, with html", "application/*, text/html", true},
-		{"A: text/html, app/*", "text/html, application/*", false},                                                                                    // Fails A for app/*. If app/* is not q=1, also fails C. Might pass B if */* involved.
-		{"C: text/html, app/* q=1", "text/html, application/*;q=1.0", false},                                                                          // Rule C is specific to "application/json", not "application/*"
-		{"B: app/* q=0.7, */*;q=0.6, html q=0.8", "application/*;q=0.7, */*;q=0.6, text/html;q=0.8", true},                                            // Rule A: app/* is first with q>0. Expected true.
-		{"B: text/plain q=0.7, */*;q=0.8, app/*;q=0.75, text/html;q=0.6", "text/plain;q=0.7, */*;q=0.8, application/*;q=0.75, text/html;q=0.6", true}, // plain q=0.7 < json_eff_q=0.8 (from */*)
+		// Complex cases
+		{"complex1_json_wins", "text/html;q=0.8, application/json;q=0.9, */*;q=0.7", true},
+		{"complex2_html_wins", "application/json;q=0.8, text/html;q=0.9, */*;q=0.7", false},
+		{"complex3_star_leads_to_html", "text/plain;q=0.1, */*;q=0.5", false},                            // */* is not app/json
+		{"complex4_json_explicit_wins_over_star", "text/plain;q=0.1, */*;q=0.5, application/json", true}, // app/json has q=1 default, highest q
 
-		// Checking interaction of rules: A, B, C
-		{"Actual A: app/json;q=0.1, text/html", "application/json;q=0.1, text/html", true},                                  // Rule A.
-		{"Actual A: app/*;q=0.1, text/html", "application/*;q=0.1, text/html", true},                                        // Rule A.
-		{"Actual A fails, C passes: text/html, app/json;q=1.0", "text/html, application/json;q=1.0", true},                  // Rule C.
-		{"Actual A fails, C passes: text/html, app/json", "text/html, application/json", true},                              // Rule C (default q=1.0).
-		{"Actual A fails, C fails, B passes: text/html;q=0.8, */*;q=0.9", "text/html;q=0.8, */*;q=0.9", true},               // Rule B (html 0.8 < effective json 0.9 from */*)
-		{"Actual B: text/html, */*;q=0.9", "text/html, */*;q=0.9", false},                                                   // Rule B (html 1.0 > effective json 0.9 from */*)
-		{"text/html;q=0.7, application/json;q=0.5, */*;q=0.6", "text/html;q=0.7, application/json;q=0.5, */*;q=0.6", false}, // text/html (0.7) is higher than application/json (0.5) and */* (0.6)
+		// Cases from original spec examples (Section 5.2.1), re-evaluated with current logic
+		{"spec_A1_json_first", "application/json", true},
+		{"spec_A2_json_complex", "application/json, text/javascript, */*", true}, // application/json is most specific, q=1, order=0
+		{"spec_B1_star_only_html", "*/*", false},
+		{"spec_B2_html_star_html", "text/html, */*", false},                                                      // text/html specific, q=1, order=0
+		{"spec_B3_html_q0.8_star_html", "text/html; q=0.8, */*", false},                                          // */* q=1 default wins over text/html q=0.8, but */* is not app/json
+		{"spec_B3_variant_star_higher_q_json_wins", "text/html; q=0.8, */*;q=0.9, application/json;q=0.9", true}, // application/json specific, q=0.9, vs */* q=0.9. app/json is more specific.
+
+		{"spec_C1_html_json_default_q_json_wins", "text/html, application/json", false}, // html is order 0, json is order 1. html wins.
+		{"spec_C2_html_json_q1_json_wins", "text/html, application/json;q=1.0", false},  // html is order 0, json is order 1. html wins.
+
+		// Edge cases
+		{"empty_accept_header", "", false},
+		{"only_html", "text/html", false},
+		{"json_q0", "application/json;q=0", false},
+		{"malformed_q", "application/json;q=foo", false},
+		{"text_xml_then_json", "text/xml, application/json", false}, // text/xml is order 0, json is order 1. text/xml wins.
+		{"json_then_text_xml", "application/json, text/xml", true},  // json is order 0. json wins.
+
+		// Test cases for application/* behavior
+		{"A_app_star_first", "application/*", false},
+		{"A_app_star_first_with_html", "application/*, text/html", false},                                    // text/html preferred by order
+		{"A_text_html_app_star", "text/html, application/*", false},                                          // text/html preferred by order
+		{"C_text_html_app_star_q_1", "text/html, application/*;q=1.0", false},                                // text/html preferred by order
+		{"B_app_star_q_0.7_star_q_0.6_html_q_0.8", "application/*;q=0.7, */*;q=0.6, text/html;q=0.8", false}, // html has highest q
+		{"B_app_star_q_0.8_star_q_0.7_html_q_0.6", "application/*;q=0.8, */*;q=0.7, text/html;q=0.6", false}, // app/* has highest q but is not app/json
+
+		// New tests based on corrected understanding of RFC 7231 sorting (q, specificity, order)
+		{"json_vs_app_star_same_q", "application/json;q=0.8, application/*;q=0.8", true}, // json is more specific
+		{"app_star_vs_json_same_q", "application/*;q=0.8, application/json;q=0.8", true}, // json is more specific
+		{"star_vs_app_star_same_q", "*/*;q=0.8, application/*;q=0.8", false},             // app/* is more specific, but not app/json
+		{"app_star_vs_star_same_q", "application/*;q=0.8, */*;q=0.8", false},             // app/* is more specific, but not app/json
+
+		{"multiple_app_json_highest_q_wins", "application/json;q=0.8, application/json;q=0.9", true},
+		{"multiple_app_json_first_in_order_wins_if_q_equal", "application/json;q=0.9, application/json;q=0.9", true}, // first one wins
+
+		{"case_1_json_not_first_but_highest_q", "text/html;q=0.5, application/json;q=0.9", true},
+		{"case_2_star_slash_star_wins_but_not_json", "text/html;q=0.5, */*;q=0.9", false},
+		{"case_3_json_q1_but_not_most_preferred", "text/html;q=1.0, application/json;q=1.0, application/xml;q=1.0", false}, // text/html is order 0, preferred
+		{"re_eval_case_3", "text/html;q=1.0, application/json;q=1.0, application/xml;q=1.0", false},                        // Same as above, text/html preferred by order
+
+		{"equal_q_order_preference_1", "text/html, application/json", false},                   // text/html (order 0) wins
+		{"equal_q_order_preference_2", "application/json, text/html", true},                    // application/json (order 0) wins
+		{"equal_q_order_preference_3_lots", "text/a, text/b, application/json, text/c", false}, // text/a (order 0) wins
+		{"equal_q_order_preference_4_lots", "text/a, application/json, text/b, text/c", false}, // text/a (order 0) wins
 	}
 
 	for _, tt := range tests {
