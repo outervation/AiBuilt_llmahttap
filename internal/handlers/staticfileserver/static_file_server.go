@@ -214,59 +214,22 @@ func (sfs *StaticFileServer) ServeHTTP2(resp http2.StreamWriter, req *http.Reque
 	}
 	subPath = strings.TrimPrefix(subPath, "/")
 
-	canonicalPath, fileInfo, httpStatusCode, err := _resolvePath(subPath, sfs.cfg.DocumentRoot, sfs.log, resp.ID(), req.URL.Path)
-	if err != nil {
-		// _resolvePath already logged the specific reason.
-		// Now, send the appropriate HTTP error response.
-		var clientMessage string
-		switch httpStatusCode {
-		case http.StatusNotFound:
-			clientMessage = "Resource not found."
-			if strings.Contains(err.Error(), "invalid path") || strings.Contains(err.Error(), "outside document root") { // Specific detail from _resolvePath
-				clientMessage = "Resource not found (invalid path)."
-			} else {
-				clientMessage = "File not found."
-			}
-		case http.StatusForbidden:
-			clientMessage = "Access denied."
-		case http.StatusInternalServerError:
-			clientMessage = "Error processing file path or accessing file."
-		default: // Should not happen if _resolvePath adheres to its contract
-			sfs.log.Error("StaticFileServer: _resolvePath returned unknown error code", logger.LogFields{
-				"stream_id":  resp.ID(),
-				"path":       req.URL.Path,
-				"statusCode": httpStatusCode,
-				"error":      err.Error(),
-			})
-			httpStatusCode = http.StatusInternalServerError
-			clientMessage = "Internal server error."
-		}
-		server.SendDefaultErrorResponse(resp, httpStatusCode, req, clientMessage, sfs.log)
-		return
-	}
-
 	// Handle HTTP methods (2.3.2)
 	switch req.Method {
 	case http.MethodGet, http.MethodHead:
-		// Proceed to file/directory handling
+		sfs.handleGetHead(resp, req, subPath)
 	case http.MethodOptions:
 		sfs.handleOptions(resp, req)
+		// handleOptions sends its own response, so return here
 		return
 	default:
 		sfs.log.Info("StaticFileServer: Method not allowed", logger.LogFields{
 			"stream_id": resp.ID(),
 			"method":    req.Method,
-			"path":      canonicalPath, // Use canonicalPath here as it's resolved
+			"path":      req.URL.Path, // Use original request path for logging unknown methods
 		})
 		server.SendDefaultErrorResponse(resp, http.StatusMethodNotAllowed, req, "Method not allowed for this resource.", sfs.log)
 		return
-	}
-
-	// File vs. Directory Handling (2.3.3)
-	if fileInfo.IsDir() {
-		sfs.handleDirectory(resp, req, canonicalPath, fileInfo, req.URL.Path) // Pass req.URL.Path as webPath
-	} else {
-		sfs.handleFile(resp, req, canonicalPath, fileInfo)
 	}
 }
 
