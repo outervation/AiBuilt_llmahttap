@@ -859,7 +859,189 @@ func TestRouting_MatchingLogic(t *testing.T) {
 
 	// Sub-test for Root Path (/) Matching
 	t.Run("RootPathMatching", func(st *testing.T) {
-		st.Skip("RootPathMatching sub-test not yet implemented")
+		baseDocRoot, cleanupBaseDocRoot, err := setupTempFilesForRoutingTest(st, map[string]string{
+			"index_for_root_exact.html":              "Root Exact Match Index Content",
+			"root_prefix/index_for_root_prefix.html": "Root Prefix Match Index Content",
+			"root_prefix/another_file.txt":           "Root Prefix Another File Content",
+		})
+		if err != nil {
+			st.Fatalf("Failed to setup temp files: %v", err)
+		}
+		defer cleanupBaseDocRoot()
+
+		// Config for Exact "/"
+		sfsRootExactCfg := config.StaticFileServerConfig{
+			DocumentRoot: baseDocRoot, // Serves from baseDocRoot
+			IndexFiles:   []string{"index_for_root_exact.html"},
+		}
+		sfsRootExactCfgJSON, _ := json.Marshal(sfsRootExactCfg)
+
+		// Config for Prefix "/"
+		// This is tricky for StaticFileServer. If PathPattern is "/" and MatchType is "Prefix",
+		// DocumentRoot should be the actual root of files.
+		// The subPath calculation in StaticFileServer for PathPattern="/" and req.URL.Path="/foo.txt" would be "foo.txt" (after stripping leading /).
+		// For req.URL.Path="/", subPath would be "".
+		sfsRootPrefixDocRoot := filepath.Join(baseDocRoot, "root_prefix")
+		sfsRootPrefixCfg := config.StaticFileServerConfig{
+			DocumentRoot: sfsRootPrefixDocRoot, // Serves from baseDocRoot/root_prefix
+			IndexFiles:   []string{"index_for_root_prefix.html"},
+		}
+		sfsRootPrefixCfgJSON, _ := json.Marshal(sfsRootPrefixCfg)
+
+		// Scenario 1: Exact "/" takes precedence over Prefix "/"
+		st.Run("ExactRootOverPrefixRoot", func(sst *testing.T) {
+			serverCfg := config.Config{
+				Server: &config.ServerConfig{Address: &defaultListenAddress},
+				Logging: &config.LoggingConfig{
+					LogLevel:  config.LogLevelDebug,
+					AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+					ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+				},
+				Routing: &config.RoutingConfig{
+					Routes: []config.Route{
+						{ // Prefix "/"
+							PathPattern:   "/",
+							MatchType:     config.MatchTypePrefix,
+							HandlerType:   "StaticFileServer",
+							HandlerConfig: sfsRootPrefixCfgJSON,
+						},
+						{ // Exact "/" - should take precedence for request to "/"
+							PathPattern:   "/",
+							MatchType:     config.MatchTypeExact,
+							HandlerType:   "StaticFileServer",
+							HandlerConfig: sfsRootExactCfgJSON,
+						},
+					},
+				},
+			}
+			testDef := testutil.E2ETestDefinition{
+				Name:                "ExactRootOverPrefixRootScenario",
+				ServerBinaryPath:    serverBinaryPath,
+				ServerConfigData:    serverCfg,
+				ServerConfigFormat:  "json",
+				ServerConfigArgName: serverConfigArgName,
+				ServerListenAddress: defaultListenAddress,
+				CurlPath:            currentCurlPath,
+				TestCases: []testutil.E2ETestCase{
+					{
+						Name:    "RequestRoot_ShouldServeExactRootIndex", // GET /
+						Request: testutil.TestRequest{Method: "GET", Path: "/"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode:  200,
+							BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Exact Match Index Content")},
+						},
+					},
+					{
+						Name:    "RequestRootPrefixedFile_ShouldServePrefixFile", // GET /another_file.txt -> handled by Prefix "/"
+						Request: testutil.TestRequest{Method: "GET", Path: "/another_file.txt"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode:  200,
+							BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Another File Content")},
+						},
+					},
+				},
+			}
+			testutil.RunE2ETest(sst, testDef)
+		})
+
+		// Scenario 2: Only Prefix "/" route
+		st.Run("PrefixRootOnly", func(sst *testing.T) {
+			serverCfg := config.Config{
+				Server: &config.ServerConfig{Address: &defaultListenAddress},
+				Logging: &config.LoggingConfig{
+					LogLevel:  config.LogLevelDebug,
+					AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+					ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+				},
+				Routing: &config.RoutingConfig{
+					Routes: []config.Route{
+						{ // Prefix "/"
+							PathPattern:   "/",
+							MatchType:     config.MatchTypePrefix,
+							HandlerType:   "StaticFileServer",
+							HandlerConfig: sfsRootPrefixCfgJSON,
+						},
+					},
+				},
+			}
+			testDef := testutil.E2ETestDefinition{
+				Name:                "PrefixRootOnlyScenario",
+				ServerBinaryPath:    serverBinaryPath,
+				ServerConfigData:    serverCfg,
+				ServerConfigFormat:  "json",
+				ServerConfigArgName: serverConfigArgName,
+				ServerListenAddress: defaultListenAddress,
+				CurlPath:            currentCurlPath,
+				TestCases: []testutil.E2ETestCase{
+					{
+						Name:    "RequestRoot_ShouldServePrefixRootIndex", // GET /
+						Request: testutil.TestRequest{Method: "GET", Path: "/"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode:  200,
+							BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Match Index Content")},
+						},
+					},
+					{
+						Name:    "RequestRootPrefixedFile_ShouldServePrefixFile", // GET /another_file.txt
+						Request: testutil.TestRequest{Method: "GET", Path: "/another_file.txt"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode:  200,
+							BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Prefix Another File Content")},
+						},
+					},
+				},
+			}
+			testutil.RunE2ETest(sst, testDef)
+		})
+
+		// Scenario 3: Only Exact "/" route
+		st.Run("ExactRootOnly", func(sst *testing.T) {
+			serverCfg := config.Config{
+				Server: &config.ServerConfig{Address: &defaultListenAddress},
+				Logging: &config.LoggingConfig{
+					LogLevel:  config.LogLevelDebug,
+					AccessLog: &config.AccessLogConfig{Enabled: &logEnabledTrue, Target: strPtr("stdout"), Format: "json"},
+					ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stdout")},
+				},
+				Routing: &config.RoutingConfig{
+					Routes: []config.Route{
+						{ // Exact "/"
+							PathPattern:   "/",
+							MatchType:     config.MatchTypeExact,
+							HandlerType:   "StaticFileServer",
+							HandlerConfig: sfsRootExactCfgJSON,
+						},
+					},
+				},
+			}
+			testDef := testutil.E2ETestDefinition{
+				Name:                "ExactRootOnlyScenario",
+				ServerBinaryPath:    serverBinaryPath,
+				ServerConfigData:    serverCfg,
+				ServerConfigFormat:  "json",
+				ServerConfigArgName: serverConfigArgName,
+				ServerListenAddress: defaultListenAddress,
+				CurlPath:            currentCurlPath,
+				TestCases: []testutil.E2ETestCase{
+					{
+						Name:    "RequestRoot_ShouldServeExactRootIndex", // GET /
+						Request: testutil.TestRequest{Method: "GET", Path: "/"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode:  200,
+							BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("Root Exact Match Index Content")},
+						},
+					},
+					{
+						Name:    "RequestRootPrefixedFile_Should404", // GET /another_file.txt -> Should 404 as Exact "/" won't match
+						Request: testutil.TestRequest{Method: "GET", Path: "/another_file.txt"},
+						Expected: testutil.ExpectedResponse{
+							StatusCode: 404,
+						},
+					},
+				},
+			}
+			testutil.RunE2ETest(sst, testDef)
+		})
 	})
 }
 
