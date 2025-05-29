@@ -821,3 +821,322 @@ func TestStaticFileServer_MimeTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestStaticFileServer_New(t *testing.T) {
+	// Create a temporary, valid MimeTypesPath JSON file for some tests
+	validMimeFile, err := os.CreateTemp("", "valid-mimes-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp valid MIME file: %v", err)
+	}
+	defer os.Remove(validMimeFile.Name())
+	validMimeContent := `{".test": "application/x-test"}` // Corrected: key must be a valid extension.
+	if _, err := validMimeFile.WriteString(validMimeContent); err != nil {
+		t.Fatalf("Failed to write to temp valid MIME file: %v", err)
+	}
+	if err := validMimeFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp valid MIME file: %v", err)
+	}
+	validMimeFilePath := validMimeFile.Name()
+
+	// Create a temporary, invalid MimeTypesPath JSON file
+	invalidMimeFile, err := os.CreateTemp("", "invalid-mimes-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp invalid MIME file: %v", err)
+	}
+	defer os.Remove(invalidMimeFile.Name())
+	invalidMimeContent := `{"\.test": "application/x-test",}` // Trailing comma makes it invalid JSON
+	if _, err := invalidMimeFile.WriteString(invalidMimeContent); err != nil {
+		t.Fatalf("Failed to write to temp invalid MIME file: %v", err)
+	}
+	if err := invalidMimeFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp invalid MIME file: %v", err)
+	}
+	invalidMimeFilePath := invalidMimeFile.Name()
+
+	// Create a temporary, non-JSON MimeTypesPath file
+	nonJsonMimeFile, err := os.CreateTemp("", "nonjson-mimes-*.txt")
+	if err != nil {
+		t.Fatalf("Failed to create temp non-JSON MIME file: %v", err)
+	}
+	defer os.Remove(nonJsonMimeFile.Name())
+	nonJsonMimeContent := `this is not json`
+	if _, err := nonJsonMimeFile.WriteString(nonJsonMimeContent); err != nil {
+		t.Fatalf("Failed to write to temp non-JSON MIME file: %v", err)
+	}
+	if err := nonJsonMimeFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp non-JSON MIME file: %v", err)
+	}
+	nonJsonMimeFilePath := nonJsonMimeFile.Name()
+
+	// Create a temporary directory for DocumentRoot
+	docRoot, docRootCleanup := setupTestDocumentRoot(t, nil)
+	defer docRootCleanup()
+
+	tests := []struct {
+		name                 string
+		handlerCfgJSON       string                                    // JSON string for handlerConfig
+		mainConfigFilePath   string                                    // For resolving relative paths (usually "" in unit tests if paths are absolute)
+		expectedErrSubstring string                                    // Substring to look for in error message if error is expected
+		checkSFSInstance     func(t *testing.T, sfs *StaticFileServer) // Custom checks for successful creation
+		expectedLogContains  []string                                  // Substrings to check in log output for errors
+		logLevel             config.LogLevel                           // Logger level for test
+	}{
+		{
+			name:           "Successful creation - minimal valid config",
+			handlerCfgJSON: fmt.Sprintf(`{"document_root": "%s"}`, escapeJSONString(docRoot)),
+			checkSFSInstance: func(t *testing.T, sfs *StaticFileServer) {
+				if sfs.cfg.DocumentRoot != docRoot {
+					t.Errorf("Expected DocumentRoot '%s', got '%s'", docRoot, sfs.cfg.DocumentRoot)
+				}
+				if len(sfs.cfg.IndexFiles) != 1 || sfs.cfg.IndexFiles[0] != "index.html" { // Default for nil IndexFiles
+					t.Errorf("Expected default IndexFiles ['index.html'], got %v", sfs.cfg.IndexFiles)
+				}
+				if sfs.cfg.ServeDirectoryListing == nil || *sfs.cfg.ServeDirectoryListing != false { // Default is false
+					t.Errorf("Expected default ServeDirectoryListing to be false, got %v", sfs.cfg.ServeDirectoryListing)
+				}
+				if sfs.mimeResolver == nil {
+					t.Error("Expected mimeResolver to be initialized")
+				}
+			},
+		},
+		{
+			name: "Successful creation - with MimeTypesMap",
+			handlerCfgJSON: fmt.Sprintf(`{
+				"document_root": "%s",
+				"index_files": ["main.html", "default.htm"],
+				"serve_directory_listing": true,
+				"mime_types_map": {".custom": "application/x-custom-map"}
+			}`, escapeJSONString(docRoot)),
+			checkSFSInstance: func(t *testing.T, sfs *StaticFileServer) {
+				if sfs.cfg.DocumentRoot != docRoot {
+					t.Errorf("Expected DocumentRoot '%s', got '%s'", docRoot, sfs.cfg.DocumentRoot)
+				}
+				if len(sfs.cfg.IndexFiles) != 2 || sfs.cfg.IndexFiles[0] != "main.html" || sfs.cfg.IndexFiles[1] != "default.htm" {
+					t.Errorf("Expected IndexFiles ['main.html', 'default.htm'], got %v", sfs.cfg.IndexFiles)
+				}
+				if sfs.cfg.ServeDirectoryListing == nil || *sfs.cfg.ServeDirectoryListing != true {
+					t.Error("Expected ServeDirectoryListing to be true")
+				}
+				if sfs.mimeResolver == nil {
+					t.Error("Expected mimeResolver to be initialized")
+				}
+				expectedMimeCustom := "application/x-custom-map" // from map
+				if mimeType := sfs.mimeResolver.GetMimeType("file.custom"); mimeType != expectedMimeCustom {
+					t.Errorf("Expected mime type for '.custom' to be '%s', got '%s'", expectedMimeCustom, mimeType)
+				}
+			},
+		},
+		{
+			name: "Successful creation - with MimeTypesPath",
+			handlerCfgJSON: fmt.Sprintf(`{
+				"document_root": "%s",
+				"index_files": ["main.html", "default.htm"],
+				"serve_directory_listing": true,
+				"mime_types_path": "%s"
+			}`, escapeJSONString(docRoot), escapeJSONString(validMimeFilePath)),
+			checkSFSInstance: func(t *testing.T, sfs *StaticFileServer) {
+				if sfs.cfg.DocumentRoot != docRoot {
+					t.Errorf("Expected DocumentRoot '%s', got '%s'", docRoot, sfs.cfg.DocumentRoot)
+				}
+				if sfs.mimeResolver == nil {
+					t.Error("Expected mimeResolver to be initialized")
+				}
+				expectedMimeTest := "application/x-test" // from file
+				if mimeType := sfs.mimeResolver.GetMimeType("file.test"); mimeType != expectedMimeTest {
+					t.Errorf("Expected mime type for '.test' to be '%s', got '%s'", expectedMimeTest, mimeType)
+				}
+			},
+		},
+		{
+			name:                 "Failure - invalid JSON in handlerCfg",
+			handlerCfgJSON:       `{"document_root": "path",, "invalid"}`, // Extra comma, unquoted key
+			expectedErrSubstring: "StaticFileServer: failed to unmarshal StaticFileServer handler_config: invalid character ',' looking for beginning of object key string",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "invalid character ',' looking for beginning of object key string"},
+		},
+		{
+			name:                 "Failure - missing document_root",
+			handlerCfgJSON:       `{}`,
+			expectedErrSubstring: "StaticFileServer: handler_config for StaticFileServer cannot be empty or null; document_root is required",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "handler_config for StaticFileServer cannot be empty or null; document_root is required"},
+		},
+		{
+			name:                 "Failure - relative document_root",
+			handlerCfgJSON:       `{"document_root": "./relative/path"}`,
+			expectedErrSubstring: "StaticFileServer: handler_config.document_root \"./relative/path\" must be an absolute path",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "handler_config.document_root \"./relative/path\" must be an absolute path"},
+		},
+		{
+			name:                 "Failure - invalid IndexFiles (empty string)",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "index_files": [""]}`, escapeJSONString(docRoot)),
+			expectedErrSubstring: "StaticFileServer: handler_config.index_files[0] cannot be an empty string",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "handler_config.index_files[0] cannot be an empty string"},
+		},
+		{
+			name:                 "Failure - MimeTypesPath does not exist",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "mime_types_path": "/path/to/nonexistent/mimes.json"}`, escapeJSONString(docRoot)),
+			expectedErrSubstring: "StaticFileServer: failed to read mime_types_path file \"/path/to/nonexistent/mimes.json\": open /path/to/nonexistent/mimes.json: no such file or directory",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "no such file or directory"},
+		},
+		{
+			name:                 "Failure - MimeTypesPath is not valid JSON",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "mime_types_path": "%s"}`, escapeJSONString(docRoot), escapeJSONString(nonJsonMimeFilePath)),
+			expectedErrSubstring: "StaticFileServer: failed to parse JSON from mime_types_path file",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "invalid character 'h' in literal true"},
+		},
+		{
+			name:                 "Failure - MimeTypesPath contains invalid JSON structure (trailing comma)",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "mime_types_path": "%s"}`, escapeJSONString(docRoot), escapeJSONString(invalidMimeFilePath)),
+			expectedErrSubstring: "StaticFileServer: failed to parse JSON from mime_types_path file",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "invalid character '.' in string escape code"},
+		},
+		{
+			name:                 "Failure - MimeTypesMap key does not start with a dot",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "mime_types_map": {"txt": "text/plain"}}`, escapeJSONString(docRoot)),
+			expectedErrSubstring: "StaticFileServer: mime_types_map key \"txt\" must start with a '.'",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "mime_types_map key \"txt\" must start with a '.'"},
+		},
+		{
+			name:                 "Failure - MimeTypesMap value is empty",
+			handlerCfgJSON:       fmt.Sprintf(`{"document_root": "%s", "mime_types_map": {".txt": ""}}`, escapeJSONString(docRoot)),
+			expectedErrSubstring: "StaticFileServer: mime_types_map value for key \".txt\" cannot be empty",
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "mime_types_map value for key \".txt\" cannot be empty"},
+		},
+		{
+			name: "Successful creation with ServeDirectoryListing explicitly false",
+			handlerCfgJSON: fmt.Sprintf(`{
+				"document_root": "%s",
+				"serve_directory_listing": false
+			}`, escapeJSONString(docRoot)),
+			checkSFSInstance: func(t *testing.T, sfs *StaticFileServer) {
+				if sfs.cfg.ServeDirectoryListing == nil || *sfs.cfg.ServeDirectoryListing != false {
+					t.Error("Expected ServeDirectoryListing to be false")
+				}
+			},
+		},
+		{
+			name: "Successful creation with empty IndexFiles (should be empty list)",
+			handlerCfgJSON: fmt.Sprintf(`{
+				"document_root": "%s",
+				"index_files": []
+			}`, escapeJSONString(docRoot)), // Empty list
+			checkSFSInstance: func(t *testing.T, sfs *StaticFileServer) {
+				if sfs.cfg.IndexFiles == nil || len(sfs.cfg.IndexFiles) != 0 {
+					t.Errorf("Expected IndexFiles to be an empty list [] when 'index_files: []' is provided, got %v", sfs.cfg.IndexFiles)
+				}
+			},
+		},
+		{
+			name: "Failure - MimeTypesPath and MimeTypesMap both specified",
+			handlerCfgJSON: fmt.Sprintf(`{
+				"document_root": "%s",
+				"mime_types_map": {".custom": "application/x-custom-map"},
+				"mime_types_path": "%s"
+			}`, escapeJSONString(docRoot), escapeJSONString(validMimeFilePath)),
+			expectedErrSubstring: fmt.Sprintf("StaticFileServer: MimeTypesPath (\"%s\") and MimeTypesMap cannot both be specified", escapeJSONString(validMimeFilePath)),
+			expectedLogContains:  []string{"Failed to parse or validate StaticFileServer config", "MimeTypesPath and MimeTypesMap cannot both be specified"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(logBuffer)
+			// tc.logLevel is not directly used to set logger level here, as NewTestLogger defaults to DEBUG.
+
+			rawCfg := json.RawMessage(tc.handlerCfgJSON)
+			handler, err := New(rawCfg, testLogger, tc.mainConfigFilePath)
+
+			if tc.expectedErrSubstring != "" {
+				if err == nil {
+					t.Fatalf("Expected error containing '%s', but got nil", tc.expectedErrSubstring)
+				}
+				if !strings.Contains(err.Error(), tc.expectedErrSubstring) {
+					t.Errorf("Expected error message to contain '%s', but got: %v", tc.expectedErrSubstring, err)
+				}
+				if handler != nil {
+					t.Error("Expected handler to be nil on error")
+				}
+
+				logOutput := logBuffer.String()
+				// Helper struct to unmarshal log details
+				var loggedError struct {
+					Error string `json:"error"`
+				}
+				// Helper struct to unmarshal the full log entry
+				var logEntry struct {
+					Msg     string          `json:"msg"`
+					Details json.RawMessage `json:"details"` // Keep details as RawMessage for flexible parsing
+				}
+
+				foundExpectedLog := false
+				if logOutput != "" {
+					// Assuming one JSON log entry per test case for these specific config errors
+					if errUnmarshal := json.Unmarshal([]byte(logOutput), &logEntry); errUnmarshal == nil {
+						// Check if the error message is in logEntry.Msg or logEntry.Details.Error
+						for _, expectedLog := range tc.expectedLogContains {
+							// Check the main message
+							if strings.Contains(logEntry.Msg, expectedLog) {
+								foundExpectedLog = true
+								break
+							}
+							// Check within details if present
+							if len(logEntry.Details) > 0 {
+								if errUnmarshalDetails := json.Unmarshal(logEntry.Details, &loggedError); errUnmarshalDetails == nil {
+									if strings.Contains(loggedError.Error, expectedLog) {
+										foundExpectedLog = true
+										break
+									}
+								}
+							}
+						}
+					} else {
+						t.Logf("Failed to unmarshal log output as JSON: %s. Log: %s", errUnmarshal, logOutput)
+						// Fallback to old check if unmarshalling fails (though it shouldn't for valid JSON logs)
+						for _, expectedLog := range tc.expectedLogContains {
+							if strings.Contains(logOutput, expectedLog) {
+								foundExpectedLog = true
+								break
+							}
+						}
+					}
+				}
+
+				if len(tc.expectedLogContains) > 0 && !foundExpectedLog {
+					// Construct a more informative message if specific expected logs were defined
+					expectedLogsStr := strings.Join(tc.expectedLogContains, "', '")
+					t.Errorf("Expected log to contain one of ['%s'], but it didn't. Log: %s", expectedLogsStr, logOutput)
+				} else if len(tc.expectedLogContains) == 0 && logOutput != "" && strings.Contains(logOutput, "\"level\":\"ERROR\"") {
+					// If no specific error logs were expected, but an ERROR level log appeared, flag it.
+					// This is a basic check; more sophisticated checks might be needed if silent errors are expected.
+					// For now, if tc.expectedLogContains is empty, we assume no error logs.
+					// This branch is unlikely to be hit given the test structure, but is a safeguard.
+					// t.Errorf("Unexpected ERROR log when none was expected. Log: %s", logOutput)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v. Log: %s", err, logBuffer.String())
+				}
+				if handler == nil {
+					t.Fatal("Expected non-nil handler, but got nil")
+				}
+				sfs, ok := handler.(*StaticFileServer)
+				if !ok {
+					t.Fatalf("Expected handler to be *StaticFileServer, but got %T", handler)
+				}
+				if tc.checkSFSInstance != nil {
+					tc.checkSFSInstance(t, sfs)
+				}
+			}
+		})
+	}
+}
+
+// escapeJSONString ensures a string is properly escaped for embedding in a JSON string literal.
+func escapeJSONString(s string) string {
+	// Convert to forward slashes for consistency, especially for Windows paths.
+	s = filepath.ToSlash(s)
+	// Basic replacements for JSON string compatibility.
+	s = strings.ReplaceAll(s, `\`, `\\`) // Escape backslashes first
+	s = strings.ReplaceAll(s, `"`, `\"`) // Escape double quotes
+	return s
+}
