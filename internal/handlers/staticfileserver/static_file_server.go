@@ -356,6 +356,52 @@ func _resolvePath(subPath string, documentRoot string, lg *logger.Logger, stream
 	return canonicalPath, fi, 0, nil // 0 indicates success (no HTTP error code from this stage)
 }
 
+// handleGetHead processes GET and HEAD requests.
+// It resolves the path, handles errors, and dispatches to serveFile or handleDirectory.
+func (sfs *StaticFileServer) handleGetHead(resp http2.StreamWriter, req *http.Request, subPath string) {
+	// _resolvePath handles path construction, canonicalization, security checks, and stat-ing.
+	// It returns the canonical path, file info, an HTTP status code for errors (404, 403, 500),
+	// and the underlying error.
+	canonicalPath, fileInfo, httpStatusCode, err := _resolvePath(subPath, sfs.cfg.DocumentRoot, sfs.log, resp.ID(), req.URL.Path)
+	if err != nil {
+		// _resolvePath already logged the specific reason.
+		// Now, send the appropriate HTTP error response.
+		var clientMessage string
+		switch httpStatusCode {
+		case http.StatusNotFound:
+			if strings.Contains(err.Error(), "invalid path") || strings.Contains(err.Error(), "outside document root") {
+				clientMessage = "Resource not found (invalid path)."
+			} else {
+				clientMessage = "File not found."
+			}
+		case http.StatusForbidden:
+			clientMessage = "Access denied."
+		case http.StatusInternalServerError:
+			clientMessage = "Error processing file path or accessing file."
+		default: // Should not happen if _resolvePath adheres to its contract
+			sfs.log.Error("StaticFileServer: _resolvePath returned unknown error code from handleGetHead", logger.LogFields{
+				"stream_id":  resp.ID(),
+				"path":       req.URL.Path,
+				"subPath":    subPath,
+				"statusCode": httpStatusCode,
+				"error":      err.Error(),
+			})
+			httpStatusCode = http.StatusInternalServerError // Ensure a valid status code
+			clientMessage = "Internal server error."
+		}
+		server.SendDefaultErrorResponse(resp, httpStatusCode, req, clientMessage, sfs.log)
+		return
+	}
+
+	// File vs. Directory Handling (2.3.3)
+	if fileInfo.IsDir() {
+		// req.URL.Path is the original request path, used as webPath for generating links in directory listings
+		sfs.handleDirectory(resp, req, canonicalPath, fileInfo, req.URL.Path)
+	} else {
+		sfs.handleFile(resp, req, canonicalPath, fileInfo)
+	}
+}
+
 // handleOptions is a stub implementation for handling OPTIONS requests.
 func (sfs *StaticFileServer) handleOptions(resp http2.StreamWriter, req *http.Request) {
 	sfs.log.Debug("StaticFileServer: handleOptions called (stub)", logger.LogFields{
