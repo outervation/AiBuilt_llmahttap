@@ -2180,3 +2180,72 @@ func TestStaticFileServer_ServeHTTP2_ConditionalRequests(t *testing.T) {
 		})
 	}
 }
+
+func TestStaticFileServer_ServeHTTP2_UnsupportedMethods(t *testing.T) {
+	docRoot, cleanup := setupTestDocumentRoot(t, []fileSpec{
+		{Path: "some_resource.txt", Content: "This resource exists"},
+	})
+	defer cleanup()
+
+	sfsConfig := config.StaticFileServerConfig{
+		DocumentRoot: docRoot,
+	}
+
+	unsupportedMethods := []string{
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodDelete,
+		http.MethodPatch,
+		http.MethodTrace,   // TRACE is often disabled for security
+		http.MethodConnect, // CONNECT is for proxies
+		"INVALIDMETHOD",    // A completely bogus method
+	}
+
+	requestPath := "/files/some_resource.txt"
+	matchedRoutePattern := "/files/"
+
+	for _, method := range unsupportedMethods {
+		t.Run(method, func(t *testing.T) {
+			logBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(logBuffer)
+			sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			req := newTestRequest(t, method, requestPath, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			expectedStatus := "405"
+			if status := mockWriter.getResponseStatus(); status != expectedStatus {
+				t.Errorf("Expected status %s for method %s, got %s. Log: %s", expectedStatus, method, status, logBuffer.String())
+			}
+
+			// Check log for "Method not allowed"
+			expectedLogMsg := "StaticFileServer: Method not allowed"
+			if !strings.Contains(logBuffer.String(), expectedLogMsg) {
+				t.Errorf("Expected log to contain '%s' for method %s, but it didn't. Log: %s", expectedLogMsg, method, logBuffer.String())
+			}
+			// Check log for the specific method
+			if !strings.Contains(logBuffer.String(), fmt.Sprintf("\"method\":\"%s\"", method)) {
+				t.Errorf("Expected log to contain method '%s', but it didn't. Log: %s", method, logBuffer.String())
+			}
+
+			// Check for default error page content
+			bodyBytes := mockWriter.getResponseBody()
+			bodyStr := string(bodyBytes)
+
+			// Assuming HTML response as default when Accept header is not set
+			if !strings.Contains(bodyStr, fmt.Sprintf("<title>%s %s</title>", expectedStatus, http.StatusText(http.StatusMethodNotAllowed))) {
+				t.Errorf("Expected error page title for status %s, but not found in body. Body: %s", expectedStatus, bodyStr)
+			}
+			expectedDetail := "Method not allowed for this resource."
+			if !strings.Contains(bodyStr, expectedDetail) {
+				t.Errorf("Expected error page body to contain detail '%s', but not found. Body: %s", expectedDetail, bodyStr)
+			}
+		})
+	}
+}
