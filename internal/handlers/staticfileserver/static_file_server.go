@@ -237,7 +237,7 @@ func (sfs *StaticFileServer) ServeHTTP2(resp http2.StreamWriter, req *http.Reque
 // It returns the canonical path, file info, an HTTP status code for errors (404, 403, 500),
 // and the underlying error.
 func _resolvePath(subPath string, documentRoot string, lg *logger.Logger, streamID uint32, reqURLPathForLog string) (
-	resolvedPath string, fileInfo os.FileInfo, httpStatusCode int, err error,
+	resolvedPath string, fileInfo os.FileInfo, httpStatusCode int, err error, isTraversalAttempt bool,
 ) {
 	// Append subPath to DocumentRoot
 	// documentRoot is guaranteed to be absolute by config validation.
@@ -251,44 +251,37 @@ func _resolvePath(subPath string, documentRoot string, lg *logger.Logger, stream
 			"target_path": targetPath,
 			"error":       absErr.Error(),
 		})
-		return "", nil, http.StatusInternalServerError, fmt.Errorf("error processing file path: %w", absErr)
+		// For path canonicalization errors, treat as internal server error, not specifically traversal.
+		return "", nil, http.StatusInternalServerError, fmt.Errorf("error processing file path: %w", absErr), false
 	}
 
 	// Security check: Ensure canonicalized path is still within DocumentRoot (2.3.1)
-	if !strings.HasPrefix(canonicalPath, documentRoot) && canonicalPath != documentRoot {
-		// The `canonicalPath != documentRoot` check is to correctly handle cases like DocumentRoot="/srv", subPath="", targetPath="/srv", canonicalPath="/srv".
-		// If DocumentRoot is "/srv/" and subPath is "", targetPath becomes "/srv/", canonicalPath="/srv". Here strings.HasPrefix "/srv" with "/srv/" is true.
-		// If DocumentRoot is "/srv"  and subPath is "", targetPath becomes "/srv",  canonicalPath="/srv". Here HasPrefix fails if DR doesn't have trailing slash but path resolves to it.
-		// For `HasPrefix` to work robustly when `canonicalPath == documentRoot`, `documentRoot` should ideally not have a trailing slash unless it's the root "/" itself.
-		// However, `filepath.Join` and `filepath.Abs` usually handle this well.
-		// The core idea is: `canonicalPath` must be `documentRoot` or a path "under" it.
-		// A stricter check: `strings.HasPrefix(canonicalPath, documentRoot + string(filepath.Separator))` OR `canonicalPath == documentRoot`.
-		// Given DocumentRoot is absolute and clean, this simpler check should be sufficient.
-		// The condition `canonicalPath != documentRoot` handles the exact match case correctly if DocumentRoot does not end with a slash.
-		// If DocumentRoot is "/var/www" and canonicalPath is "/var/www", strings.HasPrefix("/var/www", "/var/www") is true.
-		// Path traversal happens if canonicalPath is, e.g. "/var" when DocumentRoot is "/var/www".
-		// Or if canonicalPath is "/var/www-other"
-		// The spec: "ensure that the canonicalized path is still within the configured DocumentRoot."
+	// Clean the documentRoot path to remove any trailing slashes for a consistent prefix check, unless it's the root "/"
+	cleanedDocumentRoot := filepath.Clean(documentRoot)
+	// If DocumentRoot was originally "/", filepath.Clean("/") is "/".
+	// If DocumentRoot was "/foo/", filepath.Clean("/foo/") is "/foo".
 
-		// If documentRoot is "/" and canonicalPath is "/", strings.HasPrefix("/", "/") is true.
-		// If documentRoot is "/foo" and canonicalPath is "/foo", strings.HasPrefix("/foo", "/foo") is true.
-		// If documentRoot is "/foo/" and canonicalPath is "/foo", strings.HasPrefix("/foo", "/foo/") is false. This means DocumentRoot should be cleaned (no trailing slash unless it's root "/")
-		// The config validation ensures DocumentRoot is absolute. Let's assume it's also cleaned (e.g. by filepath.Clean initially).
-		// If sfs.cfg.DocumentRoot = "/tmp/www" (cleaned)
-		// subPath = ".." -> targetPath = "/tmp/www/.." -> canonicalPath = "/tmp"
-		// strings.HasPrefix("/tmp", "/tmp/www") is false. Correct.
-		// subPath = "" -> targetPath = "/tmp/www" -> canonicalPath = "/tmp/www"
-		// strings.HasPrefix("/tmp/www", "/tmp/www") is true. Correct.
+	isWithinRoot := false
+	if cleanedDocumentRoot == "/" {
+		// If document root is the filesystem root, any absolute path is "within" it for prefix checking.
+		// However, we only care if canonicalPath *is* actually under it, not just shares a prefix.
+		// For root, HasPrefix is sufficient if canonicalPath is also clean.
+		isWithinRoot = strings.HasPrefix(canonicalPath, cleanedDocumentRoot)
+	} else {
+		// For non-root document roots, canonicalPath must be equal to cleanedDocumentRoot OR start with cleanedDocumentRoot + string(filepath.Separator).
+		isWithinRoot = canonicalPath == cleanedDocumentRoot || strings.HasPrefix(canonicalPath, cleanedDocumentRoot+string(filepath.Separator))
+	}
 
+	if !isWithinRoot {
 		lg.Warn("StaticFileServer: Attempt to access path outside document root (Path Traversal)", logger.LogFields{
 			"stream_id":      streamID,
 			"requested_path": reqURLPathForLog,
 			"target_path":    targetPath,
 			"canonical_path": canonicalPath,
-			"document_root":  documentRoot,
+			"document_root":  documentRoot, // Log original for clarity
 		})
 		// Spec: 404 for path traversal (to avoid leaking info)
-		return "", nil, http.StatusNotFound, fmt.Errorf("attempt to access path outside document root: %s", canonicalPath)
+		return "", nil, http.StatusNotFound, fmt.Errorf("attempt to access path outside document root: %s", canonicalPath), true
 	}
 
 	// Check file existence and type
@@ -299,24 +292,24 @@ func _resolvePath(subPath string, documentRoot string, lg *logger.Logger, stream
 				"stream_id": streamID,
 				"path":      canonicalPath,
 			})
-			return "", nil, http.StatusNotFound, fmt.Errorf("file or directory not found: %s: %w", canonicalPath, statErr)
+			return "", nil, http.StatusNotFound, fmt.Errorf("file or directory not found: %s: %w", canonicalPath, statErr), false
 		} else if os.IsPermission(statErr) {
 			lg.Warn("StaticFileServer: Permission denied accessing path by _resolvePath", logger.LogFields{
 				"stream_id": streamID,
 				"path":      canonicalPath,
 				"error":     statErr.Error(),
 			})
-			return "", nil, http.StatusForbidden, fmt.Errorf("permission denied for path: %s: %w", canonicalPath, statErr)
+			return "", nil, http.StatusForbidden, fmt.Errorf("permission denied for path: %s: %w", canonicalPath, statErr), false
 		} else {
 			lg.Error("StaticFileServer: Error stating file in _resolvePath", logger.LogFields{
 				"stream_id": streamID,
 				"path":      canonicalPath,
 				"error":     statErr.Error(),
 			})
-			return "", nil, http.StatusInternalServerError, fmt.Errorf("error stating file: %s: %w", canonicalPath, statErr)
+			return "", nil, http.StatusInternalServerError, fmt.Errorf("error stating file: %s: %w", canonicalPath, statErr), false
 		}
 	}
-	return canonicalPath, fi, 0, nil // 0 indicates success (no HTTP error code from this stage)
+	return canonicalPath, fi, 0, nil, false // 0 indicates success (no HTTP error code from this stage)
 }
 
 // handleGetHead processes GET and HEAD requests.
@@ -325,16 +318,17 @@ func (sfs *StaticFileServer) handleGetHead(resp http2.StreamWriter, req *http.Re
 	// _resolvePath handles path construction, canonicalization, security checks, and stat-ing.
 	// It returns the canonical path, file info, an HTTP status code for errors (404, 403, 500),
 	// and the underlying error.
-	canonicalPath, fileInfo, httpStatusCode, err := _resolvePath(subPath, sfs.cfg.DocumentRoot, sfs.log, resp.ID(), req.URL.Path)
+	canonicalPath, fileInfo, httpStatusCode, err, isTraversal := _resolvePath(subPath, sfs.cfg.DocumentRoot, sfs.log, resp.ID(), req.URL.Path)
 	if err != nil {
 		// _resolvePath already logged the specific reason.
 		// Now, send the appropriate HTTP error response.
 		var clientMessage string
 		switch httpStatusCode {
 		case http.StatusNotFound:
-			if strings.Contains(err.Error(), "invalid path") || strings.Contains(err.Error(), "outside document root") {
+			if isTraversal { // Check if it was a traversal attempt
 				clientMessage = "Resource not found (invalid path)."
 			} else {
+				// For general "file or directory not found" or other non-traversal 404s from _resolvePath
 				clientMessage = "File not found."
 			}
 		case http.StatusForbidden:
@@ -703,7 +697,7 @@ func (sfs *StaticFileServer) generateDirectoryListingHTML(dirPath string, webPat
 			// This case is tricky. If webPath is "/static" and entry is "foo", link should be "/static/foo"
 			// If webPath is "/static/" and entry is "foo", link should be "foo" (relative to /static/) or "/static/foo"
 			// Let's build absolute paths from the server root for simplicity in hrefs for now.
-			hrefWebPath := strings.TrimSuffix(webPath, "/") + "/" + escapedEntryName
+			hrefWebPath := strings.TrimSuffix(webPath, "/") + "/" + entryName // USE RAW entryName not escapedEntryName
 			linkHref = html.EscapeString(hrefWebPath)
 		} else if escapedWebPath == "/" {
 			linkHref = html.EscapeString("/" + escapedEntryName)
