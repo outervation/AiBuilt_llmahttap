@@ -1414,3 +1414,226 @@ func TestStaticFileServer_ServeHTTP2_PathResolutionErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestStaticFileServer_ServeHTTP2_IndexFiles(t *testing.T) {
+	tests := []struct {
+		name                  string
+		setupFiles            []fileSpec // Files in the directory to be accessed
+		indexFilesConfig      []string   // Configuration for SFS IndexFiles
+		serveDirListingConfig *bool      // Configuration for SFS ServeDirectoryListing
+		requestPath           string     // Request path to the directory
+		matchedRoutePattern   string     // Matched route (should be prefix for directory)
+		expectedStatus        string
+		expectedContentType   string // If serving an index file
+		expectedContent       string // If serving an index file
+		expectedLogContains   []string
+		expectDefaultError    bool   // True if expecting a default 403/404 error page
+		errorDetail           string // Expected detail for error page
+	}{
+		{
+			name: "Serve first index file from config (index.html)",
+			setupFiles: []fileSpec{
+				{Path: "dir1/index.html", Content: "This is index.html from dir1"},
+				{Path: "dir1/index.php", Content: "This is index.php from dir1"},
+			},
+			indexFilesConfig:      []string{"index.html", "index.php"},
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/static/dir1/",
+			matchedRoutePattern:   "/static/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/html; charset=utf-8",
+			expectedContent:       "This is index.html from dir1",
+			expectedLogContains:   []string{"Serving index file from directory", "dir1/index.html"},
+		},
+		{
+			name: "Serve second index file from config (index.php)",
+			setupFiles: []fileSpec{
+				// No index.html here
+				{Path: "dir2/index.php", Content: "This is index.php from dir2"},
+				{Path: "dir2/other.html", Content: "Other content"},
+			},
+			indexFilesConfig:      []string{"index.html", "index.php"},
+			serveDirListingConfig: ptrToBool(false),
+
+			requestPath:         "/public/dir2/",
+			matchedRoutePattern: "/public/",
+			expectedStatus:      "200",
+			expectedContentType: "application/x-php", // Corrected: Go's mime.TypeByExtension likely knows .php
+			expectedContent:     "This is index.php from dir2",
+			expectedLogContains: []string{"Serving index file from directory", "dir2/index.php"},
+		},
+		{
+			name: "Default index.html served when IndexFiles config is default",
+			setupFiles: []fileSpec{
+				{Path: "dir3/index.html", Content: "Default index.html content"},
+			},
+			indexFilesConfig:      nil, // Will use default ["index.html"]
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/data/dir3/",
+			matchedRoutePattern:   "/data/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/html; charset=utf-8",
+			expectedContent:       "Default index.html content",
+			expectedLogContains:   []string{"Serving index file from directory", "dir3/index.html"},
+		},
+		{
+			name: "Skip index file if it's a directory, serve next in list",
+			setupFiles: []fileSpec{
+				{Path: "dir4/index.html", IsDir: true}, // index.html is a directory
+				{Path: "dir4/index.htm", Content: "This is index.htm"},
+			},
+			indexFilesConfig:      []string{"index.html", "index.htm"},
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/files/dir4/",
+			matchedRoutePattern:   "/files/",
+			expectedStatus:        "200",
+			expectedContentType:   "text/html; charset=utf-8",
+			expectedContent:       "This is index.htm",
+			expectedLogContains:   []string{"Serving index file from directory", "dir4/index.htm"},
+		},
+		{
+			name: "No index file found, ServeDirectoryListing is false, expect 403",
+			setupFiles: []fileSpec{
+				{Path: "dir5/only_data.txt", Content: "Some data"},
+			},
+			indexFilesConfig:      []string{"index.html", "index.htm"},
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/assets/dir5/",
+			matchedRoutePattern:   "/assets/",
+			expectedStatus:        "403",
+			expectDefaultError:    true,
+			errorDetail:           "Access to this directory is forbidden.",
+			expectedLogContains:   []string{"No index file and directory listing disabled, sending 403 Forbidden", "dir5"},
+		},
+		{
+			name: "IndexFiles config is empty list, ServeDirectoryListing false, expect 403",
+			setupFiles: []fileSpec{
+				{Path: "dir6/somefile.txt", Content: "content"},
+			},
+			indexFilesConfig:      []string{}, // Explicitly empty
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/emptyconfig/dir6/",
+			matchedRoutePattern:   "/emptyconfig/",
+			expectedStatus:        "403",
+			expectDefaultError:    true,
+			errorDetail:           "Access to this directory is forbidden.",
+			expectedLogContains:   []string{"No index file and directory listing disabled, sending 403 Forbidden", "dir6"},
+		},
+		{
+			name:       "Target directory does not exist, expect 404",
+			setupFiles: []fileSpec{
+				// No files needed as the dir itself is missing
+			},
+			indexFilesConfig:      []string{"index.html"},
+			serveDirListingConfig: ptrToBool(false),
+			requestPath:           "/static/nonexistentdir/",
+			matchedRoutePattern:   "/static/",
+			expectedStatus:        "404",
+			expectDefaultError:    true,
+			errorDetail:           "File not found.",
+			expectedLogContains:   []string{"File or directory not found by _resolvePath", "nonexistentdir"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			docRoot, cleanup := setupTestDocumentRoot(t, tc.setupFiles)
+			defer cleanup()
+
+			sfsConfig := config.StaticFileServerConfig{
+				DocumentRoot:          docRoot,
+				IndexFiles:            tc.indexFilesConfig,
+				ServeDirectoryListing: tc.serveDirListingConfig,
+			}
+			// If IndexFiles is nil in test case, it implies default which is handled by ParseAndValidateStaticFileServerConfig
+			// If it's an empty slice, it should remain an empty slice.
+
+			logBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(logBuffer)
+			sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			req := newTestRequest(t, http.MethodGet, tc.requestPath, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s. Log: %s", tc.expectedStatus, status, logBuffer.String())
+			}
+
+			if tc.expectedStatus == "200" {
+				if contentType := mockWriter.getResponseHeader("content-type"); contentType != tc.expectedContentType {
+					t.Errorf("Expected Content-Type %s, got %s", tc.expectedContentType, contentType)
+				}
+				if body := string(mockWriter.getResponseBody()); body != tc.expectedContent {
+					t.Errorf("Expected body\n%s\nbut got\n%s", tc.expectedContent, body)
+				}
+			}
+
+			if tc.expectDefaultError {
+				bodyBytes := mockWriter.getResponseBody()
+				bodyStr := string(bodyBytes)
+				var statusCode int
+				_, err := fmt.Sscan(tc.expectedStatus, &statusCode)
+				if err != nil {
+					t.Fatalf("Failed to convert expectedStatus '%s' to int: %v", tc.expectedStatus, err)
+				}
+
+				if !strings.Contains(bodyStr, fmt.Sprintf("<title>%s %s</title>", tc.expectedStatus, http.StatusText(statusCode))) {
+					t.Errorf("Expected error page title for status %s, but not found in body. Body: %s", tc.expectedStatus, bodyStr)
+				}
+				if tc.errorDetail != "" {
+					if !strings.Contains(bodyStr, tc.errorDetail) {
+						t.Errorf("Expected error page body to contain detail '%s', but not found. Body: %s", tc.errorDetail, bodyStr)
+					}
+				}
+			}
+
+			logOutput := logBuffer.String()
+			for _, expectedLog := range tc.expectedLogContains {
+				// For directory paths in logs, they are often absolute.
+				// We need to construct the expected absolute path for log checking.
+				// Example: "dir1" in logs might be "/tmp/sfs_test_docroot_123/dir1"
+				var logCheckString string
+				if strings.Contains(expectedLog, "/") { // If it looks like a sub-path component
+					// This is a simplification. If the log message contains a full path component like "dir1/index.html",
+					// and tc.setupFiles paths are "dir1/index.html", this should work.
+					// If expectedLog is just "dir1", it might be logged as "path: /tmp.../dir1"
+					// This part needs to be robust depending on how SFS logs paths (relative vs absolute in different messages)
+					// For "Serving index file from directory", logged path is absolute path to index file.
+					// For "No index file ... sending 403 Forbidden", logged path is dirPath (absolute).
+					// For "_resolvePath" errors, path is canonicalPath (absolute).
+
+					// Let's assume for "Serving index file" or "File or directory not found", the log contains the part of the path.
+					// For "No index file and directory listing disabled", the log contains `dirPath: <absolute path>`
+					// We are checking if `expectedLog` (e.g., "dir1") is part of the logged absolute path.
+					if strings.HasSuffix(tc.requestPath, "/") && strings.HasPrefix(expectedLog, strings.TrimSuffix(strings.TrimPrefix(tc.requestPath, tc.matchedRoutePattern), "/")) {
+						// If expectedLog is like "dir1" and request was "/static/dir1/"
+						logCheckString = filepath.Join(docRoot, expectedLog)
+					} else if strings.Contains(expectedLog, "/") && !filepath.IsAbs(expectedLog) {
+						// if expectedLog is like "dir1/index.html"
+						logCheckString = filepath.Join(docRoot, expectedLog)
+					} else {
+						logCheckString = expectedLog // Use as is if it's not clearly a relative path component or seems specific
+					}
+
+				} else {
+					logCheckString = expectedLog
+				}
+
+				if !strings.Contains(logOutput, logCheckString) && !strings.Contains(logOutput, expectedLog) {
+					t.Errorf("Expected log to contain '%s' (or its absolute form like '%s'), but it didn't. Log: %s", expectedLog, logCheckString, logOutput)
+				}
+			}
+		})
+	}
+}
+
+// ptrToBool is a helper for tests to get a pointer to a boolean.
+func ptrToBool(b bool) *bool {
+	return &b
+}
