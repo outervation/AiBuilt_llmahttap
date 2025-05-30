@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time" // Added missing import
 
 	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/http2"
@@ -1930,6 +1931,251 @@ func TestStaticFileServer_ServeHTTP2_DirectoryListing(t *testing.T) {
 			if tc.checkHTMLBody != nil {
 				// tc.requestPath is the web path to the directory (e.g., "/public/special_chars_dir/")
 				tc.checkHTMLBody(t, string(mockWriter.getResponseBody()), docRoot, tc.requestPath, tc.setupFiles)
+			}
+		})
+	}
+}
+
+func TestStaticFileServer_ServeHTTP2_ConditionalRequests(t *testing.T) {
+	fileContent := "Test content for conditional requests."
+	filePathInDocRoot := "conditional.txt"
+	pastTime := time.Now().Add(-24 * time.Hour).Truncate(time.Second) // Truncate for consistent Last-Modified comparison
+
+	setupFiles := []fileSpec{
+		{Path: filePathInDocRoot, Content: fileContent},
+	}
+
+	docRoot, cleanup := setupTestDocumentRoot(t, setupFiles)
+	defer cleanup()
+
+	// Set a specific mod time for the test file
+	fullTestFilePath := filepath.Join(docRoot, filePathInDocRoot)
+	if err := os.Chtimes(fullTestFilePath, pastTime, pastTime); err != nil {
+		t.Fatalf("Failed to set mod time for %s: %v", fullTestFilePath, err)
+	}
+
+	fileInfo, err := os.Stat(fullTestFilePath)
+	if err != nil {
+		t.Fatalf("Failed to stat test file %s: %v", fullTestFilePath, err)
+	}
+	expectedETag := generateETag(fileInfo)
+	expectedLastModified := fileInfo.ModTime().UTC().Format(http.TimeFormat)
+
+	sfsConfig := config.StaticFileServerConfig{
+		DocumentRoot: docRoot,
+	}
+	logBuffer := new(bytes.Buffer)
+	testLogger := logger.NewTestLogger(logBuffer)
+	sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+	tests := []struct {
+		name                string
+		method              string
+		requestHeaders      http.Header
+		expectedStatus      string
+		expectedContent     string // Empty if 304
+		expectedETagHeader  string // Can be same as expectedETag or empty if not checked specifically for 200
+		expectedLastMod     string // Can be same as expectedLastModified or empty if not checked specifically for 200
+		expectLogContains   []string
+		matchedRoutePattern string
+	}{
+		// --- If-None-Match Tests ---
+		{
+			name:                "If-None-Match: Matching strong ETag",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-None-Match": []string{expectedETag}},
+			expectedStatus:      "304",
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-None-Match: Matching weak ETag (client sends weak, server's is strong)",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-None-Match": []string{`W/` + expectedETag}}, // Client sends weak form
+			expectedStatus:      "304",
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-None-Match: Non-matching ETag",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-None-Match": []string{`"non-matching-etag"`}},
+			expectedStatus:      "200",
+			expectedContent:     fileContent,
+			expectedETagHeader:  expectedETag, // Server should still send its current ETag
+			expectedLastMod:     expectedLastModified,
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-None-Match: * (resource exists)",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-None-Match": []string{`*`}},
+			expectedStatus:      "304",
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-None-Match: List of ETags, one matches",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-None-Match": []string{`"etag1", ` + expectedETag + `, "etag2"`}},
+			expectedStatus:      "304",
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+
+		// --- If-Modified-Since Tests ---
+		{
+			name:           "If-Modified-Since: Resource not modified (IMS time is same as mod time)",
+			method:         http.MethodGet,
+			requestHeaders: http.Header{"If-Modified-Since": []string{expectedLastModified}},
+			expectedStatus: "304",
+			// For 304 due to If-Modified-Since, ETag might or might not be sent.
+			// http.ServeContent (stdlib ref) sends ETag if available. Let's assume SFS also does.
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-Modified-Since: Resource not modified (IMS time is after mod time)",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-Modified-Since": []string{fileInfo.ModTime().Add(1 * time.Hour).UTC().Format(http.TimeFormat)}},
+			expectedStatus:      "304",
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-Modified-Since: Resource was modified (IMS time is before mod time)",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-Modified-Since": []string{fileInfo.ModTime().Add(-1 * time.Hour).UTC().Format(http.TimeFormat)}},
+			expectedStatus:      "200",
+			expectedContent:     fileContent,
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:                "If-Modified-Since: Invalid date format (should be ignored, serve 200)",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{"If-Modified-Since": []string{"invalid-date-format"}},
+			expectedStatus:      "200",
+			expectedContent:     fileContent,
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			matchedRoutePattern: "/files/",
+		},
+
+		// --- Precedence: If-None-Match over If-Modified-Since ---
+		{
+			name:   "Precedence: If-None-Match (non-match) and If-Modified-Since (would be 304)",
+			method: http.MethodGet,
+			requestHeaders: http.Header{
+				"If-None-Match":     []string{`"non-matching-etag"`}, // This causes 200
+				"If-Modified-Since": []string{expectedLastModified},  // This alone would cause 304
+			},
+			expectedStatus:      "200", // If-None-Match takes precedence
+			expectedContent:     fileContent,
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			matchedRoutePattern: "/files/",
+		},
+		{
+			name:   "Precedence: If-None-Match (match) and If-Modified-Since (would be 200)",
+			method: http.MethodGet,
+			requestHeaders: http.Header{
+				"If-None-Match":     []string{expectedETag},                                                         // This causes 304
+				"If-Modified-Since": []string{fileInfo.ModTime().Add(-1 * time.Hour).UTC().Format(http.TimeFormat)}, // This alone would cause 200
+			},
+			expectedStatus:      "304", // If-None-Match takes precedence
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			expectLogContains:   []string{"Sending 304 Not Modified"},
+			matchedRoutePattern: "/files/",
+		},
+
+		// --- No conditional headers ---
+		{
+			name:                "No conditional headers",
+			method:              http.MethodGet,
+			requestHeaders:      http.Header{},
+			expectedStatus:      "200",
+			expectedContent:     fileContent,
+			expectedETagHeader:  expectedETag,
+			expectedLastMod:     expectedLastModified,
+			matchedRoutePattern: "/files/",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuffer.Reset() // Clear log buffer for each test case
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			reqPath := tc.matchedRoutePattern + filePathInDocRoot
+			req := newTestRequest(t, tc.method, reqPath, nil, tc.requestHeaders)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s. Log: %s", tc.expectedStatus, status, logBuffer.String())
+			}
+
+			// Check ETag header
+			respETag := mockWriter.getResponseHeader("etag")
+			if tc.expectedETagHeader != "" { // Check if an ETag is expected for this response
+				if respETag != tc.expectedETagHeader {
+					t.Errorf("Expected ETag header '%s', got '%s'", tc.expectedETagHeader, respETag)
+				}
+			} else if tc.expectedStatus == "200" && respETag == "" {
+				// For 200s, ETag should always be present if the file handler reached that stage.
+				t.Error("Expected ETag header for 200 response, but it was missing")
+			}
+
+			// Check Last-Modified header
+			respLastMod := mockWriter.getResponseHeader("last-modified")
+			if tc.expectedLastMod != "" { // Check if Last-Modified is expected
+				if respLastMod != tc.expectedLastMod {
+					t.Errorf("Expected Last-Modified header '%s', got '%s'", tc.expectedLastMod, respLastMod)
+				}
+			} else if tc.expectedStatus == "200" && respLastMod == "" {
+				// For 200s, Last-Modified should always be present
+				t.Error("Expected Last-Modified header for 200 response, but it was missing")
+			}
+
+			body := mockWriter.getResponseBody()
+			if tc.expectedStatus == "304" {
+				if len(body) != 0 {
+					t.Errorf("Expected empty body for 304 response, got %d bytes: %s", len(body), string(body))
+				}
+			} else if tc.expectedStatus == "200" {
+				if string(body) != tc.expectedContent {
+					t.Errorf("Expected body\n%s\nbut got\n%s", tc.expectedContent, string(body))
+				}
+				// Also check Content-Length for 200
+				expectedCL := fmt.Sprintf("%d", len(tc.expectedContent))
+				if cl := mockWriter.getResponseHeader("content-length"); cl != expectedCL {
+					t.Errorf("Expected Content-Length '%s' for 200 response, got '%s'", expectedCL, cl)
+				}
+			}
+
+			currentLogOutput := logBuffer.String()
+			for _, expectedLog := range tc.expectLogContains {
+				if !strings.Contains(currentLogOutput, expectedLog) {
+					t.Errorf("Expected log to contain '%s', but it didn't. Log: %s", expectedLog, currentLogOutput)
+				}
 			}
 		})
 	}
