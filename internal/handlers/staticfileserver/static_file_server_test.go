@@ -171,6 +171,12 @@ type fileSpec struct {
 }
 
 // setupTestDocumentRoot creates a temporary directory structure for testing.
+
+// ptrToMode is a helper function to get a pointer to a fs.FileMode value.
+func ptrToMode(m fs.FileMode) *fs.FileMode {
+	return &m
+}
+
 // It returns the path to the document root and a cleanup function.
 func setupTestDocumentRoot(t *testing.T, files []fileSpec) (docRoot string, cleanup func()) {
 	t.Helper()
@@ -192,6 +198,13 @@ func setupTestDocumentRoot(t *testing.T, files []fileSpec) (docRoot string, clea
 				t.Fatalf("Failed to create directory %s: %v", fullPath, err)
 			}
 		} else {
+			// Ensure parent directory exists for the file
+			parentDir := filepath.Dir(fullPath)
+			if err = os.MkdirAll(parentDir, 0755); err != nil {
+				os.RemoveAll(tmpDir)
+				t.Fatalf("Failed to create parent directory %s for file %s: %v", parentDir, fullPath, err)
+			}
+
 			if mode == 0 {
 				mode = 0644
 			}
@@ -1218,6 +1231,185 @@ func TestStaticFileServer_ServeHTTP2_OptionsRequests(t *testing.T) {
 
 			if mockWriter.ended != true {
 				t.Error("Expected stream to be ended for OPTIONS request")
+			}
+		})
+	}
+}
+
+func TestStaticFileServer_ServeHTTP2_PathResolutionErrors(t *testing.T) {
+	tests := []struct {
+		name                string
+		setupFiles          []fileSpec                                                // Files to set up initially
+		docRootSubDir       string                                                    // Subdirectory within temp docRoot to use as actual DocumentRoot for the SFS
+		pathInRequest       string                                                    // Full request path
+		matchedRoutePattern string                                                    // Route pattern that matched this request
+		modifyFs            func(actualDocRoot string, fullPathToTarget string) error // Action to modify FS after setup, actualDocRoot is the specific SFS doc root
+		expectedStatus      string
+		expectLogContains   []string
+		expectedBodyDetail  string // Optional: if a specific detail message is expected for default error responses
+	}{
+		{
+			name:                "Path traversal - attempt to go above doc root",
+			setupFiles:          []fileSpec{{Path: "secret_outside.txt", Content: "should not see this"}}, // Created in temp root
+			docRootSubDir:       "public_files",                                                           // SFS DocumentRoot = /tmp/sfs_test_docroot_XYZ/public_files
+			pathInRequest:       "/files/../secret_outside.txt",                                           // request relative to /files/
+			matchedRoutePattern: "/files/",                                                                // maps to public_files
+			expectedStatus:      "404",
+			expectLogContains:   []string{"Attempt to access path outside document root", "secret_outside.txt"},
+			expectedBodyDetail:  "Resource not found (invalid path).", // Spec 2.3.1 says 404 for traversal
+		},
+		{
+			name:                "Path traversal - normalized path still outside doc root",
+			setupFiles:          []fileSpec{{Path: "root_file.txt", Content: "content"}}, // Exists at /tmpTEMP/root_file.txt
+			docRootSubDir:       "site/public",                                           // SFS DocumentRoot = /tmpTEMP/site/public
+			pathInRequest:       "/../../root_file.txt",                                  // Request relative to SFS DocumentRoot
+			matchedRoutePattern: "/",                                                     // Route pattern is "/", subPath will be "../../root_file.txt"
+			expectedStatus:      "404",
+			expectLogContains:   []string{"Attempt to access path outside document root", "root_file.txt"}, // Log should indicate traversal attempt to the actual file
+			expectedBodyDetail:  "Resource not found (invalid path).",
+		},
+		{
+			name:                "Non-existent file in DocumentRoot",
+			docRootSubDir:       "files",
+			pathInRequest:       "/static/nonexistent.txt",
+			matchedRoutePattern: "/static/",
+			expectedStatus:      "404",
+			expectLogContains:   []string{"File or directory not found by _resolvePath", "nonexistent.txt"},
+			expectedBodyDetail:  "File not found.",
+		},
+		{
+			name:                "Non-existent file in non-existent sub-directory",
+			docRootSubDir:       "files",
+			pathInRequest:       "/data/nosuchdir/nonexistent.txt",
+			matchedRoutePattern: "/data/",
+			expectedStatus:      "404",
+			expectLogContains:   []string{"File or directory not found by _resolvePath", "nosuchdir"}, // Will fail on stating "nosuchdir"
+			expectedBodyDetail:  "File not found.",
+		},
+		{
+
+			name: "File exists but os.Stat permission denied on the file itself",
+			setupFiles: []fileSpec{
+				{Path: "files/forbidden.txt", Content: "secret", Mode: 0644}, // Create readable initially
+				{Path: "files", IsDir: true, Mode: 0755},                     // Parent dir accessible
+			},
+			docRootSubDir:       "", // DocumentRoot is the temp dir itself
+			pathInRequest:       "/files/forbidden.txt",
+			matchedRoutePattern: "/",
+			modifyFs: func(actualDocRoot string, fullPathToTarget string) error {
+				// fullPathToTarget is .../files/forbidden.txt
+				return os.Chmod(fullPathToTarget, 0000)
+			},
+			expectedStatus: "403",
+			// This log comes from serveFile's os.Open attempt, as _resolvePath's os.Stat on a 0000 file might succeed
+			expectLogContains:  []string{"Permission denied opening file for GET", "forbidden.txt"},
+			expectedBodyDetail: "Access denied while opening file.",
+		},
+		{
+
+			name: "File exists in directory, but os.Stat permission denied on parent directory",
+			setupFiles: []fileSpec{
+				{Path: "secret_dir/accessible.txt", Content: "content", Mode: 0644},
+				{Path: "secret_dir", IsDir: true, Mode: 0755}, // Create searchable initially
+			},
+			docRootSubDir:       "",
+			pathInRequest:       "/secret_dir/accessible.txt",
+			matchedRoutePattern: "/",
+			modifyFs: func(actualDocRoot string, fullPathToTarget string) error {
+				// fullPathToTarget is .../secret_dir/accessible.txt
+				// We need to chmod the parent directory .../secret_dir
+				parentDir := filepath.Dir(fullPathToTarget)
+				return os.Chmod(parentDir, 0000)
+			},
+			expectedStatus:     "403",                                                                      // os.Stat on path will fail due to parent dir perms
+			expectLogContains:  []string{"Permission denied accessing path by _resolvePath", "secret_dir"}, // Error on stating "secret_dir" part of the path
+			expectedBodyDetail: "Access denied.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tempAppRoot, cleanup := setupTestDocumentRoot(t, tc.setupFiles)
+			defer cleanup()
+
+			actualSfsDocRoot := tempAppRoot
+			if tc.docRootSubDir != "" {
+				actualSfsDocRoot = filepath.Join(tempAppRoot, tc.docRootSubDir)
+				if err := os.MkdirAll(actualSfsDocRoot, 0755); err != nil {
+					t.Fatalf("Failed to create SFS DocumentRoot subdir %s: %v", tc.docRootSubDir, err)
+				}
+			}
+
+			// Determine full path to the target file/dir for modifyFs if needed
+			var targetFsPathForModify string
+			requestSubPath := strings.TrimPrefix(tc.pathInRequest, tc.matchedRoutePattern)
+			requestSubPath = strings.TrimPrefix(requestSubPath, "/")
+			if requestSubPath != "" { // If not requesting the doc root itself
+				targetFsPathForModify = filepath.Join(actualSfsDocRoot, requestSubPath)
+			}
+
+			if tc.modifyFs != nil {
+				if err := tc.modifyFs(actualSfsDocRoot, targetFsPathForModify); err != nil {
+					t.Fatalf("modifyFs failed: %v", err)
+				}
+			}
+
+			sfsConfig := config.StaticFileServerConfig{DocumentRoot: actualSfsDocRoot}
+			logBuffer := new(bytes.Buffer)
+			testLogger := logger.NewTestLogger(logBuffer)
+			sfs := newTestStaticFileServer(t, sfsConfig, testLogger, "")
+
+			mockWriter := newMockStreamWriter(t, 1)
+			ctx := context.WithValue(context.Background(), router.MatchedPathPatternKey{}, tc.matchedRoutePattern)
+			mockWriter.setContext(ctx)
+
+			req := newTestRequest(t, http.MethodGet, tc.pathInRequest, nil, nil)
+			req = req.WithContext(ctx)
+
+			sfs.ServeHTTP2(mockWriter, req)
+
+			if status := mockWriter.getResponseStatus(); status != tc.expectedStatus {
+				t.Errorf("Expected status %s, got %s. Log: %s", tc.expectedStatus, status, logBuffer.String())
+			}
+
+			// Check if the default error response was sent
+			// The default error responses are JSON or HTML based on Accept header.
+			// For unit tests, we usually don't set Accept, so HTML is expected.
+			// For 4xx/5xx errors, server.SendDefaultErrorResponse is called.
+			bodyBytes := mockWriter.getResponseBody()
+			bodyStr := string(bodyBytes)
+
+			if tc.expectedStatus == "404" || tc.expectedStatus == "403" || tc.expectedStatus == "500" {
+				// Attempt to convert string status to int for http.StatusText
+				var statusCode int
+				_, err := fmt.Sscan(tc.expectedStatus, &statusCode)
+				if err != nil {
+					t.Fatalf("Failed to convert expectedStatus '%s' to int: %v", tc.expectedStatus, err)
+				}
+
+				if !strings.Contains(bodyStr, fmt.Sprintf("<title>%s %s</title>", tc.expectedStatus, http.StatusText(statusCode))) {
+					t.Errorf("Expected error page title for status %s, but not found in body. Body: %s", tc.expectedStatus, bodyStr)
+				}
+				if tc.expectedBodyDetail != "" {
+					// The 'detail' field in JSON is optional. The HTML version has a standard message.
+					// We're checking a simplified version of the HTML message here.
+					// For 404: "The requested resource was not found on this server."
+					// For 403: "You do not have permission to access this resource."
+					// Let's check for the detail message if provided.
+					// server.SendDefaultErrorResponse uses the `optionalDetail` as part of the specific message string for HTML.
+					// Example for 404: <h1>Not Found</h1><p>The requested resource was not found on this server. Optional Detail.</p>
+					// So, we can check if `tc.expectedBodyDetail` is in the body.
+					if !strings.Contains(bodyStr, tc.expectedBodyDetail) {
+						t.Errorf("Expected error page body to contain detail '%s', but not found. Body: %s", tc.expectedBodyDetail, bodyStr)
+					}
+				}
+			}
+
+			logOutput := logBuffer.String()
+			for _, expectedLog := range tc.expectLogContains {
+				if !strings.Contains(logOutput, expectedLog) {
+					t.Errorf("Expected log to contain '%s', but it didn't. Log: %s", expectedLog, logOutput)
+				}
 			}
 		})
 	}
