@@ -1,0 +1,212 @@
+Feature Specifications for HTTP/2 Server (Beyond Core RFC)
+
+Preamble:
+The following specifications detail additional functionalities to be implemented in the Golang HTTP/2 server. These features are layered on top of a compliant HTTP/2 implementation. The server MUST first and foremost adhere to the HTTP/2 specification (RFC 7540) and HPACK compression (RFC 7541). For the latter (HPAC) it may use the go package golang.org/x/net/http2/hpack , but RFC 7540 must be implemented from scatch without using the Golang HTTP server library. The Golang stdlib HTTP library may however be used as a client for unit testing the server.
+
+The server is configured via a single configuration file. The path to this file MUST be provided to the server at startup (e.g., via a command-line argument). The server MUST support configuration files in JSON and TOML formats. It SHOULD auto-detect the format based on file extension (e.g., .json, .toml) or content. YAML configuration files will NOT be supported. All configuration parameters mentioned are indicative and are expected to be nested within a structured configuration file.
+
+Overall Configuration Structure (Conceptual):
+The configuration file will generally be organized into top-level sections, such as:
+
+server: For general server settings like timeouts, executable paths for upgrades.
+
+routing: Containing the list of routes.
+
+logging: Containing access_log and error_log configurations.
+
+Specific handler configurations might be nested within their route definitions or referenced.
+
+1. Request Routing and Multiplexing
+
+1.1. Objective:
+To provide a configurable mechanism for dispatching incoming HTTP/2 requests to designated handlers based on the request's URI path.
+
+1.2. Configuration:
+1.2.1. The server MUST support a routing table, specified in its configuration (e.g., under a routing.routes list).
+1.2.2. Each entry in the routing table (a "route") MUST define:
+* PathPattern: A string defining the URI path pattern. Path patterns are case-sensitive.
+* MatchType: A string, either "Exact" or "Prefix", explicitly defining how the PathPattern is interpreted.
+* HandlerType: An identifier string (e.g., "StaticFileServer", "ReverseProxy_ServiceA") specifying the handler responsible for requests matching this pattern. This string is user-defined and maps to a registered handler implementation.
+* HandlerConfig (Optional): A structured object containing configuration specific to the HandlerType. The router itself MUST treat this as opaque data to be passed to the handler.
+1.2.3. Supported PathPattern types and validation:
+* Exact Match: Defined by MatchType: "Exact".
+* Example: PathPattern: "/login", MatchType: "Exact".
+* Matches only the exact path.
+* Patterns with MatchType: "Exact" MUST NOT end with a /, except for the root path / itself (e.g., PathPattern: "/", MatchType: "Exact" is valid). Configurations violating this (e.g., PathPattern: "/admin/", MatchType: "Exact") MUST be rejected at startup.
+* Prefix Match: Defined by MatchType: "Prefix".
+* Example: PathPattern: "/static/", MatchType: "Prefix".
+* Matches any path starting with this prefix.
+* Patterns with MatchType: "Prefix" MUST end with a /. Configurations violating this (e.g., PathPattern: "/images", MatchType: "Prefix") MUST be rejected at startup.
+1.2.4. Route Matching Precedence:
+* When a request URI path is received, the server MUST attempt to match it against all configured routes.
+* An Exact match MUST take precedence over a Prefix match.
+* If multiple Prefix matches are possible, the longest (most specific) PathPattern MUST be chosen.
+* If an exact match and a prefix match could conceptually apply to the same request path (e.g., request /foo/ with routes PathPattern: "/foo/", MatchType: "Exact" and PathPattern: "/foo/", MatchType: "Prefix"), the Exact match takes precedence as per the first rule.
+* Ambiguity: A configuration containing two or more routes with identical PathPattern AND identical MatchType values is considered invalid. The server MUST reject such a configuration at startup and log a critical error.
+
+1.3. Behavior:
+1.3.1. For each incoming HTTP/2 request, the server MUST extract the :path pseudo-header value.
+1.3.2. The server MUST apply the matching logic defined in 1.2.4 to find the appropriate route.
+1.3.3. If a route is successfully matched:
+* The request, its associated HTTP/2 stream, and the HandlerConfig for the matched route MUST be passed to the designated HandlerType.
+* The handler is then responsible for processing the request and generating a response.
+1.3.4. If no route matches the request path, the server MUST generate and send an HTTP 404 Not Found response on the corresponding stream, as per Section 5 (Default Error Responses).
+1.3.5. The routing mechanism MUST operate independently for each HTTP/2 stream, fully leveraging HTTP/2's multiplexing capabilities.
+
+1.4. Handler Implementation and Registration:
+1.4.1. The server's internal design MUST facilitate the registration of different HandlerType implementations. This registration mechanism SHOULD map the HandlerType string (from configuration) to a factory function or constructor for the corresponding handler.
+1.4.2. Each handler implementation MUST conform to a server-defined internal interface (e.g., a Go interface) that accepts necessary request details (like http.Request or equivalent structured data), a means to write the response (like http.ResponseWriter or equivalent stream writer), and its specific HandlerConfig (as an opaque structure to be type-asserted by the handler).
+
+2. Static File Serving
+
+2.1. Objective:
+To serve static files from the server's local filesystem for requests routed to a static file handler. This handler is activated by a specific HandlerType (e.g., "StaticFileServer") in a route.
+
+2.2. Configuration (within HandlerConfig for a "StaticFileServer" route):
+2.2.1. DocumentRoot: A string specifying the absolute filesystem path to the root directory from which files will be served for this route. Relative paths are NOT permitted for DocumentRoot to avoid ambiguity.
+2.2.2. IndexFiles (Optional): An ordered list of strings (e.g., ["index.html", "index.htm"]). If a request path maps to a directory within the DocumentRoot, the server will attempt to serve these files in the order specified. Defaults to ["index.html"] if not provided.
+2.2.3. ServeDirectoryListing (Optional): A boolean. If true, and a request path maps to a directory, and no IndexFiles are found in that directory, the server MUST generate and serve an HTML listing of the directory's contents. Defaults to false.
+2.2.4. MimeTypes (Optional): A map (inline object) or a string path to a JSON file defining custom file extension to MIME type mappings (e.g., { ".custom": "application/x-custom", ".webp": "image/webp" }). If a path is provided, the file MUST be a JSON object where keys are extensions (including the leading dot) and values are MIME type strings. If not provided, or if an extension is not found in custom mappings, the server MUST use a comprehensive built-in set of common MIME types (e.g., derived from Go's mime.TypeByExtension). Default to application/octet-stream if no type can be determined.
+
+2.3. Behavior:
+2.3.1. Path Resolution and Security:
+* When a request is received by this handler, the part of the request path that follows the matched PathPattern prefix (from the route definition) MUST be appended to the DocumentRoot to form the target filesystem path. If the request path is identical to the PathPattern (e.g., request for /static/ with PathPattern: "/static/"), the effective path component to append is empty, correctly targeting the DocumentRoot itself for index file lookup or directory listing.
+* The resulting path MUST be canonicalized (e.g., resolving . and ..).
+* The server MUST ensure that the canonicalized path is still within the configured DocumentRoot. Any attempt to access files outside the DocumentRoot (e.g., using ../ to escape) MUST result in an HTTP 404 Not Found response (as per Section 5, to avoid leaking information about filesystem structure).
+2.3.2. Supported HTTP Methods: This handler primarily supports GET and HEAD requests. It SHOULD also support OPTIONS requests, responding with an HTTP 204 No Content (or 200 OK) and an Allow: GET, HEAD, OPTIONS header. Other methods SHOULD result in an HTTP 405 Method Not Allowed response (as per Section 5).
+2.3.3. File Handling:
+* If the resolved path points to a regular file:
+* For GET requests: Respond with HTTP 200 OK. Set Content-Type (per 2.2.4), Content-Length, Last-Modified (from file metadata), and an ETag (e.g., based on file size and modification time). Send the file content as the response body.
+* For HEAD requests: Respond as per GET, but OMIT the response body. All headers MUST be identical to a GET request.
+* If the resolved path points to a directory:
+* Attempt to serve an IndexFiles entry (per 2.2.2). If an index file is found, it is served as a regular file (per 2.3.3.1). The search stops at the first IndexFiles entry found.
+* If no IndexFiles found and ServeDirectoryListing is true (per 2.2.3), generate and serve an HTML directory listing with HTTP 200 OK and Content-Type: text/html; charset=utf-8.
+* If no IndexFiles found and ServeDirectoryListing is false, respond with HTTP 403 Forbidden (as per Section 5).
+2.3.4. Error Handling (responses as per Section 5):
+* If the resolved path does not exist (after DocumentRoot validation): HTTP 404 Not Found.
+* If file access is denied due to filesystem permissions (and path is validly within DocumentRoot): HTTP 403 Forbidden.
+* Other I/O errors during file read: HTTP 500 Internal Server Error.
+2.3.5. Conditional Requests (Caching):
+* The server MUST support If-None-Match request headers. If the client's ETag matches the current ETag for the resource, respond with HTTP 304 Not Modified.
+* The server MUST support If-Modified-Since request headers. If the resource has not been modified since the timestamp, respond with HTTP 304 Not Modified.
+* If both If-None-Match and If-Modified-Since are present, If-None-Match takes precedence.
+2.3.6. HTTP/2 Considerations: Large file transfers MUST respect HTTP/2 flow control mechanisms.
+
+3. Configurable Logging
+
+3.1. Objective:
+To provide structured and configurable logging for server operational events (access and errors).
+
+3.2. General Logging Configuration (e.g., under a top-level logging object):
+3.2.1. LogLevel: A string defining the minimum severity for error logs. Supported values: "DEBUG", "INFO", "WARNING", "ERROR". Default: "INFO".
+* Hierarchy: Levels are hierarchical (inclusive of higher severity):
+* DEBUG: Logs DEBUG, INFO, WARNING, ERROR.
+* INFO: Logs INFO, WARNING, ERROR.
+* WARNING: Logs WARNING, ERROR.
+* ERROR: Logs only ERROR.
+* Server internal messages with severity below the configured LogLevel MUST NOT be logged by the error logger.
+
+3.3. Access Logging (e.g., under logging.access_log):
+3.3.1. AccessLog Configuration:
+* Enabled: Boolean. true to enable. Default: true.
+* Target: String. "stdout", "stderr", or an absolute filesystem path for the log file. Default: "stdout".
+* Format: String. Currently supported: "json". Future MAY include "clf" (Common Log Format). Default: "json".
+* TrustedProxies (Optional): An array of strings representing CIDR blocks (e.g., ["192.168.1.0/24", "10.0.0.0/8"]) or individual IP addresses of trusted reverse proxies.
+* RealIPHeader (Optional): String, name of the HTTP header to consult for the client's real IP if the request's direct peer is in TrustedProxies (e.g., "X-Forwarded-For", "CF-Connecting-IP"). Defaults to "X-Forwarded-For". The server MUST parse this header from right to left, selecting the first IP address that is not listed in TrustedProxies. If all IPs in the header are trusted, or the header is malformed, the direct peer IP is used.
+3.3.2. JSON Access Log Entry: Each entry MUST be a single JSON object per line. Each line MUST be written atomically to the target to prevent interleaving from concurrent requests. Fields MUST include:
+* ts: String (ISO 8601 UTC with millisecond precision, e.g., "2023-03-15T12:00:00.123Z").
+* remote_addr: String (Client IP). If TrustedProxies and RealIPHeader are configured and conditions met, this is the identified real client IP; otherwise, it's the direct peer IP address.
+* remote_port: Number (Client port of the direct peer).
+* protocol: String (e.g., "HTTP/2.0").
+* method: String (e.g., "GET", "POST").
+* uri: String (Original request URI including path and query, e.g., "/search?q=http2").
+* status: Number (HTTP status code, e.g., 200, 404).
+* resp_bytes: Number (Response body size in bytes, excluding headers).
+* duration_ms: Number (Request processing time in milliseconds, from first byte of request received to last byte of response sent, or as close as practically measurable).
+* user_agent (Optional): String (From User-Agent header, if present).
+* referer (Optional): String (From Referer header, if present).
+* h2_stream_id: Number (HTTP/2 stream ID associated with the request).
+
+3.4. Error Logging (e.g., under logging.error_log):
+3.4.1. ErrorLog Configuration:
+* Target: String. "stdout", "stderr", or an absolute filesystem path for the log file. Default: "stderr". (LogLevel is global, see 3.2.1)
+3.4.2. Error Log Entry Format: Each entry MUST be a single line. If logging structured data (e.g. JSON), it must be a single JSON object per line. Each line MUST be written atomically. Fields MUST include:
+* ts: String (ISO 8601 UTC with millisecond precision, same format as access log ts).
+* level: String (Log level of the message, e.g., "ERROR", "WARNING", "INFO", "DEBUG").
+* msg: String (The primary error message).
+* source (Optional): String (e.g., filename.go:123 or module.function). The server framework SHOULD attempt to populate this automatically for errors originating within its core or common utilities (e.g., using runtime.Caller()). Handlers MAY also provide this field for errors they log.
+* Associated request details (Optional, if error is request-bound and available): method (string), uri (string), h2_stream_id (number).
+* Additional structured error details (Optional): A key-value map for other relevant error context.
+
+3.5. Log File Handling:
+3.5.1. If logging to a file (Target is a filesystem path for access or error logs), the server SHOULD attempt to reopen its log files upon receiving a SIGHUP signal (or an equivalent mechanism on non-POSIX systems, if supported). This facilitates external log rotation utilities. This is separate from full configuration reload functionality.
+
+4. Zero-Downtime Configuration Reload and Binary Upgrade (Hot Reload)
+
+4.1. Objective:
+To allow the server to apply new configuration and/or upgrade its executable binary without losing active connections or failing in-flight requests. This feature primarily targets POSIX-like environments supporting SIGHUP and FD passing.
+
+4.2. Trigger:
+4.2.1. The server MUST listen for the SIGHUP signal to initiate a configuration reload or binary upgrade.
+
+4.3. Core Mechanism (Graceful Process Handoff):
+4.3.1. Initial State: The server runs as a "parent" process. This parent process is responsible for binding to network ports and managing connections.
+4.3.2. On Receiving SIGHUP:
+* Parent Process (Old):
+1. Re-reads its configuration from the original configuration file path it was started with. Validates the new configuration. If the new configuration is invalid, it logs a critical error and continues operating with its current (old) configuration; the reload attempt is aborted.
+2. If the new configuration is valid:
+* Determine the path to the server executable for the new process. This is the path of the currently running executable unless the newly loaded configuration contains a valid server.executable_path (a top-level configuration string parameter, e.g., in a server section) which specifies a different path. If server.executable_path is specified, that path is used.
+* Fork and execute a new instance of the server executable ("Child Process" or "New Parent") using the determined path.
+3. Pass the listening socket file descriptor(s) to the Child Process. This is typically achieved by ensuring the FDs are not marked FD_CLOEXEC and then passing their numbers via environment variables (e.g., LISTEN_FDS=fd_num1:fd_num2). The Child Process MUST be designed to detect and use these inherited FDs.
+4. Wait for a readiness signal from the Child Process. A common mechanism is for the child to close an inherited pipe file descriptor (also passed from parent to child) once it has successfully initialized, bound to the inherited listening sockets, and is ready to serve traffic. This wait MUST have a configurable timeout (e.g., server.child_readiness_timeout: 10s, specified in the server's main configuration).
+5. If the Child Process signals readiness within the timeout:
+* The Old Parent stops accepting new connections on its instances of the listening sockets.
+* For all existing HTTP/2 connections it manages, the Old Parent sends a GOAWAY frame. The GOAWAY frame's "Last-Stream-ID" MUST indicate the highest stream ID on which requests might have been or are being processed by this Old Parent.
+* The Old Parent allows existing connections and their active streams to complete gracefully, up to a configurable server.graceful_shutdown_timeout (e.g., 30s, specified in the server's main configuration).
+* After all its connections are closed or the server.graceful_shutdown_timeout expires, the Old Parent process MUST exit.
+6. If the Child Process fails to signal readiness (e.g., exits prematurely or the child_readiness_timeout expires): The Old Parent logs a critical error, aborts the reload/upgrade attempt, and continues operating with its current configuration and connections. It MUST NOT proceed with its own shutdown.
+* Child Process (New Parent):
+1. On startup, check for inherited listening socket file descriptors (e.g., from LISTEN_FDS environment variable).
+2. If found, initialize listeners using these FDs instead of creating new ones. This allows it to accept connections on the same ports as the Old Parent.
+3. Load its configuration (which will be the newly specified one if the Old Parent successfully re-read and validated it).
+4. Begin accepting new connections.
+5. Signal readiness back to the Old Parent process (e.g., by closing its end of the inherited readiness pipe).
+
+4.4. Socket Configuration for Handoff:
+4.4.1. The initial listening sockets MUST be created with properties that facilitate sharing or inheritance. Specifically, they MUST NOT have the FD_CLOEXEC (close-on-exec) flag set before the Old Parent execs the Child Process.
+
+4.5. State Considerations:
+4.5.1. This mechanism primarily handles connection persistence and configuration updates. Application-level in-memory state (e.g., caches not backed by an external store, non-idempotent operations in progress specific to a handler instance) is NOT inherently preserved across the process boundary unless explicitly designed for by the application logic (e.g., via externalized state stores).
+
+4.6. Error Handling during Reload (Covered in 4.3.2 Parent item 6):
+The Old Parent process is responsible for robustly handling failures of the Child Process to initialize and take over, ensuring it continues service if the reload/upgrade cannot complete.
+
+4.7. Binary Upgrade Notes:
+4.7.1. If the server.executable_path in the newly loaded configuration specifies a new binary, the exec call by the Old Parent process will start that new binary version. The new binary must be compatible with the FD passing and readiness signaling mechanisms. If server.executable_path is not specified or is the same as the current executable, the existing binary is re-exec'd (useful for configuration-only reloads or replacing the binary in-place with an identical path).
+
+5. Default Error Responses
+
+5.1. Objective:
+To define standard, minimal, and content-negotiated response bodies for server-generated HTTP errors when a more specific handler response is not provided.
+
+5.2. Behavior:
+5.2.1. When the server itself (not a specific application handler providing its own custom error page) needs to generate an HTTP error response (e.g., 403 Forbidden, 404 Not Found, 405 Method Not Allowed, 500 Internal Server Error):
+* It MUST inspect the Accept header of the incoming request.
+* If the Accept header indicates a preference for application/json (e.g., application/json is the first listed type with q > 0, or */* is present and no other type has higher q-value than application/json, or application/json is present with q=1.0), the server SHOULD respond with a JSON body. The Content-Type header MUST be application/json; charset=utf-8. The JSON body structure SHOULD be:
+json { "error": { "status_code": <HTTP_STATUS_CODE_INT>, "message": "<STANDARD_HTTP_STATUS_MESSAGE_STRING>", "detail": "<OPTIONAL_MORE_SPECIFIC_MESSAGE_STRING>" } }
+Example for 404:
+json { "error": { "status_code": 404, "message": "Not Found" } }
+* Otherwise (including if Accept header is absent, or indicates preference for text/html or text/*), the server MUST respond with a minimal HTML body. The Content-Type header MUST be text/html; charset=utf-8.
+* Example for 404 Not Found:
+<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1><p>The requested resource was not found on this server.</p></body></html>
+* Example for 500 Internal Server Error:
+<html><head><title>500 Internal Server Error</title></head><body><h1>Internal Server Error</h1><p>The server encountered an internal error and was unable to complete your request.</p></body></html>
+5.2.2. The content of these default messages MUST be simple and avoid exposing sensitive internal structural details. The optional detail field in the JSON response MAY provide slightly more context if deemed safe and useful.
+5.2.3. These default error response mechanisms are overridden if a specific handler (e.g., the Static File Server for its own 403/404 errors related to file access, or a custom application handler) generates its own complete error response.
+
+The server must be implemented in a "functional core, imperative shell" style that maximises testability and makes code more pure/deterministic by putting IO at the edge of the program. Internal mutability is however allowed, for performance reasons (e.g. functions taking pointers as arguments and modifying them).
+
+Each component should have some unit tests, and there should also be some extensive whole-program/end-to-end tests that use the go stdlib http client and curl to verify the responses are correct. Ideally a test abstraction would be build that allows testing a single request and expected output with both curl and the go stdlib http client, without needing to duplicate the test or request/expected output. Unit tests should use the spec as reference for determining what is correct behaviour, but if the spec appears to contradict with what curl expects in integration tests, then curl's expectations should be used as reference.
+
+DO NOT use TestMain for the tests as the harness framework can't determine between a TestMain test logic failure and a unit test compilation failure (compilation failures are treated differently from test failures).
+DO NOT try increasing the timeout, when an end-to-end test times out at 10+ seconds. The tests are running on a fast machine and server startup shouldn't take more than a second; if it's hitting a 10 second timeout that means the response isn't coming, and it should be debugged why the server isn't sending a response. Increasing the timeout (or running tests in parallel) won't help!
