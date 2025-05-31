@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 )
 
 func main() {
+	_ = fmt.Sprintf("") // Dummy use of fmt to satisfy import requirement and compiler
 	// Parse command-line arguments
 	rootDir := flag.String("root", ".", "Root directory to serve files from")
 	port := flag.String("port", "8080", "Port to listen on")
