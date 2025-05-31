@@ -2095,3 +2095,115 @@ func TestPriorityTree_UpdatePriority_SelfDependencyError(t *testing.T) {
 		t.Errorf("Sibling %d: children changed. Expected [], got %v", siblingID, cs)
 	}
 }
+
+func TestPriorityTree_ExclusiveChildOfStream0(t *testing.T) {
+	pt := NewPriorityTree()
+
+	// Initial streams, all direct children of stream 0
+	streamA := uint32(1)
+	streamB := uint32(3)
+	streamC := uint32(5)
+	streamToBeExclusive := streamA // Stream 1 will become the exclusive child of stream 0
+
+	weightA := uint8(10)
+	weightB := uint8(20)
+	weightC := uint8(30)
+	newWeightForExclusive := uint8(100) // New weight for streamA when it becomes exclusive
+
+	// Add initial streams
+	// These calls will use UpdatePriority internally, which correctly handles locking.
+	if err := pt.AddStream(streamA, &streamDependencyInfo{StreamDependency: 0, Weight: weightA, Exclusive: false}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamA, err)
+	}
+	if err := pt.AddStream(streamB, &streamDependencyInfo{StreamDependency: 0, Weight: weightB, Exclusive: false}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamB, err)
+	}
+	if err := pt.AddStream(streamC, &streamDependencyInfo{StreamDependency: 0, Weight: weightC, Exclusive: false}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamC, err)
+	}
+
+	// Verify initial state of stream 0
+	_, rootChildrenPre, _, _ := pt.GetDependencies(0)
+	expectedRootChildrenPre := []uint32{streamA, streamB, streamC}
+	if !reflect.DeepEqual(sortUint32Slice(rootChildrenPre), sortUint32Slice(expectedRootChildrenPre)) {
+		t.Fatalf("Pre-Update: Stream 0 children expected %v, got %v", sortUint32Slice(expectedRootChildrenPre), sortUint32Slice(rootChildrenPre))
+	}
+
+	// Make streamA an exclusive child of stream 0
+	// UpdatePriority is called by AddStream or ProcessPriorityFrame which handle locking.
+	// Here, we call UpdatePriority directly for testing its effect.
+	// The public UpdatePriority method itself now handles locking.
+	err := pt.UpdatePriority(streamToBeExclusive, 0, newWeightForExclusive, true)
+
+	if err != nil {
+		t.Fatalf("UpdatePriority to make stream %d exclusive child of stream 0 failed: %v", streamToBeExclusive, err)
+	}
+
+	// Verifications:
+
+	// 1. streamToBeExclusive (streamA)
+	//    - Parent should be 0.
+	//    - Weight should be newWeightForExclusive.
+	//    - Children should be streamB and streamC.
+	sA_parent, sA_children, sA_weight, errGetA := pt.GetDependencies(streamToBeExclusive)
+	if errGetA != nil {
+		t.Fatalf("GetDependencies for stream %d (exclusive child) failed: %v", streamToBeExclusive, errGetA)
+	}
+	if sA_parent != 0 {
+		t.Errorf("Stream %d: expected parent 0, got %d", streamToBeExclusive, sA_parent)
+	}
+	if sA_weight != newWeightForExclusive {
+		t.Errorf("Stream %d: expected weight %d, got %d", streamToBeExclusive, newWeightForExclusive, sA_weight)
+	}
+	expected_sA_children := []uint32{streamB, streamC}
+	if !reflect.DeepEqual(sortUint32Slice(sA_children), sortUint32Slice(expected_sA_children)) {
+		t.Errorf("Stream %d: expected children %v, got %v", streamToBeExclusive, sortUint32Slice(expected_sA_children), sortUint32Slice(sA_children))
+	}
+
+	// 2. Stream 0 (root)
+	//    - Parent is 0.
+	//    - Children list should only contain streamToBeExclusive (streamA).
+	//    - Weight is 0.
+	s0_parent, s0_children, s0_weight, errGet0 := pt.GetDependencies(0)
+	if errGet0 != nil {
+		t.Fatalf("GetDependencies for stream 0 failed: %v", errGet0)
+	}
+	if s0_parent != 0 {
+		t.Errorf("Stream 0: expected parent 0, got %d", s0_parent)
+	}
+	if s0_weight != 0 {
+		t.Errorf("Stream 0: expected weight 0, got %d", s0_weight)
+	}
+	expected_s0_children := []uint32{streamToBeExclusive}
+	if !reflect.DeepEqual(sortUint32Slice(s0_children), sortUint32Slice(expected_s0_children)) {
+		t.Errorf("Stream 0: expected children %v, got %v", sortUint32Slice(expected_s0_children), sortUint32Slice(s0_children))
+	}
+
+	// 3. streamB
+	//    - Parent should now be streamToBeExclusive (streamA).
+	//    - Weight should be preserved (weightB).
+	sB_parent, _, sB_weight, errGetB := pt.GetDependencies(streamB)
+	if errGetB != nil {
+		t.Fatalf("GetDependencies for stream %d failed: %v", streamB, errGetB)
+	}
+	if sB_parent != streamToBeExclusive {
+		t.Errorf("Stream %d: expected parent %d, got %d", streamB, streamToBeExclusive, sB_parent)
+	}
+	if sB_weight != weightB {
+		t.Errorf("Stream %d: expected weight %d (preserved), got %d", streamB, weightB, sB_weight)
+	}
+
+	// 4. streamC
+	//    - Parent should now be streamToBeExclusive (streamA).
+	//    - Weight should be preserved (weightC).
+	sC_parent, _, sC_weight, errGetC := pt.GetDependencies(streamC)
+	if errGetC != nil {
+		t.Fatalf("GetDependencies for stream %d failed: %v", streamC, errGetC)
+	}
+	if sC_parent != streamToBeExclusive {
+		t.Errorf("Stream %d: expected parent %d, got %d", streamC, streamToBeExclusive, sC_parent)
+	}
+	if sC_weight != weightC {
+		t.Errorf("Stream %d: expected weight %d (preserved), got %d", streamC, weightC, sC_weight)
+	}
+}
