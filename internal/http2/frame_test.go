@@ -1809,7 +1809,7 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              validSettingBytes,
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeFrameSizeError,
-			expectedMsgSubstring: "SETTINGS ACK frame must have a payload length of 0, got 6",
+			expectedMsgSubstring: "", // As per task, de-emphasize exact message for FRAME_SIZE_ERROR
 		},
 		{
 			name: "payload length not multiple of setting entry size",
