@@ -2972,7 +2972,8 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				0x00, 0x00, 0x00, 0x01, // StreamID=1
 				0x01, 0x02, 0x03, // Dummy payload
 			},
-			expectedErrStr: "parsing PRIORITY payload: PRIORITY frame payload must be 5 bytes, got 3",
+			// ReadFrame wraps the error: "parsing PRIORITY payload: <original error>"
+			expectedErrStr: "parsing PRIORITY payload: stream error on stream 1: PRIORITY frame payload must be 5 bytes, got 3 (code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "RST_STREAM frame, Header.Length != 4 (is 2)",
