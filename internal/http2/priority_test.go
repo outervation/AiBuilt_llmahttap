@@ -1656,17 +1656,14 @@ func TestPriorityTree_UpdatePriority_CycleDetection(t *testing.T) {
 	}
 
 	// Setup for another cycle test: 0 -> 105, 105 -> 104
-	pt.mu.Lock()
+
 	// Create 105 (child of 0), then 104 (child of 105)
 	// Use UpdatePriority directly for setup convenience as getOrCreateNodeNoLock is used internally.
 	_ = pt.UpdatePriority(105, 0, 10, false)
 	_ = pt.UpdatePriority(104, 105, 10, false)
-	pt.mu.Unlock()
 
 	// Attempt to make 105 depend on 104. This would create a cycle: 105 -> 104 -> 105
-	pt.mu.Lock()
 	err = pt.UpdatePriority(105, 104, 10, false)
-	pt.mu.Unlock()
 
 	if err == nil {
 		t.Fatalf("UpdatePriority should have failed due to cycle detection (105 depends on 104)")
