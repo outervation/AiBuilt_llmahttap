@@ -1376,10 +1376,13 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 	baseHeaderZeroStreamID := http2.FrameHeader{Type: http2.FramePriority, StreamID: 0}
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string // Expects exact error string for these tests
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedMsgSubstring string // Substring for error messages
+		expectStreamError    bool
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "payload too short, stream ID > 0",
@@ -1388,8 +1391,10 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 4 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
-			payload:     make([]byte, 4),
-			expectedErr: "stream error on stream 1: PRIORITY frame payload must be 5 bytes, got 4 (code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 4),
+			expectedMsgSubstring: "PRIORITY frame payload must be 5 bytes, got 4",
+			expectStreamError:    true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
 		},
 		{
 			name: "payload too long, stream ID > 0",
@@ -1398,8 +1403,10 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 6 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
-			payload:     make([]byte, 6),
-			expectedErr: "stream error on stream 1: PRIORITY frame payload must be 5 bytes, got 6 (code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 6),
+			expectedMsgSubstring: "PRIORITY frame payload must be 5 bytes, got 6",
+			expectStreamError:    true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
 		},
 		{
 			name: "payload too short, stream ID 0",
@@ -1408,8 +1415,10 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 4 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
-			payload:     make([]byte, 4),
-			expectedErr: "connection error: PRIORITY frame payload must be 5 bytes, got 4 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 4),
+			expectedMsgSubstring: "PRIORITY frame payload must be 5 bytes, got 4",
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
 		},
 		{
 			name: "payload too long, stream ID 0",
@@ -1418,8 +1427,10 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 6 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
-			payload:     make([]byte, 6),
-			expectedErr: "connection error: PRIORITY frame payload must be 5 bytes, got 6 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 6),
+			expectedMsgSubstring: "PRIORITY frame payload must be 5 bytes, got 6",
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
 		},
 		{
 			name: "error reading payload (EOF), stream ID > 0",
@@ -1428,8 +1439,9 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 5
 				return h
 			}(),
-			payload:     make([]byte, 3),                            // Provide only 3 of 5 bytes
-			expectedErr: "reading PRIORITY payload: unexpected EOF", // This is an io error, not FRAME_SIZE_ERROR
+			payload:              make([]byte, 3), // Provide only 3 of 5 bytes
+			expectedMsgSubstring: "reading PRIORITY payload: unexpected EOF",
+			// Not a StreamError or ConnectionError directly from ParsePayload's length check
 		},
 	}
 
@@ -1440,11 +1452,44 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error '%s', got nil", tt.expectedErr)
+				if tt.expectStreamError || tt.expectConnError || tt.expectedMsgSubstring != "" {
+					t.Fatalf("ParsePayload expected an error, got nil. Test case: %s", tt.name)
+				}
+				return // No error occurred, and none was expected.
 			}
-			// For these tests, we expect an exact match for the error string
-			if err.Error() != tt.expectedErr {
-				t.Errorf("ParsePayload error mismatch:\nExpected: %s\nGot:      %v", tt.expectedErr, err)
+
+			if tt.expectStreamError {
+				var streamErr *http2.StreamError
+				if !errors.As(err, &streamErr) {
+					t.Fatalf("ParsePayload expected a *http2.StreamError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if streamErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload StreamError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, streamErr.Code, tt.name)
+				}
+				if streamErr.StreamID != tt.header.StreamID {
+					t.Errorf("ParsePayload StreamError StreamID mismatch: expected %d, got %d. Test case: %s", tt.header.StreamID, streamErr.StreamID, tt.name)
+				}
+				if tt.expectedMsgSubstring != "" && !strings.Contains(streamErr.Msg, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload StreamError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, streamErr.Msg, tt.name)
+				}
+			} else if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				if tt.expectedMsgSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+				}
+			} else { // Not expecting StreamError or ConnectionError, but some other error (e.g., IO error)
+				if tt.expectedMsgSubstring == "" {
+					t.Fatalf("Test logic error: error occurred (%v), but no specific error type or expectedMsgSubstring provided for test case: %s", err, tt.name)
+				}
+				if !strings.Contains(err.Error(), tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedMsgSubstring, err, tt.name)
+				}
 			}
 		})
 	}
