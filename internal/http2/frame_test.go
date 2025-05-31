@@ -2234,10 +2234,12 @@ func TestPingFrame_ParsePayload_Errors(t *testing.T) {
 	baseHeader := http2.FrameHeader{Type: http2.FramePing, StreamID: 0}
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg)
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "payload too short",
@@ -2246,8 +2248,10 @@ func TestPingFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 7 // PING payload must be 8 bytes
 				return h
 			}(),
-			payload:     make([]byte, 7),
-			expectedErr: "PING frame payload must be 8 bytes, got 7",
+			payload:              make([]byte, 7),
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedMsgSubstring: "PING frame payload must be 8 bytes, got 7",
 		},
 		{
 			name: "payload too long",
@@ -2256,8 +2260,10 @@ func TestPingFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 9 // PING payload must be 8 bytes
 				return h
 			}(),
-			payload:     make([]byte, 9),
-			expectedErr: "PING frame payload must be 8 bytes, got 9",
+			payload:              make([]byte, 9),
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedMsgSubstring: "PING frame payload must be 8 bytes, got 9",
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -2266,8 +2272,9 @@ func TestPingFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 8
 				return h
 			}(),
-			payload:     make([]byte, 5), // Provide only 5 of 8 bytes
-			expectedErr: "reading PING opaque data: unexpected EOF",
+			payload:              make([]byte, 5), // Provide only 5 of 8 bytes
+			expectConnError:      false,
+			expectedMsgSubstring: "reading PING opaque data: unexpected EOF",
 		},
 	}
 
@@ -2278,10 +2285,35 @@ func TestPingFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				if tt.expectConnError || tt.expectedMsgSubstring != "" {
+					t.Fatalf("ParsePayload expected an error, got nil. Test case: %s", tt.name)
+				}
+				return // No error occurred, and none was expected.
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+
+			// An error occurred, now check if it's the expected kind.
+			if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				if tt.expectedMsgSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+				}
+			} else { // Not expecting a ConnectionError, but some other error (e.g., IO error)
+				if tt.expectedMsgSubstring == "" {
+					// This implies an error occurred, but it was not expected to be a ConnectionError,
+					// and no specific error string was provided for it. This is a test logic error.
+					t.Fatalf("Test logic error: error occurred (%v), expectConnError is false, but no expectedMsgSubstring provided for test case: %s", err, tt.name)
+				}
+				// For generic errors, the tt.expectedMsgSubstring is part of the full error string.
+				// The 'matchErr' helper uses strings.Contains(err.Error(), substr)
+				if !matchErr(err, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedMsgSubstring, err, tt.name)
+				}
 			}
 		})
 	}
