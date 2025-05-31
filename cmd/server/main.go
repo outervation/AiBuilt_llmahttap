@@ -22,54 +22,15 @@ var (
 	configFilePath string
 )
 
-func main() {
-	// CLI arguments
-	flag.StringVar(&configFilePath, "config", "", "Path to the configuration file (JSON or TOML)")
-	flag.Parse()
-
-	if configFilePath == "" {
-		fmt.Fprintln(os.Stderr, "Error: Configuration file path must be provided via -config flag.")
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	absConfigPath, err := filepath.Abs(configFilePath)
-	if err != nil {
-		log.Fatalf("Error getting absolute path for config file %s: %v", configFilePath, err)
-	}
-	configFilePath = absConfigPath
-
-	// 1. Load Configuration
-	cfg, err := config.LoadConfig(configFilePath)
-	if err != nil {
-		// Manually construct and print a JSON log entry to stderr
-		// to match the format expected by E2E tests for startup errors.
-		// This is used when the full logger hasn't been initialized due to config load failure.
-		errorLogEntry := struct {
-			Timestamp string `json:"ts"`
-			Level     string `json:"level"`
-			Msg       string `json:"msg"`
-			Source    string `json:"source,omitempty"` // Optional, but good for context
-		}{
-			Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), // Consistent format
-			Level:     "ERROR",
-			Msg:       fmt.Sprintf("Failed to load configuration from %s: %v", configFilePath, err),
-			Source:    "cmd/server/main.go:config_load_error", // Pinpoint the source
-		}
-		jsonErrorBytes, marshalErr := json.Marshal(errorLogEntry)
-		if marshalErr != nil {
-			// Fallback if JSON marshaling itself fails
-			fmt.Fprintf(os.Stderr, "CRITICAL: Failed to marshal startup error to JSON: %v. Original error: %v\n", marshalErr, err)
-		} else {
-			fmt.Fprintln(os.Stderr, string(jsonErrorBytes))
-		}
-		os.Exit(1) // Crucial: ensure the program exits
-	}
-
+func setupAndRunServer(cfg *config.Config, originalCfgPath string) error {
 	// 2. Initialize Logger
 	appLogger, err := logger.NewLogger(cfg.Logging)
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		// This error is critical for server operation, log it directly if possible,
+		// but it will be returned and handled by the caller (main).
+		// Using fmt.Fprintf for initial startup errors if logger itself fails.
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		return fmt.Errorf("failed to initialize logger: %w", err)
 	}
 	defer func() {
 		if err := appLogger.CloseLogFiles(); err != nil {
@@ -83,20 +44,16 @@ func main() {
 	handlerRegistry := server.NewHandlerRegistry()
 
 	// Register StaticFileServer Handler Factory
-	// The factory function is a closure, capturing 'configFilePath' and 'appLogger' from the main scope.
+	// The factory function is a closure, capturing 'originalCfgPath' from setupAndRunServer's arguments.
 	staticFileServerFactory := func(handlerConfig json.RawMessage, factoryLogger *logger.Logger) (server.Handler, error) {
-		// 'configFilePath' is the absolute path to the main config file, available from main() scope.
-		// It's used by ParseAndValidateStaticFileServerConfig to resolve relative paths within the static server's config (e.g., MimeTypesPath).
-		staticServerSpecificConfig, err := config.ParseAndValidateStaticFileServerConfig(handlerConfig, configFilePath)
+		// 'originalCfgPath' is the absolute path to the main config file.
+		// It's used by ParseAndValidateStaticFileServerConfig to resolve relative paths within the static server's config.
+		staticServerSpecificConfig, err := config.ParseAndValidateStaticFileServerConfig(handlerConfig, originalCfgPath)
 		if err != nil {
-			// The factory returns an error; the server/router layer (which calls CreateHandler, which calls this factory)
-			// will be responsible for logging this appropriately and likely returning a 500 error for the request.
 			return nil, fmt.Errorf("StaticFileServer: failed to parse/validate specific handler config: %w", err)
 		}
 
-		// Assume staticfile.New constructor exists in example.com/llmahttap/v2/internal/handlers/staticfile
-		// and its signature is: func New(cfg *config.StaticFileServerConfig, lg *logger.Logger) (server.Handler, error)
-		handler, err := staticfile.New(staticServerSpecificConfig, factoryLogger) // Pass the logger provided to the factory
+		handler, err := staticfile.New(staticServerSpecificConfig, factoryLogger)
 		if err != nil {
 			return nil, fmt.Errorf("StaticFileServer: failed to create handler instance: %w", err)
 		}
@@ -105,31 +62,17 @@ func main() {
 
 	if err := handlerRegistry.Register("StaticFileServer", staticFileServerFactory); err != nil {
 		appLogger.Error("Failed to register StaticFileServer handler factory", logger.LogFields{"error": err.Error()})
-		os.Exit(1) // Critical if core handler type registration fails
+		return fmt.Errorf("failed to register StaticFileServer handler factory: %w", err)
 	}
 	appLogger.Info("Registered StaticFileServer handler factory.", nil)
 
-	// Example of how another handler might be registered:
-	// myOtherHandlerFactory := func(handlerConfig json.RawMessage, factoryLogger *logger.Logger) (server.Handler, error) {
-	//     // ... parse handlerConfig, create and return handler ...
-	//     return myotherhandler.New(handlerConfig, factoryLogger)
-	// }
-	// if err := handlerRegistry.Register("MyOtherHandler", myOtherHandlerFactory); err != nil {
-	//     appLogger.Error("Failed to register MyOtherHandler handler factory", logger.LogFields{"error": err.Error()})
-	//     os.Exit(1)
-	// }
-	// appLogger.Info("Registered MyOtherHandler handler factory.", nil)
-
-	// (Actual handler registration will be done in subsequent steps when handlers are implemented)
-	if handlerRegistry == nil { // Should not happen if NewHandlerRegistry is correct
-		appLogger.Error("Handler registry is nil after initialization", nil)
-		os.Exit(1)
+	if handlerRegistry == nil {
+		appLogger.Error("Handler registry is nil after initialization (should not happen)", nil)
+		return fmt.Errorf("handler registry became nil after initialization")
 	}
 	appLogger.Info("Handler registry initialized.", nil)
-	// (Actual handler registration will be done in subsequent steps when handlers are implemented)
 
 	// 4. Initialize Router
-	// The router needs the routes from the config and the handler registry.
 	var routesToUse []config.Route
 	if cfg.Routing != nil {
 		routesToUse = cfg.Routing.Routes
@@ -137,32 +80,86 @@ func main() {
 	appRouter, err := router.NewRouter(routesToUse, handlerRegistry, appLogger)
 	if err != nil {
 		appLogger.Error("Failed to initialize router", logger.LogFields{"error": err.Error()})
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize router: %w", err)
 	}
 	appLogger.Info("Router initialized", nil)
 
 	// 5. Initialize Server
-	// NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, originalCfgPath string, registry *HandlerRegistry)
-	http2Server, err := server.NewServer(cfg, appLogger, appRouter, configFilePath, handlerRegistry)
+	http2Server, err := server.NewServer(cfg, appLogger, appRouter, originalCfgPath, handlerRegistry)
 	if err != nil {
 		appLogger.Error("Failed to initialize server", logger.LogFields{"error": err.Error()})
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize server: %w", err)
 	}
 	appLogger.Info("HTTP/2 server instance created.", nil)
 
-	// Start the server. This is a blocking call that will only return when
-	// the server shuts down (either gracefully or due to an error).
-	// Signal handling (SIGINT, SIGTERM, SIGHUP) is managed internally by the Server instance.
+	// Start the server. This is a blocking call.
 	appLogger.Info("Starting HTTP/2 server...", logger.LogFields{"address": cfg.Server.Address})
-
 	if err := http2Server.Start(); err != nil {
 		appLogger.Error("Server exited with an error", logger.LogFields{"error": err.Error()})
-		// The deferred appLogger.CloseLogFiles() will run automatically on exit.
-		os.Exit(1)
+		return fmt.Errorf("server exited with an error: %w", err)
 	}
 
 	// If http2Server.Start() returns nil, it means a graceful shutdown completed.
-	appLogger.Info("Server has shut down gracefully. Main application exiting.", nil)
-	// The deferred appLogger.CloseLogFiles() will run automatically on exit.
+	appLogger.Info("Server has shut down gracefully.", nil)
+	return nil
+}
+
+func main() {
+	// CLI arguments
+	flag.StringVar(&configFilePath, "config", "", "Path to the configuration file (JSON or TOML)")
+	flag.Parse()
+
+	if configFilePath == "" {
+		fmt.Fprintln(os.Stderr, "Error: Configuration file path must be provided via -config flag.")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	absConfigPath, err := filepath.Abs(configFilePath)
+	if err != nil {
+		// Use standard log before logger is initialized
+		log.Fatalf("Error getting absolute path for config file %s: %v", configFilePath, err)
+	}
+	configFilePath = absConfigPath // Use absolute path from here
+
+	// 1. Load Configuration
+	cfg, err := config.LoadConfig(configFilePath)
+	if err != nil {
+		// Manually construct and print a JSON log entry to stderr for startup errors,
+		// as the full logger might not be initialized.
+		errorLogEntry := struct {
+			Timestamp string `json:"ts"`
+			Level     string `json:"level"`
+			Msg       string `json:"msg"`
+			Source    string `json:"source,omitempty"`
+		}{
+			Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			Level:     "ERROR",
+			Msg:       fmt.Sprintf("Failed to load configuration from %s: %v", configFilePath, err),
+			Source:    "cmd/server/main.go:config_load_error",
+		}
+		jsonErrorBytes, marshalErr := json.Marshal(errorLogEntry)
+		if marshalErr != nil {
+			fmt.Fprintf(os.Stderr, "CRITICAL: Failed to marshal startup error to JSON: %v. Original error: %v\n", marshalErr, err)
+		} else {
+			fmt.Fprintln(os.Stderr, string(jsonErrorBytes))
+		}
+		os.Exit(1)
+	}
+
+	// Call the new setup and run function
+	if err := setupAndRunServer(cfg, configFilePath); err != nil {
+		// setupAndRunServer should have already logged details using the initialized logger.
+		// If setupAndRunServer returns an error, it means something went wrong during server setup or execution.
+		// The logger inside setupAndRunServer would have logged specifics.
+		// We print a general message here to stderr and exit.
+		// For critical init errors *before* logger, setupAndRunServer itself might use fmt.Fprintf.
+		fmt.Fprintf(os.Stderr, "Server setup or execution failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// If setupAndRunServer returns nil, it means a graceful shutdown completed.
+	// The logger within setupAndRunServer would have logged "Server has shut down gracefully."
+	// The deferred logger close in setupAndRunServer will also execute.
 	os.Exit(0)
 }
