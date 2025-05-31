@@ -2042,9 +2042,8 @@ func TestPriorityTree_UpdatePriority_SelfDependencyError(t *testing.T) {
 
 	// Attempt to make streamID depend on itself. Weight in call is different to check it's not applied.
 	attemptedNewWeight := uint8(100)
-	pt.mu.Lock()
+
 	err := pt.UpdatePriority(streamID, streamID, attemptedNewWeight, false)
-	pt.mu.Unlock()
 
 	if err == nil {
 		t.Fatalf("UpdatePriority for stream %d should have failed due to self-dependency, but did not", streamID)
