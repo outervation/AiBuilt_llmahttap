@@ -319,7 +319,7 @@ func TestGenerateGoAwayFrame(t *testing.T) {
 			errArg:               &ConnectionError{LastStreamID: 200, Code: ErrCodeProtocolError, Msg: "bad handshake"},
 			expectedLastStreamID: 200,
 			expectedErrorCode:    ErrCodeProtocolError,
-			expectedDebugDataStr: "bad handshake", // Msg used as debug data if debugStrArg is empty and ce.DebugData is empty
+			expectedDebugDataStr: "generic shutdown", // With new logic, debugStrArg ("generic shutdown") takes precedence over ce.Msg ("bad handshake") when ce.DebugData is empty.
 		},
 		{
 			name:                 "ConnectionError with its own DebugData",
@@ -384,7 +384,7 @@ func TestGenerateGoAwayFrame(t *testing.T) {
 			errArg:               &ConnectionError{LastStreamID: 20, Code: ErrCodeSettingsTimeout, Msg: "settings timeout msg"},
 			expectedLastStreamID: 20,
 			expectedErrorCode:    ErrCodeSettingsTimeout,
-			expectedDebugDataStr: "settings timeout msg",
+			expectedDebugDataStr: "explicit debug string",
 		},
 	}
 
