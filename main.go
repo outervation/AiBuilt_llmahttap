@@ -22,6 +22,13 @@ func main() {
 	port := flag.String("port", "8080", "Port to listen on")
 	flag.Parse()
 
+	if *rootDir == "" {
+		log.Fatalf("Error: root directory cannot be empty")
+	}
+	if *port == "" {
+		log.Fatalf("Error: port cannot be empty")
+	}
+
 	// Resolve absolute path for DocumentRoot
 	absRootDir, err := filepath.Abs(*rootDir)
 	if err != nil {
