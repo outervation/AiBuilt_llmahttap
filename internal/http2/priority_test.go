@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -2048,9 +2049,9 @@ func TestPriorityTree_UpdatePriority_SelfDependencyError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("UpdatePriority for stream %d should have failed due to self-dependency, but did not", streamID)
 	}
-	expectedErrorMsgPart := fmt.Sprintf("stream %d cannot depend on itself", streamID)
-	if !strings.Contains(err.Error(), expectedErrorMsgPart) {
-		t.Errorf("Expected error message for stream %d to contain '%s', got: '%s'", streamID, expectedErrorMsgPart, err.Error())
+	// UpdatePriority now returns a sentinel error, not a formatted one with streamID.
+	if !errors.Is(err, errSelfDependency) { // Check for the specific sentinel error
+		t.Errorf("Expected error '%v', got: '%v'", errSelfDependency, err)
 	}
 
 	// Verify streamID's properties (parent, weight) are unchanged
