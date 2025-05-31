@@ -1174,6 +1174,108 @@ func TestPriorityTree_ComplexScenario(t *testing.T) {
 		if p_after_err != 2 || w_after_err != 30 || len(c_after_err) != 0 {
 			t.Errorf("Step 6 S1 (after error): P:%d W:%d C:%v. Expected P:2 W:30 C:[] (state unchanged)", p_after_err, w_after_err, c_after_err)
 		}
+
+		// --- Start of Enhancement: Series of Exclusive Operations on Stream 0 ---
+
+		// 7. Add stream 5 as a default child of stream 0.
+		// Current Tree (end of 5.5):
+		// 0 -> 2 (w:15)
+		//      -> 1 (w:30)
+		// Expected Tree after adding 5:
+		// 0 -> 2 (w:15)
+		//      -> 1 (w:30)
+		//   -> 5 (w:15 def)
+		if err := pt.AddStream(5, nil); err != nil {
+			t.Fatalf("Step 7 AddStream(5) failed: %v", err)
+		}
+		p, c, w, _ = pt.GetDependencies(5)
+		if p != 0 || w != 15 || len(c) != 0 {
+			t.Errorf("Step 7 S5: P:%d W:%d C:%v. Expected P:0 W:15 C:[]", p, w, c)
+		}
+		_, rootChildren7, _, _ := pt.GetDependencies(0)
+		expectedRootChildren7 := []uint32{2, 5} // Stream 1 is child of 2
+		if !reflect.DeepEqual(sortUint32Slice(rootChildren7), sortUint32Slice(expectedRootChildren7)) {
+			t.Errorf("Step 7 Root children: %v. Expected sorted %v", sortUint32Slice(rootChildren7), sortUint32Slice(expectedRootChildren7))
+		}
+
+		// 8. Make stream 5 an exclusive child of stream 0, with new weight 70.
+		// Stream 2 (the other direct child of 0) should become a child of stream 5.
+		// Stream 1 (child of 2) should remain child of 2.
+		// Expected Tree:
+		// 0 -> 5 (w:70)
+		//      -> 2 (w:15, parent:5)
+		//         -> 1 (w:30, parent:2)
+		err = pt.UpdatePriority(5, 0, 70, true)
+		if err != nil {
+			t.Fatalf("Step 8 UpdatePriority(5) exclusive child of 0 failed: %v", err)
+		}
+		p, c, w, _ = pt.GetDependencies(5) // Check S5
+		if p != 0 || w != 70 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{2}) {
+			t.Errorf("Step 8 S5: P:%d W:%d C:%v. Expected P:0 W:70 C:[2]", p, w, c)
+		}
+		p, c, w, _ = pt.GetDependencies(2) // Check S2
+		if p != 5 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
+			t.Errorf("Step 8 S2: P:%d W:%d C:%v. Expected P:5 W:15 C:[1]", p, w, c)
+		}
+		p, c, w, _ = pt.GetDependencies(1) // Check S1
+		if p != 2 || w != 30 || len(c) != 0 {
+			t.Errorf("Step 8 S1: P:%d W:%d C:%v. Expected P:2 W:30 C:[]", p, w, c)
+		}
+		_, rootChildren8, _, _ := pt.GetDependencies(0) // Check Root children
+		if !reflect.DeepEqual(sortUint32Slice(rootChildren8), []uint32{5}) {
+			t.Errorf("Step 8 Root children: %v. Expected [5]", sortUint32Slice(rootChildren8))
+		}
+
+		// 9. Add stream 6 as a default child of stream 0.
+		// Expected Tree:
+		// 0 -> 5 (w:70)
+		//      -> 2 (w:15) -> 1 (w:30)
+		//   -> 6 (w:15 def)
+		if err := pt.AddStream(6, nil); err != nil {
+			t.Fatalf("Step 9 AddStream(6) failed: %v", err)
+		}
+		p, c, w, _ = pt.GetDependencies(6)
+		if p != 0 || w != 15 || len(c) != 0 {
+			t.Errorf("Step 9 S6: P:%d W:%d C:%v. Expected P:0 W:15 C:[]", p, w, c)
+		}
+		_, rootChildren9, _, _ := pt.GetDependencies(0)
+		expectedRootChildren9 := []uint32{5, 6}
+		if !reflect.DeepEqual(sortUint32Slice(rootChildren9), sortUint32Slice(expectedRootChildren9)) {
+			t.Errorf("Step 9 Root children: %v. Expected sorted %v", sortUint32Slice(rootChildren9), sortUint32Slice(expectedRootChildren9))
+		}
+
+		// 10. Make stream 6 an exclusive child of stream 0, with new weight 80.
+		// Stream 5 (the other direct child of 0) and its subtree should become children of stream 6.
+		// Expected Tree:
+		// 0 -> 6 (w:80)
+		//      -> 5 (w:70, parent:6)
+		//         -> 2 (w:15, parent:5)
+		//            -> 1 (w:30, parent:2)
+		err = pt.UpdatePriority(6, 0, 80, true)
+		if err != nil {
+			t.Fatalf("Step 10 UpdatePriority(6) exclusive child of 0 failed: %v", err)
+		}
+		p, c, w, _ = pt.GetDependencies(6) // Check S6
+		if p != 0 || w != 80 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{5}) {
+			t.Errorf("Step 10 S6: P:%d W:%d C:%v. Expected P:0 W:80 C:[5]", p, w, c)
+		}
+		p, c, w, _ = pt.GetDependencies(5) // Check S5
+		if p != 6 || w != 70 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{2}) {
+			t.Errorf("Step 10 S5: P:%d W:%d C:%v. Expected P:6 W:70 C:[2]", p, w, c)
+		}
+		p, c, w, _ = pt.GetDependencies(2) // Check S2
+		if p != 5 || w != 15 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{1}) {
+			t.Errorf("Step 10 S2: P:%d W:%d C:%v. Expected P:5 W:15 C:[1]", p, w, c)
+		}
+		p, c, w, _ = pt.GetDependencies(1) // Check S1
+		if p != 2 || w != 30 || len(c) != 0 {
+			t.Errorf("Step 10 S1: P:%d W:%d C:%v. Expected P:2 W:30 C:[]", p, w, c)
+		}
+		_, rootChildren10, _, _ := pt.GetDependencies(0) // Check Root children
+		if !reflect.DeepEqual(sortUint32Slice(rootChildren10), []uint32{6}) {
+			t.Errorf("Step 10 Root children: %v. Expected [6]", sortUint32Slice(rootChildren10))
+		}
+		// --- End of Enhancement ---
 	}
 }
 
