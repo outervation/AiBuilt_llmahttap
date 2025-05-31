@@ -346,6 +346,8 @@ func (pt *PriorityTree) RemoveStream(streamID uint32) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
+	var inconsistencyError error // Variable to store the error if detected
+
 	if streamID == 0 {
 		return &ConnectionError{Code: ErrCodeProtocolError, Msg: "cannot remove stream 0 from priority tree"}
 	}
@@ -390,7 +392,7 @@ func (pt *PriorityTree) RemoveStream(streamID uint32) error {
 	}
 
 	delete(pt.nodes, streamID)
-	return nil
+	return inconsistencyError // Returns nil if no inconsistency was found, or the recorded error.
 }
 
 // GetDependencies returns the parent ID, children IDs, and weight for a given stream.
