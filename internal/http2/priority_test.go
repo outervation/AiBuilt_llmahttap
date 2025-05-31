@@ -1645,9 +1645,8 @@ func TestPriorityTree_UpdatePriority_CycleDetection(t *testing.T) {
 	}
 
 	// Attempt to make 2 depend on 2 (self-dependency)
-	pt.mu.Lock()
+
 	err = pt.UpdatePriority(2, 2, 20, false)
-	pt.mu.Unlock()
 	if err == nil {
 		t.Fatalf("UpdatePriority should have failed due to self-dependency (2 depends on 2)")
 	}
