@@ -3,7 +3,6 @@ package http2
 import (
 	"errors" // Added for sentinel errors
 	"fmt"
-	"strings"
 	"sync"
 )
 
@@ -325,10 +324,10 @@ func (pt *PriorityTree) ProcessPriorityFrame(frame *PriorityFrame) error {
 		// UpdatePriority can return an error if streamID tries to depend on itself or creates a cycle.
 		// RFC 7540, Section 5.3.3: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
 		// RFC 7540, Section 5.3.1: "A stream cannot be dependent on any of its own dependencies." This implies cycles are protocol errors.
-		if strings.Contains(err.Error(), "cannot depend on itself") {
+		if errors.Is(err, errSelfDependency) {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself in PRIORITY frame: %v", streamID, err)}
 		}
-		if strings.Contains(err.Error(), "cycle detected") {
+		if errors.Is(err, errCycleDetected) {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("cycle detected in PRIORITY frame for stream %d: %v", streamID, err)}
 		}
 		// Other errors from UpdatePriority might indicate internal issues or inconsistencies.
