@@ -1724,9 +1724,8 @@ func TestPriorityTree_UpdatePriority_ReparentExclusive_NewParentNoChildren(t *te
 	}
 
 	// Operation: Re-parent streamToReparentID (3) to be an exclusive child of newParentStreamID (1)
-	pt.mu.Lock()
+
 	err := pt.UpdatePriority(streamToReparentID, newParentStreamID, newWeightForReparented, true)
-	pt.mu.Unlock()
 
 	if err != nil {
 		t.Fatalf("UpdatePriority failed: %v", err)
