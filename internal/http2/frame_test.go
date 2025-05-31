@@ -1819,7 +1819,8 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:              make([]byte, 5),
-			expectConnError:      false, // This specific case in frame.go returns a generic fmt.Errorf currently
+			expectConnError:      true,                        // Changed from false
+			expectedCode:         http2.ErrCodeFrameSizeError, // Added
 			expectedMsgSubstring: "SETTINGS frame payload length 5 is not a multiple of 6",
 		},
 		{
