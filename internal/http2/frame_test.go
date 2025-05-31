@@ -1583,10 +1583,12 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 	baseHeader := http2.FrameHeader{Type: http2.FrameRSTStream, StreamID: 1}
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string // Expects exact error string
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg)
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "payload too short",
@@ -1595,8 +1597,10 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 3 // RST_STREAM payload must be 4 bytes
 				return h
 			}(),
-			payload:     make([]byte, 3),
-			expectedErr: "connection error: RST_STREAM frame payload must be 4 bytes, got 3 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 3),
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 3",
 		},
 		{
 			name: "payload too long",
@@ -1605,8 +1609,10 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 5 // RST_STREAM payload must be 4 bytes
 				return h
 			}(),
-			payload:     make([]byte, 5),
-			expectedErr: "connection error: RST_STREAM frame payload must be 4 bytes, got 5 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			payload:              make([]byte, 5),
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 5",
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -1615,8 +1621,9 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 4
 				return h
 			}(),
-			payload:     make([]byte, 2), // Provide only 2 of 4 bytes
-			expectedErr: "reading RST_STREAM error code: unexpected EOF",
+			payload:              make([]byte, 2), // Provide only 2 of 4 bytes
+			expectConnError:      false,
+			expectedMsgSubstring: "reading RST_STREAM error code: unexpected EOF",
 		},
 	}
 
@@ -1627,10 +1634,30 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error: '%s', got nil", tt.expectedErr)
+				if tt.expectConnError || tt.expectedMsgSubstring != "" {
+					t.Fatalf("ParsePayload expected an error, got nil. Test case: %s", tt.name)
+				}
+				return // No error, and none expected
 			}
-			if err.Error() != tt.expectedErr {
-				t.Errorf("ParsePayload error mismatch:\nExpected: %s\nGot:      %v", tt.expectedErr, err)
+
+			if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				if tt.expectedMsgSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+				}
+			} else { // Not expecting ConnectionError, but some other error (e.g., IO error)
+				if tt.expectedMsgSubstring == "" {
+					t.Fatalf("Test logic error: error occurred (%v), but no specific error type or expectedMsgSubstring provided for test case: %s", err, tt.name)
+				}
+				if !strings.Contains(err.Error(), tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedMsgSubstring, err, tt.name)
+				}
 			}
 		})
 	}
