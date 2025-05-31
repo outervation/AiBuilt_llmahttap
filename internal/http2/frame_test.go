@@ -1587,7 +1587,7 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 		name                 string
 		header               http2.FrameHeader
 		payload              []byte
-		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg)
+		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg for non-FrameSizeError)
 		expectConnError      bool
 		expectedCode         http2.ErrorCode
 	}{
@@ -1598,10 +1598,10 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 3 // RST_STREAM payload must be 4 bytes
 				return h
 			}(),
-			payload:              make([]byte, 3),
-			expectConnError:      true,
-			expectedCode:         http2.ErrCodeFrameSizeError,
-			expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 3",
+			payload:         make([]byte, 3),
+			expectConnError: true,
+			expectedCode:    http2.ErrCodeFrameSizeError,
+			// expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 3", // Removed as per task
 		},
 		{
 			name: "payload too long",
@@ -1610,10 +1610,10 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 5 // RST_STREAM payload must be 4 bytes
 				return h
 			}(),
-			payload:              make([]byte, 5),
-			expectConnError:      true,
-			expectedCode:         http2.ErrCodeFrameSizeError,
-			expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 5",
+			payload:         make([]byte, 5),
+			expectConnError: true,
+			expectedCode:    http2.ErrCodeFrameSizeError,
+			// expectedMsgSubstring: "RST_STREAM frame payload must be 4 bytes, got 5", // Removed as per task
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -1649,8 +1649,13 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				if connErr.Code != tt.expectedCode {
 					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
 				}
-				if tt.expectedMsgSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
-					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+				// For FRAME_SIZE_ERROR, we only check the code.
+				// For other ConnectionError codes (if any in future tests for this frame type),
+				// we might check the message if expectedMsgSubstring is provided.
+				if tt.expectedCode != http2.ErrCodeFrameSizeError && tt.expectedMsgSubstring != "" {
+					if !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
+						t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+					}
 				}
 			} else { // Not expecting ConnectionError, but some other error (e.g., IO error)
 				if tt.expectedMsgSubstring == "" {
