@@ -1541,7 +1541,7 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 		name        string
 		header      http2.FrameHeader
 		payload     []byte
-		expectedErr string
+		expectedErr string // Expects exact error string
 	}{
 		{
 			name: "payload too short",
@@ -1551,7 +1551,7 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     make([]byte, 3),
-			expectedErr: "RST_STREAM frame payload must be 4 bytes, got 3",
+			expectedErr: "connection error: RST_STREAM frame payload must be 4 bytes, got 3 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "payload too long",
@@ -1561,7 +1561,7 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     make([]byte, 5),
-			expectedErr: "RST_STREAM frame payload must be 4 bytes, got 5",
+			expectedErr: "connection error: RST_STREAM frame payload must be 4 bytes, got 5 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -1582,10 +1582,10 @@ func TestRSTStreamFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				t.Fatalf("ParsePayload expected an error: '%s', got nil", tt.expectedErr)
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			if err.Error() != tt.expectedErr {
+				t.Errorf("ParsePayload error mismatch:\nExpected: %s\nGot:      %v", tt.expectedErr, err)
 			}
 		})
 	}
