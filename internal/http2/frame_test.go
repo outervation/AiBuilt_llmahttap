@@ -3425,6 +3425,9 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 					if actConnErr.Code != expConnErr.Code {
 						t.Errorf("TestReadFrame_ErrorConditions/%s: ConnectionError code mismatch. Got Code: %s, want Code: %s. Full error: %v", tt.name, actConnErr.Code, expConnErr.Code, err)
 					}
+					if actConnErr.LastStreamID != expConnErr.LastStreamID {
+						t.Errorf("TestReadFrame_ErrorConditions/%s: ConnectionError LastStreamID mismatch. Got LastStreamID: %d, want LastStreamID: %d. Full error: %v", tt.name, actConnErr.LastStreamID, expConnErr.LastStreamID, err)
+					}
 					// Check message containment. Error from ReadFrame is wrapped.
 					// The ConnectionError's Msg might be the root cause message.
 					if expConnErr.Msg != "" && !strings.Contains(err.Error(), expConnErr.Msg) {
