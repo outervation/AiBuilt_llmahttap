@@ -1716,7 +1716,8 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 		name        string
 		header      http2.FrameHeader
 		payload     []byte
-		expectedErr string
+		expectedErr string // Expects exact error string or substring for wrapped errors
+		isExact     bool   // True if expectedErr should be an exact match
 	}{
 		{
 			name: "ACK flag set but payload not empty",
@@ -1727,7 +1728,8 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     validSettingBytes,
-			expectedErr: "SETTINGS ACK frame must have a payload length of 0, got 6",
+			expectedErr: "connection error: SETTINGS ACK frame must have a payload length of 0, got 6 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			isExact:     true,
 		},
 		{
 			name: "payload length not multiple of setting entry size",
@@ -1737,7 +1739,8 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     make([]byte, 5),
-			expectedErr: "SETTINGS frame payload length 5 is not a multiple of 6",
+			expectedErr: "SETTINGS frame payload length 5 is not a multiple of 6", // This is currently a generic fmt.Errorf
+			isExact:     false,                                                    // Substring match
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -1748,6 +1751,7 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:     append(validSettingBytes, make([]byte, 3)...), // Provide 1 full setting + 3 bytes of next
 			expectedErr: "reading SETTINGS payload: unexpected EOF",
+			isExact:     false, // Substring match due to wrapping
 		},
 		{
 			name: "ACK flag, payload length is 0, valid", // Non-error case, implicitly tested by main test loop
@@ -1759,6 +1763,7 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:     []byte{},
 			expectedErr: "", // No error
+			isExact:     true,
 		},
 		{
 			name: "No ACK flag, payload length is 0, valid", // Non-error case
@@ -1770,6 +1775,7 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:     []byte{},
 			expectedErr: "", // No error
+			isExact:     true,
 		},
 	}
 
@@ -1787,10 +1793,17 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			}
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				t.Fatalf("ParsePayload expected an error, got nil. Expected: '%s'", tt.expectedErr)
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+
+			if tt.isExact {
+				if err.Error() != tt.expectedErr {
+					t.Errorf("ParsePayload error mismatch:\nExpected (exact): %s\nGot:              %v", tt.expectedErr, err)
+				}
+			} else {
+				if !matchErr(err, tt.expectedErr) { // matchErr uses strings.Contains
+					t.Errorf("ParsePayload error mismatch:\nExpected (to contain): %s\nGot:                 %v", tt.expectedErr, err)
+				}
 			}
 		})
 	}
@@ -3015,7 +3028,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				0x00, 0x00, 0x00, 0x00, // StreamID=0
 				0xAA, // Dummy payload byte
 			},
-			expectedErrStr: "parsing SETTINGS payload: SETTINGS ACK frame must have a payload length of 0, got 1",
+			expectedErrStr: "parsing SETTINGS payload: connection error: SETTINGS ACK frame must have a payload length of 0, got 1 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "SETTINGS frame, Header.Length not multiple of 6 (is 5)",
