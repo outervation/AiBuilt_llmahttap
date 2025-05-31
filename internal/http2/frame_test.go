@@ -1372,43 +1372,64 @@ func TestPriorityFrame(t *testing.T) {
 }
 
 func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
-	baseHeader := http2.FrameHeader{Type: http2.FramePriority, StreamID: 1}
+	baseHeaderNonZeroStreamID := http2.FrameHeader{Type: http2.FramePriority, StreamID: 1}
+	baseHeaderZeroStreamID := http2.FrameHeader{Type: http2.FramePriority, StreamID: 0}
 
 	tests := []struct {
 		name        string
 		header      http2.FrameHeader
 		payload     []byte
-		expectedErr string
+		expectedErr string // Expects exact error string for these tests
 	}{
 		{
-			name: "payload too short",
+			name: "payload too short, stream ID > 0",
 			header: func() http2.FrameHeader {
-				h := baseHeader
+				h := baseHeaderNonZeroStreamID
 				h.Length = 4 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
 			payload:     make([]byte, 4),
-			expectedErr: "PRIORITY frame payload must be 5 bytes, got 4",
+			expectedErr: "stream error on stream 1: PRIORITY frame payload must be 5 bytes, got 4 (code FRAME_SIZE_ERROR, 6)",
 		},
 		{
-			name: "payload too long",
+			name: "payload too long, stream ID > 0",
 			header: func() http2.FrameHeader {
-				h := baseHeader
+				h := baseHeaderNonZeroStreamID
 				h.Length = 6 // PRIORITY payload must be 5 bytes
 				return h
 			}(),
 			payload:     make([]byte, 6),
-			expectedErr: "PRIORITY frame payload must be 5 bytes, got 6",
+			expectedErr: "stream error on stream 1: PRIORITY frame payload must be 5 bytes, got 6 (code FRAME_SIZE_ERROR, 6)",
 		},
 		{
-			name: "error reading payload (EOF)",
+			name: "payload too short, stream ID 0",
 			header: func() http2.FrameHeader {
-				h := baseHeader
+				h := baseHeaderZeroStreamID
+				h.Length = 4 // PRIORITY payload must be 5 bytes
+				return h
+			}(),
+			payload:     make([]byte, 4),
+			expectedErr: "connection error: PRIORITY frame payload must be 5 bytes, got 4 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+		},
+		{
+			name: "payload too long, stream ID 0",
+			header: func() http2.FrameHeader {
+				h := baseHeaderZeroStreamID
+				h.Length = 6 // PRIORITY payload must be 5 bytes
+				return h
+			}(),
+			payload:     make([]byte, 6),
+			expectedErr: "connection error: PRIORITY frame payload must be 5 bytes, got 6 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+		},
+		{
+			name: "error reading payload (EOF), stream ID > 0",
+			header: func() http2.FrameHeader {
+				h := baseHeaderNonZeroStreamID
 				h.Length = 5
 				return h
 			}(),
-			payload:     make([]byte, 3), // Provide only 3 of 5 bytes
-			expectedErr: "reading PRIORITY payload: unexpected EOF",
+			payload:     make([]byte, 3),                            // Provide only 3 of 5 bytes
+			expectedErr: "reading PRIORITY payload: unexpected EOF", // This is an io error, not FRAME_SIZE_ERROR
 		},
 	}
 
@@ -1419,10 +1440,11 @@ func TestPriorityFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				t.Fatalf("ParsePayload expected an error '%s', got nil", tt.expectedErr)
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+			// For these tests, we expect an exact match for the error string
+			if err.Error() != tt.expectedErr {
+				t.Errorf("ParsePayload error mismatch:\nExpected: %s\nGot:      %v", tt.expectedErr, err)
 			}
 		})
 	}
