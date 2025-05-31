@@ -1627,9 +1627,8 @@ func TestPriorityTree_UpdatePriority_CycleDetection(t *testing.T) {
 	_ = pt.AddStream(3, &streamDependencyInfo{StreamDependency: 2, Weight: 10})
 
 	// Attempt to make 1 depend on 3 (1 -> 3), creating a cycle 1 -> 2 -> 3 -> 1
-	pt.mu.Lock()
+
 	err := pt.UpdatePriority(1, 3, 20, false)
-	pt.mu.Unlock()
 
 	if err == nil {
 		t.Fatalf("UpdatePriority should have failed due to cycle detection (1 depends on 3)")
