@@ -3608,33 +3608,16 @@ func TestServerHandshake_ConnectionClosedExternally(t *testing.T) {
 	// The specific error might be "connection shutdown during handshake" or similar.
 	t.Logf("DEBUG TestServerHandshake_ConnectionClosedExternally: handshakeActualErr.Code = %s (%d), handshakeActualErr.Msg = %q", connErr.Code, connErr.Code, connErr.Msg)
 	if connErr.Code == ErrCodeConnectError {
-		// If it's ConnectError, it must be our specific simulated error
-		// This relies on the ConnectionError.Error() hack for the message.
-		// The underlying Msg field should be "simulated external close during handshake"
-		// but err.Error() for this specific error instance is what we test against the plain string.
-		// Let's check connErr.Msg directly for now, assuming the test wants to verify the underlying message.
-		// And ConnectionError.Error() should also produce this due to the hack.
-		// The test currently asserts on connErr.Msg in the t.Errorf.
-		// The failing line was comparing connErr.Msg.
-
-		// The original failure:
-		// conn_test.go:3620: ServerHandshake error message 'simulated external close during handshake' unexpected for external close scenario
-		// This means the 'else if' condition was true, and the message was 'simulated external close during handshake'.
-		// The 'else if' condition was:
-		// !strings.Contains(connErr.Msg, "connection shutdown during handshake") && !strings.Contains(connErr.Msg, "timeout waiting for initial server SETTINGS write")
-		// If connErr.Msg = "simulated external close during handshake", then:
-		// !strings.Contains("simulated external close during handshake", "connection shutdown during handshake") => !true => false
-		// ... so the 'else if' should have been false.
-		// This implies that connErr.Msg was NOT "simulated external close during handshake" when the else if was evaluated.
-		// This contradicts the error message of the t.Errorf itself.
 
 		// Let's keep it simple: if code is ConnectError, Msg must be "simulated external close during handshake"
 		if connErr.Msg != "simulated external close during handshake" {
 			t.Errorf("For ErrCodeConnectError, expected Msg %q, got %q", "simulated external close during handshake", connErr.Msg)
 		}
 		// And also check the err.Error() string, which the original test was sensitive to
-		if handshakeActualErr.Error() != "simulated external close during handshake" {
-			t.Errorf("For ErrCodeConnectError, expected handshakeActualErr.Error() to be %q due to hack, got %q", "simulated external close during handshake", handshakeActualErr.Error())
+
+		expectedErrorStr := fmt.Sprintf("connection error: %s (last_stream_id %d, code %s, %d)", connErr.Msg, connErr.LastStreamID, connErr.Code.String(), connErr.Code)
+		if handshakeActualErr.Error() != expectedErrorStr {
+			t.Errorf("For ErrCodeConnectError, expected handshakeActualErr.Error() to be %q, got %q", expectedErrorStr, handshakeActualErr.Error())
 		}
 
 	} else if connErr.Code == ErrCodeInternalError {
