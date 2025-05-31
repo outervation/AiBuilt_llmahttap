@@ -1,9 +1,16 @@
 package http2
 
 import (
+	"errors" // Added for sentinel errors
 	"fmt"
 	"strings"
 	"sync"
+)
+
+// Sentinel errors for specific priority violations.
+var (
+	errSelfDependency = errors.New("stream cannot depend on itself")
+	errCycleDetected  = errors.New("priority dependency cycle detected")
 )
 
 // priorityNode stores individual stream priority information.
@@ -163,17 +170,18 @@ func (pt *PriorityTree) AddStream(streamID uint32, prioInfo *streamDependencyInf
 	// We can directly call updatePriorityNoLock.
 	err := pt.UpdatePriority(streamID, newParentID, newWeight, isExclusiveOperation)
 	if err != nil {
-		// updatePriorityNoLock might return fmt.Errorf for "cannot depend on itself".
-		// We should wrap this in a StreamError for AddStream, which is often
+		// updatePriorityNoLock (now UpdatePriority) returns sentinel errors for specific violations.
+		// We wrap these in a StreamError for AddStream, which is often
 		// called in the context of HEADERS processing.
 		// RFC 7540, Section 5.3.3: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
 		// RFC 7540, Section 5.3.1: "A stream cannot be dependent on any of its own dependencies." This implies cycles are protocol errors.
-		if strings.Contains(err.Error(), "cannot depend on itself") {
+		if errors.Is(err, errSelfDependency) {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("stream %d cannot depend on itself: %v", streamID, err)}
 		}
-		if strings.Contains(err.Error(), "cycle detected") {
+		if errors.Is(err, errCycleDetected) {
 			return &StreamError{StreamID: streamID, Code: ErrCodeProtocolError, Msg: fmt.Sprintf("cycle detected when adding/updating stream %d: %v", streamID, err)}
 		}
+		// For other errors not matching specific sentinel errors, consider them internal.
 		return &StreamError{StreamID: streamID, Code: ErrCodeInternalError, Msg: fmt.Sprintf("error updating priority for stream %d: %v", streamID, err)}
 	}
 	return nil
@@ -202,7 +210,7 @@ func (pt *PriorityTree) UpdatePriority(streamID uint32, depStreamID uint32, weig
 	// as they have specific error types (ConnectionError for stream 0 PRIORITY, StreamError for HEADERS)
 
 	if depStreamID == streamID {
-		return fmt.Errorf("stream %d cannot depend on itself (new parent %d)", streamID, depStreamID)
+		return errSelfDependency
 	}
 
 	// Cycle detection: A stream cannot depend on one of its own descendants.
@@ -222,7 +230,7 @@ func (pt *PriorityTree) UpdatePriority(streamID uint32, depStreamID uint32, weig
 				break // or return an internal error
 			}
 			if currNode.parentID == streamID {
-				return fmt.Errorf("cycle detected: stream %d cannot depend on %d because %d is/would be an ancestor of %d", streamID, depStreamID, streamID, depStreamID)
+				return errCycleDetected
 			}
 			if currNode.parentID == 0 { // Reached root without finding streamID as an ancestor of depStreamID
 				break
