@@ -218,6 +218,9 @@ func (f *DataFrame) Header() *FrameHeader { return &f.FrameHeader }
 
 func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	f.FrameHeader = header
+	if header.StreamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "received DATA on stream 0")
+	}
 	payloadLen := f.Length
 
 	if f.Flags&FlagDataPadded != 0 {
@@ -228,7 +231,7 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		f.PadLength = padLenBuf[0]
 		payloadLen-- // Subtract pad length octet
 		if uint32(f.PadLength) > payloadLen {
-			return fmt.Errorf("pad length %d exceeds payload length %d", f.PadLength, payloadLen)
+			return NewStreamError(header.StreamID, ErrCodeProtocolError, fmt.Sprintf("pad length %d exceeds payload length %d", f.PadLength, payloadLen))
 		}
 	}
 
@@ -533,15 +536,8 @@ func (f *SettingsFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	if f.Length%settingEntrySize != 0 {
 		// "SETTINGS frames with a length other than a multiple of 6 octets MUST be
 		// treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
-		// H2spec test "6.5. SETTINGS - 3: Sends a SETTINGS frame with a length other than a multiple of 6 octets"
-		// currently passes with the server returning what is likely PROTOCOL_ERROR for this, not FRAME_SIZE_ERROR from this ParsePayload.
-		// The spec for FRAME_SIZE_ERROR in 6.5 seems specific to "ACK flag set and a length field value other than 0".
-		// For "length other than a multiple of 6 octets", it might be a PROTOCOL_ERROR.
-		// The task requirement is specific to "SETTINGS ACK with payload case".
-		// So, we only change the ACK case here. The h2spec output for 6.5.1 indicates this should be FRAME_SIZE_ERROR.
-		// Let's stick to the task for now. The other FrameSizeError for non-multiple-of-6 is handled by a different h2spec test
-		// and might be a PROTOCOL_ERROR as per some interpretations or general error handling.
-		return fmt.Errorf("SETTINGS frame payload length %d is not a multiple of %d", f.Length, settingEntrySize)
+		// This aligns with RFC 7540, Section 6.5.
+		return NewConnectionError(ErrCodeFrameSizeError, fmt.Sprintf("SETTINGS frame payload length %d is not a multiple of %d", f.Length, settingEntrySize))
 	}
 
 	numSettings := f.Length / settingEntrySize
@@ -606,6 +602,9 @@ func (f *PushPromiseFrame) Header() *FrameHeader { return &f.FrameHeader }
 
 func (f *PushPromiseFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	f.FrameHeader = header
+	if header.StreamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "received PUSH_PROMISE on stream 0")
+	}
 	payloadLen := f.Length
 	currentPos := 0
 
@@ -755,7 +754,7 @@ func (f *GoAwayFrame) Header() *FrameHeader { return &f.FrameHeader }
 func (f *GoAwayFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	f.FrameHeader = header
 	if f.Length < 8 { // LastStreamID (4) + ErrorCode (4)
-		return fmt.Errorf("GOAWAY frame payload must be at least 8 bytes, got %d", f.Length)
+		return NewConnectionError(ErrCodeFrameSizeError, fmt.Sprintf("GOAWAY frame payload must be at least 8 bytes, got %d", f.Length))
 	}
 	var fixedPart [8]byte
 	if _, err := io.ReadFull(r, fixedPart[:]); err != nil {
@@ -859,6 +858,9 @@ func (f *ContinuationFrame) Header() *FrameHeader { return &f.FrameHeader }
 
 func (f *ContinuationFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	f.FrameHeader = header
+	if header.StreamID == 0 {
+		return NewConnectionError(ErrCodeProtocolError, "received CONTINUATION on stream 0")
+	}
 	f.HeaderBlockFragment = make([]byte, f.Length)
 	if _, err := io.ReadFull(r, f.HeaderBlockFragment); err != nil {
 		return fmt.Errorf("reading CONTINUATION header block fragment: %w", err)
