@@ -3005,7 +3005,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				0x00, 0x00, 0x00, 0x01, // StreamID=1
 				0x00, 0x00, // Dummy payload
 			},
-			expectedErrStr: "parsing RST_STREAM payload: RST_STREAM frame payload must be 4 bytes, got 2",
+			expectedErrStr: "parsing RST_STREAM payload: connection error: RST_STREAM frame payload must be 4 bytes, got 2 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "SETTINGS ACK frame, Header.Length != 0 (is 1)",
