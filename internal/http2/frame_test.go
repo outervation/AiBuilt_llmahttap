@@ -3,7 +3,7 @@ package http2_test
 import (
 	"bytes"
 	"errors"
-	"strings"
+	"strings" // Added for strings.Contains
 	// "encoding/binary" // Removed as not used
 	"fmt"
 	"io" // Needed for io.EOF, io.ErrUnexpectedEOF
