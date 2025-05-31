@@ -359,11 +359,32 @@ func (pt *PriorityTree) RemoveStream(streamID uint32) error {
 
 	// Determine the new parent for the children of the removed stream.
 	// This is the parent of the stream being removed.
-	newParentForChildrenNode, parentExists := pt.nodes[streamToRemoveNode.parentID]
+	newParentForChildrenNodeID := streamToRemoveNode.parentID
+	newParentForChildrenNode, parentExists := pt.nodes[newParentForChildrenNodeID]
+
 	if !parentExists {
-		// This indicates an inconsistent tree. Fallback to root (stream 0).
-		newParentForChildrenNode = pt.nodes[0]
+		// This indicates an inconsistent tree.
+		rootNodeForFallback := pt.nodes[0]
+		if rootNodeForFallback == nil {
+			// Catastrophic inconsistency: stream 0, the root, is missing.
+			// Attempt to remove the problematic node from the map to prevent further issues.
+			delete(pt.nodes, streamID)
+			return &ConnectionError{ // Immediate return, as tree is too broken to proceed further with re-parenting logic.
+				Code: ErrCodeInternalError,
+				Msg:  fmt.Sprintf("catastrophic priority tree inconsistency: stream 0 (root) is missing during removal of stream %d (parent %d was also missing); stream %d removed from map", streamID, streamToRemoveNode.parentID, streamID),
+			}
+		}
+		newParentForChildrenNode = rootNodeForFallback // Set the node for re-parenting
+		newParentForChildrenNodeID = 0                 // Update the ID for re-parenting logic
+
+		// Record the error to be returned later, after cleanup
+		inconsistencyError = &ConnectionError{
+			Code: ErrCodeInternalError,
+			Msg:  fmt.Sprintf("priority tree inconsistent: parent stream %d (for stream %d being removed) not found. Children of stream %d re-parented to stream 0.", streamToRemoveNode.parentID, streamID, streamID),
+		}
 	}
+	// From here, newParentForChildrenNode is guaranteed to be non-nil (either the actual parent or stream 0).
+	// And newParentForChildrenNodeID is its ID.
 
 	// Remove streamID from its (original) parent's children list.
 	if originalParentNode, ok := pt.nodes[streamToRemoveNode.parentID]; ok {
