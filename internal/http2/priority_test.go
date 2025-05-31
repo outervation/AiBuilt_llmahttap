@@ -2416,3 +2416,68 @@ func TestPriorityTree_ExclusiveChildOfStream0(t *testing.T) {
 		t.Errorf("Stream %d: expected weight %d (preserved), got %d", streamC, weightC, sC_weight)
 	}
 }
+
+func TestPriorityTree_UpdatePriority_Stream0_Behavior(t *testing.T) {
+	pt := NewPriorityTree()
+	// Add a stream that stream 0 might try to depend on
+	if err := pt.AddStream(1, nil); err != nil {
+		t.Fatalf("Setup: AddStream(1) failed: %v", err)
+	}
+
+	// Attempt to make stream 0 depend on stream 1. This is invalid.
+	// A robust UpdatePriority should prevent this and/or return an error.
+	err := pt.UpdatePriority(0, 1, 10, false)
+
+	// Check if an error was returned (ideal behavior for UpdatePriority)
+	if err != nil {
+		// This is good if UpdatePriority becomes robust enough to detect this.
+		t.Logf("UpdatePriority(0, 1, ...) returned error: %v", err)
+		// If an error IS returned, it should ideally be a specific type.
+		// e.g., if errors.Is(err, ErrCodeProtocolError) or a new specific error.
+	}
+
+	// Verify stream 0's integrity: parent must remain 0, weight must remain 0.
+	s0Parent, s0Children, s0Weight, getErr0 := pt.GetDependencies(0)
+	if getErr0 != nil {
+		t.Fatalf("GetDependencies(0) failed: %v", getErr0)
+	}
+	if s0Parent != 0 {
+		t.Errorf("Stream 0 parent illegally changed to %d, expected 0", s0Parent)
+	}
+	if s0Weight != 0 { // Stream 0's weight is defined as 0 in NewPriorityTree
+		t.Errorf("Stream 0 weight changed to %d, expected 0", s0Weight)
+	}
+
+	// Verify stream 1's integrity: it should not have stream 0 as a child.
+	s1Parent, s1Children, _, getErr1 := pt.GetDependencies(1)
+	if getErr1 != nil {
+		t.Fatalf("GetDependencies(1) failed: %v", getErr1)
+	}
+	if s1Parent != 0 { // Stream 1 was initially child of 0.
+		t.Errorf("Stream 1 parent expected 0, got %d", s1Parent)
+	}
+	for _, childID := range s1Children {
+		if childID == 0 {
+			t.Errorf("Stream 1 illegally has stream 0 as a child. s1Children: %v", s1Children)
+			break
+		}
+	}
+
+	// Stream 0 should not have itself as a child
+	for _, childID := range s0Children {
+		if childID == 0 {
+			t.Errorf("Stream 0 illegally has itself as a child. s0Children: %v", s0Children)
+		}
+	}
+
+	// Attempt to make stream 0 depend on itself (which UpdatePriority should already handle via errSelfDependency)
+	errSelf := pt.UpdatePriority(0, 0, 10, false)
+	if !errors.Is(errSelf, errSelfDependency) {
+		t.Errorf("UpdatePriority(0,0,...) expected errSelfDependency, got %v", errSelf)
+	}
+	// Verify stream 0's parent is still 0 after self-dependency attempt
+	s0ParentAfterSelf, _, _, _ := pt.GetDependencies(0)
+	if s0ParentAfterSelf != 0 {
+		t.Errorf("Stream 0 parent changed to %d after self-dependency attempt, expected 0", s0ParentAfterSelf)
+	}
+}
