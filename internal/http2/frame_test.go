@@ -1785,11 +1785,12 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 	validSettingBytes := []byte{0x00, byte(http2.SettingInitialWindowSize), 0x00, 0x00, 0xFF, 0xFF} // ID=INITIAL_WINDOW_SIZE, Val=65535
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string // Expects exact error string or substring for wrapped errors
-		isExact     bool   // True if expectedErr should be an exact match
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg)
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "ACK flag set but payload not empty",
@@ -1799,9 +1800,10 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 6 // ACK must have 0 length
 				return h
 			}(),
-			payload:     validSettingBytes,
-			expectedErr: "connection error: SETTINGS ACK frame must have a payload length of 0, got 6 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
-			isExact:     true,
+			payload:              validSettingBytes,
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedMsgSubstring: "SETTINGS ACK frame must have a payload length of 0, got 6",
 		},
 		{
 			name: "payload length not multiple of setting entry size",
@@ -1810,9 +1812,9 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 5 // Setting entry is 6 bytes
 				return h
 			}(),
-			payload:     make([]byte, 5),
-			expectedErr: "SETTINGS frame payload length 5 is not a multiple of 6", // This is currently a generic fmt.Errorf
-			isExact:     false,                                                    // Substring match
+			payload:              make([]byte, 5),
+			expectConnError:      false, // This specific case in frame.go returns a generic fmt.Errorf currently
+			expectedMsgSubstring: "SETTINGS frame payload length 5 is not a multiple of 6",
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -1821,9 +1823,9 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 12 // Expect 2 settings
 				return h
 			}(),
-			payload:     append(validSettingBytes, make([]byte, 3)...), // Provide 1 full setting + 3 bytes of next
-			expectedErr: "reading SETTINGS payload: unexpected EOF",
-			isExact:     false, // Substring match due to wrapping
+			payload:              append(validSettingBytes, make([]byte, 3)...), // Provide 1 full setting + 3 bytes of next
+			expectConnError:      false,
+			expectedMsgSubstring: "reading SETTINGS payload: unexpected EOF",
 		},
 		{
 			name: "ACK flag, payload length is 0, valid", // Non-error case, implicitly tested by main test loop
@@ -1833,9 +1835,9 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 0
 				return h
 			}(),
-			payload:     []byte{},
-			expectedErr: "", // No error
-			isExact:     true,
+			payload:              []byte{},
+			expectConnError:      false,
+			expectedMsgSubstring: "", // No error
 		},
 		{
 			name: "No ACK flag, payload length is 0, valid", // Non-error case
@@ -1845,9 +1847,9 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 0
 				return h
 			}(),
-			payload:     []byte{},
-			expectedErr: "", // No error
-			isExact:     true,
+			payload:              []byte{},
+			expectConnError:      false,
+			expectedMsgSubstring: "", // No error
 		},
 	}
 
@@ -1857,24 +1859,36 @@ func TestSettingsFrame_ParsePayload_Errors(t *testing.T) {
 			frame := &http2.SettingsFrame{}
 			err := frame.ParsePayload(r, tt.header)
 
-			if tt.expectedErr == "" { // For cases that should not error
+			if tt.expectedMsgSubstring == "" && !tt.expectConnError { // For cases that should not error
 				if err != nil {
-					t.Errorf("ParsePayload expected no error, got %v", err)
+					t.Errorf("ParsePayload expected no error, got %v. Test case: %s", err, tt.name)
 				}
 				return
 			}
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error, got nil. Expected: '%s'", tt.expectedErr)
+				t.Fatalf("ParsePayload expected an error, got nil. Test case: %s, Expected Msg Substring: '%s', ExpectConnError: %v", tt.name, tt.expectedMsgSubstring, tt.expectConnError)
 			}
 
-			if tt.isExact {
-				if err.Error() != tt.expectedErr {
-					t.Errorf("ParsePayload error mismatch:\nExpected (exact): %s\nGot:              %v", tt.expectedErr, err)
+			if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
 				}
-			} else {
-				if !matchErr(err, tt.expectedErr) { // matchErr uses strings.Contains
-					t.Errorf("ParsePayload error mismatch:\nExpected (to contain): %s\nGot:                 %v", tt.expectedErr, err)
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				if tt.expectedMsgSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedMsgSubstring, connErr.Msg, tt.name)
+				}
+			} else { // Not expecting ConnectionError, but some other error (e.g., IO error or generic fmt.Errorf)
+				if tt.expectedMsgSubstring == "" {
+					// This implies an error occurred, but it was not expected to be a ConnectionError,
+					// and no specific error string was provided for it. This is a test logic error.
+					t.Fatalf("Test logic error: error occurred (%v), expectConnError is false, but no expectedMsgSubstring provided for test case: %s", err, tt.name)
+				}
+				if !strings.Contains(err.Error(), tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedMsgSubstring, err, tt.name)
 				}
 			}
 		})
