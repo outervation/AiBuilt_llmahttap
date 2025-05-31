@@ -3012,7 +3012,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				0x00, 0x00, 0x00, 0x00, // StreamID=0
 				1, 2, 3, 4, 5, 6, 7, // Dummy payload
 			},
-			expectedErrStr: "parsing PING payload: PING frame payload must be 8 bytes, got 7",
+			expectedErrStr: "connection error: PING frame payload must be 8 bytes, got 7 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "WINDOW_UPDATE frame, Header.Length != 4 (is 3)",
