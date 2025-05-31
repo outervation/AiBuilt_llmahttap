@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"example.com/llmahttap/v2/internal/config"
-	"example.com/llmahttap/v2/internal/handlers/staticfileserver"
+	"example.com/llmahttap/v2/internal/handlers/staticfile"
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/router"
 	"example.com/llmahttap/v2/internal/server"
@@ -94,7 +94,11 @@ func main() {
 	err = handlerRegistry.Register("StaticFileServer", func(hc json.RawMessage, l *logger.Logger) (server.Handler, error) {
 		// The mainConfigFilePath is empty because MimeTypesPath is not being used here.
 		// If MimeTypesPath were used, we'd need to pass a valid path or handle it.
-		return staticfileserver.New(hc, l, "")
+		parsedSFSConfig, err := config.ParseAndValidateStaticFileServerConfig(hc, "")
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse static file server config: %w", err)
+		}
+		return staticfile.New(parsedSFSConfig, l)
 	})
 	if err != nil {
 		lg.Error("Error registering StaticFileServer handler", logger.LogFields{"error": err.Error()})
