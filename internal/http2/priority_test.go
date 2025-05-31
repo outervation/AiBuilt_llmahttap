@@ -1277,6 +1277,124 @@ func TestPriorityTree_ComplexScenario(t *testing.T) {
 		}
 		// --- End of Enhancement ---
 	}
+
+	// --- Start of Enhancement: Further exclusive re-parenting and complex interaction tests ---
+	// State after Step 10 (successful exclusive update of stream 6 as child of 0):
+	// 0 -> 6(w80)
+	//      -> 5(w70)
+	//         -> 2(w15)
+	//            -> 1(w30)
+
+	// Step 11: Add stream 20 as a non-exclusive child of stream 5.
+	// Expected tree: 0 -> 6(w80) -> 5(w70) -> {2(w15), 20(w15def)}
+	//                                      (1 is child of 2)
+	if err := pt.AddStream(20, &streamDependencyInfo{StreamDependency: 5, Weight: 15, Exclusive: false}); err != nil {
+		t.Fatalf("Step 11 AddStream(20) non-exclusive to S5 failed: %v", err)
+	}
+	p, c, w, _ = pt.GetDependencies(20)
+	if p != 5 || w != 15 || len(c) != 0 {
+		t.Errorf("Step 11 S20: P:%d W:%d C:%v. Expected P:5 W:15 C:[]", p, w, c)
+	}
+	_, s5Children11, _, _ := pt.GetDependencies(5)
+	expectedS5Children11 := []uint32{2, 20}
+	if !reflect.DeepEqual(sortUint32Slice(s5Children11), sortUint32Slice(expectedS5Children11)) {
+		t.Errorf("Step 11 S5 children: %v. Expected sorted %v", sortUint32Slice(s5Children11), sortUint32Slice(expectedS5Children11))
+	}
+
+	// Step 12: Add stream 21 as an exclusive child of stream 5, weight 88.
+	// Stream 2 and 20 (current children of 5) should become children of 21.
+	// Expected tree: 0 -> 6(w80) -> 5(w70) -> 21(w88) -> {2(w15), 20(w15)}
+	//                                                (1 is child of 2)
+	if err := pt.AddStream(21, &streamDependencyInfo{StreamDependency: 5, Weight: 88, Exclusive: true}); err != nil {
+		t.Fatalf("Step 12 AddStream(21) exclusive to S5 failed: %v", err)
+	}
+	p, c, w, _ = pt.GetDependencies(21)
+	if p != 5 || w != 88 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{2, 20}) {
+		t.Errorf("Step 12 S21: P:%d W:%d C:%v. Expected P:5 W:88 C:[2 20]", p, w, c)
+	}
+	_, s5Children12, _, _ := pt.GetDependencies(5)
+	if !reflect.DeepEqual(sortUint32Slice(s5Children12), []uint32{21}) {
+		t.Errorf("Step 12 S5 children: %v. Expected [21]", sortUint32Slice(s5Children12))
+	}
+	p20_parent, _, _, _ := pt.GetDependencies(20)
+	if p20_parent != 21 {
+		t.Errorf("Step 12 S20 parent: %d. Expected 21", p20_parent)
+	}
+	p2_parent, _, _, _ := pt.GetDependencies(2) // S2 is also child of S21 now
+	if p2_parent != 21 {
+		t.Errorf("Step 12 S2 parent: %d. Expected 21", p2_parent)
+	}
+
+	// Step 13: Remove stream 5.
+	// Stream 5 is child of 6. Stream 21 is child of 5.
+	// Children of 5 (i.e., stream 21) should be re-parented to 6 (parent of 5).
+	// Expected tree: 0 -> 6(w80) -> 21(w88) -> {2(w15), 20(w15)}
+	//                                      (1 is child of 2)
+	if err := pt.RemoveStream(5); err != nil {
+		t.Fatalf("Step 13 RemoveStream(5) failed: %v", err)
+	}
+	_, _, _, errGet5 := pt.GetDependencies(5)
+	if errGet5 == nil {
+		t.Errorf("Step 13 S5: Should be removed, but GetDependencies succeeded")
+	}
+	p, c, w, _ = pt.GetDependencies(21) // Check S21
+	if p != 6 || w != 88 || !reflect.DeepEqual(sortUint32Slice(c), []uint32{2, 20}) {
+		t.Errorf("Step 13 S21: P:%d W:%d C:%v. Expected P:6 W:88 C:[2 20]", p, w, c)
+	}
+	_, s6Children13, _, _ := pt.GetDependencies(6)
+	if !reflect.DeepEqual(sortUint32Slice(s6Children13), []uint32{21}) {
+		t.Errorf("Step 13 S6 children: %v. Expected [21]", sortUint32Slice(s6Children13))
+	}
+
+	// Step 14: Stream 1 (deepest child) reprioritized to be non-exclusive child of root (stream 0), weight 5.
+	// Original tree: 0 -> 6(w80) -> 21(w88) -> 2(w15) -> 1(w30)
+	//                                         -> 20(w15)
+	// Expected tree:
+	// 0 -> 6(w80) -> 21(w88) -> 2(w15) (S1 no longer child of S2)
+	//                         -> 20(w15)
+	//   -> 1(w5) (new child of 0)
+	err = pt.UpdatePriority(1, 0, 5, false)
+	if err != nil {
+		t.Fatalf("Step 14 UpdatePriority(1) to child of 0 failed: %v", err)
+	}
+	p, c, w, _ = pt.GetDependencies(1)
+	if p != 0 || w != 5 || len(c) != 0 {
+		t.Errorf("Step 14 S1: P:%d W:%d C:%v. Expected P:0 W:5 C:[]", p, w, c)
+	}
+	_, s2Children14, _, _ := pt.GetDependencies(2) // S2 should no longer have S1 as child
+	if contains(s2Children14, 1) {
+		t.Errorf("Step 14 S2 children: %v. Expected not to contain 1", s2Children14)
+	}
+	if len(s2Children14) != 0 { // S2 had only S1 as child.
+		t.Errorf("Step 14 S2 children: %v. Expected empty", s2Children14)
+	}
+
+	_, rootChildren14, _, _ := pt.GetDependencies(0)
+	expectedRootChildren14 := []uint32{1, 6} // S1 is now child of 0, S6 remains.
+	if !reflect.DeepEqual(sortUint32Slice(rootChildren14), sortUint32Slice(expectedRootChildren14)) {
+		t.Errorf("Step 14 Root children: %v. Expected sorted %v", sortUint32Slice(rootChildren14), sortUint32Slice(expectedRootChildren14))
+	}
+
+	// Step 15: Remove stream 2 (which is now a leaf node)
+	// Original tree: 0 -> 6(w80) -> 21(w88) -> 2(w15)
+	//                                         -> 20(w15)
+	//                  -> 1(w5)
+	// Expected tree:
+	// 0 -> 6(w80) -> 21(w88) -> 20(w15) (S2 removed from S21's children)
+	//   -> 1(w5)
+	if err := pt.RemoveStream(2); err != nil {
+		t.Fatalf("Step 15 RemoveStream(2) failed: %v", err)
+	}
+	_, _, _, errGet2 := pt.GetDependencies(2)
+	if errGet2 == nil {
+		t.Errorf("Step 15 S2: Should be removed, but GetDependencies succeeded")
+	}
+	_, s21Children15, _, _ := pt.GetDependencies(21) // S21 children should now only be S20
+	if !reflect.DeepEqual(sortUint32Slice(s21Children15), []uint32{20}) {
+		t.Errorf("Step 15 S21 children: %v. Expected [20]", sortUint32Slice(s21Children15))
+	}
+
+	// --- End of Further Enhancements ---
 }
 
 // Helper to sort uint32 slices for consistent comparison
