@@ -1492,9 +1492,8 @@ func TestPriorityTree_UpdatePriority_WeightOnly(t *testing.T) {
 	// However, since it uses getOrCreateNodeNoLock, it's better to simulate external call.
 	// The public API for this through AddStream (with existing stream) or ProcessPriorityFrame.
 	// Let's acquire lock for direct UpdatePriority call test.
-	pt.mu.Lock()
+
 	err := pt.UpdatePriority(targetStreamID, parentStreamID, newTargetWeight, false)
-	pt.mu.Unlock()
 
 	if err != nil {
 		t.Fatalf("UpdatePriority for weight change failed: %v", err)
