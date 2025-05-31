@@ -1551,9 +1551,8 @@ func TestPriorityTree_UpdatePriority_StreamDoesNotExist(t *testing.T) {
 
 	// Lock is normally acquired by public methods like ProcessPriorityFrame or AddStream.
 	// For direct testing of UpdatePriority's internal logic, we manage the lock.
-	pt.mu.Lock()
+
 	err := pt.UpdatePriority(nonExistentStreamID, parentStreamID, newWeight, isExclusive)
-	pt.mu.Unlock()
 
 	if err != nil {
 		t.Fatalf("UpdatePriority for non-existent stream %d failed: %v", nonExistentStreamID, err)
