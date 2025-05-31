@@ -2573,7 +2573,8 @@ func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
 		name        string
 		header      http2.FrameHeader
 		payload     []byte
-		expectedErr string
+		expectedErr string // Expects exact error string for ConnectionError, substring for others
+		isExact     bool
 	}{
 		{
 			name: "payload too short",
@@ -2583,7 +2584,8 @@ func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     make([]byte, 3),
-			expectedErr: "WINDOW_UPDATE frame payload must be 4 bytes, got 3",
+			expectedErr: "connection error: WINDOW_UPDATE frame payload must be 4 bytes, got 3 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			isExact:     true,
 		},
 		{
 			name: "payload too long",
@@ -2593,7 +2595,8 @@ func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     make([]byte, 5),
-			expectedErr: "WINDOW_UPDATE frame payload must be 4 bytes, got 5",
+			expectedErr: "connection error: WINDOW_UPDATE frame payload must be 4 bytes, got 5 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
+			isExact:     true,
 		},
 		{
 			name: "error reading payload (EOF)",
@@ -2604,9 +2607,9 @@ func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:     make([]byte, 2), // Provide only 2 of 4 bytes
 			expectedErr: "reading WINDOW_UPDATE increment: unexpected EOF",
+			isExact:     false,
 		},
-		// WindowSizeIncrement == 0 is not a parsing error, but a protocol error handled at a higher level.
-		// TestWindowUpdateFrame already covers the zero increment case for parsing.
+		// WindowSizeIncrement == 0 is not a parsing error at this level, but a protocol error handled higher up.
 	}
 
 	for _, tt := range tests {
@@ -2616,10 +2619,17 @@ func TestWindowUpdateFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				t.Fatalf("ParsePayload expected an error, got nil. Expected: '%s'", tt.expectedErr)
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+
+			if tt.isExact {
+				if err.Error() != tt.expectedErr {
+					t.Errorf("ParsePayload error mismatch:\nExpected (exact): %s\nGot:              %v", tt.expectedErr, err)
+				}
+			} else {
+				if !matchErr(err, tt.expectedErr) { // matchErr uses strings.Contains or similar logic
+					t.Errorf("ParsePayload error mismatch:\nExpected (to contain): %s\nGot:                 %v", tt.expectedErr, err)
+				}
 			}
 		})
 	}
@@ -3058,7 +3068,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				0x00, 0x00, 0x00, 0x01, // StreamID=1
 				1, 2, 3, // Dummy payload
 			},
-			expectedErrStr: "parsing WINDOW_UPDATE payload: WINDOW_UPDATE frame payload must be 4 bytes, got 3",
+			expectedErrStr: "parsing WINDOW_UPDATE payload: connection error: WINDOW_UPDATE frame payload must be 4 bytes, got 3 (last_stream_id 0, code FRAME_SIZE_ERROR, 6)",
 		},
 		{
 			name: "GOAWAY frame, Header.Length < 8 (is 7)",
