@@ -3120,10 +3120,19 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				"frame_len":   frameHeader.Length,
 				"max_len":     currentMaxFrameSize,
 			})
+
+			if frameHeader.StreamID != 0 {
+				// Attempt to send RST_STREAM for stream-specific frames exceeding max size.
+				// Errors sending RST_STREAM are logged but don't prevent the ConnectionError.
+				if rstErr := c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError); rstErr != nil {
+					c.log.Error("Failed to send RST_STREAM for frame exceeding SETTINGS_MAX_FRAME_SIZE",
+						logger.LogFields{"stream_id": frameHeader.StreamID, "error": rstErr.Error()})
+				}
+			}
 			// RFC 7540, Section 4.2: "An endpoint MUST treat receipt of a frame that is larger than
 			// SETTINGS_MAX_FRAME_SIZE ... as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
 			return NewConnectionError(ErrCodeFrameSizeError, errMsg)
-		} // End of switch frameHeader.Type for MAX_FRAME_SIZE
+		}
 
 		dispatchErr := c.dispatchFrame(frame)
 		if dispatchErr != nil {
