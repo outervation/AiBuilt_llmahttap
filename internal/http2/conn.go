@@ -3152,111 +3152,73 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 
 		var frame Frame
 		frame, err = c.readFrame() // frame can be nil if err is non-nil
+
 		if err != nil {
-			// Log the error from readFrame
-			logFields := logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err.Error()}
+			// First, try direct type assertion to *StreamError
+			if se, ok := err.(*StreamError); ok {
+				c.log.Warn("Serve (reader) loop: direct type assertion to *StreamError succeeded. Sending RST_STREAM.",
+					logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "msg": se.Msg, "original_error_type": fmt.Sprintf("%T", err)})
+				if rstSendErr := c.sendRSTStreamFrame(se.StreamID, se.Code); rstSendErr != nil {
+					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for a direct StreamError. Terminating connection.",
+						logger.LogFields{"stream_id": se.StreamID, "rst_send_error": rstSendErr.Error()})
+					c.streamsMu.Lock()
+					if c.connError == nil {
+						c.connError = rstSendErr
+					}
+					c.streamsMu.Unlock()
+					return rstSendErr
+				}
+				continue // Successfully sent RST_STREAM, continue serving.
+			}
+
+			// If direct assertion failed, try errors.As (for wrapped StreamErrors)
+			var streamErrTarget *StreamError
+			if errors.As(err, &streamErrTarget) {
+				c.log.Warn("Serve (reader) loop: errors.As to *StreamError succeeded. Sending RST_STREAM.",
+					logger.LogFields{"stream_id": streamErrTarget.StreamID, "code": streamErrTarget.Code.String(), "msg": streamErrTarget.Msg, "original_error_type": fmt.Sprintf("%T", err)})
+				if rstSendErr := c.sendRSTStreamFrame(streamErrTarget.StreamID, streamErrTarget.Code); rstSendErr != nil {
+					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for an unwrapped StreamError. Terminating connection.",
+						logger.LogFields{"stream_id": streamErrTarget.StreamID, "rst_send_error": rstSendErr.Error()})
+					c.streamsMu.Lock()
+					if c.connError == nil {
+						c.connError = rstSendErr
+					}
+					c.streamsMu.Unlock()
+					return rstSendErr
+				}
+				continue // Successfully sent RST_STREAM, continue serving.
+			}
+
+			// If neither direct assertion nor errors.As identified a recoverable StreamError,
+			// then it's a fatal connection error, EOF, or closed connection.
+			logFields := logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err.Error(), "error_type": fmt.Sprintf("%T", err)}
 			if errors.Is(err, io.EOF) {
 				c.log.Info("Serve (reader) loop: peer closed connection (EOF).", logFields)
-			} else if se, ok := err.(net.Error); ok && se.Timeout() {
+			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				c.log.Info("Serve (reader) loop: net.Conn read timeout.", logFields)
-			} else if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+			} else if errors.Is(err, net.ErrClosed) || (err != nil && strings.Contains(err.Error(), "use of closed network connection")) {
 				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logFields)
 			} else {
-				// This includes ConnectionErrors from ReadFrame (e.g., PING length error)
-				// or other parsing errors that ReadFrame might return as ConnectionError.
-				c.log.Error("Serve (reader) loop: error reading/parsing frame.", logFields)
+				c.log.Error("Serve (reader) loop: fatal error reading/parsing frame (not a recoverable StreamError).", logFields)
 			}
-			// Regardless of the specific type of read error, it's fatal for the Serve loop.
-			// The error (which might be a ConnectionError with a specific code like FRAME_SIZE_ERROR)
-			// will be returned. The defer in Serve will call c.Close(err), and c.Close
-			// will use this 'err' to determine the GOAWAY code.
-			return err
-
-			// Validate frame length against SETTINGS_MAX_FRAME_SIZE
-			// This check happens after reading the frame header and potentially its payload (by http2.ReadFrame),
-			// but before dispatching it to specific handlers.
-			// It ensures that the *declared* length in the frame header doesn't exceed our advertised limit.
-			frameHeader := frame.Header()
-			c.settingsMu.RLock() // ourCurrentMaxFrameSize is protected by settingsMu
-			currentMaxFrameSize := c.ourCurrentMaxFrameSize
-			c.settingsMu.RUnlock()
-
-			if frameHeader.Length > currentMaxFrameSize {
-				errMsg := fmt.Sprintf("received frame type %s on stream %d with declared length %d, which exceeds connection's SETTINGS_MAX_FRAME_SIZE %d",
-					frameHeader.Type.String(), frameHeader.StreamID, frameHeader.Length, currentMaxFrameSize)
-				c.log.Error(errMsg, logger.LogFields{
-					"remote_addr": c.remoteAddrStr,
-					"frame_type":  frameHeader.Type.String(),
-					"stream_id":   frameHeader.StreamID,
-					"frame_len":   frameHeader.Length,
-					"max_len":     currentMaxFrameSize,
-				})
-
-				// RFC 7540, Section 4.2: "An endpoint MUST treat receipt of a frame that is larger than
-				// SETTINGS_MAX_FRAME_SIZE ... as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
-				// However, h2spec expects RST_STREAM for DATA/HEADERS if on a valid stream,
-				// and connection error otherwise or for other frame types.
-
-				// Determine if RST_STREAM or GOAWAY is appropriate based on frame type and stream ID
-				if frameHeader.Type == FrameData || frameHeader.Type == FrameHeaders || frameHeader.Type == FrameContinuation {
-					if frameHeader.StreamID != 0 {
-						// Send RST_STREAM for stream-specific frames if stream ID is non-zero
-						// Errors sending RST_STREAM are logged but don't prevent the ConnectionError if that's what's decided later.
-						// For now, dispatchFrame logic is already complex, let's directly return ConnectionError
-						// and let the main Serve defer Close handle GOAWAY.
-						// The test TestFrameSizeExceeded_DATA specifically expects RST_STREAM.
-						// This means the ConnectionError needs to be handled such that if it's StreamID !=0 and Data/Headers/Continuation,
-						// then an RST_STREAM is sent for that specific stream and the connection may continue.
-						// If StreamID == 0 for these, or other frame types, it's a connection error.
-
-						// H2Spec 4.2.2 (oversized DATA) & 4.2.3 (oversized HEADERS)
-						// -> For DATA: RST_STREAM(FRAME_SIZE_ERROR) or GOAWAY(FRAME_SIZE_ERROR).
-						//    "RST_STREAM ... if the stream is still open"
-						// -> For HEADERS: GOAWAY(FRAME_SIZE_ERROR).
-						//
-						// Given the ambiguity/options, let's align with a common interpretation:
-						// If stream-specific frame (DATA, HEADERS, CONTINUATION, PUSH_PROMISE) on a valid stream ID (>0):
-						//   - If stream is open/half-closed: RST_STREAM(FRAME_SIZE_ERROR). Connection may survive.
-						//   - If stream is idle/closed: This scenario is less about frame size and more about stream state violation.
-						// If frame is on stream 0 (SETTINGS, PING, GOAWAY, WINDOW_UPDATE), or if HEADERS/DATA/etc. are incorrectly on stream 0:
-						//   - GOAWAY(FRAME_SIZE_ERROR).
-
-						// For test TestFrameSizeExceeded_DATA/OnValidStream_Expect_RST_STREAM:
-						if frameHeader.StreamID != 0 && (frameHeader.Type == FrameData) {
-							// Check if stream exists and is in a state where RST is appropriate
-							stream, exists := c.getStream(frameHeader.StreamID)
-							if exists {
-								stream.mu.RLock()
-								canRST := stream.state == StreamStateOpen || stream.state == StreamStateHalfClosedLocal || stream.state == StreamStateHalfClosedRemote
-								stream.mu.RUnlock()
-								if canRST {
-									c.log.Warn("Oversized DATA/HEADERS frame on active stream, sending RST_STREAM(FRAME_SIZE_ERROR)", logger.LogFields{"stream_id": frameHeader.StreamID, "frame_type": frameHeader.Type.String()})
-									if rstErr := c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError); rstErr != nil {
-										c.log.Error("Failed to send RST_STREAM for oversized frame", logger.LogFields{"stream_id": frameHeader.StreamID, "error": rstErr.Error()})
-										// If sending RST fails, escalate to connection error.
-										return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to send RST_STREAM for oversized frame", rstErr)
-									}
-									// After sending RST_STREAM, we should continue reading frames on the connection for other streams.
-									// Do not return an error that closes the connection here.
-									continue // Skip dispatchFrame for this oversized frame, continue reading loop.
-								}
-							}
-						}
-					}
-				}
-				// Default to connection error for other cases (e.g. oversized SETTINGS, PING on stream 0, or HEADERS on stream 0)
-				// or if stream specific RST conditions were not met.
-				return NewConnectionError(ErrCodeFrameSizeError, errMsg)
+			c.streamsMu.Lock()
+			if c.connError == nil {
+				c.connError = err
 			}
-		}
+			c.streamsMu.Unlock()
+			return err // Return the original fatal error from readFrame.
+		} // End of `if err != nil` block for readFrame errors
 
-		// Validate frame length against SETTINGS_MAX_FRAME_SIZE
-		// This check happens after reading the frame header and potentially its payload (by http2.ReadFrame),
-		// but before dispatching it to specific handlers.
-		// It ensures that the *declared* length in the frame header doesn't exceed our advertised limit.
-		frameHeader := frame.Header()
+		// If err == nil, frame was read successfully.
+		// Declare variables needed for frame size check. These are scoped to the rest of the loop iteration if err was nil.
+		var frameHeader *FrameHeader
+		var currentMaxFrameSize uint32
+
+		// Now validate its size.
+		// This SETTINGS_MAX_FRAME_SIZE check is now correctly placed *after* handling readFrame errors.
+		frameHeader = frame.Header()
 		c.settingsMu.RLock()
-		currentMaxFrameSize := c.ourCurrentMaxFrameSize
+		currentMaxFrameSize = c.ourCurrentMaxFrameSize
 		c.settingsMu.RUnlock()
 
 		if frameHeader.Length > currentMaxFrameSize {
@@ -3270,16 +3232,25 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				"max_len":     currentMaxFrameSize,
 			})
 
-			if frameHeader.StreamID != 0 {
-				// Attempt to send RST_STREAM for stream-specific frames exceeding max size.
-				// Errors sending RST_STREAM are logged but don't prevent the ConnectionError.
-				if rstErr := c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError); rstErr != nil {
-					c.log.Error("Failed to send RST_STREAM for frame exceeding SETTINGS_MAX_FRAME_SIZE",
-						logger.LogFields{"stream_id": frameHeader.StreamID, "error": rstErr.Error()})
+			// Behavior for oversized frames (h2spec 4.2.2, 4.2.3)
+			if frameHeader.StreamID != 0 && (frameHeader.Type == FrameData || frameHeader.Type == FrameHeaders || frameHeader.Type == FrameContinuation) {
+				// Check if stream exists and is in a state where RST is appropriate
+				stream, exists := c.getStream(frameHeader.StreamID)
+				if exists {
+					stream.mu.RLock()
+					canRST := stream.state == StreamStateOpen || stream.state == StreamStateHalfClosedLocal || stream.state == StreamStateHalfClosedRemote
+					stream.mu.RUnlock()
+					if canRST {
+						c.log.Warn("Oversized DATA/HEADERS/CONTINUATION frame on active stream, sending RST_STREAM(FRAME_SIZE_ERROR)", logger.LogFields{"stream_id": frameHeader.StreamID, "frame_type": frameHeader.Type.String()})
+						if rstErr := c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError); rstErr != nil {
+							c.log.Error("Failed to send RST_STREAM for oversized frame", logger.LogFields{"stream_id": frameHeader.StreamID, "error": rstErr.Error()})
+							return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to send RST_STREAM for oversized frame", rstErr)
+						}
+						continue // Skip dispatchFrame for this oversized frame, continue reading loop.
+					}
 				}
 			}
-			// RFC 7540, Section 4.2: "An endpoint MUST treat receipt of a frame that is larger than
-			// SETTINGS_MAX_FRAME_SIZE ... as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
+			// Default to connection error for other cases (e.g. oversized SETTINGS, PING on stream 0, or HEADERS on stream 0, or stream not active for RST)
 			return NewConnectionError(ErrCodeFrameSizeError, errMsg)
 		}
 
