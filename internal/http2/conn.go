@@ -1587,6 +1587,25 @@ func (c *Connection) dispatchFrame(frame Frame) error {
 		"flags":       frame.Header().Flags,
 	})
 
+	// h2spec tests (e.g., 4.3/2, 5.5/2, 6.2/1) require that if a header block is
+	// being assembled (activeHeaderBlockStreamID != 0), only CONTINUATION frames are allowed.
+	// Any other frame type arriving during this state is a PROTOCOL_ERROR.
+	if c.activeHeaderBlockStreamID != 0 {
+		// Check if the current frame is NOT a CONTINUATION frame.
+		if _, isContinuation := frame.(*ContinuationFrame); !isContinuation {
+			errMsg := fmt.Sprintf("received non-CONTINUATION frame (type %s, stream %d) while header block for stream %d is active",
+				frame.Header().Type.String(), frame.Header().StreamID, c.activeHeaderBlockStreamID)
+			c.log.Error(errMsg, logger.LogFields{
+				"frame_type":                 frame.Header().Type.String(),
+				"frame_stream_id":            frame.Header().StreamID,
+				"active_header_block_stream": c.activeHeaderBlockStreamID,
+			})
+			c.resetHeaderAssemblyState() // Reset state before propagating error
+			// The Serve loop will ensure GOAWAY is sent based on this ConnectionError.
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
+		}
+	}
+
 	// Common validations that apply to many frame types before specific dispatch
 	// Individual handlers currently perform many of these checks.
 
