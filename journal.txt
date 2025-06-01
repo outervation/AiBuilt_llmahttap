@@ -6,3 +6,9 @@ Task_SFS_LoggingIntegration: An important aspect of testing the StaticFileServer
 2.  After an operation, asserting that expected log messages (with correct levels and contextual fields like stream_id, path, error) are present in the buffer.
 3.  Asserting that no unexpected error/critical logs appear for successful operations.
 This ensures that the logging requirements of the StaticFileServer are met alongside its functional requirements.
+The fix for FlowControlWindow.Acquire (to correctly block on negative window) is expected to address the h2spec failure:
+`Hypertext Transfer Protocol Version 2 (HTTP/2) / 6. Frame Definitions / 6.9.2. Initial Flow-Control Window Size / 2: Sends a SETTINGS frame for window size to be negative`
+  `-> The endpoint MUST track the negative flow-control window.`
+  `Expected: DATA frame`
+  `Actual: HEADERS Frame (length:77, flags:0x04, stream_id:1)`
+Verifying this h2spec test passes after the change will be a key validation point.
