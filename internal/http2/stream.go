@@ -703,92 +703,92 @@ func (s *Stream) closeStreamResourcesProtected() {
 // 3. Handling the END_STREAM flag.
 // Returns a StreamError if stream-level flow control is violated or other stream-specific
 // issues occur. Returns a ConnectionError if a problem warrants closing the connection.
+
 func (s *Stream) handleDataFrame(frame *DataFrame) error {
 	s.mu.Lock() // Lock for state and flow control updates
 
-	// 1. Stream-level flow control
-	payloadLen := uint32(len(frame.Data)) // Assumes frame.Data is the actual payload after any depadding
-	// Accumulate received data bytes for content-length validation.
-	// This happens regardless of subsequent flow control success/failure for these bytes,
-	// as content-length refers to the declared length of the body being transmitted.
+	payloadLen := uint32(len(frame.Data))
 	if payloadLen > 0 {
 		s.receivedDataBytes += uint64(payloadLen)
 	}
 
 	if err := s.fcManager.DataReceived(payloadLen); err != nil {
-		s.mu.Unlock()
 		s.conn.log.Error("Stream flow control error on DATA frame",
 			logger.LogFields{"stream_id": s.id, "payload_len": payloadLen, "error": err.Error()})
-		// This error from sfcm.DataReceived should be a *StreamError with ErrCodeFlowControlError
-		// The connection will then RST the stream.
-		return err
+		s.mu.Unlock()
+		return err // This error from sfcm.DataReceived should be a *StreamError with ErrCodeFlowControlError
 	}
 
-	// Check stream state again under lock before writing to pipe, as it might have been closed concurrently.
+	// Content-Length validation for frames with END_STREAM
+	// This check is done early, before attempting to write to the (potentially blocking) pipe.
+	if frame.Header().Flags&FlagDataEndStream != 0 {
+		if s.parsedContentLength != nil {
+			if s.receivedDataBytes != uint64(*s.parsedContentLength) {
+				errMsg := fmt.Sprintf("content-length mismatch on END_STREAM: received %d bytes, expected %d", s.receivedDataBytes, *s.parsedContentLength)
+				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id})
+				// --- BEGIN FOCUSED DEBUG LOGGING (from previous step, can be removed if test passes) ---
+				var pclValForLog interface{} = "nil_pointer"
+				if s.parsedContentLength != nil {
+					pclValForLog = *s.parsedContentLength
+				}
+				s.conn.log.Debug("Stream.handleDataFrame: CL CHECK inside END_STREAM (early check)", logger.LogFields{
+					"stream_id":              s.id,
+					"parsedContentLength":    pclValForLog,
+					"receivedDataBytes":      s.receivedDataBytes,
+					"condition_evaluates_to": s.receivedDataBytes != uint64(*s.parsedContentLength),
+				})
+				// --- END FOCUSED DEBUG LOGGING ---
+				s.mu.Unlock()
+				return NewStreamError(s.id, ErrCodeProtocolError, errMsg)
+			}
+		}
+	}
+
+	// Check stream state *after* potential early exit from CL validation on END_STREAM.
 	if s.state == StreamStateHalfClosedRemote || s.state == StreamStateClosed {
-		s.mu.Unlock()
 		s.conn.log.Warn("DATA frame received on stream that is already half-closed (remote) or closed",
 			logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		// The peer shouldn't send DATA in these states. Already handled by dispatchDataFrames,
-		// but this is a defensive check. If reached, it means dispatchDataFrames's check was racy.
-		// Send RST_STREAM with STREAM_CLOSED.
+		s.mu.Unlock()
+		// Peer shouldn't send DATA in these states.
+		// RST_STREAM with STREAM_CLOSED. This ensures conn.dispatchDataFrame handles it.
 		return NewStreamError(s.id, ErrCodeStreamClosed, "DATA frame on closed/half-closed-remote stream")
 	}
 
 	s.mu.Unlock() // Unlock before writing to pipe, which can block.
 
-	// 2. Pass data to handler via requestBodyWriter
-	// If payloadLen is 0 and END_STREAM is not set, this is a no-op data-wise.
-	// If payloadLen is 0 and END_STREAM is set, this effectively just signals EOF.
+	// Pass data to handler via requestBodyWriter
 	if payloadLen > 0 {
 		if _, err := s.requestBodyWriter.Write(frame.Data); err != nil {
-			s.mu.Lock()
-			defer s.mu.Unlock()
 			s.conn.log.Error("Error writing to stream requestBodyWriter",
 				logger.LogFields{"stream_id": s.id, "error": err.Error()})
-			// This typically means the reader (handler) side of the pipe was closed.
-			// We should RST the stream because we can't process the data.
-			// ErrCodeInternalError or ErrCodeCancel depending on who closed the pipe.
-			// If the handler intentionally closed it, it might be okay, but if data is still incoming,
-			// it's an issue. RST_STREAM with CANCEL is appropriate if handler signaled it's done.
-			// If it's an unexpected pipe error, INTERNAL_ERROR.
-			// For now, assume CANCEL as the handler might be done.
+			// This typically means the reader (handler) side of the pipe was closed or an error occurred.
+			// We should RST the stream. If END_STREAM was already processed and CL was ok,
+			// this write error still means the stream can't proceed.
+			// Acquire lock to set state and then return error for RST.
+			s.mu.Lock()
 			_ = s.requestBodyWriter.CloseWithError(err) // Ensure writer is closed
-			s._setState(StreamStateClosed)              // Force closed, resources will be cleaned.
+			s._setState(StreamStateClosed)              // Force closed
+			s.mu.Unlock()
 			return NewStreamError(s.id, ErrCodeCancel, "failed to write to request body pipe: "+err.Error())
 		}
 	}
 
-	s.mu.Lock() // Lock for final state updates and END_STREAM flag processing.
+	s.mu.Lock() // Lock for final state updates for END_STREAM flag if not handled by early CL check.
+	defer s.mu.Unlock()
 
-	// Note: s.receivedDataBytes has been updated earlier in this function with current frame's data.
-	// The update to s.receivedDataBytes (lines 708-712) should also be under this lock,
-	// or s.receivedDataBytes needs to be an atomic type if handleDataFrame can be called concurrently
-	// for the same stream (which it shouldn't be). Assuming serialized calls for now, the read here is consistent.
-
-	// 3. Handle END_STREAM flag
+	// Handle END_STREAM flag related to pipe closure and state transition.
+	// CL validation already happened if END_STREAM was set.
 	if frame.Header().Flags&FlagDataEndStream != 0 {
-		s.conn.log.Debug("END_STREAM received on DATA frame", logger.LogFields{"stream_id": s.id})
-		s.endStreamReceivedFromClient = true
-
-		// Task: Content-length validation on END_STREAM (h2spec 8.1.2.6 #1, #2)
-		// This check uses s.parsedContentLength (set from HEADERS) and s.receivedDataBytes (accumulated).
-		// Both are read here under lock for consistency.
-		if s.parsedContentLength != nil {
-			if s.receivedDataBytes != uint64(*s.parsedContentLength) {
-				errMsg := fmt.Sprintf("content-length mismatch on END_STREAM: received %d bytes, expected %d", s.receivedDataBytes, *s.parsedContentLength)
-				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id})
-				// Unlock before calling sendRSTStream, which takes its own lock.
-				s.mu.Unlock()
-				_ = s.sendRSTStream(ErrCodeProtocolError)
-				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return error after attempting RST
-			}
+		s.conn.log.Debug("END_STREAM received on DATA frame (post-write, post-CL-check path)", logger.LogFields{"stream_id": s.id})
+		if !s.endStreamReceivedFromClient { // Ensure flag is only set once
+			s.endStreamReceivedFromClient = true
 		}
 
 		// Close the writer end of the pipe to signal EOF to the reader (handler).
+		// This is done even if CL check passed, as it's part of normal END_STREAM.
 		if s.requestBodyWriter != nil {
 			if err := s.requestBodyWriter.Close(); err != nil {
-				s.conn.log.Warn("Error closing requestBodyWriter on END_STREAM", logger.LogFields{"stream_id": s.id, "error": err.Error()})
+				s.conn.log.Warn("Error closing requestBodyWriter on END_STREAM (post-write path)", logger.LogFields{"stream_id": s.id, "error": err.Error()})
 				// Not fatal for connection, handler might get a pipe error.
 			}
 		}
@@ -798,17 +798,14 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 			s._setState(StreamStateHalfClosedRemote)
 		} else if s.state == StreamStateHalfClosedLocal { // Server already sent END_STREAM
 			s._setState(StreamStateClosed)
-		} else {
-			// This implies an invalid state for receiving END_STREAM (e.g., already closed, reserved).
-			s.conn.log.Error("END_STREAM received in unexpected stream state",
+		} else if s.state != StreamStateClosed && s.state != StreamStateHalfClosedRemote {
+			// This implies an invalid state for receiving END_STREAM if not already handled by earlier checks.
+			// e.g. Reserved states. Given earlier checks, this branch might be less likely to hit for DATA errors.
+			s.conn.log.Error("END_STREAM received in unexpected stream state (post-write path)",
 				logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-			s.mu.Unlock()                                     // Unlock before returning the error
-			return NewStreamError(s.id, ErrCodeProtocolError, // Or StreamClosed if state was already terminal
-				fmt.Sprintf("END_STREAM received in unexpected state %s for stream %d", s.state.String(), s.id))
+			return NewStreamError(s.id, ErrCodeProtocolError,
+				fmt.Sprintf("END_STREAM received in unexpected state %s for stream %d (post-write path)", s.state.String(), s.id))
 		}
-		s.mu.Unlock() // Unlock after state changes related to END_STREAM
-	} else {
-		s.mu.Unlock() // Unlock if not END_STREAM
 	}
 	return nil
 }
