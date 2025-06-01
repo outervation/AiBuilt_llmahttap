@@ -1279,6 +1279,26 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client attempted to send HEADERS on existing stream %d in state %s", streamID, state.String()))
 		}
 
+		// Validate stream ID ordering for client-initiated streams.
+		// RFC 7540, Section 5.1.1:
+		// "Stream identifiers cannot be reused. An endpoint that receives an unexpected
+		// stream identifier MUST respond with a connection error (Section 5.4.1) of
+		// type PROTOCOL_ERROR."
+		// "The identifier of a newly established stream MUST be numerically greater
+		// than all streams that the initiating endpoint has opened or reserved."
+		// This applies to streams initiated by the client (peer for the server).
+		c.streamsMu.Lock() // Lock for reading and writing highestPeerInitiatedStreamID
+		if streamID <= c.highestPeerInitiatedStreamID {
+			currentHighest := c.highestPeerInitiatedStreamID // Capture for logging before unlock
+			c.streamsMu.Unlock()
+			errMsg := fmt.Sprintf("client initiated stream ID %d is not greater than highest previously seen peer-initiated stream ID %d", streamID, currentHighest)
+			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "highest_peer_initiated_stream_id": currentHighest})
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
+		}
+		c.highestPeerInitiatedStreamID = streamID
+		c.log.Debug("Updated highestPeerInitiatedStreamID", logger.LogFields{"stream_id": streamID, "new_highest_peer_id": c.highestPeerInitiatedStreamID})
+		c.streamsMu.Unlock()
+
 		// Create the stream generically first.
 		c.log.Debug("Conn: About to call createStream", logger.LogFields{"stream_id": streamID, "prioInfo_present": prioInfo != nil})
 		// The dispatcher (c.dispatcher, type RequestDispatcherFunc) will be called by the stream
