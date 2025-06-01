@@ -332,9 +332,12 @@ func NewConnection(
 // applyOurSettings updates connection's operational parameters based on conn.ourSettings.
 // This should be called when our settings are initialized or changed.
 // Assumes settingsMu is held if called outside constructor.
-func (c *Connection) applyOurSettings() {
+func (c *Connection) applyOurSettings() error {
 	// Ensure SettingMaxFrameSize is within RFC 7540 Section 6.5.2 limits.
 	// MinMaxFrameSize (16384) and MaxAllowedFrameSizeValue (2^24-1).
+	// This function assumes the caller holds c.settingsMu if c.ourSettings can be modified concurrently.
+	// For NewConnection, it's safe as it's single-threaded at that point for 'c'.
+
 	if val, ok := c.ourSettings[SettingMaxFrameSize]; ok {
 		if val < MinMaxFrameSize {
 			c.log.Warn("Configured SETTINGS_MAX_FRAME_SIZE is too low, adjusting to minimum allowed.", logger.LogFields{
@@ -349,14 +352,14 @@ func (c *Connection) applyOurSettings() {
 			})
 			c.ourSettings[SettingMaxFrameSize] = MaxAllowedFrameSizeValue
 		}
-		// If val is within limits, it's used as is.
 	} else {
-		// If SettingMaxFrameSize is not in ourSettings map (e.g., not initialized), set to valid default.
 		c.log.Warn("SETTINGS_MAX_FRAME_SIZE not found in ourSettings, setting to default.", logger.LogFields{
-			"default_value": DefaultSettingsMaxFrameSize, // DefaultSettingsMaxFrameSize is 16384
+			"default_value": DefaultSettingsMaxFrameSize,
 		})
 		c.ourSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
 	}
+
+	oldOurInitialWindowSize := c.ourInitialWindowSize // Capture before update
 
 	c.ourCurrentMaxFrameSize = c.ourSettings[SettingMaxFrameSize]
 	c.ourInitialWindowSize = c.ourSettings[SettingInitialWindowSize]
@@ -365,6 +368,30 @@ func (c *Connection) applyOurSettings() {
 
 	enablePushVal, ok := c.ourSettings[SettingEnablePush]
 	c.ourEnablePush = (ok && enablePushVal == 1)
+
+	// Propagate change in our SETTINGS_INITIAL_WINDOW_SIZE to existing streams' receive windows
+	if c.ourInitialWindowSize != oldOurInitialWindowSize {
+		c.log.Debug("Our SETTINGS_INITIAL_WINDOW_SIZE changed, updating streams' receive windows.",
+			logger.LogFields{"old_value": oldOurInitialWindowSize, "new_value": c.ourInitialWindowSize})
+
+		var streamsToUpdate []*Stream
+		c.streamsMu.RLock()
+		// c.streams could be empty if called from NewConnection before any streams are created.
+		for _, stream := range c.streams {
+			streamsToUpdate = append(streamsToUpdate, stream)
+		}
+		c.streamsMu.RUnlock()
+
+		for _, stream := range streamsToUpdate {
+			if err := stream.fcManager.HandleOurSettingsInitialWindowSizeChange(c.ourInitialWindowSize); err != nil {
+				c.log.Error("Error updating stream receive window for new our SETTINGS_INITIAL_WINDOW_SIZE",
+					logger.LogFields{"stream_id": stream.id, "new_initial_size": c.ourInitialWindowSize, "error": err.Error()})
+				// This error is a ConnectionError, propagate it.
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // applyPeerSettings updates connection's operational parameters based on conn.peerSettings.
