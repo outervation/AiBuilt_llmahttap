@@ -1040,7 +1040,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		// Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding, Upgrade
 		lowerName := strings.ToLower(hf.Name)
 		switch lowerName {
-		case "connection", "proxy-connection", "keep-alive", "upgrade":
+		case "connection", "proxy-connection", "keep-alive", "upgrade", "transfer-encoding":
 			errMsg := fmt.Sprintf("connection-specific header field '%s' is forbidden", hf.Name)
 			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
 			if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
