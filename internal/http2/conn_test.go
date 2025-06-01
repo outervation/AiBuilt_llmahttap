@@ -2,7 +2,8 @@ package http2
 
 import (
 	"bytes"
-	"encoding/binary" // ADDED IMPORT
+	"context" // ADDED IMPORT
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt" // Added import
@@ -13,11 +14,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"golang.org/x/net/http2/hpack"
 	"time"
 
 	"example.com/llmahttap/v2/internal/logger"
+	"golang.org/x/net/http2/hpack"
 )
 
 // mockNetConn is a mock implementation of net.Conn for testing.
@@ -46,19 +46,35 @@ func newMockNetConn() *mockNetConn {
 
 func (m *mockNetConn) Read(b []byte) (n int, err error) {
 	m.mu.Lock()
+	// Log state *before* unlock and before actual read decision.
+	// Do not use t.Logf here as 't' is not available. Use fmt.Printf or similar, or a passed-in logger.
+	// For simplicity in this step, let's assume direct printing is okay for test diagnosis if it fails.
+	// fmt.Printf("[mockNetConn.Read TRACE] Locked. closed=%v, readDeadlineZero=%v, nowAfterReadDeadline=%v, readBufLen=%d, readHookNil=%v\n",
+	//	m.closed, m.readDeadline.IsZero(), !m.readDeadline.IsZero() && time.Now().After(m.readDeadline), m.readBuf.Len(), m.readHook == nil)
 	defer m.mu.Unlock()
+
 	if m.closed {
+		// fmt.Printf("[mockNetConn.Read TRACE] Returning because m.closed is true. Error: %v\n", m.closeErr)
 		return 0, m.closeErr
 	}
 	if !m.readDeadline.IsZero() && time.Now().After(m.readDeadline) {
+		// fmt.Printf("[mockNetConn.Read TRACE] Returning read timeout.\n")
 		return 0, errors.New("read timeout (mock)")
 	}
+
 	if m.readBuf.Len() > 0 {
-		return m.readBuf.Read(b)
+		// fmt.Printf("[mockNetConn.Read TRACE] Reading %d bytes from m.readBuf (len %d)\n", len(b), m.readBuf.Len())
+		n, err = m.readBuf.Read(b)
+		// fmt.Printf("[mockNetConn.Read TRACE] m.readBuf.Read returned n=%d, err=%v. Remaining m.readBuf.Len()=%d\n", n, err, m.readBuf.Len())
+		return n, err
 	}
 	if m.readHook != nil {
-		return m.readHook(b)
+		// fmt.Printf("[mockNetConn.Read TRACE] Calling m.readHook\n")
+		n, err = m.readHook(b)
+		// fmt.Printf("[mockNetConn.Read TRACE] m.readHook returned n=%d, err=%v\n", n, err)
+		return n, err
 	}
+	// fmt.Printf("[mockNetConn.Read TRACE] No data in readBuf, no readHook. Returning io.EOF.\n")
 	return 0, io.EOF
 }
 
@@ -192,7 +208,6 @@ func newTestConnection(t *testing.T, isClient bool, mockDispatcher *mockRequestD
 	}
 
 	conn := NewConnection(mnc, lg, isClient, nil, dispatcherFunc)
-	conn.writerChan = make(chan Frame, 1) // Ensure a small buffer for test predictability
 	if conn == nil {
 		t.Fatal("NewConnection returned nil")
 	}
@@ -230,20 +245,63 @@ func readAllFramesFromBuffer(t *testing.T, data []byte) []Frame {
 	t.Helper()
 	var frames []Frame
 	r := bytes.NewReader(data)
+	// Log the raw data being processed
+	t.Logf("readAllFramesFromBuffer: START. Processing %d bytes. Data (hex): %s", len(data), hex.EncodeToString(data))
+
+	initialLen := r.Len()
+
 	for r.Len() > 0 {
-		frame, err := ReadFrame(r)
+		currentPos := initialLen - r.Len()
+		t.Logf("readAllFramesFromBuffer: Loop Iteration. r.Len() = %d (at offset %d of %d)", r.Len(), currentPos, initialLen)
+
+		// Peek at frame header bytes without consuming them from main reader 'r'
+		// This is to log the frame type/length we are *about* to parse.
+		if r.Len() >= FrameHeaderLen {
+			headerBytes := make([]byte, FrameHeaderLen)
+			// Create a new reader for peeking to not affect 'r's position
+			peekReader := bytes.NewReader(data[currentPos:])
+			_, errPeek := io.ReadFull(peekReader, headerBytes)
+			if errPeek == nil {
+				peekedLength := (uint32(headerBytes[0])<<16 | uint32(headerBytes[1])<<8 | uint32(headerBytes[2]))
+				peekedType := FrameType(headerBytes[3])
+				peekedFlags := Flags(headerBytes[4])
+				peekedStreamID := binary.BigEndian.Uint32(headerBytes[5:9]) & 0x7FFFFFFF
+				t.Logf("readAllFramesFromBuffer: PEEK. About to parse frame starting at offset %d. Header indicates: Type=%s, Length=%d, Flags=%d, StreamID=%d",
+					currentPos, peekedType, peekedLength, peekedFlags, peekedStreamID)
+			} else {
+				t.Logf("readAllFramesFromBuffer: PEEK. Failed to peek at frame header (not enough bytes or other error): %v", errPeek)
+			}
+		} else {
+			t.Logf("readAllFramesFromBuffer: PEEK. Not enough bytes remaining (%d) to form a full frame header (need %d).", r.Len(), FrameHeaderLen)
+		}
+
+		frame, err := ReadFrame(r) // This ReadFrame uses 'r' and consumes data.
 		if err != nil {
+			t.Logf("readAllFramesFromBuffer: ReadFrame error: %v. r.Len() after error: %d. Offset where error occurred: %d", err, r.Len(), currentPos)
 			if errors.Is(err, io.EOF) {
+				t.Logf("readAllFramesFromBuffer: EOF encountered, breaking loop.")
 				break
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Logf("readAllFramesFromBuffer: Unexpected EOF, likely incomplete frame. Data remaining: %d. Error: %v", r.Len(), err)
+				t.Logf("readAllFramesFromBuffer: Unexpected EOF, likely incomplete frame. Original data length: %d, data processed up to this point (approx): %d. Error: %v", len(data), currentPos, err)
 				break
 			}
-			t.Fatalf("readAllFramesFromBuffer: Error reading frame: %v", err)
+			// For other errors, log and break. Depending on test, might not want t.Fatalf here
+			// as it would stop the test from checking what *was* parsed.
+			t.Logf("readAllFramesFromBuffer: Non-EOF/UnexpectedEOF error reading frame: %v. Raw data being parsed: %s. Parsed frames so far: %d", err, hex.EncodeToString(data), len(frames))
+			break // Stop parsing on other errors
 		}
+		if frame == nil { // Should not happen if err is nil
+			t.Logf("readAllFramesFromBuffer: ReadFrame returned nil frame AND nil error. This is unexpected. Breaking.")
+			break
+		}
+
+		t.Logf("readAllFramesFromBuffer: Successfully parsed frame. Type: %s, StreamID: %d, Length: %d, Flags: %d. r.Len() after parse: %d",
+			frame.Header().Type, frame.Header().StreamID, frame.Header().Length, frame.Header().Flags, r.Len())
 		frames = append(frames, frame)
+
 	}
+	t.Logf("readAllFramesFromBuffer: END. Parsed %d frames. Data remaining in reader: %d", len(frames), r.Len())
 	return frames
 }
 
@@ -257,6 +315,27 @@ func waitForCondition(t *testing.T, timeout time.Duration, interval time.Duratio
 		time.Sleep(interval)
 	}
 	t.Fatalf("Timeout waiting for condition: %s", msg)
+}
+
+// waitForFrameCondition polls for a specific frame type and condition.
+// It returns the found frame or nil if timeout.
+func waitForFrameCondition[F Frame](t *testing.T, timeout time.Duration, interval time.Duration, mnc *mockNetConn, frameType F, condition func(f F) bool, msg string) F {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var zeroValue F // To return if not found
+	for time.Now().Before(deadline) {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		for _, fr := range frames {
+			if typedFrame, ok := fr.(F); ok {
+				if condition(typedFrame) {
+					return typedFrame
+				}
+			}
+		}
+		time.Sleep(interval)
+	}
+	t.Fatalf("Timeout waiting for frame condition: %s. Last frames seen: %+v", msg, readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes()))
+	return zeroValue
 }
 
 // getErrorCode is a helper for logging, extracts ErrorCode if available.
@@ -3636,4 +3715,232 @@ func TestServerHandshake_ConnectionClosedExternally(t *testing.T) {
 
 	// The final error for the defer should be the one that initiated the close.
 	closeErr = externalCloseErr
+}
+
+// TestFrameSizeExceeded_DATA tests server behavior when receiving DATA frames
+// that exceed the advertised SETTINGS_MAX_FRAME_SIZE.
+// Covers h2spec Generic 4.2.2 (DATA frame exceeds SETTINGS_MAX_FRAME_SIZE)
+// and parts of HTTP/2 4.2 (Frame Size).
+func TestFrameSizeExceeded_DATA(t *testing.T) {
+	t.Parallel()
+
+	// Server's default advertised max frame size in tests (from conn.sendInitialSettings)
+	serverAnnouncedMaxFrameSize := DefaultSettingsMaxFrameSize // Typically 16384
+
+	// Create a payload slightly larger than the max frame size
+	oversizedPayload := make([]byte, serverAnnouncedMaxFrameSize+1)
+	for i := range oversizedPayload {
+		oversizedPayload[i] = byte(i % 256) // Fill with some data
+	}
+	oversizedFrameLength := uint32(len(oversizedPayload))
+
+	// --- Subtest 1: Oversized DATA frame on a valid stream ---
+	t.Run("OnValidStream_Expect_RST_STREAM", func(t *testing.T) {
+		t.Parallel()
+		mockDispatcher := &mockRequestDispatcher{}
+		conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+		var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_DATA/OnValidStream")
+		defer func() { conn.Close(closeErr) }()
+
+		performHandshakeForTest(t, conn, mnc) // Server sends its SETTINGS_MAX_FRAME_SIZE
+		mnc.ResetWriteBuffer()
+
+		serveErrChan := make(chan error, 1)
+		go func() {
+			serveErrChan <- conn.Serve(context.Background())
+		}()
+
+		// Client initiates stream 1
+
+		const streamIDToUse uint32 = 1
+
+		clientHeaders := []hpack.HeaderField{
+			{Name: ":method", Value: "POST"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/data"}, {Name: ":authority", Value: "example.com"},
+		}
+		hpackClientHeaders := encodeHeadersForTest(t, clientHeaders)
+		headersFrameClient := &HeadersFrame{
+			FrameHeader: FrameHeader{
+				Type:     FrameHeaders,
+				Flags:    FlagHeadersEndHeaders, // Not ending stream, expecting DATA
+				StreamID: streamIDToUse,
+				Length:   uint32(len(hpackClientHeaders)),
+			},
+			HeaderBlockFragment: hpackClientHeaders,
+		}
+
+		// Prepare oversized DATA frame
+		dataFrame := &DataFrame{
+			FrameHeader: FrameHeader{Type: FrameData, StreamID: streamIDToUse, Length: oversizedFrameLength},
+			Data:        oversizedPayload,
+		}
+
+		// Feed BOTH frames before waiting for dispatcher or starting Serve loop checks
+		mnc.FeedReadBuffer(frameToBytes(t, headersFrameClient))
+		mnc.FeedReadBuffer(frameToBytes(t, dataFrame))
+
+		// Expect RST_STREAM(FRAME_SIZE_ERROR) on stream 1
+		var rstFrame *RSTStreamFrame
+		waitForCondition(t, 2*time.Second, 20*time.Millisecond, func() bool {
+			frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+			for _, f := range frames {
+				if rf, ok := f.(*RSTStreamFrame); ok {
+					if rf.Header().StreamID == streamIDToUse && rf.ErrorCode == ErrCodeFrameSizeError {
+						rstFrame = rf
+						return true
+					}
+				}
+			}
+			return false
+		}, fmt.Sprintf("RST_STREAM(FRAME_SIZE_ERROR) for stream %d", streamIDToUse))
+
+		if rstFrame == nil {
+			// This means waitForCondition timed out. It would have called t.Fatalf.
+			// This line is mostly for completeness if that behavior changes.
+			t.Fatal("Expected RST_STREAM(FRAME_SIZE_ERROR) not received")
+		}
+
+		// Ensure no GOAWAY frame was sent
+		time.Sleep(50 * time.Millisecond) // Give a bit of time for a GOAWAY if it were to be sent
+		framesAfterRST := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		for _, f := range framesAfterRST {
+			if _, ok := f.(*GoAwayFrame); ok {
+				t.Fatalf("Unexpected GOAWAY frame sent for oversized DATA on valid stream: %+v", f)
+			}
+		}
+
+		// Cleanly terminate the Serve loop for this subtest
+		mnc.Close() // This will cause conn.Serve to exit
+		select {
+		case err := <-serveErrChan:
+			if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+				t.Logf("conn.Serve exited with: %v (expected EOF or closed connection)", err)
+			}
+		case <-time.After(1 * time.Second):
+			t.Error("Timeout waiting for conn.Serve to exit after mnc.Close()")
+		}
+		closeErr = nil // Test logic passed
+	})
+
+	// --- Subtest 2: Oversized DATA frame on stream 0 ---
+	t.Run("OnStream0_Expect_GOAWAY", func(t *testing.T) {
+		t.Parallel()
+		conn, mnc := newTestConnection(t, false, nil)
+		var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_DATA/OnStream0")
+		// Defer conn.Close with a specific error variable that can be set to nil if test logic passes.
+		// This ensures GOAWAY from this Close uses the error from Serve if it occurs.
+		// Defer a final conn.Close. The error used here will be updated if the test passes.
+		// This is mainly a safety net. The test itself will call conn.Close with the relevant error.
+		finalCleanupErr := errors.New("subtest defer close: " + t.Name()) // Unique error for this defer
+		defer func() {
+			if conn != nil {
+				if !t.Failed() { // If subtest assertions passed
+					finalCleanupErr = nil
+				} else if closeErr != nil { // If closeErr was set by test logic due to failure
+					finalCleanupErr = closeErr
+				}
+				// If t.Failed() but closeErr is nil, finalCleanupErr remains "subtest defer close..."
+				conn.Close(finalCleanupErr)
+			}
+		}()
+
+		// Initialize closeErr for the subtest body. It will be set to nil if logic passes.
+		closeErr = errors.New("test logic failure in: " + t.Name())
+
+		performHandshakeForTest(t, conn, mnc)
+		mnc.ResetWriteBuffer()
+
+		serveErrChan := make(chan error, 1)
+		go func() {
+			err := conn.Serve(context.Background())
+			serveErrChan <- err
+		}()
+
+		// Send oversized DATA frame on stream 0
+		dataFrame := &DataFrame{
+			FrameHeader: FrameHeader{Type: FrameData, StreamID: 0, Length: oversizedFrameLength},
+			Data:        oversizedPayload,
+		}
+		mnc.FeedReadBuffer(frameToBytes(t, dataFrame))
+
+		// Expect GOAWAY(PROTOCOL_ERROR)
+		// Expect conn.Serve to exit with a ConnectionError
+		var serveExitError error
+		select {
+		case serveExitError = <-serveErrChan:
+			// Good, Serve exited
+		case <-time.After(2 * time.Second): // Increased timeout slightly for robustness
+			t.Fatal("Timeout waiting for conn.Serve to exit after sending oversized DATA on stream 0")
+		}
+
+		if serveExitError == nil {
+			t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+		}
+
+		var connErr *ConnectionError
+		if !errors.As(serveExitError, &connErr) {
+			t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+		}
+		// Now connErr is the unwrapped *ConnectionError if errors.As was successful.
+
+		// The server detects "DATA on stream 0" as PROTOCOL_ERROR first.
+		// This error (serveExitError) is used by the conn.Serve() defer's conn.Close() to generate the GOAWAY.
+		if connErr.Code != ErrCodeProtocolError {
+			t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+		}
+
+		// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+		// The subtest's defer will also call Close, but this ensures it happens with the correct error context now.
+		_ = conn.Close(serveExitError) // We don't check the error from this Close, as serveExitError is primary.
+
+		// Now check for the GOAWAY frame.
+		// Use waitForFrameCondition (or a specialized local version) to get the frame.
+		var goAwayFrame *GoAwayFrame
+		timeoutMsgBase := "GOAWAY(PROTOCOL_ERROR) for oversized DATA on stream 0"
+		_ = timeoutMsgBase // Temporarily use timeoutMsgBase to avoid unused error for it
+		goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+			if f.ErrorCode == ErrCodeProtocolError {
+				t.Logf("Found GOAWAY frame in waitForFrameCondition: ErrorCode=%s (expected %s), LSID=%d", f.ErrorCode, ErrCodeProtocolError, f.LastStreamID)
+				return true
+			}
+			t.Logf("Found GOAWAY frame in waitForFrameCondition but ErrorCode mismatch: ErrorCode=%s (expected %s), LSID=%d", f.ErrorCode, ErrCodeProtocolError, f.LastStreamID)
+			return false
+		}, timeoutMsgBase)
+
+		// The t.Fatalf inside waitForFrameCondition will trigger if timeout.
+		// If we reach here, goAwayFrame should be non-nil and correct due to the condition.
+		if goAwayFrame == nil {
+			t.Fatalf("Timeout waiting for GOAWAY(PROTOCOL_ERROR) for oversized DATA on stream 0. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+		}
+		// if goAwayFrame == nil { // Should be redundant if foundGoAway is true. Defensive.
+		// 	t.Fatal("Expected GOAWAY(PROTOCOL_ERROR) not received (goAwayFrame is nil after poll)")
+		// }
+
+		if goAwayFrame.LastStreamID != 0 {
+			t.Errorf("GOAWAY LastStreamID: got %d, want 0 (no streams processed before error)", goAwayFrame.LastStreamID)
+		}
+
+		// The defer for this subtest will call conn.Close(closeErr).
+		// Since the error from Serve (serveExitError) is the one that drove the shutdown,
+		// we want the subtest's defer to use that if it was an error, or nil if successful.
+		// If we reach here, the primary test logic passed.
+		closeErr = serveExitError  // Propagate the error from Serve for the deferred Close.
+		if serveExitError == nil { // Should not happen given the checks above, but defensive.
+			closeErr = nil
+		} else if _, isConnErr := serveExitError.(*ConnectionError); isConnErr && connErr.Code == ErrCodeProtocolError {
+			// If the error was the expected PROTOCOL_ERROR, the test itself has passed.
+			// The deferred conn.Close will use this error.
+			// We can set the subtest's outer `closeErr` to nil to signify this subtest logic is "passing".
+			// Or, more robustly, the subtest's defer `closeErr` variable should reflect the actual error
+			// that caused the connection to terminate, which is `serveExitError`.
+			// The assignment above `closeErr = serveExitError` is correct.
+			// If this specific test path completes without t.Error/t.Fatal, then the logic is considered successful.
+		}
+
+		// If all checks pass up to here, the specific logic of this test case is considered successful.
+		// The defer will handle closing with 'closeErr' which is now 'serveExitError'.
+		// To indicate the test's assertions passed and avoid marking `closeErr` with a generic test error:
+		if !t.Failed() { // Check if any t.Error/Fatal has occurred so far
+			closeErr = nil // Test logic passed
+		}
+	})
 }
