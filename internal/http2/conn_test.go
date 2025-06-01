@@ -4255,3 +4255,99 @@ func TestInterleavedFramesDuringHeaderBlock(t *testing.T) {
 		})
 	}
 }
+
+// TestRSTStreamOnIdleStream_ServeLoop tests that the server correctly handles
+// an RST_STREAM frame received for an idle stream when the main Serve loop is running.
+// It expects the server to treat this as a connection error (PROTOCOL_ERROR),
+// send a GOAWAY frame, and close the connection.
+// Covers h2spec 5.1.2 and 6.4.2.
+func TestRSTStreamOnIdleStream_ServeLoop(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestRSTStreamOnIdleStream_ServeLoop")
+	// Defer a final conn.Close. The error used here will be updated by test logic.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background()) // Use a background context
+		serveErrChan <- err
+	}()
+
+	const idleStreamID uint32 = 3 // Client-initiated odd ID, not used by handshake
+	rstFrame := &RSTStreamFrame{
+		FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: idleStreamID, Length: 4},
+		ErrorCode:   ErrCodeCancel, // Client's error code doesn't affect server's PROTOCOL_ERROR response here
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, rstFrame))
+
+	// Expect conn.Serve to exit with a ConnectionError(PROTOCOL_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second): // Give ample time for processing and exit
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending RST_STREAM on idle stream")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+	}
+	// The message should indicate it's about an idle stream.
+	// Example msg: "RST_STREAM received for numerically idle stream 3 (highest peer initiated: 0)"
+	expectedMsgSubstr := fmt.Sprintf("RST_STREAM received for numerically idle stream %d", idleStreamID)
+	if !strings.Contains(connErr.Msg, expectedMsgSubstr) {
+		t.Errorf("ConnectionError message '%s' does not contain expected substring '%s'", connErr.Msg, expectedMsgSubstr)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to ensure GOAWAY logic uses it.
+	// conn.Close is idempotent.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeProtocolError
+	}, "GOAWAY(PROTOCOL_ERROR) for RST_STREAM on idle stream")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(PROTOCOL_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should be 0 (or highest *successfully processed* client stream ID before this error).
+	// Since stream `idleStreamID` was idle, no client streams were processed before the error.
+	// If handshake involved client sending SETTINGS on stream 0, lastProcessedStreamID might be 0.
+	// Let's check against conn.lastProcessedStreamID.
+	conn.streamsMu.RLock()
+	expectedLastStreamID := conn.lastProcessedStreamID
+	conn.streamsMu.RUnlock()
+
+	if goAwayFrame.LastStreamID != expectedLastStreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want %d (conn.lastProcessedStreamID)", goAwayFrame.LastStreamID, expectedLastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil for the deferred Close.
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
