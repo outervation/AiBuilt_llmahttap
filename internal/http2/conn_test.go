@@ -4677,3 +4677,104 @@ func TestInterleavedPriorityFrameDuringHeaderBlock(t *testing.T) {
 		closeErr = nil
 	}
 }
+
+// TestInterleavedUnknownFrameDuringHeaderBlock specifically tests that sending an unknown frame
+// after a HEADERS frame (without END_HEADERS) and before any CONTINUATION frame
+// results in a connection error (PROTOCOL_ERROR) and a GOAWAY frame.
+// This covers h2spec 5.5.2.
+func TestInterleavedUnknownFrameDuringHeaderBlock(t *testing.T) {
+	t.Parallel()
+
+	initialHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/test"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedInitialHeaders := encodeHeadersForTest(t, initialHeaders)
+
+	initialHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    0, // CRITICAL: No END_HEADERS flag
+			StreamID: 1, // New client-initiated stream
+			Length:   uint32(len(encodedInitialHeaders)),
+		},
+		HeaderBlockFragment: encodedInitialHeaders,
+	}
+
+	interleavedUnknownFrame := &UnknownFrame{
+		FrameHeader: FrameHeader{Type: FrameType(0xFA), StreamID: 1, Length: 4}, // Arbitrary unknown type 0xFA and length
+		Payload:     []byte{0xDE, 0xAD, 0xBE, 0xEF},
+	}
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInterleavedUnknownFrameDuringHeaderBlock")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	// Send initial HEADERS frame (no END_HEADERS)
+	mnc.FeedReadBuffer(frameToBytes(t, initialHeadersFrame))
+	// Send the interleaved UnknownFrame
+	mnc.FeedReadBuffer(frameToBytes(t, interleavedUnknownFrame))
+
+	// Expect conn.Serve to exit with a ConnectionError(PROTOCOL_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending interleaved UnknownFrame")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeProtocolError
+	}, "GOAWAY(PROTOCOL_ERROR) for interleaved UnknownFrame")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(PROTOCOL_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should be 0 as the stream 1 was not fully established.
+	// Or it could be the stream ID of the frame that initiated the header block (stream 1).
+	if goAwayFrame.LastStreamID != 0 && goAwayFrame.LastStreamID != initialHeadersFrame.Header().StreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want 0 or %d (stream ID of initial HEADERS)", goAwayFrame.LastStreamID, initialHeadersFrame.Header().StreamID)
+	} else {
+		t.Logf("GOAWAY LastStreamID is %d, which is acceptable.", goAwayFrame.LastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
