@@ -78,21 +78,22 @@ type Connection struct {
 	connError    error         // Stores the first fatal connection error
 
 	// HTTP/2 state
-	streamsMu                sync.RWMutex
-	streams                  map[uint32]*Stream
-	nextStreamIDClient       uint32 // Next client-initiated stream ID (odd), server consumes
-	nextStreamIDServer       uint32 // Next server-initiated stream ID (even), server produces (for PUSH)
-	lastProcessedStreamID    uint32 // Highest stream ID processed or accepted for GOAWAY
-	peerReportedLastStreamID uint32 // Highest stream ID peer reported processing in a GOAWAY frame (initially max_uint32)
-	priorityTree             *PriorityTree
-	hpackAdapter             *HpackAdapter
-	connFCManager            *ConnectionFlowControlManager
-	goAwaySent               bool      // Added this missing field from thought process
-	peerReportedErrorCode    ErrorCode // NEW FIELD
-	goAwayReceived           bool
-	gracefulShutdownTimer    *time.Timer
-	activePings              map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
-	activePingsMu            sync.Mutex
+	streamsMu                    sync.RWMutex
+	streams                      map[uint32]*Stream
+	nextStreamIDClient           uint32 // Next client-initiated stream ID (odd), server consumes
+	nextStreamIDServer           uint32 // Next server-initiated stream ID (even), server produces (for PUSH)
+	lastProcessedStreamID        uint32 // Highest stream ID processed or accepted for GOAWAY
+	highestPeerInitiatedStreamID uint32 // Highest stream ID initiated by peer (client for server, server for client)
+	peerReportedLastStreamID     uint32 // Highest stream ID peer reported processing in a GOAWAY frame (initially max_uint32)
+	priorityTree                 *PriorityTree
+	hpackAdapter                 *HpackAdapter
+	connFCManager                *ConnectionFlowControlManager
+	goAwaySent                   bool      // Added this missing field from thought process
+	peerReportedErrorCode        ErrorCode // NEW FIELD
+	goAwayReceived               bool
+	gracefulShutdownTimer        *time.Timer
+	activePings                  map[[8]byte]*time.Timer // Tracks outstanding PINGs and their timeout timers
+	activePingsMu                sync.Mutex
 
 	// Header block assembly state
 	activeHeaderBlockStreamID     uint32                // Stream ID of the current header block being assembled
@@ -179,12 +180,13 @@ func NewConnection(
 		activePings:   make(map[[8]byte]*time.Timer),
 		ourSettings:   make(map[SettingID]uint32),
 		// initialSettingsOnce is zero-valued correctly by default
-		initialSettingsWritten:   make(chan struct{}), // Initialize the new channel
-		peerSettings:             make(map[SettingID]uint32),
-		remoteAddrStr:            nc.RemoteAddr().String(),
-		dispatcher:               dispatcher,     // Store dispatcher func
-		peerReportedLastStreamID: 0xffffffff,     // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
-		peerReportedErrorCode:    ErrCodeNoError, // Initialize to NoError
+		initialSettingsWritten:       make(chan struct{}), // Initialize the new channel
+		peerSettings:                 make(map[SettingID]uint32),
+		remoteAddrStr:                nc.RemoteAddr().String(),
+		dispatcher:                   dispatcher,     // Store dispatcher func
+		peerReportedLastStreamID:     0xffffffff,     // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
+		peerReportedErrorCode:        ErrCodeNoError, // Initialize to NoError
+		highestPeerInitiatedStreamID: 0,              // Initialize new field
 	}
 
 	lg.Debug("NewConnection: Post-initialization. Dumping conn.ourSettings before applyOurSettings", logger.LogFields{"conn_ourSettingsDump_before_apply": fmt.Sprintf("%#v", conn.ourSettings)})
