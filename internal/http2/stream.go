@@ -757,13 +757,32 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 		}
 	}
 
-	s.mu.Lock() // Re-lock for END_STREAM processing and state update
-	defer s.mu.Unlock()
+	s.mu.Lock() // Lock for final state updates and END_STREAM flag processing.
+
+	// Note: s.receivedDataBytes has been updated earlier in this function with current frame's data.
+	// The update to s.receivedDataBytes (lines 708-712) should also be under this lock,
+	// or s.receivedDataBytes needs to be an atomic type if handleDataFrame can be called concurrently
+	// for the same stream (which it shouldn't be). Assuming serialized calls for now, the read here is consistent.
 
 	// 3. Handle END_STREAM flag
 	if frame.Header().Flags&FlagDataEndStream != 0 {
 		s.conn.log.Debug("END_STREAM received on DATA frame", logger.LogFields{"stream_id": s.id})
 		s.endStreamReceivedFromClient = true
+
+		// Task: Content-length validation on END_STREAM (h2spec 8.1.2.6 #1, #2)
+		// This check uses s.parsedContentLength (set from HEADERS) and s.receivedDataBytes (accumulated).
+		// Both are read here under lock for consistency.
+		if s.parsedContentLength != nil {
+			if s.receivedDataBytes != uint64(*s.parsedContentLength) {
+				errMsg := fmt.Sprintf("content-length mismatch on END_STREAM: received %d bytes, expected %d", s.receivedDataBytes, *s.parsedContentLength)
+				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id})
+				// Unlock before calling sendRSTStream, which takes its own lock.
+				s.mu.Unlock()
+				_ = s.sendRSTStream(ErrCodeProtocolError)
+				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return error after attempting RST
+			}
+		}
+
 		// Close the writer end of the pipe to signal EOF to the reader (handler).
 		if s.requestBodyWriter != nil {
 			if err := s.requestBodyWriter.Close(); err != nil {
@@ -779,18 +798,16 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 			s._setState(StreamStateClosed)
 		} else {
 			// This implies an invalid state for receiving END_STREAM (e.g., already closed, reserved).
-			// The frame dispatch logic in conn.go should prevent this.
-			// If it happens, it's a protocol violation or internal state error.
-			// s.mu.Unlock() is not needed here because of the defer s.mu.Unlock() at the top of this locked section.
 			s.conn.log.Error("END_STREAM received in unexpected stream state",
 				logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+			s.mu.Unlock()                                     // Unlock before returning the error
 			return NewStreamError(s.id, ErrCodeProtocolError, // Or StreamClosed if state was already terminal
 				fmt.Sprintf("END_STREAM received in unexpected state %s for stream %d", s.state.String(), s.id))
 		}
+		s.mu.Unlock() // Unlock after state changes related to END_STREAM
+	} else {
+		s.mu.Unlock() // Unlock if not END_STREAM
 	}
-
-	// The problematic call to s.fcManager.SendWindowUpdateIfNeeded(payloadLen) has been removed.
-	// The application layer will be responsible for signaling data consumption.
 	return nil
 }
 
