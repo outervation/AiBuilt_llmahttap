@@ -2305,6 +2305,105 @@ func TestPriorityTree_UpdatePriority_SelfDependencyError(t *testing.T) {
 	}
 }
 
+func TestPriorityTree_UpdatePriority_ExclusiveReordering(t *testing.T) {
+	pt := NewPriorityTree()
+
+	parentID := uint32(1)
+	streamExID := uint32(2) // Stream that will become exclusive child of parentID
+	streamExChild1ID := uint32(3)
+	streamExChild2ID := uint32(4)
+	parentOtherChild1ID := uint32(5)
+	parentOtherChild2ID := uint32(6)
+
+	// Setup:
+	// 0 -> parentID (1)
+	//      parentID -> streamExID (2)
+	//                  streamExID -> streamExChild1ID (3)
+	//                  streamExID -> streamExChild2ID (4)
+	//      parentID -> parentOtherChild1ID (5)
+	//      parentID -> parentOtherChild2ID (6)
+
+	// AddStream calls UpdatePriority, which expects the caller to handle locking.
+	// AddStream itself handles locking.
+	if err := pt.AddStream(parentID, nil); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", parentID, err)
+	}
+	if err := pt.AddStream(streamExID, &streamDependencyInfo{StreamDependency: parentID, Weight: 10}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamExID, err)
+	}
+	if err := pt.AddStream(streamExChild1ID, &streamDependencyInfo{StreamDependency: streamExID, Weight: 1}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamExChild1ID, err)
+	}
+	if err := pt.AddStream(streamExChild2ID, &streamDependencyInfo{StreamDependency: streamExID, Weight: 2}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", streamExChild2ID, err)
+	}
+	if err := pt.AddStream(parentOtherChild1ID, &streamDependencyInfo{StreamDependency: parentID, Weight: 20}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", parentOtherChild1ID, err)
+	}
+	if err := pt.AddStream(parentOtherChild2ID, &streamDependencyInfo{StreamDependency: parentID, Weight: 30}); err != nil {
+		t.Fatalf("Setup AddStream(%d) failed: %v", parentOtherChild2ID, err)
+	}
+
+	// Verify initial children of streamExID (2)
+	// AddStream appends children, so their order [3,4] should be stable if added 3 then 4.
+	_, sExChildrenPre, _, _ := pt.GetDependencies(streamExID)
+	expectedExChildrenPre := []uint32{streamExChild1ID, streamExChild2ID}
+	if !reflect.DeepEqual(sExChildrenPre, expectedExChildrenPre) {
+		// Note: GetDependencies returns a copy; if the internal order from AddStream was different this might vary.
+		// However, UpdatePriority (called by AddStream) appends non-exclusive children.
+		t.Logf("Pre-condition S_ex children (actual): %v, (expected): %v. This test relies on AddStream creating children in order.", sExChildrenPre, expectedExChildrenPre)
+		if !reflect.DeepEqual(sortUint32Slice(sExChildrenPre), sortUint32Slice(expectedExChildrenPre)) {
+			t.Fatalf("Pre-condition S_ex children (sorted): %v, expected (sorted): %v", sortUint32Slice(sExChildrenPre), sortUint32Slice(expectedExChildrenPre))
+		}
+	}
+
+	// Verify initial children of parentID (1)
+	// Children added in order: streamExID(2), parentOtherChild1ID(5), parentOtherChild2ID(6)
+	_, pChildrenPre, _, _ := pt.GetDependencies(parentID)
+	expectedParentChildrenPre := []uint32{streamExID, parentOtherChild1ID, parentOtherChild2ID}
+	if !reflect.DeepEqual(pChildrenPre, expectedParentChildrenPre) {
+		t.Logf("Pre-condition Parent children (actual): %v, (expected based on AddStream order): %v.", pChildrenPre, expectedParentChildrenPre)
+		if !reflect.DeepEqual(sortUint32Slice(pChildrenPre), sortUint32Slice(expectedParentChildrenPre)) {
+			t.Fatalf("Pre-condition Parent children (sorted): %v, expected (sorted): %v", sortUint32Slice(pChildrenPre), sortUint32Slice(expectedParentChildrenPre))
+		}
+	}
+
+	// Operation: Update streamExID (2) to be an exclusive child of parentID (1)
+	// (it's already a child, but this applies the exclusive logic)
+	// The public UpdatePriority method itself handles locking.
+	err := pt.UpdatePriority(streamExID, parentID, 10, true) // Weight 10 is arbitrary, not changing it here
+	if err != nil {
+		t.Fatalf("UpdatePriority failed: %v", err)
+	}
+
+	// Verifications
+	// Parent's (1) only child should be streamExID (2)
+	_, pChildrenPost, _, _ := pt.GetDependencies(parentID)
+	if !reflect.DeepEqual(pChildrenPost, []uint32{streamExID}) { // Order matters for single child
+		t.Errorf("Parent children post-update: %v, expected [%d]", pChildrenPost, streamExID)
+	}
+
+	// streamExID's (2) children should be its original children [3,4] followed by adopted children [5,6]
+	// Original children of streamExID (2) were [3,4]
+	// Original children of parentID (1) were [2,5,6]. Adopted children are [5,6].
+	// Expected order: [original_children_of_S_ex, adopted_children_from_P] = [3,4,5,6]
+	_, sExChildrenPost, _, _ := pt.GetDependencies(streamExID)
+	expectedExChildrenOrder := []uint32{streamExChild1ID, streamExChild2ID, parentOtherChild1ID, parentOtherChild2ID}
+	if !reflect.DeepEqual(sExChildrenPost, expectedExChildrenOrder) {
+		t.Errorf("streamExID children post-update: %v, expected %v (order specific)", sExChildrenPost, expectedExChildrenOrder)
+	}
+
+	// Verify parents of adopted children
+	p5_parent, _, _, _ := pt.GetDependencies(parentOtherChild1ID)
+	if p5_parent != streamExID {
+		t.Errorf("parentOtherChild1ID parent: %d, expected %d", p5_parent, streamExID)
+	}
+	p6_parent, _, _, _ := pt.GetDependencies(parentOtherChild2ID)
+	if p6_parent != streamExID {
+		t.Errorf("parentOtherChild2ID parent: %d, expected %d", p6_parent, streamExID)
+	}
+}
+
 func TestPriorityTree_ExclusiveChildOfStream0(t *testing.T) {
 	pt := NewPriorityTree()
 
