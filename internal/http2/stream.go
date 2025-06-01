@@ -821,6 +821,8 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	s.mu.RLock()
 	currentState := s.state
+	// Capture the state of s.initialHeadersProcessed *before* this header block potentially modifies it.
+	hasInitialHeadersBeenProcessed := s.initialHeadersProcessed
 	s.mu.RUnlock()
 
 	if currentState == StreamStateClosed {
@@ -834,9 +836,21 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		return nil // Stream error handled by RST
 	}
 
-	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
+	// NEW CHECK for h2spec 8.1/1 (Task Item 3.b)
+	// If a second HEADERS frame is received for a stream that is currently in StreamStateOpen
+	// (i.e., the first HEADERS frame for the request did not have END_STREAM set, which is implied by StreamStateOpen),
+	// and this second HEADERS frame also does not have END_STREAM set, it MUST be treated as a stream error of type PROTOCOL_ERROR.
+	// `hasInitialHeadersBeenProcessed` captures if this is a "second" (or subsequent) HEADERS block.
+	if hasInitialHeadersBeenProcessed && currentState == StreamStateOpen && !endStream {
+		s.conn.log.Warn("Stream: Subsequent HEADERS frame received on Open stream without END_STREAM flag (violates h2spec 8.1/1).",
+			logger.LogFields{"stream_id": s.id, "state": currentState.String()})
+		if rstErr := s.sendRSTStream(ErrCodeProtocolError); rstErr != nil {
+			return rstErr // Propagate error if sending RST fails
+		}
+		return nil // RST_STREAM sent, stream error handled.
+	}
 
-	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
+	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered (after h2spec 8.1/1 check)", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
 	if dispatcher == nil {
 		s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Dispatcher is nil, cannot proceed.", logger.LogFields{"stream_id": s.id})
@@ -846,11 +860,9 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil") // Signal error to caller
 	}
 
-	// --- BEGIN New Header Validations (Task Items 1a, 1b, 1c, 1d) ---
-	s.mu.RLock()
-	// isPotentiallyTrailers: true if initial headers were already processed AND current HEADERS frame has END_STREAM.
-	isPotentiallyTrailers := s.initialHeadersProcessed && endStream
-	s.mu.RUnlock()
+	// --- BEGIN Original Header Validations (Task Items 1a, 1b, 1c, 1d) ---
+	// `isPotentiallyTrailers` uses `hasInitialHeadersBeenProcessed` which was captured at the start of this function.
+	isPotentiallyTrailers := hasInitialHeadersBeenProcessed && endStream
 
 	for _, hf := range headers { // 'headers' are the full hpack.HeaderFields for this block
 		// 1.a Uppercase header field names (h2spec 8.1.2 #1)
@@ -907,7 +919,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			return nil
 		}
 	}
-	// --- END New Header Validations ---
+	// --- END Original Header Validations ---
 
 	var clHeaderValue string
 	var clHeaderFound bool
