@@ -1082,6 +1082,57 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		return NewConnectionError(ErrCodeEnhanceYourCalm, msg)
 	}
 
+	// ----- BEGIN TRAILER-SPECIFIC HEADER VALIDATION -----
+	// This check is performed if the current header block is identified as trailers.
+	// It specifically looks for pseudo-header fields in trailers, which are forbidden.
+	streamIDForTrailerCheck := c.activeHeaderBlockStreamID
+	isCurrentBlockPotentiallyTrailers := false
+
+	if c.headerFragmentInitialType == FrameHeaders {
+		// Trailers must have END_STREAM on the current HEADERS block.
+		currentBlockHasEndStream := c.headerFragmentEndStream
+		if currentBlockHasEndStream { // Condition for trailers
+			stream, streamExists := c.getStream(streamIDForTrailerCheck)
+			if streamExists {
+				stream.mu.RLock()
+				initialHeadersProcessedOnStream := stream.requestHeaders != nil
+				endStreamPreviouslyReceivedOnStream := stream.endStreamReceivedFromClient
+				stream.mu.RUnlock()
+
+				// A block is trailers if:
+				// 1. It's for an existing stream where initial headers were processed.
+				// 2. The client hadn't already sent END_STREAM on that stream.
+				// 3. The current header block itself has END_STREAM (already checked by currentBlockHasEndStream).
+				if initialHeadersProcessedOnStream && !endStreamPreviouslyReceivedOnStream {
+					isCurrentBlockPotentiallyTrailers = true
+				}
+			}
+		}
+	}
+
+	if isCurrentBlockPotentiallyTrailers {
+		c.log.Debug("Current header block identified as potential trailers, validating for pseudo-headers.",
+			logger.LogFields{"stream_id": streamIDForTrailerCheck})
+		for _, hf := range decodedHeaders {
+			if strings.HasPrefix(hf.Name, ":") {
+				errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block for stream %d", hf.Name, streamIDForTrailerCheck)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": streamIDForTrailerCheck, "header_name": hf.Name})
+
+				c.resetHeaderAssemblyState() // Reset assembly state before returning an error.
+				// Send RST_STREAM(PROTOCOL_ERROR) as per h2spec expectation.
+				if rstErr := c.sendRSTStreamFrame(streamIDForTrailerCheck, ErrCodeProtocolError); rstErr != nil {
+					c.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation (in finalizeHeaderBlockAndDispatch)",
+						logger.LogFields{"stream_id": streamIDForTrailerCheck, "error": rstErr.Error()})
+					// If sending RST_STREAM fails, the ConnectionError below is still the primary issue.
+				}
+				// Return ConnectionError to trigger GOAWAY, aligning with h2spec 8.1.2.1/3.
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
+			}
+		}
+		c.log.Debug("Trailer block validated: no pseudo-headers found.", logger.LogFields{"stream_id": streamIDForTrailerCheck})
+	}
+	// ----- END TRAILER-SPECIFIC HEADER VALIDATION -----
+
 	// Store relevant state before resetting, as dispatch might be complex.
 	streamID := c.activeHeaderBlockStreamID
 	initialType := c.headerFragmentInitialType
