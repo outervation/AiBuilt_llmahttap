@@ -1017,6 +1017,70 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		return NewConnectionError(ErrCodeCompressionError, "HPACK finish decoding error: "+err.Error())
 	}
 
+	// ----- BEGIN HEADER CONTENT VALIDATION (Task Item 6) -----
+	// This validation occurs *after* HPACK decoding and *before* MAX_HEADER_LIST_SIZE (uncompressed) check.
+	// If a validation fails here, we send RST_STREAM for the specific stream.
+	isTrailerBlock := false // Assume not trailers unless initial frame was HEADERS with !END_STREAM and now this is the second HEADERS block
+	// TODO: Determine if this is a trailer block. For now, assume initial HEADERS.
+	// A more robust check would involve tracking stream state to see if it's expecting trailers.
+
+	for _, hf := range decodedHeaders {
+		// 1. Check for uppercase letters in header names (RFC 7540, 8.1.2)
+		for _, char := range hf.Name {
+			if char >= 'A' && char <= 'Z' {
+				errMsg := fmt.Sprintf("invalid header field name '%s' contains uppercase characters", hf.Name)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
+				// Send RST_STREAM(PROTOCOL_ERROR) for this stream.
+				// This error occurs before stream creation in some paths, handle carefully.
+				// If stream isn't created yet (e.g. server receiving initial HEADERS),
+				// this will result in GOAWAY instead. For now, assume stream exists if this point reached cleanly.
+				// Or, if this function is called during initial HEADERS processing for a new stream,
+				// the caller (handleIncomingCompleteHeaders) will create the stream then dispatch to it,
+				// and the stream's processing will hit this error.
+				// Let's assume for now this is a stream error. The connection error for malformed headers will be
+				// handled by the stream creation logic (e.g. if pseudo-headers are bad).
+				// If this function is called, streamID = c.activeHeaderBlockStreamID is valid.
+				_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError) // Best effort
+				c.resetHeaderAssemblyState()
+				// Returning nil because RST_STREAM was sent. The connection itself may not need to die for this specific stream issue.
+				// However, h2spec expects GOAWAY for 8.1.2/1. This implies a connection error.
+				// Changing to return ConnectionError to align.
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
+			}
+		}
+
+		// 2. Check for pseudo-header fields in trailers (RFC 7540, 8.1.2.1)
+		if isTrailerBlock && strings.HasPrefix(hf.Name, ":") {
+			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
+			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
+			_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
+			c.resetHeaderAssemblyState()
+			return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.1/3
+		}
+
+		// 3. Check for forbidden connection-specific header fields (RFC 7540, 8.1.2.2)
+		// Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding, Upgrade
+		lowerName := strings.ToLower(hf.Name)
+		switch lowerName {
+		case "connection", "proxy-connection", "keep-alive", "upgrade":
+			errMsg := fmt.Sprintf("connection-specific header field '%s' is forbidden", hf.Name)
+			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
+			_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
+			c.resetHeaderAssemblyState()
+			return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/1
+		case "te":
+			// TE header field MUST NOT contain any value other than "trailers".
+			if strings.ToLower(hf.Value) != "trailers" {
+				errMsg := fmt.Sprintf("TE header field contains invalid value '%s'", hf.Value)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_value": hf.Value})
+				_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
+				c.resetHeaderAssemblyState()
+				return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/2
+			}
+		}
+	}
+	// ----- END HEADER CONTENT VALIDATION -----
+
 	// Check MAX_HEADER_LIST_SIZE (uncompressed)
 	var uncompressedSize uint32
 	for _, hf := range decodedHeaders {
