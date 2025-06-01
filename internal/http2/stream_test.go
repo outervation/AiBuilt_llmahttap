@@ -1598,7 +1598,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			} else {
 			}
 
-			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, nil /* contentLength */, dispatcherToUse)
+			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
 
 			if tc.expectErrorFromFunc {
 				if err == nil {
