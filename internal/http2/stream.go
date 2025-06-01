@@ -142,6 +142,9 @@ type Stream struct {
 	pendingRSTCode              *ErrorCode         // If non-nil, an RST_STREAM with this code needs to be sent (or was received)
 	initiatedByPeer             bool               // True if this stream was initiated by the peer
 
+	initialHeadersProcessed bool   // True if the initial request HEADERS have been processed
+	parsedContentLength     *int64 // Parsed Content-Length from request headers
+	receivedDataBytes       uint64 // Accumulates received DATA frame payload sizes
 	// Channels for internal coordination (examples, might evolve)
 	// headersComplete chan struct{} // Signals that all request headers (and CONTINUATIONs) have been received
 	// dataAvailable   *sync.Cond  // Signals new data in requestBodyWriter or error
@@ -786,7 +789,7 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // set of request headers is received for this stream. It constructs an http.Request
 // and dispatches it via the provided router.
 
-func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
+func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, contentLength *int64, dispatcher func(sw StreamWriter, req *http.Request)) error {
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
 	if dispatcher == nil {
