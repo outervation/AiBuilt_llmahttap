@@ -62,6 +62,7 @@ const (
 )
 
 // Connection manages an entire HTTP/2 connection.
+
 type Connection struct {
 	netConn net.Conn
 	log     *logger.Logger
@@ -80,11 +81,12 @@ type Connection struct {
 	// HTTP/2 state
 	streamsMu                    sync.RWMutex
 	streams                      map[uint32]*Stream
-	nextStreamIDClient           uint32 // Next client-initiated stream ID (odd), server consumes
-	nextStreamIDServer           uint32 // Next server-initiated stream ID (even), server produces (for PUSH)
-	lastProcessedStreamID        uint32 // Highest stream ID processed or accepted for GOAWAY
-	highestPeerInitiatedStreamID uint32 // Highest stream ID initiated by peer (client for server, server for client)
-	peerReportedLastStreamID     uint32 // Highest stream ID peer reported processing in a GOAWAY frame (initially max_uint32)
+	nextStreamIDClient           uint32               // Next client-initiated stream ID (odd), server consumes
+	nextStreamIDServer           uint32               // Next server-initiated stream ID (even), server produces (for PUSH)
+	lastProcessedStreamID        uint32               // Highest stream ID processed or accepted for GOAWAY
+	highestPeerInitiatedStreamID uint32               // Highest stream ID initiated by peer (client for server, server for client)
+	peerRstStreamTimes           map[uint32]time.Time // Tracks streams recently RST'd by the peer and when. Used for h2spec 5.1.9.
+	peerReportedLastStreamID     uint32               // Highest stream ID peer reported processing in a GOAWAY frame (initially max_uint32)
 	priorityTree                 *PriorityTree
 	hpackAdapter                 *HpackAdapter
 	connFCManager                *ConnectionFlowControlManager
@@ -917,15 +919,31 @@ func (c *Connection) dispatchDataFrame(frame *DataFrame) error {
 	}
 
 	// 4. Dispatch to stream for stream-level processing
+	c.log.Debug("Conn.dispatchDataFrame: About to call stream.handleDataFrame", logger.LogFields{
+		"stream_id":                streamID,
+		"stream_state_at_dispatch": state.String(),
+		"frame_payload_len":        len(frame.Data),
+		"frame_is_end_stream":      (frame.Header().Flags & FlagDataEndStream) != 0,
+	})
+
 	if err := stream.handleDataFrame(frame); err != nil {
-		// stream.handleDataFrame might return a StreamError (e.g., stream FC violation)
+		// stream.handleDataFrame might return a StreamError (e.g., stream FC violation, content-length mismatch)
 		// or a ConnectionError if something catastrophic happened at stream level.
 		if se, ok := err.(*StreamError); ok {
-			c.log.Warn("Stream error handling DATA frame",
+			c.log.Warn("Stream error handling DATA frame, sending RST_STREAM",
 				logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "msg": se.Msg})
-			return c.sendRSTStreamFrame(se.StreamID, se.Code)
+			// Send RST_STREAM for the stream error.
+			// If sending RST_STREAM fails, it's a connection-level problem.
+			if rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code); rstErr != nil {
+				c.log.Error("Failed to send RST_STREAM for stream error during DATA frame handling",
+					logger.LogFields{"stream_id": se.StreamID, "original_stream_error_code": se.Code.String(), "rst_send_error": rstErr.Error()})
+				return rstErr // Propagate the error from sending RST_STREAM
+			}
+			return nil // Stream error handled by sending RST_STREAM. Connection remains open.
 		}
 		// If it's a ConnectionError or other fatal error, propagate it.
+		c.log.Error("Connection error or other fatal error from stream.handleDataFrame",
+			logger.LogFields{"stream_id": streamID, "error": err.Error(), "error_type": fmt.Sprintf("%T", err)})
 		return err
 	}
 
@@ -1315,8 +1333,20 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		// Check if stream already exists
 		c.streamsMu.RLock()
 		existingStream, streamFound := c.streams[streamID]
+		_, peerHasRSTDThisStream := c.peerRstStreamTimes[streamID] // Check if peer ever RST'd this stream.
 		c.streamsMu.RUnlock()
-		c.log.Debug("Conn: Finished checking if stream exists (released RLock)", logger.LogFields{"stream_id": streamID, "exists": streamFound})
+		c.log.Debug("Conn: Finished checking if stream exists (released RLock)", logger.LogFields{"stream_id": streamID, "exists": streamFound, "peerHasRSTDThisStream": peerHasRSTDThisStream})
+
+		if peerHasRSTDThisStream { // This check now comes BEFORE streamFound and other logic for existing streams.
+			// h2spec 5.1.9: Client sends HEADERS after it has RST the stream.
+			// Server MUST send RST_STREAM with STREAM_CLOSED.
+			c.log.Warn("Server received HEADERS for a stream previously RST'd by the client. Sending RST_STREAM(STREAM_CLOSED).",
+				logger.LogFields{"stream_id": streamID})
+			if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
+				return errRST // If sending RST fails, propagate connection error
+			}
+			return nil // RST_STREAM sent, stream error handled.
+		}
 
 		if streamFound {
 			// Stream already exists. This HEADERS frame is either an error or trailers.
@@ -1371,7 +1401,9 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 			} else if state == StreamStateClosed {
 				// HEADERS on a closed stream is an error (h2spec 5.1/9 - "closed: Sends a HEADERS frame after sending RST_STREAM frame" -> STREAM_CLOSED).
-				c.log.Warn("Server received HEADERS for a Closed stream. Sending RST_STREAM(STREAM_CLOSED).",
+				// This case should be caught by the `peerHasRSTDThisStream` check earlier if the client RST'd it.
+				// If it reaches here, it means the stream was closed by server or gracefully.
+				c.log.Warn("Server received HEADERS for a Closed stream (not previously RST'd by client). Sending RST_STREAM(STREAM_CLOSED).",
 					logger.LogFields{"stream_id": streamID, "state": state.String()})
 				if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
 					return errRST
@@ -1389,29 +1421,20 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 		// Validate stream ID ordering for client-initiated streams.
 		// This logic applies only if the stream was not found (truly new stream attempt).
-		// If streamFound is true, we've already handled it above (as trailers or error).
-		// The failing test (TestHEADERSOnClientRSTStream_ServeLoop) has `streamFound == false`
-		// because the stream was removed after client RST.
-		// We need to differentiate "truly new stream" from "HEADERS on a recently closed stream".
-
 		c.streamsMu.Lock() // Lock for reading and writing highestPeerInitiatedStreamID
-		// Check if the stream ID was *ever* processed or is numerically less than the highest *peer* initiated.
-		// This helps distinguish a new stream from one that might have been closed and removed.
-		// If streamID <= c.highestPeerInitiatedStreamID, it's not a "new" stream in sequence.
-		// If it's not in c.streams map, it means it was closed.
 		if streamID <= c.highestPeerInitiatedStreamID {
-			// This implies HEADERS on a stream that was previously active (or an out-of-order new stream).
-			// Since streamFound was false, it means this stream was closed and removed.
-			// This is the condition for h2spec 5.1.9: HEADERS on a client-RST'd stream.
-			// Server should send RST_STREAM(STREAM_CLOSED).
-			c.streamsMu.Unlock()
-			c.log.Warn("Server received HEADERS for a stream that was previously active but is now closed/removed. Sending RST_STREAM(STREAM_CLOSED).",
-				logger.LogFields{"stream_id": streamID, "highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID})
-			if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
-				// If sending RST fails, it's a more severe connection issue.
-				return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to send RST_STREAM(STREAM_CLOSED) for HEADERS on closed stream", errRST)
-			}
-			return nil // RST_STREAM sent, stream error handled.
+			// This case covers when a client sends HEADERS for a stream ID that is
+			// not strictly greater than the highest one it has already initiated.
+			// If `streamFound` (checked earlier) was false, it means this stream ID
+			// refers to a stream that was closed or never fully opened by the client.
+			// Here, `peerHasRSTDThisStream` was false, so client didn't RST it.
+			// Thus, this is a PROTOCOL_ERROR for reusing an ID or using one out of order.
+			c.streamsMu.Unlock() // Unlock before sending RST or returning
+			errMsg := fmt.Sprintf("client attempted to initiate new stream %d, which is not numerically greater than highest previously client-initiated stream ID %d (and not a known client-RST'd stream)", streamID, c.highestPeerInitiatedStreamID)
+
+			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID})
+			// This is a connection error as per RFC 7540, Section 5.1.1.
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		}
 		// If streamID > c.highestPeerInitiatedStreamID, it's a genuinely new stream ID.
 		c.highestPeerInitiatedStreamID = streamID
@@ -1860,6 +1883,7 @@ func (c *Connection) dispatchFrame(frame Frame) error {
 // dispatchRSTStreamFrame handles an incoming RST_STREAM frame.
 // It finds the target stream, instructs it to handle the RST (which closes it),
 // and then removes the stream from connection tracking.
+
 func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 	streamID := frame.Header().StreamID
 	errorCode := frame.ErrorCode
@@ -1885,6 +1909,14 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 		return NewConnectionError(ErrCodeProtocolError, errMsg)
 	}
 
+	// Record that peer RST'd this stream. This is crucial for h2spec 5.1.9.
+	c.streamsMu.Lock()
+	if c.peerRstStreamTimes == nil { // Should be initialized in NewConnection
+		c.peerRstStreamTimes = make(map[uint32]time.Time)
+	}
+	c.peerRstStreamTimes[streamID] = time.Now()
+	c.streamsMu.Unlock()
+
 	stream, found := c.getStream(streamID) // getStream uses RLock
 
 	if !found {
@@ -1892,16 +1924,7 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 		if !c.isClient { // Server-side: client sent RST_STREAM for a stream server doesn't know/is idle.
 			// RFC 6.4: "If a RST_STREAM frame identifying an idle stream is received,
 			// the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
-			// This specifically covers streams that are not in c.streams map.
-			// An "idle stream" is one not in open, reserved, or half-closed states.
-			// For a server, if a client sends RST_STREAM for a stream ID it has never seen or has already fully closed
-			// (and removed from active tracking), this condition applies.
-			// h2spec 5.1/2 ("idle: Sends a RST_STREAM frame") and 6.4/2 ("Sends a RST_STREAM frame on a idle stream")
-			// both expect GOAWAY(PROTOCOL_ERROR).
-
 			c.streamsMu.RLock()
-			// Check if streamID is greater than any stream ID the peer (client) has initiated.
-			// This is the definition of an "idle" stream in this context.
 			isNumericallyIdle := streamID > c.highestPeerInitiatedStreamID
 			c.streamsMu.RUnlock()
 
