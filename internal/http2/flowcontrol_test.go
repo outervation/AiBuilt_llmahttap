@@ -649,6 +649,64 @@ func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange(t *t
 	// Delta is newPeerInitial - (oldPeerInitial+1000) = -2000
 	assert.Equal(t, initialSendAvail+1000-2000, sfcm.GetStreamSendAvailable())
 	assert.Equal(t, newPeerInitial, sfcm.sendWindow.initialWindowSize)
+
+	// Test scenario: available becomes negative due to settings change and GetStreamSendAvailable reports it
+	t.Run("send window becomes negative and GetStreamSendAvailable reports it", func(t *testing.T) {
+		const subStreamID = testStreamID + 1
+		const subInitialPeerSize uint32 = 100
+
+		sfcmNegative := NewStreamFlowControlManager(nil, subStreamID, testOurInitialWindowSize, subInitialPeerSize)
+		require.Equal(t, int64(subInitialPeerSize), sfcmNegative.GetStreamSendAvailable(), "Initial send window should match peer's initial setting")
+		require.Equal(t, subInitialPeerSize, sfcmNegative.sendWindow.initialWindowSize)
+
+		// Acquire some data to make available != initialWindowSize
+		// available = 100 - 30 = 70
+		acquireAmount := uint32(30)
+		err := sfcmNegative.AcquireSendSpace(acquireAmount)
+		require.NoError(t, err)
+		require.Equal(t, int64(subInitialPeerSize-acquireAmount), sfcmNegative.GetStreamSendAvailable()) // 70
+
+		// Update peer's initial window size to be very small, driving available negative
+		// Old initialWindowSize for sendWindow = 100. Current available = 70.
+		// New peer's initial setting = 10. Delta = 10 - 100 = -90.
+		// New available = current_available + delta = 70 + (-90) = -20.
+		// New initialWindowSize for sendWindow becomes 10.
+		newSmallPeerInitialSize := uint32(10)
+		err = sfcmNegative.HandlePeerSettingsInitialWindowSizeChange(newSmallPeerInitialSize)
+		require.NoError(t, err)
+		assert.Equal(t, int64(-20), sfcmNegative.GetStreamSendAvailable(), "Send window should be negative after settings change")
+		assert.Equal(t, newSmallPeerInitialSize, sfcmNegative.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be updated to the new small size")
+
+		// Test scenario: available is already negative, settings change makes it more negative
+		// Current available = -20. Current initialWindowSize = 10.
+		// New peer's initial setting = 5. Delta = 5 - 10 = -5.
+		// New available = -20 + (-5) = -25.
+		newEvenSmallerPeerInitialSize := uint32(5)
+		err = sfcmNegative.HandlePeerSettingsInitialWindowSizeChange(newEvenSmallerPeerInitialSize)
+		require.NoError(t, err)
+		assert.Equal(t, int64(-25), sfcmNegative.GetStreamSendAvailable(), "Send window should be more negative")
+		assert.Equal(t, newEvenSmallerPeerInitialSize, sfcmNegative.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be updated to even smaller size")
+
+		// Test scenario: available is negative, settings change makes it less negative (but still negative)
+		// Current available = -25. Current initialWindowSize = 5.
+		// New peer's initial setting = 15. Delta = 15 - 5 = 10.
+		// New available = -25 + 10 = -15.
+		newSlightlyLargerPeerInitialSize := uint32(15)
+		err = sfcmNegative.HandlePeerSettingsInitialWindowSizeChange(newSlightlyLargerPeerInitialSize)
+		require.NoError(t, err)
+		assert.Equal(t, int64(-15), sfcmNegative.GetStreamSendAvailable(), "Send window should be less negative")
+		assert.Equal(t, newSlightlyLargerPeerInitialSize, sfcmNegative.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be updated")
+
+		// Test scenario: available is negative, settings change makes it positive
+		// Current available = -15. Current initialWindowSize = 15.
+		// New peer's initial setting = 50. Delta = 50 - 15 = 35.
+		// New available = -15 + 35 = 20.
+		newPositivePeerInitialSize := uint32(50)
+		err = sfcmNegative.HandlePeerSettingsInitialWindowSizeChange(newPositivePeerInitialSize)
+		require.NoError(t, err)
+		assert.Equal(t, int64(20), sfcmNegative.GetStreamSendAvailable(), "Send window should become positive")
+		assert.Equal(t, newPositivePeerInitialSize, sfcmNegative.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be updated")
+	})
 }
 
 func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange_OverflowError(t *testing.T) {
