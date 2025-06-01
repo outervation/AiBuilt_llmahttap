@@ -547,6 +547,19 @@ func TestServerHandshake_Failure_InvalidPrefaceContent(t *testing.T) {
 			closeErr = fmt.Errorf("%w; %w", closeErr, e)
 		}
 		t.Error(e) // Use Error to allow other checks like IsClosed to run
+	} else {
+		// This 'else' block executes if goAwayFrame is NOT nil.
+		// Now check its LastStreamID.
+		if goAwayFrame.LastStreamID != 0 {
+			e := fmt.Errorf("GOAWAY LastStreamID: got %d, want 0 for preface error", goAwayFrame.LastStreamID)
+			// Standard pattern for accumulating errors into closeErr
+			if closeErr == nil {
+				closeErr = e
+			} else {
+				closeErr = fmt.Errorf("%w; %w", closeErr, e)
+			}
+			t.Error(e) // Report this specific error
+		}
 	}
 
 	// Verify mockNetConn is closed
