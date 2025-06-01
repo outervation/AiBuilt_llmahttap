@@ -1265,8 +1265,18 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		c.log.Debug("Conn: About to check if stream exists (acquiring RLock)", logger.LogFields{"stream_id": streamID})
 
 		// Check if stream already exists
+
 		c.streamsMu.RLock()
 		existingStream, streamFound := c.streams[streamID]
+		// --- BEGIN ADDED LOGGING ---
+		valTime, keyActuallyExistsInMap := c.peerRstStreamTimes[streamID]
+		c.log.Debug("Conn.handleIncomingCompleteHeaders: DEBUG check peerRstStreamTimes", logger.LogFields{
+			"stream_id":                          streamID,
+			"keyExistsInMap_peerRstStreamTimes":  keyActuallyExistsInMap,
+			"value_if_exists_peerRstStreamTimes": valTime.String(),
+			"len_peerRstStreamTimes_map":         len(c.peerRstStreamTimes),
+		})
+		// --- END ADDED LOGGING ---
 		_, peerHasRSTDThisStream := c.peerRstStreamTimes[streamID] // Check if peer ever RST'd this stream.
 		c.streamsMu.RUnlock()
 		c.log.Debug("Conn: Finished checking if stream exists (released RLock)", logger.LogFields{"stream_id": streamID, "exists": streamFound, "peerHasRSTDThisStream": peerHasRSTDThisStream})
