@@ -800,6 +800,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	s.mu.Lock()
 	s.requestHeaders = headers
+	s.parsedContentLength = contentLength // Store the pre-parsed content length
 	s.mu.Unlock()
 
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
