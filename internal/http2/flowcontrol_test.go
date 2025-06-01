@@ -1081,6 +1081,58 @@ func TestFlowControlWindow_UpdateInitialWindowSize_Stream(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, currentAvailBeforeNoChange, fcw.Available(), "Available window should be unchanged after a no-op update")
 	assert.Equal(t, currentInitialBeforeNoChange, fcw.initialWindowSize, "Initial window size should be unchanged after a no-op update")
+
+	// Test scenario: available becomes negative due to settings change
+	// Setup: initialSize = 500, available = 500
+	fcwNegative := NewFlowControlWindow(500, false, testStreamID+1)
+	require.Equal(t, int64(500), fcwNegative.Available())
+	require.Equal(t, uint32(500), fcwNegative.initialWindowSize)
+
+	// Acquire some data to make available != initialWindowSize
+	// available = 500 - 100 = 400
+	err = fcwNegative.Acquire(100)
+	require.NoError(t, err)
+	require.Equal(t, int64(400), fcwNegative.Available())
+
+	// Update initial window size to be very small, driving available negative
+	// Old initialWindowSize = 500. Current available = 400.
+	// New initialWindowSize = 50. Delta = 50 - 500 = -450.
+	// New available = current_available + delta = 400 + (-450) = -50.
+	newSmallInitialSize := uint32(50)
+	err = fcwNegative.UpdateInitialWindowSize(newSmallInitialSize)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-50), fcwNegative.Available(), "Available window should be negative after settings change")
+	assert.Equal(t, newSmallInitialSize, fcwNegative.initialWindowSize, "Initial window size should be updated to the new small size")
+
+	// Test scenario: available is already negative, and settings change makes it more negative
+	// Current available = -50. Current initialWindowSize = 50.
+	// New initialWindowSize = 20. Delta = 20 - 50 = -30.
+	// New available = current_available + delta = -50 + (-30) = -80.
+	newEvenSmallerInitialSize := uint32(20)
+	err = fcwNegative.UpdateInitialWindowSize(newEvenSmallerInitialSize)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-80), fcwNegative.Available(), "Available window should be more negative")
+	assert.Equal(t, newEvenSmallerInitialSize, fcwNegative.initialWindowSize, "Initial window size should be updated to even smaller size")
+
+	// Test scenario: available is negative, settings change makes it less negative (but still negative)
+	// Current available = -80. Current initialWindowSize = 20.
+	// New initialWindowSize = 40. Delta = 40 - 20 = 20.
+	// New available = current_available + delta = -80 + 20 = -60.
+	newSlightlyLargerInitialSize := uint32(40)
+	err = fcwNegative.UpdateInitialWindowSize(newSlightlyLargerInitialSize)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-60), fcwNegative.Available(), "Available window should be less negative")
+	assert.Equal(t, newSlightlyLargerInitialSize, fcwNegative.initialWindowSize, "Initial window size should be updated")
+
+	// Test scenario: available is negative, settings change makes it positive
+	// Current available = -60. Current initialWindowSize = 40.
+	// New initialWindowSize = 150. Delta = 150 - 40 = 110.
+	// New available = current_available + delta = -60 + 110 = 50.
+	newPositiveInitialSize := uint32(150)
+	err = fcwNegative.UpdateInitialWindowSize(newPositiveInitialSize)
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), fcwNegative.Available(), "Available window should become positive")
+	assert.Equal(t, newPositiveInitialSize, fcwNegative.initialWindowSize, "Initial window size should be updated")
 }
 
 func TestFlowControlWindow_UpdateInitialWindowSize_ConnectionNoOp(t *testing.T) {
