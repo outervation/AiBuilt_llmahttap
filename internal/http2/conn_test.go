@@ -2187,15 +2187,18 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 	// It accumulates dynamic table state, which is good for testing HPACK.
 
 	tests := []struct {
-		name                       string
-		setupFunc                  func(t *testing.T, conn *Connection, mnc *mockNetConn) // Optional setup
-		framesToFeed               func(t *testing.T) [][]byte                            // Function to generate frame bytes to feed
+		name      string
+		setupFunc func(t *testing.T, conn *Connection, mnc *mockNetConn) // Optional setup
+
+		framesToFeed               func(t *testing.T) [][]byte // Function to generate frame bytes to feed
 		expectDispatcherCall       bool
 		expectDispatcherStreamID   uint32
 		expectConnectionError      bool
 		expectedConnErrorCode      ErrorCode
 		expectedConnErrorMsgSubstr string
-		expectedGoAway             bool // If connection error leads to GOAWAY
+		expectedGoAway             bool      // If connection error leads to GOAWAY
+		expectedRSTStreamID        uint32    // If a specific RST_STREAM is expected on this stream ID
+		expectedRSTStreamErrorCode ErrorCode // The error code for the expected RST_STREAM
 		customOurMaxHeaderListSize *uint32
 	}{
 		{
@@ -2380,6 +2383,143 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 			expectedConnErrorCode: ErrCodeCompressionError,
 			expectedGoAway:        true,
 		},
+
+		// --- Malformed Headers (h2spec 8.1.x) ---
+		{
+			name: "Malformed Headers: Uppercase header name",
+			framesToFeed: func(t *testing.T) [][]byte {
+				malformedHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "User-Agent", Value: "uppercase-client"}, // Uppercase 'U' and 'A'
+				}
+				hpackPayload := encodeHeadersForTest(t, malformedHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 21, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:       false,
+			expectConnectionError:      false, // Expect RST_STREAM, not connection error
+			expectedRSTStreamID:        21,
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+		},
+		{
+			name: "Malformed Headers: Connection-specific header (Connection)",
+			framesToFeed: func(t *testing.T) [][]byte {
+				malformedHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "connection", Value: "keep-alive"},
+				}
+				hpackPayload := encodeHeadersForTest(t, malformedHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 23, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:       false,
+			expectConnectionError:      false,
+			expectedRSTStreamID:        23,
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+		},
+		{
+			name: "Malformed Headers: Connection-specific header (Transfer-Encoding)",
+			framesToFeed: func(t *testing.T) [][]byte {
+				malformedHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "transfer-encoding", Value: "chunked"}, // Forbidden
+				}
+				hpackPayload := encodeHeadersForTest(t, malformedHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 29, Length: uint32(len(hpackPayload))}, // Use odd StreamID 29
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:       false,
+			expectConnectionError:      false,
+			expectedRSTStreamID:        29, // Updated
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+		},
+		{
+			name: "Malformed Headers: Invalid TE header value",
+			framesToFeed: func(t *testing.T) [][]byte {
+				malformedHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "te", Value: "gzip"}, // Invalid, only "trailers" is allowed
+				}
+				hpackPayload := encodeHeadersForTest(t, malformedHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 25, Length: uint32(len(hpackPayload))},
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:       false,
+			expectConnectionError:      false,
+			expectedRSTStreamID:        25,
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+		},
+		{
+			name: "Malformed Headers: Valid TE header value (trailers)",
+			framesToFeed: func(t *testing.T) [][]byte {
+				validTeHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+					{Name: "te", Value: "trailers"}, // Valid
+				}
+				hpackPayload := encodeHeadersForTest(t, validTeHeaders)
+				headersFrame := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 31, Length: uint32(len(hpackPayload))}, // Use odd StreamID 31
+					HeaderBlockFragment: hpackPayload,
+				}
+				return [][]byte{frameToBytes(t, headersFrame)}
+			},
+			expectDispatcherCall:     true, // Should be accepted
+			expectDispatcherStreamID: 31,   // Updated
+			expectConnectionError:    false,
+		},
+		{
+			name: "Malformed Headers: Pseudo-header in trailers",
+			framesToFeed: func(t *testing.T) [][]byte {
+				// Step 1: Send initial HEADERS to open the stream
+				initialReqHeaders := []hpack.HeaderField{
+					{Name: ":method", Value: "POST"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/submit"}, {Name: ":authority", Value: "example.com"},
+					{Name: "content-length", Value: "5"}, {Name: "te", Value: "trailers"},
+				}
+				hpackInitial := encodeHeadersForTest(t, initialReqHeaders)
+				headersFrame1 := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders, StreamID: 27, Length: uint32(len(hpackInitial))}, // No END_STREAM
+					HeaderBlockFragment: hpackInitial,
+				}
+
+				// Step 2: Send DATA frame
+				dataPayload := []byte("hello")
+				dataFrame := &DataFrame{
+					FrameHeader: FrameHeader{Type: FrameData, Flags: 0, StreamID: 27, Length: uint32(len(dataPayload))}, // No END_STREAM
+					Data:        dataPayload,
+				}
+
+				// Step 3: Send TRAILERS with a pseudo-header
+				trailerHeadersWithPseudo := []hpack.HeaderField{
+					{Name: "x-trailer-info", Value: "final-data"},
+					{Name: ":status", Value: "200"}, // Pseudo-header in trailers block - MALFORMED
+				}
+				hpackTrailers := encodeHeadersForTest(t, trailerHeadersWithPseudo)
+				headersFrame2Trailers := &HeadersFrame{
+					FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 27, Length: uint32(len(hpackTrailers))},
+					HeaderBlockFragment: hpackTrailers,
+				}
+				return [][]byte{frameToBytes(t, headersFrame1), frameToBytes(t, dataFrame), frameToBytes(t, headersFrame2Trailers)}
+			},
+			// Dispatcher *is* called for the initial HEADERS. The error occurs on the *trailer* HEADERS.
+			expectDispatcherCall:       true,
+			expectDispatcherStreamID:   27,
+			expectConnectionError:      true,
+			expectedConnErrorCode:      ErrCodeProtocolError,
+			expectedGoAway:             true,
+			expectedConnErrorMsgSubstr: "pseudo-header field ':status' found in trailer block",
+		},
 	}
 
 	for _, tc := range tests {
@@ -2406,6 +2546,50 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 			mnc.ResetWriteBuffer()                // Clear handshake frames
 
 			serveErrChan := make(chan error, 1)
+
+			// Special dispatcher logic for the trailer test case to consume the body.
+			// This must be reset after the test case.
+			var originalDispatcherFn func(sw StreamWriter, req *http.Request)
+			if tc.name == "Malformed Headers: Pseudo-header in trailers" {
+				originalDispatcherFn = mockDispatcher.fn // Save current fn before overriding
+				t.Logf("Configuring special dispatcher for test: %s", tc.name)
+				mockDispatcher.fn = func(sw StreamWriter, req *http.Request) {
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Consuming request body (ContentLength: %d, TE: %s)", tc.name, sw.ID(), req.ContentLength, req.Header.Get("Transfer-Encoding"))
+					if req.Body != nil {
+						_, err := io.Copy(io.Discard, req.Body)
+						if err != nil {
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error consuming request body: %v", tc.name, sw.ID(), err)
+						}
+						req.Body.Close()
+					}
+					// Send a minimal response to unblock the handler and allow the stream to proceed/close.
+					// Use http2.HeaderField here
+					if err := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); err != nil {
+						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error sending 204 response: %v", tc.name, sw.ID(), err)
+					}
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, sent 204.", tc.name, sw.ID())
+				}
+			}
+			if tc.name == "Malformed Headers: Pseudo-header in trailers" {
+				t.Logf("Configuring special dispatcher for test: %s", tc.name)
+				mockDispatcher.fn = func(sw StreamWriter, req *http.Request) {
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Consuming request body (ContentLength: %d, TE: %s)", tc.name, sw.ID(), req.ContentLength, req.Header.Get("Transfer-Encoding"))
+					if req.Body != nil {
+						_, err := io.Copy(io.Discard, req.Body)
+						if err != nil {
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error consuming request body: %v", tc.name, sw.ID(), err)
+						}
+						req.Body.Close()
+					}
+					// Send a minimal response to unblock the handler and allow the stream to proceed/close.
+					// This helps ensure the server doesn't hang waiting for the handler if that's part of the issue.
+					// A 204 No Content is simple and often appropriate after consuming a POST body.
+					if err := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); err != nil {
+						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error sending 204 response: %v", tc.name, sw.ID(), err)
+					}
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, sent 204.", tc.name, sw.ID())
+				}
+			}
 			go func() {
 				err := conn.Serve(nil) // Pass nil context for test simplicity
 				serveErrChan <- err
@@ -2425,6 +2609,11 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				}
 
 				if tc.expectConnectionError {
+
+					// Restore original dispatcher function if it was changed for the trailer test
+					if tc.name == "Malformed Headers: Pseudo-header in trailers" {
+						mockDispatcher.fn = originalDispatcherFn
+					}
 					if serveExitError == nil {
 						t.Fatalf("conn.Serve exited with nil error, expected a ConnectionError")
 					}
