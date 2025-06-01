@@ -10,6 +10,8 @@ import (
 	"runtime/debug" // For stack traces in panic recovery
 	"strings"       // For strings.Index and strings.HasPrefix
 
+	"strconv" // For parsing content-length
+
 	"fmt" // For error formatting, Sprintf
 	// "net/url" // For url.URL (REMOVED as potentially unused or only in stubs)
 	"sync"
@@ -709,6 +711,9 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 		s.conn.log.Error("Stream flow control error on DATA frame",
 			logger.LogFields{"stream_id": s.id, "payload_len": payloadLen, "error": err.Error()})
 		// This error from sfcm.DataReceived should be a *StreamError with ErrCodeFlowControlError
+
+		// Accumulate received data bytes for content-length validation.
+		s.receivedDataBytes += uint64(payloadLen)
 		// The connection will then RST the stream.
 		return err
 	}
@@ -789,7 +794,7 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // set of request headers is received for this stream. It constructs an http.Request
 // and dispatches it via the provided router.
 
-func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, contentLength *int64, dispatcher func(sw StreamWriter, req *http.Request)) error {
+func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
 	if dispatcher == nil {
@@ -798,9 +803,34 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil")
 	}
 
+	var clHeaderValue string
+	var clHeaderFound bool
+	for _, hf := range headers {
+		if strings.ToLower(hf.Name) == "content-length" {
+			if clHeaderFound { // Duplicate content-length header
+				s.conn.log.Error("Duplicate content-length header found", logger.LogFields{"stream_id": s.id, "value1": clHeaderValue, "value2": hf.Value})
+				_ = s.sendRSTStream(ErrCodeProtocolError)
+				return NewStreamError(s.id, ErrCodeProtocolError, "duplicate content-length header")
+			}
+			clHeaderValue = hf.Value
+			clHeaderFound = true
+		}
+	}
+
+	var parsedCL *int64
+	if clHeaderFound {
+		val, err := strconv.ParseInt(clHeaderValue, 10, 64)
+		if err != nil || val < 0 { // Invalid format or negative value
+			s.conn.log.Error("Invalid content-length header value", logger.LogFields{"stream_id": s.id, "value": clHeaderValue, "parse_error": err})
+			_ = s.sendRSTStream(ErrCodeProtocolError)
+			return NewStreamError(s.id, ErrCodeProtocolError, fmt.Sprintf("invalid content-length value: %s", clHeaderValue))
+		}
+		parsedCL = &val
+	}
+
 	s.mu.Lock()
 	s.requestHeaders = headers
-	s.parsedContentLength = contentLength // Store the pre-parsed content length
+	s.parsedContentLength = parsedCL // Store the parsed content length (or nil if not present)
 	s.mu.Unlock()
 
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
@@ -839,6 +869,12 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		RemoteAddr: s.conn.remoteAddrStr,
 		RequestURI: pseudoPath,
 	}
+	if parsedCL != nil { // Set ContentLength on http.Request if parsed
+		req.ContentLength = *parsedCL
+	} else if clHeaderFound { // If header was present but couldn't parse (should have been caught above, but defensive)
+		req.ContentLength = -1 // Indicate unknown or problematic
+	}
+
 	req = req.WithContext(s.ctx)
 
 	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
