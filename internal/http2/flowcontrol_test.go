@@ -883,32 +883,72 @@ func TestFlowControlWindow_Acquire_ErrorOnPriorError(t *testing.T) {
 }
 
 func TestFlowControlWindow_Acquire_NegativeAvailableError(t *testing.T) {
-	t.Run("Connection window negative", func(t *testing.T) {
+	t.Run("Connection window negative blocks then unblocks", func(t *testing.T) {
 		fcw := NewFlowControlWindow(100, true, 0)
 		fcw.mu.Lock()
-		fcw.available = -50 // Manually set to negative to simulate prior failure
+		fcw.available = -50 // Manually set to negative
 		fcw.mu.Unlock()
 
-		err := fcw.Acquire(10)
-		require.Error(t, err)
-		connErr, ok := err.(*ConnectionError)
-		require.True(t, ok)
-		assert.Equal(t, ErrCodeFlowControlError, connErr.Code)
-		assert.Contains(t, connErr.Msg, "window is negative")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		acquired := false
+		var acquireErr error
+
+		go func() {
+			defer wg.Done()
+			// This should block because fcw.available is -50
+			acquireErr = fcw.Acquire(10)
+			if acquireErr == nil {
+				acquired = true
+			}
+		}()
+
+		time.Sleep(100 * time.Millisecond) // Give goroutine time to block
+		assert.False(t, acquired, "Acquire should be blocking on negative window")
+
+		// Increase the window to make it positive and sufficient
+		// -50 + 70 = 20. 20 >= 10 (acquire amount)
+		err := fcw.Increase(70)
+		require.NoError(t, err)
+
+		wg.Wait() // Wait for Acquire to complete
+		assert.True(t, acquired, "Acquire should have unblocked and succeeded")
+		require.NoError(t, acquireErr)
+		assert.Equal(t, int64(10), fcw.Available()) // -50 + 70 - 10 = 10
 	})
-	t.Run("Stream window negative", func(t *testing.T) {
+
+	t.Run("Stream window negative blocks then unblocks", func(t *testing.T) {
 		fcw := NewFlowControlWindow(100, false, testStreamID)
 		fcw.mu.Lock()
 		fcw.available = -50 // Manually set to negative
 		fcw.mu.Unlock()
 
-		err := fcw.Acquire(10)
-		require.Error(t, err)
-		streamErr, ok := err.(*StreamError)
-		require.True(t, ok)
-		assert.Equal(t, ErrCodeFlowControlError, streamErr.Code)
-		assert.Equal(t, testStreamID, streamErr.StreamID)
-		assert.Contains(t, streamErr.Msg, "window is negative")
+		var wg sync.WaitGroup
+		wg.Add(1)
+		acquired := false
+		var acquireErr error
+
+		go func() {
+			defer wg.Done()
+			// This should block
+			acquireErr = fcw.Acquire(10)
+			if acquireErr == nil {
+				acquired = true
+			}
+		}()
+
+		time.Sleep(100 * time.Millisecond) // Give goroutine time to block
+		assert.False(t, acquired, "Acquire should be blocking on negative window")
+
+		// Increase the window
+		// -50 + 70 = 20. 20 >= 10
+		err := fcw.Increase(70)
+		require.NoError(t, err)
+
+		wg.Wait() // Wait for Acquire to complete
+		assert.True(t, acquired, "Acquire should have unblocked and succeeded")
+		require.NoError(t, acquireErr)
+		assert.Equal(t, int64(10), fcw.Available()) // -50 + 70 - 10 = 10
 	})
 }
 
