@@ -4778,3 +4778,286 @@ func TestInterleavedUnknownFrameDuringHeaderBlock(t *testing.T) {
 		closeErr = nil
 	}
 }
+
+// TestInvalidFrameLength_PING tests that sending a PING frame with an invalid length
+// results in a connection error (FRAME_SIZE_ERROR) and a GOAWAY frame.
+// Covers h2spec 6.7.4.
+func TestInvalidFrameLength_PING(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_PING")
+	// Defer a final conn.Close. The error used here will be updated if the test passes.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	// Send PING frame with invalid length (e.g., 7 instead of 8)
+	invalidPingFrameBytes := []byte{
+		0x00, 0x00, 0x07, // Length = 7
+		byte(FramePing),        // Type = PING
+		0x00,                   // Flags = 0
+		0x00, 0x00, 0x00, 0x00, // StreamID = 0
+		// Payload (7 bytes instead of 8)
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+	}
+	mnc.FeedReadBuffer(invalidPingFrameBytes)
+
+	// Expect conn.Serve to exit with a ConnectionError(FRAME_SIZE_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending PING with invalid length")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeFrameSizeError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeFrameSizeError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeFrameSizeError
+	}, "GOAWAY(FRAME_SIZE_ERROR) for PING with invalid length")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(FRAME_SIZE_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should typically be 0.
+	conn.streamsMu.RLock()
+	expectedLastStreamID := conn.lastProcessedStreamID
+	conn.streamsMu.RUnlock()
+	if goAwayFrame.LastStreamID != expectedLastStreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want %d (conn.lastProcessedStreamID)", goAwayFrame.LastStreamID, expectedLastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
+
+// TestInvalidFrameLength_PRIORITY tests that sending a PRIORITY frame with an invalid length
+// on a stream ID > 0 results in an RST_STREAM frame with FRAME_SIZE_ERROR.
+// Covers h2spec 6.3.2.
+func TestInvalidFrameLength_PRIORITY(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_PRIORITY")
+	// Defer a final conn.Close. The error used here will be updated if the test passes.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDToUse uint32 = 1 // Client-initiated stream
+
+	// 1. Client sends HEADERS to open stream 1, so it's not idle for the PRIORITY frame.
+	//    A PRIORITY frame on an idle stream would be a PROTOCOL_ERROR.
+	//    h2spec 6.3.2 implies the stream should exist or be creatable.
+	clientInitialHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedClientInitialHeaders := encodeHeadersForTest(t, clientInitialHeaders)
+	initialHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream, // End stream immediately for simplicity
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedClientInitialHeaders)),
+		},
+		HeaderBlockFragment: encodedClientInitialHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, initialHeadersFrame))
+
+	// Wait for the server to process the HEADERS frame.
+	// We don't need to check for dispatcher call, just give server time to open the stream.
+	time.Sleep(100 * time.Millisecond)
+	mnc.ResetWriteBuffer() // Clear any response from server for the HEADERS
+
+	// 2. Send PRIORITY frame with invalid length (e.g., 4 instead of 5)
+	// Frame structure: Length (3 bytes), Type (1), Flags (1), StreamID (4), Payload (Length bytes)
+	// PRIORITY payload: Exclusive (1 bit) + Stream Dependency (31 bits) + Weight (8 bits) = 5 bytes.
+	// We send a frame with header length 4.
+	invalidPriorityFrameBytes := []byte{
+		0x00, 0x00, 0x04, // Length = 4 (invalid, should be 5)
+		byte(FramePriority),                   // Type = PRIORITY
+		0x00,                                  // Flags = 0
+		0x00, 0x00, 0x00, byte(streamIDToUse), // StreamID
+		// Payload (4 bytes instead of 5)
+		0x00, 0x00, 0x00, 0x0A, // Example: Dependency 0, Weight 10 (incomplete)
+	}
+	mnc.FeedReadBuffer(invalidPriorityFrameBytes)
+
+	// 3. Expect server to send RST_STREAM(FRAME_SIZE_ERROR) for stream 1
+	var rstFrame *RSTStreamFrame
+	rstFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*RSTStreamFrame)(nil), func(f *RSTStreamFrame) bool {
+		return f.Header().StreamID == streamIDToUse && f.ErrorCode == ErrCodeFrameSizeError
+	}, fmt.Sprintf("RST_STREAM(FRAME_SIZE_ERROR) for stream %d due to invalid PRIORITY length", streamIDToUse))
+
+	if rstFrame == nil {
+		// waitForFrameCondition would have t.Fatal'd.
+		t.Fatalf("Expected RST_STREAM(FRAME_SIZE_ERROR) not received for stream %d.", streamIDToUse)
+	}
+
+	// 4. Ensure no GOAWAY frame was sent (connection should remain open)
+	time.Sleep(50 * time.Millisecond) // Give a bit of time for a GOAWAY if it were to be sent
+	framesAfterRST := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+	for _, f := range framesAfterRST {
+		// Allow for the expected RST_STREAM frame to be in the buffer if not reset
+		if f == rstFrame {
+			continue
+		}
+		if _, ok := f.(*GoAwayFrame); ok {
+			t.Fatalf("Unexpected GOAWAY frame sent by server: %+v", f)
+		}
+	}
+
+	// 5. Clean up: Close mock net conn, wait for Serve to exit.
+	mnc.Close()
+	select {
+	case err := <-serveErrChan:
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Logf("conn.Serve exited with: %v (expected EOF or closed connection error)", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Timeout waiting for conn.Serve to exit after mnc.Close()")
+	}
+
+	// If all checks pass, update closeErr to nil
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
+
+// TestInvalidFrameLength_RST_STREAM tests that sending an RST_STREAM frame with an invalid length
+// results in a connection error (FRAME_SIZE_ERROR) and a GOAWAY frame.
+// Covers h2spec 6.4.3.
+func TestInvalidFrameLength_RST_STREAM(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_RST_STREAM")
+	// Defer a final conn.Close. The error used here will be updated if the test passes.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDForRST uint32 = 1 // Can be any valid stream ID, even if not open, for this test.
+
+	// Send RST_STREAM frame with invalid length (e.g., 3 instead of 4)
+	// Frame structure: Length (3 bytes), Type (1), Flags (1), StreamID (4), Payload (Length bytes)
+	// An RST_STREAM frame *must* have a length of 4 octets (RFC 7540, Section 6.4).
+	invalidRSTStreamFrameBytes := []byte{
+		0x00, 0x00, 0x03, // Length = 3 (invalid, should be 4)
+		byte(FrameRSTStream),                   // Type = RST_STREAM
+		0x00,                                   // Flags = 0
+		0x00, 0x00, 0x00, byte(streamIDForRST), // StreamID
+		// Payload (3 bytes instead of 4 for ErrorCode)
+		0x00, 0x00, 0x01, // Example: Partial ErrorCode (ErrCodeProtocolError)
+	}
+	mnc.FeedReadBuffer(invalidRSTStreamFrameBytes)
+
+	// Expect conn.Serve to exit with a ConnectionError(FRAME_SIZE_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending RST_STREAM with invalid length")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeFrameSizeError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeFrameSizeError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeFrameSizeError
+	}, "GOAWAY(FRAME_SIZE_ERROR) for RST_STREAM with invalid length")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(FRAME_SIZE_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should typically be 0, or the last processed stream ID by the client.
+	// Since the error is frame-level before stream processing, it's often 0.
+	conn.streamsMu.RLock()
+	expectedLastStreamID := conn.lastProcessedStreamID // Or conn.highestPeerInitiatedStreamID if more appropriate for client RSTs
+	conn.streamsMu.RUnlock()
+	if goAwayFrame.LastStreamID != expectedLastStreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want %d (conn's last known good stream ID)", goAwayFrame.LastStreamID, expectedLastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
