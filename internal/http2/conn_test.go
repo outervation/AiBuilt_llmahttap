@@ -5678,3 +5678,121 @@ func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
 		closeErr = nil
 	}
 }
+
+// TestPriorityOnHalfClosedRemoteStream verifies that the server accepts PRIORITY frames
+// on streams that are in the half-closed (remote) state without erroring or sending
+// unexpected frames. This covers h2spec 2.3.
+func TestPriorityOnHalfClosedRemoteStream(t *testing.T) {
+	t.Parallel()
+
+	mockDispatcher := &mockRequestDispatcher{}
+	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+	var closeErr error = errors.New("test cleanup: TestPriorityOnHalfClosedRemoteStream")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	ctx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+
+	go func() {
+		err := conn.Serve(ctx)
+		serveErrChan <- err
+	}()
+
+	const streamIDToUse uint32 = 1
+
+	// 1. Client sends HEADERS with END_STREAM to put stream in half-closed (remote) state on server
+	clientHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedClientHeaders := encodeHeadersForTest(t, clientHeaders)
+	headersFrameClient := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream, // END_STREAM is key here
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedClientHeaders)),
+		},
+		HeaderBlockFragment: encodedClientHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrameClient))
+
+	// Wait for dispatcher to be called, confirming stream is processed
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		mockDispatcher.mu.Lock()
+		defer mockDispatcher.mu.Unlock()
+		// Check calledCount as lastStreamID might persist from other activities if dispatcher isn't reset carefully in all tests
+		return mockDispatcher.calledCount > 0 && mockDispatcher.lastStreamID == streamIDToUse
+	}, fmt.Sprintf("dispatcher to be called for stream %d", streamIDToUse))
+
+	// Verify stream state is HalfClosedRemote
+	stream, exists := conn.getStream(streamIDToUse)
+	if !exists {
+		t.Fatalf("Stream %d not found after HEADERS", streamIDToUse)
+	}
+	stream.mu.RLock()
+	state := stream.state
+	stream.mu.RUnlock()
+	if state != StreamStateHalfClosedRemote {
+		t.Fatalf("Stream %d state: got %s, want %s", streamIDToUse, state, StreamStateHalfClosedRemote)
+	}
+
+	// Server might send a response to the initial GET. Reset write buffer *before* sending PRIORITY.
+	// This ensures that frames checked later are only those potentially sent due to PRIORITY processing.
+	mnc.ResetWriteBuffer()
+	// No need to reset mockDispatcher here as its state for initial HEADERS is already checked.
+
+	// 2. Client sends PRIORITY frame for this half-closed (remote) stream
+	priorityFrame := &PriorityFrame{
+		FrameHeader:      FrameHeader{Type: FramePriority, StreamID: streamIDToUse, Length: 5},
+		StreamDependency: 0,
+		Weight:           20, // Some weight
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, priorityFrame))
+
+	// 3. Server should accept this PRIORITY frame without error.
+	// No RST_STREAM or GOAWAY should be sent as a result of the PRIORITY frame.
+	time.Sleep(100 * time.Millisecond) // Allow server time to process PRIORITY frame
+
+	framesAfterPriority := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+	for _, f := range framesAfterPriority {
+		if rst, ok := f.(*RSTStreamFrame); ok {
+			t.Fatalf("Server sent RST_STREAM frame (StreamID: %d, ErrorCode: %s) after PRIORITY on half-closed (remote) stream", rst.Header().StreamID, rst.ErrorCode)
+		}
+		if _, ok := f.(*GoAwayFrame); ok {
+			t.Fatalf("Server sent GOAWAY frame after PRIORITY on half-closed (remote) stream: %+v", f)
+		}
+	}
+
+	// (Optional: Deeper check of priority tree update. For now, this is sufficient for spec compliance on frame acceptance)
+
+	// 4. Clean up: Close mock net conn, wait for Serve to exit.
+	cancelServe() // Signal Serve to stop
+	mnc.Close()   // Close the connection to unblock ReadFrame in Serve
+
+	select {
+	case err := <-serveErrChan:
+		// Expect EOF, "use of closed network connection", or "context canceled"
+		if err != nil && !errors.Is(err, io.EOF) &&
+			!strings.Contains(err.Error(), "use of closed network connection") &&
+			!errors.Is(err, context.Canceled) &&
+			!strings.Contains(err.Error(), "connection shutdown initiated") { // Conn.Close might be called by Serve's defer
+			t.Logf("conn.Serve exited with: %v (expected EOF, closed connection, or context canceled)", err)
+		} else if err != nil {
+			t.Logf("conn.Serve exited as expected with: %v", err)
+		}
+	case <-time.After(2 * time.Second): // Increased timeout slightly
+		t.Error("Timeout waiting for conn.Serve to exit after mnc.Close() and context cancel")
+	}
+
+	if !t.Failed() {
+		closeErr = nil // Test logic passed
+	}
+}
