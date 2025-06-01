@@ -548,9 +548,9 @@ func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isI
 		c.log.Debug("Conn.createStream: Incremented concurrentStreamsOutbound", logger.LogFields{"stream_id": id, "new_count": c.concurrentStreamsOutbound})
 	}
 
-	if id > c.lastProcessedStreamID {
+	if isInitiatedByPeer && id > c.lastProcessedStreamID {
 		c.lastProcessedStreamID = id
-		c.log.Debug("Conn.createStream: Updated lastProcessedStreamID", logger.LogFields{"stream_id": id, "new_last_id": c.lastProcessedStreamID})
+		c.log.Debug("Conn.createStream: Updated lastProcessedStreamID for peer-initiated stream", logger.LogFields{"stream_id": id, "new_last_id": c.lastProcessedStreamID})
 	}
 
 	c.streamsMu.Unlock() // Release streamsMu
