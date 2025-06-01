@@ -3035,55 +3035,10 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				"frame_len":   frameHeader.Length,
 				"max_len":     currentMaxFrameSize,
 			})
-			// Per RFC 7540 Section 4.2 and h2spec expectations, any frame exceeding SETTINGS_MAX_FRAME_SIZE
-			// should generally lead to a connection error of type FRAME_SIZE_ERROR.
-			// The h2spec output specifically expects GOAWAY(FRAME_SIZE_ERROR) for large DATA or HEADERS frames.
-			// For other frame types, RST_STREAM(FRAME_SIZE_ERROR) if stream-specific, or GOAWAY(FRAME_SIZE_ERROR) if connection-wide.
-			// Given the severity, GOAWAY is safer for any frame type, as the specific h2spec failures target DATA and HEADERS.
-			// Individual frame parsers (e.g. for PRIORITY, RST_STREAM) will be updated to check their specific fixed lengths.
-			// This general check is for variable length frames like DATA, HEADERS, CONTINUATION, PUSH_PROMISE, UNKNOWN.
-			// The problem asks for RST_STREAM(FRAME_SIZE_ERROR) for DATA frames, and GOAWAY(FRAME_SIZE_ERROR) for HEADERS frames.
-			// This general check *before* dispatchFrame means we don't know the *exact* type yet beyond what ReadFrame gives.
-			// So, a general connection error (GOAWAY) is a safe default here for *any* frame type.
-			// The specific requirement of RST_STREAM for DATA vs GOAWAY for HEADERS suggests this check might need to be
-			// *after* type determination, or `ReadFrame` needs to return a more typed error.
-			//
-			// Given the location (before dispatchFrame), the most robust general response for an oversized frame
-			// *header length* is a connection error.
-			// The task description "Enhance the Serve loop to validate incoming frame header lengths ... sending RST_STREAM(FRAME_SIZE_ERROR) or GOAWAY(FRAME_SIZE_ERROR) as appropriate."
-			// This implies we need to know the frame type to decide between RST_STREAM and GOAWAY.
-			//
-			// Let's refine:
-			// - DATA frame -> RST_STREAM(FRAME_SIZE_ERROR) on frameHeader.StreamID
-			// - HEADERS frame -> GOAWAY(FRAME_SIZE_ERROR)
-			// - Other stream-specific frames (PRIORITY, RST_STREAM, WINDOW_UPDATE, CONTINUATION) -> RST_STREAM(FRAME_SIZE_ERROR) on frameHeader.StreamID
-			// - Connection-specific frames (SETTINGS, PING, GOAWAY) -> GOAWAY(FRAME_SIZE_ERROR)
-			//
-			// For now, let's implement the specific DATA/HEADERS behavior and a general GOAWAY for others caught here.
-			// The more granular RST_STREAM for PRIORITY etc. fixed-length frames will be in their parse methods.
-
-			switch frameHeader.Type {
-			case FrameData:
-				// Send RST_STREAM(FRAME_SIZE_ERROR) for DATA frames.
-				// We must not process the frame further if its length is too large.
-				// The error returned here will be used by Serve's defer to close the connection,
-				// but we first attempt to send RST_STREAM.
-				// This RST_STREAM is a 'best effort' as the connection will be torn down anyway.
-				_ = c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError)
-				return NewConnectionError(ErrCodeFrameSizeError, errMsg) // Connection error will trigger GOAWAY
-			case FrameHeaders:
-				// Send GOAWAY(FRAME_SIZE_ERROR) for HEADERS frames.
-				return NewConnectionError(ErrCodeFrameSizeError, errMsg)
-			default:
-				// For other frame types, if they have a StreamID, attempt RST_STREAM.
-				// Otherwise, or if StreamID is 0, it's a GOAWAY.
-				if frameHeader.StreamID != 0 {
-					_ = c.sendRSTStreamFrame(frameHeader.StreamID, ErrCodeFrameSizeError)
-					return NewConnectionError(ErrCodeFrameSizeError, errMsg) // Connection error still
-				}
-				return NewConnectionError(ErrCodeFrameSizeError, errMsg)
-			}
-		}
+			// RFC 7540, Section 4.2: "An endpoint MUST treat receipt of a frame that is larger than
+			// SETTINGS_MAX_FRAME_SIZE ... as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
+			return NewConnectionError(ErrCodeFrameSizeError, errMsg)
+		} // End of switch frameHeader.Type for MAX_FRAME_SIZE
 
 		dispatchErr := c.dispatchFrame(frame)
 		if dispatchErr != nil {
