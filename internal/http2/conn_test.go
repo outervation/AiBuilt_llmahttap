@@ -2535,7 +2535,9 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 			// Dispatcher *is* called for the initial HEADERS. The error occurs on the *trailer* HEADERS.
 			expectDispatcherCall:       true,
 			expectDispatcherStreamID:   27,
-			expectConnectionError:      true,
+			expectedRSTStreamID:        27, // Server should RST the stream
+			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+			expectConnectionError:      true, // Then a connection error should follow
 			expectedConnErrorCode:      ErrCodeProtocolError,
 			expectedGoAway:             true,
 			expectedConnErrorMsgSubstr: "pseudo-header field ':status' found in trailer block",
