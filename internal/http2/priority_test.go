@@ -2481,3 +2481,87 @@ func TestPriorityTree_UpdatePriority_Stream0_Behavior(t *testing.T) {
 		t.Errorf("Stream 0 parent changed to %d after self-dependency attempt, expected 0", s0ParentAfterSelf)
 	}
 }
+
+func TestPriorityTree_RemoveStream_ParentMissing_ReparentToRoot(t *testing.T) {
+	pt := NewPriorityTree()
+	// Setup: 0 -> P(1) -> S(2) -> C(3)
+	// Stream 1 will be parent P
+	// Stream 2 will be stream S, child of P
+	// Stream 3 will be stream C, child of S
+	if err := pt.AddStream(1, nil); err != nil { // P
+		t.Fatalf("Setup AddStream(1) failed: %v", err)
+	}
+	if err := pt.AddStream(2, &streamDependencyInfo{StreamDependency: 1, Weight: 10}); err != nil { // S
+		t.Fatalf("Setup AddStream(2) failed: %v", err)
+	}
+	if err := pt.AddStream(3, &streamDependencyInfo{StreamDependency: 2, Weight: 20}); err != nil { // C
+		t.Fatalf("Setup AddStream(3) failed: %v", err)
+	}
+
+	// Manually remove P(1) from the nodes map to simulate inconsistency
+	// This action requires holding the lock, as we are modifying internal state directly.
+	pt.mu.Lock()
+	delete(pt.nodes, 1)
+	pt.mu.Unlock()
+
+	// Now remove S(2). Its parent P(1) is missing.
+	// RemoveStream itself handles locking.
+	err := pt.RemoveStream(2)
+	if err == nil {
+		t.Fatalf("RemoveStream(2) with missing parent P(1) should have returned an error for inconsistency")
+	}
+
+	connErr, ok := err.(*ConnectionError)
+	if !ok {
+		t.Fatalf("Expected RemoveStream to return *ConnectionError for missing parent, got %T: %v", err, err)
+	}
+	if connErr.Code != ErrCodeInternalError {
+		t.Errorf("Expected ConnectionError code ErrCodeInternalError, got %v", connErr.Code)
+	}
+	expectedMsgPart := "parent stream 1 (for stream 2 being removed) not found"
+	if !strings.Contains(connErr.Msg, expectedMsgPart) {
+		t.Errorf("Error message for missing parent mismatch. Expected to contain '%s', got '%s'", expectedMsgPart, connErr.Msg)
+	}
+	t.Logf("Received expected error: %v", err)
+
+	// S(2) should be removed from the tree
+	_, _, _, errGetS := pt.GetDependencies(2)
+	if errGetS == nil {
+		t.Errorf("Stream S(2) should be removed from the tree, but GetDependencies found it.")
+	} else if !strings.Contains(errGetS.Error(), "not found") {
+		t.Errorf("Expected 'not found' error for stream S(2), got: %v", errGetS)
+	}
+
+	// C(3) should be re-parented to stream 0, its weight should be preserved.
+	cParentID, cChildren, cWeight, errGetC := pt.GetDependencies(3)
+	if errGetC != nil {
+		t.Fatalf("GetDependencies for stream C(3) failed: %v", errGetC)
+	}
+	if cParentID != 0 {
+		t.Errorf("Stream C(3) parent: expected 0 (re-parented to root), got %d", cParentID)
+	}
+	if cWeight != 20 { // Original weight of C(3) was 20
+		t.Errorf("Stream C(3) weight: expected 20 (preserved), got %d", cWeight)
+	}
+	if len(cChildren) != 0 {
+		t.Errorf("Stream C(3) children: expected empty, got %v", cChildren)
+	}
+
+	// Stream 0 (root) should now have C(3) as one of its children.
+	// Stream P(1) was removed manually, Stream S(2) was removed by RemoveStream.
+	// Stream 0's children might also include other streams if the test setup was more complex,
+	// but here it should primarily contain C(3) among the streams involved.
+	_, rootChildren, _, errGetRoot := pt.GetDependencies(0)
+	if errGetRoot != nil {
+		t.Fatalf("GetDependencies for stream 0 failed: %v", errGetRoot)
+	}
+	if !contains(rootChildren, 3) {
+		t.Errorf("Stream 0 children %v, expected to contain C(3) after re-parenting.", rootChildren)
+	}
+
+	// Verify stream P(1) is indeed gone from the perspective of GetDependencies as well
+	_, _, _, errGetP := pt.GetDependencies(1)
+	if errGetP == nil {
+		t.Errorf("Stream P(1) should not be found after manual deletion, but GetDependencies succeeded")
+	}
+}
