@@ -2735,8 +2735,9 @@ func TestConnection_DispatchRSTStreamFrame(t *testing.T) {
 				FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: 99, Length: 4}, // Stream 99 does not exist
 				ErrorCode:   ErrCodeStreamClosed,
 			},
-			expectedError:             true, // Now expect an error as per h2spec 5.1/2 & 6.4/2
-			expectedConnectionError:   &ConnectionError{Code: ErrCodeProtocolError, Msg: "RST_STREAM received for idle stream 99"},
+			expectedError: true, // Now expect an error as per h2spec 5.1/2 & 6.4/2
+
+			expectedConnectionError:   &ConnectionError{Code: ErrCodeProtocolError, Msg: "RST_STREAM received for numerically idle stream 99"},
 			expectGoAwayFromConnClose: true, // Since it's a connection error
 			expectedGoAwayErrorCode:   ErrCodeProtocolError,
 		},
