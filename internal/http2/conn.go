@@ -1799,6 +1799,15 @@ func (c *Connection) handleWindowUpdateFrameConnLevel(frame *WindowUpdateFrame) 
 // It routes the frame to either connection-level or stream-level processing.
 func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	streamID := frame.Header().StreamID
+	header := frame.Header()
+
+	// RFC 7540, Section 6.9: "A WINDOW_UPDATE frame with a length other than 4 octets MUST be
+	// treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR."
+	if header.Length != 4 {
+		errMsg := fmt.Sprintf("WINDOW_UPDATE frame (stream %d) received with invalid length %d, expected 4", streamID, header.Length)
+		c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "length": header.Length})
+		return NewConnectionError(ErrCodeFrameSizeError, errMsg)
+	}
 
 	if streamID == 0 {
 		return c.handleWindowUpdateFrameConnLevel(frame)
