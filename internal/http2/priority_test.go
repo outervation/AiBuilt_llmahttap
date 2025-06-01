@@ -2664,3 +2664,167 @@ func TestPriorityTree_RemoveStream_ParentMissing_ReparentToRoot(t *testing.T) {
 		t.Errorf("Stream P(1) should not be found after manual deletion, but GetDependencies succeeded")
 	}
 }
+
+func TestPriorityTree_RepeatedExclusiveReparenting(t *testing.T) {
+	pt := NewPriorityTree()
+
+	parentID := uint32(1)
+	childA := uint32(10)
+	childB := uint32(11)
+	childC := uint32(12)
+
+	streamX := uint32(20)
+	streamY := uint32(21)
+	streamZ := uint32(22)
+
+	wA, wB, wC := uint8(10), uint8(11), uint8(12) // Weights for initial children
+	wX, wY, wZ := uint8(20), uint8(21), uint8(22) // Weights for streams X, Y, Z
+
+	// Initial setup: 0 -> parentID -> {childA, childB, childC}
+	// AddStream handles locking and calls UpdatePriority internally correctly.
+	if err := pt.AddStream(parentID, nil); err != nil {
+		t.Fatalf("Setup AddStream(parentID: %d) failed: %v", parentID, err)
+	}
+	if err := pt.AddStream(childA, &streamDependencyInfo{StreamDependency: parentID, Weight: wA}); err != nil {
+		t.Fatalf("Setup AddStream(childA: %d) failed: %v", childA, err)
+	}
+	if err := pt.AddStream(childB, &streamDependencyInfo{StreamDependency: parentID, Weight: wB}); err != nil {
+		t.Fatalf("Setup AddStream(childB: %d) failed: %v", childB, err)
+	}
+	if err := pt.AddStream(childC, &streamDependencyInfo{StreamDependency: parentID, Weight: wC}); err != nil {
+		t.Fatalf("Setup AddStream(childC: %d) failed: %v", childC, err)
+	}
+
+	// Add X, Y, Z initially as children of 0.
+	// UpdatePriority (called by AddStream) will correctly create them if they don't exist
+	// or update them if they do. AddStream is used here for clean initialization.
+	if err := pt.AddStream(streamX, &streamDependencyInfo{StreamDependency: 0, Weight: wX}); err != nil {
+		t.Fatalf("Setup AddStream(streamX: %d) failed: %v", streamX, err)
+	}
+	if err := pt.AddStream(streamY, &streamDependencyInfo{StreamDependency: 0, Weight: wY}); err != nil {
+		t.Fatalf("Setup AddStream(streamY: %d) failed: %v", streamY, err)
+	}
+	if err := pt.AddStream(streamZ, &streamDependencyInfo{StreamDependency: 0, Weight: wZ}); err != nil {
+		t.Fatalf("Setup AddStream(streamZ: %d) failed: %v", streamZ, err)
+	}
+
+	// --- Step 1: Make streamX an exclusive child of parentID ---
+	// Expected tree structure after Step 1:
+	// 0 -> parentID (w:15 def)
+	//      -> streamX (w:wX)
+	//         -> childA (w:wA)
+	//         -> childB (w:wB)
+	//         -> childC (w:wC)
+	// (streamY, streamZ still children of 0)
+
+	err := pt.UpdatePriority(streamX, parentID, wX, true)
+	if err != nil {
+		t.Fatalf("Step 1: UpdatePriority(streamX %d as exclusive child of parentID %d) failed: %v", streamX, parentID, err)
+	}
+
+	// Verify parentID after Step 1
+	p_pID, c_pID, _, _ := pt.GetDependencies(parentID)
+	if p_pID != 0 || !reflect.DeepEqual(sortUint32Slice(c_pID), []uint32{streamX}) {
+		t.Errorf("Step 1 parentID (%d): P:%d C:%v. Expected P:0 C:[%d]", parentID, p_pID, c_pID, streamX)
+	}
+
+	// Verify streamX after Step 1
+	p_sX, c_sX, w_sX, _ := pt.GetDependencies(streamX)
+	expected_sX_children_S1 := []uint32{childA, childB, childC}
+	if p_sX != parentID || w_sX != wX || !reflect.DeepEqual(sortUint32Slice(c_sX), sortUint32Slice(expected_sX_children_S1)) {
+		t.Errorf("Step 1 streamX (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamX, p_sX, w_sX, c_sX, parentID, wX, expected_sX_children_S1)
+	}
+
+	// Verify children A, B, C now parented by streamX
+	for _, child := range []uint32{childA, childB, childC} {
+		p_child, _, _, _ := pt.GetDependencies(child)
+		if p_child != streamX {
+			t.Errorf("Step 1 child %d: P:%d. Expected P:%d", child, p_child, streamX)
+		}
+	}
+
+	// --- Step 2: Make streamY an exclusive child of parentID ---
+	// streamX (which was parentID's only child) and its subtree should become child of streamY.
+	// Expected tree structure after Step 2:
+	// 0 -> parentID (w:15 def)
+	//      -> streamY (w:wY)
+	//         -> streamX (w:wX)
+	//            -> childA (w:wA)
+	//            -> childB (w:wB)
+	//            -> childC (w:wC)
+	// (streamZ still child of 0)
+
+	err = pt.UpdatePriority(streamY, parentID, wY, true)
+	if err != nil {
+		t.Fatalf("Step 2: UpdatePriority(streamY %d as exclusive child of parentID %d) failed: %v", streamY, parentID, err)
+	}
+
+	// Verify parentID after Step 2
+	p_pID_S2, c_pID_S2, _, _ := pt.GetDependencies(parentID)
+	if p_pID_S2 != 0 || !reflect.DeepEqual(sortUint32Slice(c_pID_S2), []uint32{streamY}) {
+		t.Errorf("Step 2 parentID (%d): P:%d C:%v. Expected P:0 C:[%d]", parentID, p_pID_S2, c_pID_S2, streamY)
+	}
+
+	// Verify streamY after Step 2
+	p_sY, c_sY, w_sY, _ := pt.GetDependencies(streamY)
+	expected_sY_children_S2 := []uint32{streamX}
+	if p_sY != parentID || w_sY != wY || !reflect.DeepEqual(sortUint32Slice(c_sY), sortUint32Slice(expected_sY_children_S2)) {
+		t.Errorf("Step 2 streamY (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamY, p_sY, w_sY, c_sY, parentID, wY, expected_sY_children_S2)
+	}
+
+	// Verify streamX is now child of streamY, and its own children are intact
+	p_sX_S2, c_sX_S2, w_sX_S2, _ := pt.GetDependencies(streamX)
+	if p_sX_S2 != streamY || w_sX_S2 != wX || !reflect.DeepEqual(sortUint32Slice(c_sX_S2), sortUint32Slice(expected_sX_children_S1)) { // expected_sX_children_S1 are children of X
+		t.Errorf("Step 2 streamX (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamX, p_sX_S2, w_sX_S2, c_sX_S2, streamY, wX, expected_sX_children_S1)
+	}
+
+	// --- Step 3: Make streamZ an exclusive child of parentID ---
+	// streamY (which was parentID's only child) and its subtree should become child of streamZ.
+	// Expected tree structure after Step 3:
+	// 0 -> parentID (w:15 def)
+	//      -> streamZ (w:wZ)
+	//         -> streamY (w:wY)
+	//            -> streamX (w:wX)
+	//               -> childA (w:wA)
+	//               -> childB (w:wB)
+	//               -> childC (w:wC)
+
+	err = pt.UpdatePriority(streamZ, parentID, wZ, true)
+	if err != nil {
+		t.Fatalf("Step 3: UpdatePriority(streamZ %d as exclusive child of parentID %d) failed: %v", streamZ, parentID, err)
+	}
+
+	// Verify parentID after Step 3
+	p_pID_S3, c_pID_S3, _, _ := pt.GetDependencies(parentID)
+	if p_pID_S3 != 0 || !reflect.DeepEqual(sortUint32Slice(c_pID_S3), []uint32{streamZ}) {
+		t.Errorf("Step 3 parentID (%d): P:%d C:%v. Expected P:0 C:[%d]", parentID, p_pID_S3, c_pID_S3, streamZ)
+	}
+
+	// Verify streamZ after Step 3
+	p_sZ, c_sZ, w_sZ, _ := pt.GetDependencies(streamZ)
+	expected_sZ_children_S3 := []uint32{streamY}
+	if p_sZ != parentID || w_sZ != wZ || !reflect.DeepEqual(sortUint32Slice(c_sZ), sortUint32Slice(expected_sZ_children_S3)) {
+		t.Errorf("Step 3 streamZ (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamZ, p_sZ, w_sZ, c_sZ, parentID, wZ, expected_sZ_children_S3)
+	}
+
+	// Verify streamY is now child of streamZ, and its own child (streamX) is intact
+	p_sY_S3, c_sY_S3, w_sY_S3, _ := pt.GetDependencies(streamY)
+	expected_sY_children_S3 := []uint32{streamX} // streamX was streamY's child
+	if p_sY_S3 != streamZ || w_sY_S3 != wY || !reflect.DeepEqual(sortUint32Slice(c_sY_S3), sortUint32Slice(expected_sY_children_S3)) {
+		t.Errorf("Step 3 streamY (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamY, p_sY_S3, w_sY_S3, c_sY_S3, streamZ, wY, expected_sY_children_S3)
+	}
+
+	// Verify streamX is still child of streamY, and its children are intact
+	p_sX_S3, c_sX_S3, w_sX_S3, _ := pt.GetDependencies(streamX)
+	if p_sX_S3 != streamY || w_sX_S3 != wX || !reflect.DeepEqual(sortUint32Slice(c_sX_S3), sortUint32Slice(expected_sX_children_S1)) { // expected_sX_children_S1 are children of X
+		t.Errorf("Step 3 streamX (%d): P:%d W:%d C:%v. Expected P:%d W:%d C:%v", streamX, p_sX_S3, w_sX_S3, c_sX_S3, streamY, wX, expected_sX_children_S1)
+	}
+
+	// Verify children A, B, C are still parented by streamX
+	for _, child := range []uint32{childA, childB, childC} {
+		p_child, _, _, _ := pt.GetDependencies(child)
+		if p_child != streamX {
+			t.Errorf("Step 3 child %d: P:%d. Expected P:%d", child, p_child, streamX)
+		}
+	}
+}
