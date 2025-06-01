@@ -14,7 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http" // For http.Request, used by RequestDispatcherFunc
-	"strconv"  // Added for parsing content-length
+
 	"strings"
 	"sync"
 	"time"
@@ -1021,45 +1021,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		return NewConnectionError(ErrCodeCompressionError, "HPACK finish decoding error: "+err.Error())
 	}
 
-	// ----- BEGIN CONTENT-LENGTH PARSING (for h2spec 8.1.2.6) -----
-	var parsedContentLength *int64
-	var contentLengthHeaderValue string
-	contentLengthHeaderFound := false // Initialize to false
-
-	for _, hf := range decodedHeaders {
-		// HTTP header field names are case-insensitive.
-		if strings.ToLower(hf.Name) == "content-length" {
-			contentLengthHeaderValue = hf.Value
-			contentLengthHeaderFound = true
-			break // Found it, no need to search further.
-		}
-	}
-
-	if contentLengthHeaderFound {
-		val, errConv := strconv.ParseInt(contentLengthHeaderValue, 10, 64)
-		// RFC 7230 Section 3.3.2: Content-Length must be a non-negative decimal integer.
-		if errConv != nil || val < 0 {
-			errMsg := fmt.Sprintf("invalid Content-Length header value '%s' (must be non-negative integer) for stream %d",
-				contentLengthHeaderValue, c.activeHeaderBlockStreamID)
-			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_value": contentLengthHeaderValue})
-
-			// Per HTTP/2 RFC 7540 Section 8.1.2.6, malformed requests (including invalid Content-Length)
-			// are connection errors. However, h2spec expects RST_STREAM(PROTOCOL_ERROR) for some Content-Length issues.
-			// "A receiver MAY treat a content-length header field that is ... invalid as an HTTP error of type PROTOCOL_ERROR."
-			// Sending RST_STREAM for an invalid format is consistent with this "MAY".
-			if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
-				c.log.Error("Failed to send RST_STREAM for invalid Content-Length value", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
-				// If sending RST fails, escalate to connection error.
-				c.resetHeaderAssemblyState()
-				return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to RST stream for invalid content-length: "+rstErr.Error(), rstErr)
-			}
-			c.resetHeaderAssemblyState()
-			return nil // RST_STREAM sent, stream error handled. Connection may continue.
-		}
-		parsedVal := val // Temporary variable for pointer.
-		parsedContentLength = &parsedVal
-	}
-	// ----- END CONTENT-LENGTH PARSING -----
+	// Content-length parsing and validation will now be handled by stream.go
 
 	// ----- BEGIN HEADER CONTENT VALIDATION (Task Item 6) -----
 	for _, hf := range decodedHeaders {
@@ -1175,14 +1137,10 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 			"stream_id":                  streamID,
 			"num_headers":                len(decodedHeaders),
 			"end_stream_flag_on_headers": endStreamFlag,
-			"content_length_ptr_is_nil":  parsedContentLength == nil,
-		}
-		if parsedContentLength != nil {
-			logFields["content_length_val"] = *parsedContentLength
 		}
 		c.log.Debug("Dispatching assembled HEADERS", logFields)
 		// Pass endStreamFlag (from initial HEADERS) and parsedContentLength
-		err = c.handleIncomingCompleteHeaders(streamID, decodedHeaders, endStreamFlag, initialFramePrioInfo, parsedContentLength)
+		err = c.handleIncomingCompleteHeaders(streamID, decodedHeaders, endStreamFlag, initialFramePrioInfo)
 		if err != nil {
 			return err
 		}
@@ -1318,7 +1276,7 @@ func (c *Connection) processPushPromiseFrame(frame *PushPromiseFrame) error {
 	return nil
 }
 
-func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hpack.HeaderField, endStream bool, prioInfo *streamDependencyInfo, contentLength *int64) error {
+func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hpack.HeaderField, endStream bool, prioInfo *streamDependencyInfo) error {
 	c.log.Debug("Handling complete headers",
 		logger.LogFields{
 			"stream_id":         streamID,
@@ -1413,7 +1371,7 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 				// If it's not valid trailers, stream processing should error out.
 				c.log.Debug("Server received subsequent HEADERS (with END_STREAM) for Open/HalfClosedLocal stream. Delegating to stream for potential trailer processing or error.",
 					logger.LogFields{"stream_id": streamID, "state": state.String()})
-				return existingStream.processRequestHeadersAndDispatch(headers, endStream, contentLength, c.dispatcher)
+				return existingStream.processRequestHeadersAndDispatch(headers, endStream, nil, c.dispatcher)
 
 			} else if state == StreamStateClosed {
 				// HEADERS on a closed stream is an error (h2spec 5.1/9 - "closed: Sends a HEADERS frame after sending RST_STREAM frame" -> STREAM_CLOSED).
@@ -1430,7 +1388,7 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			// We delegate to the stream's processing logic to make the final determination.
 			c.log.Debug("Server received HEADERS for existing stream in other state (e.g. HalfClosedRemote, Reserved), passing to stream processing",
 				logger.LogFields{"stream_id": streamID, "state": state.String()})
-			return existingStream.processRequestHeadersAndDispatch(headers, endStream, contentLength, c.dispatcher)
+			return existingStream.processRequestHeadersAndDispatch(headers, endStream, nil, c.dispatcher)
 		}
 
 		// Validate stream ID ordering for client-initiated streams.
@@ -1534,7 +1492,7 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 		c.log.Debug("Conn: Attempting to call newStream.processRequestHeadersAndDispatch", logger.LogFields{"stream_id": newStream.id, "newStream_is_nil": newStream == nil, "dispatcher_is_nil": c.dispatcher == nil})
 
-		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, contentLength, c.dispatcher)
+		errDispatch := newStream.processRequestHeadersAndDispatch(headers, endStream, nil, c.dispatcher)
 		if errDispatch != nil {
 			// If it's a connection error, propagate it.
 			if _, ok := errDispatch.(*ConnectionError); ok {
