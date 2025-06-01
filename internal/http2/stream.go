@@ -199,6 +199,8 @@ func newStream(
 		endStreamSentToClient:       false,
 		initiatedByPeer:             isInitiatedByPeer, // Set the field
 		responseHeadersSent:         false,
+		initialHeadersProcessed:     false,
+		requestTrailers:             nil,
 	}
 
 	priorityInfo := &streamDependencyInfo{
