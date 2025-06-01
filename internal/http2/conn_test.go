@@ -5061,3 +5061,94 @@ func TestInvalidFrameLength_RST_STREAM(t *testing.T) {
 		closeErr = nil
 	}
 }
+
+// TestInvalidFrameLength_WINDOW_UPDATE tests that sending a WINDOW_UPDATE frame with an invalid length
+// results in a connection error (FRAME_SIZE_ERROR) and a GOAWAY frame.
+// Covers h2spec 6.9.3.
+func TestInvalidFrameLength_WINDOW_UPDATE(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_WINDOW_UPDATE")
+	// Defer a final conn.Close. The error used here will be updated if the test passes.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDForWindowUpdate uint32 = 0 // WINDOW_UPDATE can be on stream 0 or an active stream. Use 0 for simplicity.
+
+	// Send WINDOW_UPDATE frame with invalid length (e.g., 3 instead of 4)
+	// Frame structure: Length (3 bytes), Type (1), Flags (1), StreamID (4), Payload (Length bytes)
+	// A WINDOW_UPDATE frame *must* have a length of 4 octets (RFC 7540, Section 6.9).
+	invalidWindowUpdateFrameBytes := []byte{
+		0x00, 0x00, 0x03, // Length = 3 (invalid, should be 4)
+		byte(FrameWindowUpdate),                         // Type = WINDOW_UPDATE
+		0x00,                                            // Flags = 0
+		0x00, 0x00, 0x00, byte(streamIDForWindowUpdate), // StreamID
+		// Payload (3 bytes instead of 4 for WindowSizeIncrement)
+		0x00, 0x00, 0x01, // Example: Partial WindowSizeIncrement
+	}
+	mnc.FeedReadBuffer(invalidWindowUpdateFrameBytes)
+
+	// Expect conn.Serve to exit with a ConnectionError(FRAME_SIZE_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending WINDOW_UPDATE with invalid length")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeFrameSizeError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeFrameSizeError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeFrameSizeError
+	}, "GOAWAY(FRAME_SIZE_ERROR) for WINDOW_UPDATE with invalid length")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(FRAME_SIZE_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should typically be 0.
+	conn.streamsMu.RLock()
+	expectedLastStreamID := conn.lastProcessedStreamID
+	conn.streamsMu.RUnlock()
+	if goAwayFrame.LastStreamID != expectedLastStreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want %d (conn.lastProcessedStreamID)", goAwayFrame.LastStreamID, expectedLastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
