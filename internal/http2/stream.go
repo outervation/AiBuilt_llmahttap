@@ -913,10 +913,16 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		if isPotentiallyTrailers && strings.HasPrefix(hf.Name, ":") {
 			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
 			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
-			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
-				return sendErr
+			// Attempt to RST the stream first, as per h2spec expecting RST_STREAM.
+			if rstSendErr := s.sendRSTStream(ErrCodeProtocolError); rstSendErr != nil {
+				s.conn.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation (stream.go)", logger.LogFields{"stream_id": s.id, "error": rstSendErr.Error()})
+				// Even if RST_STREAM fails, the spec mandates a connection error.
+				// The error from sending RST might itself be a ConnectionError (e.g., writer problem).
+				// We will return the ConnectionError for the protocol violation below.
+				// If rstSendErr is critical (like a conn write error), it will likely surface when trying to send GOAWAY.
 			}
-			return nil
+			// Spec 8.1.2.1 mandates a connection error for pseudo-headers in trailers.
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		}
 	}
 	// --- END Original Header Validations ---
