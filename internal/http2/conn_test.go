@@ -5151,4 +5151,352 @@ func TestInvalidFrameLength_WINDOW_UPDATE(t *testing.T) {
 	if !t.Failed() {
 		closeErr = nil
 	}
+
 }
+
+// TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength tests server behavior
+// when HEADERS frame has END_STREAM set and a non-zero Content-Length.
+// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 1.
+// "An HTTP/2 request or response is malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the body,
+// or if it contains a content-length header field and the END_STREAM flag is set on the header block."
+func TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDToUse uint32 = 1
+	headersWithInvalidCL := []hpack.HeaderField{
+		{Name: ":method", Value: "POST"}, // Method that might have a body
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/submit"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: "content-length", Value: "10"}, // Non-zero Content-Length
+	}
+	encodedHeaders := encodeHeadersForTest(t, headersWithInvalidCL)
+
+	// HEADERS frame with END_STREAM and non-zero Content-Length
+	headersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream, // END_STREAM is set
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedHeaders)),
+		},
+		HeaderBlockFragment: encodedHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrame))
+
+	// Expect RST_STREAM(PROTOCOL_ERROR) on stream 1
+	var rstFrame *RSTStreamFrame
+	rstFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*RSTStreamFrame)(nil), func(f *RSTStreamFrame) bool {
+		return f.Header().StreamID == streamIDToUse && f.ErrorCode == ErrCodeProtocolError
+	}, fmt.Sprintf("RST_STREAM(PROTOCOL_ERROR) for stream %d due to non-zero CL with END_STREAM", streamIDToUse))
+
+	if rstFrame == nil {
+		t.Fatalf("Expected RST_STREAM(PROTOCOL_ERROR) not received for stream %d.", streamIDToUse)
+	}
+
+	// Ensure no GOAWAY frame was sent (connection should remain open)
+	time.Sleep(50 * time.Millisecond) // Give a bit of time for a GOAWAY if it were to be sent
+	framesAfterRST := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+	for _, f := range framesAfterRST {
+		if f == rstFrame { // Allow the RST frame itself if not cleared
+			continue
+		}
+		if _, ok := f.(*GoAwayFrame); ok {
+			t.Fatalf("Unexpected GOAWAY frame sent by server: %+v", f)
+		}
+	}
+
+	// Clean up: Close mock net conn, wait for Serve to exit.
+	mnc.Close()
+	select {
+	case err := <-serveErrChan:
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Logf("conn.Serve exited with: %v (expected EOF or closed connection error)", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Timeout waiting for conn.Serve to exit after mnc.Close()")
+	}
+
+	if !t.Failed() {
+		closeErr = nil // Test logic passed
+	}
+}
+
+// TestMalformedContentLength_DATA_DoesNotMatch_EndStream tests server behavior
+// when DATA frames' total payload length does not match the Content-Length header,
+// and END_STREAM is received.
+// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 2.
+func TestMalformedContentLength_DATA_DoesNotMatch_EndStream(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestMalformedContentLength_DATA_DoesNotMatch_EndStream")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDToUse uint32 = 1
+	const declaredContentLength = "10"
+	actualDataPayload := []byte("short") // Length 5, which is != 10
+
+	headersWithCL := []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/upload"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: "content-length", Value: declaredContentLength},
+	}
+	encodedHeaders := encodeHeadersForTest(t, headersWithCL)
+
+	// 1. Send HEADERS frame (no END_STREAM)
+	headersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders, // NO END_STREAM
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedHeaders)),
+		},
+		HeaderBlockFragment: encodedHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrame))
+
+	// Wait for server to process HEADERS, dispatcher might be called.
+	// We don't strictly need to check dispatcher call for this test's focus.
+	time.Sleep(100 * time.Millisecond)
+	mnc.ResetWriteBuffer() // Clear any ACK or response from initial HEADERS
+
+	// 2. Send DATA frame with mismatched length and END_STREAM
+	dataFrame := &DataFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameData,
+			Flags:    FlagDataEndStream, // END_STREAM is set here
+			StreamID: streamIDToUse,
+			Length:   uint32(len(actualDataPayload)),
+		},
+		Data: actualDataPayload,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, dataFrame))
+
+	// Expect RST_STREAM(PROTOCOL_ERROR) on stream 1
+	var rstFrame *RSTStreamFrame
+	rstFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*RSTStreamFrame)(nil), func(f *RSTStreamFrame) bool {
+		return f.Header().StreamID == streamIDToUse && f.ErrorCode == ErrCodeProtocolError
+	}, fmt.Sprintf("RST_STREAM(PROTOCOL_ERROR) for stream %d due to CL mismatch", streamIDToUse))
+
+	if rstFrame == nil {
+		t.Fatalf("Expected RST_STREAM(PROTOCOL_ERROR) not received for stream %d.", streamIDToUse)
+	}
+
+	// Ensure no GOAWAY frame was sent (connection should remain open)
+	time.Sleep(50 * time.Millisecond) // Give a bit of time for a GOAWAY if it were to be sent
+	framesAfterRST := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+	for _, f := range framesAfterRST {
+		if f == rstFrame { // Allow the RST frame itself if not cleared
+			continue
+		}
+		if _, ok := f.(*GoAwayFrame); ok {
+			t.Fatalf("Unexpected GOAWAY frame sent by server: %+v", f)
+		}
+	}
+
+	// Clean up: Close mock net conn, wait for Serve to exit.
+	mnc.Close()
+	select {
+	case err := <-serveErrChan:
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Logf("conn.Serve exited with: %v (expected EOF or closed connection error)", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Timeout waiting for conn.Serve to exit after mnc.Close()")
+	}
+
+	if !t.Failed() {
+		closeErr = nil // Test logic passed
+	}
+}
+
+// TestStreamIDNumericallySmaller_ServeLoop tests that the server correctly handles
+// a client attempting to initiate a new stream with an ID numerically smaller than
+// a previously initiated one.
+// It expects the server to treat this as a connection error (PROTOCOL_ERROR),
+// send a GOAWAY frame, and close the connection.
+// Covers h2spec 5.1.1.2.
+func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
+	t.Parallel()
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestStreamIDNumericallySmaller_ServeLoop")
+	// Defer a final conn.Close. The error used here will be updated by test logic.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background()) // Use a background context
+		serveErrChan <- err
+	}()
+
+	// Standard headers for requests
+	requestHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/test"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedRequestHeaders := encodeHeadersForTest(t, requestHeaders)
+
+	// 1. Client initiates stream 3 (valid)
+	const higherStreamID uint32 = 3
+	headersFrameHigher := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream,
+			StreamID: higherStreamID,
+			Length:   uint32(len(encodedRequestHeaders)),
+		},
+		HeaderBlockFragment: encodedRequestHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrameHigher))
+
+	// Wait for server to process this. Server should accept it.
+	// We need to ensure stream 3 is fully processed and highestPeerInitiatedStreamID updated.
+	// A simple way is to use a mock dispatcher and wait for it to be called for stream 3.
+	// For this test, we'll assume the default no-op dispatcher is fine, but we need a reliable
+	// way to know stream 3's creation logic (including highestPeerInitiatedStreamID update) has completed.
+	// Using a small delay is still racy. Let's modify the test to use a mock dispatcher for this wait.
+
+	// Re-create connection with a mock dispatcher for this specific test
+	// This is a bit heavy, but ensures reliable synchronization.
+	_ = conn.Close(errors.New("re-initializing conn for dispatcher")) // Close previous conn
+	mockDisp := &mockRequestDispatcher{}
+	conn, mnc = newTestConnection(t, false, mockDisp) // Re-assign conn and mnc
+	// Re-perform handshake and start Serve for the new connection instance
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+	serveErrChan = make(chan error, 1) // Re-make channel
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	// Now send stream 3's HEADERS to the new connection
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrameHigher))
+
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		mockDisp.mu.Lock()
+		defer mockDisp.mu.Unlock()
+		return mockDisp.called && mockDisp.lastStreamID == higherStreamID
+	}, fmt.Sprintf("dispatcher to be called for stream %d", higherStreamID))
+
+	mnc.ResetWriteBuffer()
+
+	// 2. Client attempts to initiate stream 1 (numerically smaller than 3, invalid)
+	const lowerStreamID uint32 = 1
+	headersFrameLower := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream,
+			StreamID: lowerStreamID,
+			Length:   uint32(len(encodedRequestHeaders)),
+		},
+		HeaderBlockFragment: encodedRequestHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrameLower))
+
+	// Expect conn.Serve to exit with a ConnectionError(PROTOCOL_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second): // Give ample time for processing and exit
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending HEADERS for numerically smaller stream ID")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+	}
+	// The message should indicate the stream ID violation.
+
+	expectedMsgSubstr := fmt.Sprintf("client attempted to initiate new stream %d, which is not numerically greater than highest previously client-initiated stream ID %d", lowerStreamID, higherStreamID)
+	if !strings.Contains(connErr.Msg, expectedMsgSubstr) {
+		t.Errorf("ConnectionError message '%s' does not contain expected substring '%s'", connErr.Msg, expectedMsgSubstr)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to ensure GOAWAY logic uses it.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeProtocolError
+	}, "GOAWAY(PROTOCOL_ERROR) for numerically smaller stream ID")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(PROTOCOL_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should be the highest *successfully processed* client stream ID before this error.
+	// In this case, it should be `higherStreamID` (stream 3).
+	if goAwayFrame.LastStreamID != higherStreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want %d", goAwayFrame.LastStreamID, higherStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil for the deferred Close.
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
+
+// TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength tests server behavior
+// when HEADERS frame has END_STREAM set and a non-zero Content-Length.
+// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 1.
+// "An HTTP/2 request or response is malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the body,
+// or if it contains a content-length header field and the END_STREAM flag is set on the header block."
+
+// TestMalformedContentLength_DATA_DoesNotMatch_EndStream tests server behavior
+// when DATA frames' total payload length does not match the Content-Length header,
+// and END_STREAM is received.
+// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 2.
