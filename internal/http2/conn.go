@@ -2283,36 +2283,42 @@ func (c *Connection) Close(err error) error {
 		if currentErrForGoAway == nil {
 			goAwayErrorCode = ErrCodeNoError
 			gracefulTimeout = 5 * time.Second // Default graceful timeout
-		} else if ce, ok := currentErrForGoAway.(*ConnectionError); ok {
-			goAwayErrorCode = ce.Code
-			if len(ce.DebugData) > 0 {
-				debugData = ce.DebugData
-			} else if ce.Msg != "" {
-				debugData = []byte(ce.Msg)
-			}
-			// If both ce.DebugData and ce.Msg are empty, debugData remains nil.
-			gracefulTimeout = 0 // Connection errors usually imply immediate shutdown
 		} else {
-			// For generic errors, use their message as debug data.
-			if currentErrForGoAway != nil {
-				debugData = []byte(currentErrForGoAway.Error())
-			}
-
-			if errors.Is(currentErrForGoAway, io.EOF) {
-				goAwayErrorCode = ErrCodeNoError
-				gracefulTimeout = 5 * time.Second
-			} else if errors.Is(currentErrForGoAway, net.ErrClosed) || (currentErrForGoAway != nil && strings.Contains(currentErrForGoAway.Error(), "use of closed network connection")) {
-				goAwayErrorCode = ErrCodeConnectError
+			var cerr *ConnectionError
+			if errors.As(currentErrForGoAway, &cerr) { // Use errors.As to unwrap ConnectionError
+				goAwayErrorCode = cerr.Code
+				if len(cerr.DebugData) > 0 {
+					debugData = cerr.DebugData
+				} else if cerr.Msg != "" {
+					debugData = []byte(cerr.Msg)
+				}
+				// Connection errors usually imply immediate shutdown
 				gracefulTimeout = 0
 			} else {
-				goAwayErrorCode = ErrCodeProtocolError // Default for other unexpected errors
-				if currentErrForGoAway != nil && (strings.Contains(currentErrForGoAway.Error(), "connection reset by peer") ||
-					strings.Contains(currentErrForGoAway.Error(), "broken pipe") ||
-					strings.Contains(currentErrForGoAway.Error(), "forcibly closed") ||
-					currentErrForGoAway == context.Canceled || currentErrForGoAway == context.DeadlineExceeded) {
-					goAwayErrorCode = ErrCodeConnectError
+				// Not a ConnectionError (or doesn't wrap one). Handle specific non-ConnectionError types.
+				if currentErrForGoAway != nil { // Ensure not nil before .Error()
+					debugData = []byte(currentErrForGoAway.Error())
 				}
-				gracefulTimeout = 0
+
+				if errors.Is(currentErrForGoAway, io.EOF) {
+					goAwayErrorCode = ErrCodeNoError
+					gracefulTimeout = 5 * time.Second
+				} else if errors.Is(currentErrForGoAway, net.ErrClosed) ||
+					(currentErrForGoAway != nil && strings.Contains(currentErrForGoAway.Error(), "use of closed network connection")) {
+					goAwayErrorCode = ErrCodeConnectError
+					gracefulTimeout = 0
+				} else {
+					goAwayErrorCode = ErrCodeProtocolError // Default for other unexpected generic errors
+					// Specific string matches for ConnectError from generic errors
+					if currentErrForGoAway != nil &&
+						(strings.Contains(currentErrForGoAway.Error(), "connection reset by peer") ||
+							strings.Contains(currentErrForGoAway.Error(), "broken pipe") ||
+							strings.Contains(currentErrForGoAway.Error(), "forcibly closed") ||
+							currentErrForGoAway == context.Canceled || currentErrForGoAway == context.DeadlineExceeded) {
+						goAwayErrorCode = ErrCodeConnectError
+					}
+					gracefulTimeout = 0
+				}
 			}
 		}
 		// initiateShutdown is responsible for closing shutdownChan.
@@ -3145,20 +3151,26 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 		}
 
 		var frame Frame
-		frame, err = c.readFrame()
+		frame, err = c.readFrame() // frame can be nil if err is non-nil
 		if err != nil {
+			// Log the error from readFrame
+			logFields := logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err.Error()}
 			if errors.Is(err, io.EOF) {
-				c.log.Info("Serve (reader) loop: peer closed connection (EOF).", logger.LogFields{"remote_addr": c.remoteAddrStr})
+				c.log.Info("Serve (reader) loop: peer closed connection (EOF).", logFields)
 			} else if se, ok := err.(net.Error); ok && se.Timeout() {
-				c.log.Info("Serve (reader) loop: net.Conn read timeout.", logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err})
-				// Optional: Implement PING frames for keepalive or specific idle timeout logic.
-				// For now, any read timeout is fatal for the loop.
+				c.log.Info("Serve (reader) loop: net.Conn read timeout.", logFields)
 			} else if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logFields)
 			} else {
-				c.log.Error("Serve (reader) loop: error reading frame.", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+				// This includes ConnectionErrors from ReadFrame (e.g., PING length error)
+				// or other parsing errors that ReadFrame might return as ConnectionError.
+				c.log.Error("Serve (reader) loop: error reading/parsing frame.", logFields)
 			}
-			return err // Exit loop, defer will handle Close with this 'err'.
+			// Regardless of the specific type of read error, it's fatal for the Serve loop.
+			// The error (which might be a ConnectionError with a specific code like FRAME_SIZE_ERROR)
+			// will be returned. The defer in Serve will call c.Close(err), and c.Close
+			// will use this 'err' to determine the GOAWAY code.
+			return err
 
 			// Validate frame length against SETTINGS_MAX_FRAME_SIZE
 			// This check happens after reading the frame header and potentially its payload (by http2.ReadFrame),
