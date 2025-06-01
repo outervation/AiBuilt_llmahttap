@@ -1848,7 +1848,16 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 	if c.peerRstStreamTimes == nil { // Should be initialized in NewConnection
 		c.peerRstStreamTimes = make(map[uint32]time.Time)
 	}
+
 	c.peerRstStreamTimes[streamID] = time.Now()
+	// --- BEGIN ADDED LOGGING ---
+	c.log.Debug("dispatchRSTStreamFrame: DEBUG stored RST time in peerRstStreamTimes", logger.LogFields{
+		"stream_id":                          streamID,
+		"time_stored_is_zero":                c.peerRstStreamTimes[streamID].IsZero(),
+		"map_len_after_store":                len(c.peerRstStreamTimes),
+		"map_entry_exists_check_after_store": func() bool { _, ok := c.peerRstStreamTimes[streamID]; return ok }(),
+	})
+	// --- END ADDED LOGGING ---
 	c.streamsMu.Unlock()
 
 	stream, found := c.getStream(streamID) // getStream uses RLock
