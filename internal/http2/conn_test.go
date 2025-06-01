@@ -4124,3 +4124,134 @@ func TestFrameSizeExceeded_HEADERS(t *testing.T) {
 		closeErr = nil
 	}
 }
+
+// TestInterleavedFramesDuringHeaderBlock tests server behavior when disallowed frames
+// are sent in the middle of a header block (i.e., after HEADERS without END_HEADERS,
+// but before or instead of CONTINUATION).
+// Covers h2spec 4.3.2 (PRIORITY), 6.2.1 (PRIORITY), 5.5.2 (Unknown Extension Frame).
+func TestInterleavedFramesDuringHeaderBlock(t *testing.T) {
+	t.Parallel()
+
+	// Standard headers for the initial HEADERS frame
+	initialHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/test"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedInitialHeaders := encodeHeadersForTest(t, initialHeaders)
+
+	// Frame definitions for subtests
+	initialHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    0, // CRITICAL: No END_HEADERS flag
+			StreamID: 1, // New client-initiated stream
+			Length:   uint32(len(encodedInitialHeaders)),
+		},
+		HeaderBlockFragment: encodedInitialHeaders,
+	}
+
+	interleavedPriorityFrame := &PriorityFrame{
+		FrameHeader:      FrameHeader{Type: FramePriority, StreamID: 1, Length: 5},
+		StreamDependency: 0,
+		Weight:           10,
+	}
+
+	interleavedUnknownFrame := &UnknownFrame{
+		FrameHeader: FrameHeader{Type: FrameType(0xFF), StreamID: 1, Length: 4}, // Arbitrary unknown type and length
+		Payload:     []byte{1, 2, 3, 4},
+	}
+
+	tests := []struct {
+		name             string
+		interleavedFrame Frame // The frame to send after initial HEADERS
+	}{
+		{
+			name:             "Interleaved PRIORITY Frame",
+			interleavedFrame: interleavedPriorityFrame,
+		},
+		{
+			name:             "Interleaved Unknown Frame",
+			interleavedFrame: interleavedUnknownFrame,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc // capture range variable
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+			var closeErr error = errors.New("test cleanup: " + tc.name)
+			defer func() {
+				if conn != nil {
+					conn.Close(closeErr)
+				}
+			}()
+
+			performHandshakeForTest(t, conn, mnc)
+			mnc.ResetWriteBuffer()
+
+			serveErrChan := make(chan error, 1)
+			go func() {
+				err := conn.Serve(context.Background())
+				serveErrChan <- err
+			}()
+
+			// Send initial HEADERS frame (no END_HEADERS)
+			mnc.FeedReadBuffer(frameToBytes(t, initialHeadersFrame))
+			// Send the interleaved frame
+			mnc.FeedReadBuffer(frameToBytes(t, tc.interleavedFrame))
+
+			// Expect conn.Serve to exit with a ConnectionError(PROTOCOL_ERROR)
+			var serveExitError error
+			select {
+			case serveExitError = <-serveErrChan:
+				// Good, Serve exited
+			case <-time.After(2 * time.Second):
+				t.Fatal("Timeout waiting for conn.Serve to exit after sending interleaved frame")
+			}
+
+			if serveExitError == nil {
+				t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+			}
+
+			var connErr *ConnectionError
+			if !errors.As(serveExitError, &connErr) {
+				t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+			}
+
+			if connErr.Code != ErrCodeProtocolError {
+				t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+			}
+
+			// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+			_ = conn.Close(serveExitError)
+
+			// Now check for the GOAWAY frame.
+			var goAwayFrame *GoAwayFrame
+			goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+				return f.ErrorCode == ErrCodeProtocolError
+			}, "GOAWAY(PROTOCOL_ERROR) for interleaved frame")
+
+			if goAwayFrame == nil {
+				t.Fatalf("GOAWAY(PROTOCOL_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+			}
+
+			// LastStreamID in GOAWAY should be 0 as the stream 1 was not fully established.
+			if goAwayFrame.LastStreamID != 0 {
+				// Allow for stream 1 to be the last stream ID IF initial HEADERS was somehow processed enough to open stream 1
+				// RFC 7540 Section 6.10 "CONTINUATION frames MUST be preceded by a HEADERS, PUSH_PROMISE or CONTINUATION frame without the END_HEADERS flag set."
+				// "A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+				// This means stream 1 was likely not considered "processed".
+				if goAwayFrame.LastStreamID != initialHeadersFrame.Header().StreamID {
+					t.Errorf("GOAWAY LastStreamID: got %d, want 0 or %d (stream ID of initial HEADERS)", goAwayFrame.LastStreamID, initialHeadersFrame.Header().StreamID)
+				} else {
+					t.Logf("GOAWAY LastStreamID is %d (stream ID of initial HEADERS), which is acceptable.", goAwayFrame.LastStreamID)
+				}
+			}
+
+			// If all checks pass, update closeErr to nil
+			if !t.Failed() {
+				closeErr = nil
+			}
+		})
+	}
+}
