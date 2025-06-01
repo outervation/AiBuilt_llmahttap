@@ -1027,22 +1027,12 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 			if char >= 'A' && char <= 'Z' {
 				errMsg := fmt.Sprintf("invalid header field name '%s' contains uppercase characters", hf.Name)
 				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
-				// Send RST_STREAM(PROTOCOL_ERROR) for this stream.
-				// This error occurs before stream creation in some paths, handle carefully.
-				// If stream isn't created yet (e.g. server receiving initial HEADERS),
-				// this will result in GOAWAY instead. For now, assume stream exists if this point reached cleanly.
-				// Or, if this function is called during initial HEADERS processing for a new stream,
-				// the caller (handleIncomingCompleteHeaders) will create the stream then dispatch to it,
-				// and the stream's processing will hit this error.
-				// Let's assume for now this is a stream error. The connection error for malformed headers will be
-				// handled by the stream creation logic (e.g. if pseudo-headers are bad).
-				// If this function is called, streamID = c.activeHeaderBlockStreamID is valid.
-				_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError) // Best effort
+				if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
+					c.log.Error("Failed to send RST_STREAM for uppercase header name violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
+					// The original ConnectionError is still the primary reason for connection termination.
+				}
 				c.resetHeaderAssemblyState()
-				// Returning nil because RST_STREAM was sent. The connection itself may not need to die for this specific stream issue.
-				// However, h2spec expects GOAWAY for 8.1.2/1. This implies a connection error.
-				// Changing to return ConnectionError to align.
-				return NewConnectionError(ErrCodeProtocolError, errMsg)
+				return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2/1
 			}
 		}
 
@@ -1053,7 +1043,9 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		case "connection", "proxy-connection", "keep-alive", "upgrade":
 			errMsg := fmt.Sprintf("connection-specific header field '%s' is forbidden", hf.Name)
 			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
-			_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
+			if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
+				c.log.Error("Failed to send RST_STREAM for forbidden connection-specific header violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
+			}
 			c.resetHeaderAssemblyState()
 			return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/1
 		case "te":
@@ -1061,7 +1053,9 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 			if strings.ToLower(hf.Value) != "trailers" {
 				errMsg := fmt.Sprintf("TE header field contains invalid value '%s'", hf.Value)
 				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_value": hf.Value})
-				_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
+				if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
+					c.log.Error("Failed to send RST_STREAM for invalid TE header value violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
+				}
 				c.resetHeaderAssemblyState()
 				return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/2
 			}
