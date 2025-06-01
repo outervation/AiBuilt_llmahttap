@@ -419,24 +419,76 @@ func TestServerHandshake_Success(t *testing.T) {
 func TestServerHandshake_Failure_InvalidPrefaceContent(t *testing.T) {
 	conn, mnc := newTestConnection(t, false, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_InvalidPrefaceContent")
-	defer func() { conn.Close(closeErr) }()
+	// The defer will be a safety net. Test logic will explicitly call conn.Close().
+	// closeErr will be updated by the test logic to reflect the outcome.
+	defer func() {
+		if conn != nil && closeErr != nil { // Only close with error if test indicated one
+			conn.Close(closeErr)
+		} else if conn != nil {
+			conn.Close(nil) // Default close if test passed or didn't set closeErr
+		}
+	}()
 
 	invalidPreface := "THIS IS NOT THE PREFACE YOU ARE LOOKING FOR"
 	mnc.FeedReadBuffer([]byte(invalidPreface))
 
 	err := conn.ServerHandshake()
 	if err == nil {
-		t.Fatal("ServerHandshake succeeded with invalid preface, expected error")
+		closeErr = errors.New("ServerHandshake succeeded with invalid preface, expected error")
+		t.Fatal(closeErr)
 	}
 
 	connErr, ok := err.(*ConnectionError)
 	if !ok {
-		t.Fatalf("Expected ConnectionError, got %T: %v", err, err)
+		closeErr = fmt.Errorf("Expected ConnectionError, got %T: %v", err, err)
+		t.Fatal(closeErr)
 	}
 	if connErr.Code != ErrCodeProtocolError {
-		t.Errorf("Expected ProtocolError for invalid preface, got %s", connErr.Code)
+		e := fmt.Errorf("Expected ProtocolError for invalid preface, got %s", connErr.Code)
+		if closeErr == nil {
+			closeErr = e
+		} else {
+			closeErr = fmt.Errorf("%w; %w", closeErr, e)
+		}
+		t.Error(e)
 	}
-	closeErr = nil
+
+	// Explicitly close the connection with the error from ServerHandshake.
+	// This should trigger the GOAWAY frame.
+	_ = conn.Close(err) // The error from this Close() itself isn't primary for this check.
+
+	// Verify GOAWAY frame with PROTOCOL_ERROR
+	var goAwayFrame *GoAwayFrame
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		for _, f := range frames {
+			if gaf, ok := f.(*GoAwayFrame); ok {
+				if gaf.ErrorCode == ErrCodeProtocolError {
+					goAwayFrame = gaf
+					return true
+				}
+			}
+		}
+		return false
+	}, "GOAWAY frame with PROTOCOL_ERROR to be written")
+
+	if goAwayFrame == nil {
+		e := errors.New("GOAWAY frame with PROTOCOL_ERROR not found")
+		if closeErr == nil {
+			closeErr = e
+		} else {
+			closeErr = fmt.Errorf("%w; %w", closeErr, e)
+		}
+		t.Error(e) // Use Error to allow other checks like IsClosed to run
+	}
+
+	// Verify mockNetConn is closed
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks passed, set closeErr to nil so the defer knows the test logic was successful.
+	if !t.Failed() {
+		closeErr = nil
+	}
 }
 
 func TestHandleSettingsFrame_ClientAckToServerSettings(t *testing.T) {
