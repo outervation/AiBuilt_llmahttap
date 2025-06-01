@@ -242,7 +242,16 @@ func NewConnection(
 	}
 
 	// Apply initial settings to derive operational values
-	conn.applyOurSettings()
+	if err := conn.applyOurSettings(); err != nil {
+		// If applyOurSettings fails (e.g. due to inconsistent initial settings leading to FC error),
+		// NewConnection should fail.
+		// Clean up by cancelling context before returning error.
+		if conn.cancelCtx != nil {
+			conn.cancelCtx()
+		}
+		conn.log.Error("NewConnection: applyOurSettings failed", logger.LogFields{"error": err.Error()})
+		return nil // Error logged; returning nil for *Connection as per build error "want (*Connection)"
+	}
 	conn.applyPeerSettings()
 
 	// Initialize HPACK adapter.
