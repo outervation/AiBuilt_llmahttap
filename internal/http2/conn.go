@@ -1307,7 +1307,24 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			// Stream already exists. This HEADERS frame is either an error or trailers.
 			existingStream.mu.RLock()
 			state := existingStream.state
+			initialHeadersAlreadyProcessed := existingStream.requestHeaders != nil // Heuristic: if requestHeaders were ever populated.
+			isEndStreamAlreadyReceived := existingStream.endStreamReceivedFromClient
 			existingStream.mu.RUnlock()
+
+			// If initial headers were processed and the client's side of the stream isn't closed yet,
+			// this subsequent HEADERS block is considered trailers.
+			isTrailerBlock := initialHeadersAlreadyProcessed && !isEndStreamAlreadyReceived
+
+			if isTrailerBlock {
+				for _, hf := range headers {
+					if strings.HasPrefix(hf.Name, ":") {
+						errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block for stream %d", hf.Name, streamID)
+						c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "header_name": hf.Name})
+						// Per h2spec 8.1.2.1/3, this should be a connection error.
+						return NewConnectionError(ErrCodeProtocolError, errMsg)
+					}
+				}
+			}
 
 			c.log.Debug("handleIncomingCompleteHeaders: Existing stream found for incoming HEADERS", logger.LogFields{"stream_id": streamID, "state": state.String()})
 
@@ -1829,32 +1846,46 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 	stream, found := c.getStream(streamID) // getStream uses RLock
 
 	if !found {
-		// Stream does not exist or was already closed and removed.
-		// RFC 7540, Section 6.4: "An endpoint that receives a RST_STREAM frame on a closed stream MUST ignore it."
-		// This also covers "idle" streams that were never opened or were numbers higher than previously opened.
-		// For idle streams (higher than previously seen), h2spec 5.1/2 and 6.4/2 say this should be PROTOCOL_ERROR (connection error).
+		// Stream does not exist (idle from this endpoint's perspective) or was already closed and removed.
+		if !c.isClient { // Server-side: client sent RST_STREAM for a stream server doesn't know/is idle.
+			// RFC 6.4: "If a RST_STREAM frame identifying an idle stream is received,
+			// the recipient MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+			// This specifically covers streams that are not in c.streams map.
+			// An "idle stream" is one not in open, reserved, or half-closed states.
+			// For a server, if a client sends RST_STREAM for a stream ID it has never seen or has already fully closed
+			// (and removed from active tracking), this condition applies.
+			// h2spec 5.1/2 ("idle: Sends a RST_STREAM frame") and 6.4/2 ("Sends a RST_STREAM frame on a idle stream")
+			// both expect GOAWAY(PROTOCOL_ERROR).
 
-		c.streamsMu.RLock()
-		highestPeerID := c.highestPeerInitiatedStreamID
-		isClientConn := c.isClient // Capture this under lock if it could change, though unlikely for conn.
-		c.streamsMu.RUnlock()
+			c.streamsMu.RLock()
+			// Check if streamID is greater than any stream ID the peer (client) has initiated.
+			// This is the definition of an "idle" stream in this context.
+			isNumericallyIdle := streamID > c.highestPeerInitiatedStreamID
+			c.streamsMu.RUnlock()
 
-		// A stream is "truly idle" if its ID is greater than any ID the peer has initiated.
-		// This check is primarily for servers receiving RST_STREAM from clients.
-		// Clients usually send RST_STREAM for streams they initiated or server pushed streams they accepted.
-		if !isClientConn && streamID > highestPeerID {
-			// RST_STREAM on an idle stream (numerically higher than any previous peer-initiated stream)
-			// is a connection error of type PROTOCOL_ERROR.
-			errMsg := fmt.Sprintf("RST_STREAM received for idle stream %d (higher than highest peer-initiated %d)", streamID, highestPeerID)
-			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "highest_peer_initiated_stream_id": highestPeerID})
-			return NewConnectionError(ErrCodeProtocolError, errMsg)
+			if isNumericallyIdle {
+				errMsg := fmt.Sprintf("RST_STREAM received for numerically idle stream %d (higher than highest peer-initiated %d)", streamID, c.highestPeerInitiatedStreamID)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID})
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
+			} else {
+				// Stream ID is not numerically idle (it's <= highestPeerInitiatedStreamID),
+				// but not in our active map. This implies it was closed or never fully opened correctly by the peer,
+				// or we already RST'd it.
+				// RFC 6.4: "An endpoint that receives a RST_STREAM frame on a closed stream MUST ignore it."
+				c.log.Warn("RST_STREAM received for non-active (closed or never fully opened by peer) but not numerically idle stream, ignoring.",
+					logger.LogFields{
+						"stream_id":                        streamID,
+						"error_code":                       errorCode.String(),
+						"highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID,
+					})
+				return nil
+			}
 		}
-
-		// Otherwise, it's for a stream that was known and is now closed, or an idle stream that
-		// might have been implicitly closed by GOAWAY, or is lower than one already seen.
-		// Or it's a client receiving RST_STREAM for a stream it initiated but server doesn't know/already closed.
-		// In these cases, ignoring is fine.
-		c.log.Warn("RST_STREAM received for unknown, closed, or ignorable idle stream, ignoring.",
+		// Client-side: received RST_STREAM for a stream we don't have.
+		// This could be for a stream we already closed/reset, or a server error.
+		// RFC 6.4: "An endpoint that receives a RST_STREAM frame on a closed stream MUST ignore it."
+		// This also covers streams the client never opened or considers idle.
+		c.log.Warn("Client received RST_STREAM for unknown or closed stream, ignoring.",
 			logger.LogFields{
 				"stream_id":  streamID,
 				"error_code": errorCode.String(),
