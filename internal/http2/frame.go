@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings" // Added import
 )
 
 // FrameType represents an HTTP/2 frame type.
@@ -950,7 +951,60 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 
 	err = frame.ParsePayload(r, fh)
+
 	if err != nil {
+		// Specific error handling for PRIORITY frame length
+		if fh.Type == FramePriority && strings.Contains(err.Error(), "PRIORITY frame payload must be 5 bytes") {
+			// ParsePayload for PriorityFrame already returns NewConnectionError or NewStreamError.
+			// This check is to ensure if a generic error was somehow passed up, it's typed.
+			// However, the current PriorityFrame.ParsePayload returns:
+			// - NewConnectionError(ErrCodeFrameSizeError, ...) if header.StreamID == 0
+			// - NewStreamError(header.StreamID, ErrCodeFrameSizeError, ...) if header.StreamID > 0
+			// So, err from ParsePayload should already be typed. This specific block might be redundant
+			// if PriorityFrame.ParsePayload is guaranteed to return these typed errors.
+			// For safety, or if ParsePayload could return a more generic fmt.Errorf, we keep it.
+			// Let's assume err might be a wrapper, so we check contents.
+			if fh.StreamID > 0 {
+				return nil, NewStreamError(fh.StreamID, ErrCodeFrameSizeError, err.Error())
+			}
+			// If fh.StreamID == 0, PriorityFrame.ParsePayload should already return ConnectionError.
+			// If it somehow didn't, this would become a generic error.
+			// Fallthrough to generic error wrapping is okay if err isn't FrameSizeError from ParsePayload.
+		}
+
+		// Convert generic errors from ParsePayload to specific ConnectionErrors for frame size issues.
+		// RSTStreamFrame.ParsePayload returns NewConnectionError directly.
+		// PingFrame.ParsePayload returns NewConnectionError directly.
+		// WindowUpdateFrame.ParsePayload returns NewConnectionError directly.
+		// SettingsFrame.ParsePayload (for ACK with payload, or non-multiple of 6) returns NewConnectionError directly.
+
+		// The following checks are defensive, in case ParsePayload implementations change or if err is a wrapped generic error.
+		if fh.Type == FrameRSTStream && strings.Contains(err.Error(), "RST_STREAM frame payload must be 4 bytes") {
+			return nil, NewConnectionError(ErrCodeFrameSizeError, err.Error())
+		}
+		if fh.Type == FrameWindowUpdate && strings.Contains(err.Error(), "WINDOW_UPDATE frame payload must be 4 bytes") {
+			return nil, NewConnectionError(ErrCodeFrameSizeError, err.Error())
+		}
+		if fh.Type == FramePing && strings.Contains(err.Error(), "PING frame payload must be 8 bytes") {
+			return nil, NewConnectionError(ErrCodeFrameSizeError, err.Error())
+		}
+		if fh.Type == FrameSettings && (fh.Flags&FlagSettingsAck != 0) && strings.Contains(err.Error(), "SETTINGS ACK frame must have a payload length of 0") {
+			return nil, NewConnectionError(ErrCodeFrameSizeError, err.Error())
+		}
+		if fh.Type == FrameSettings && strings.Contains(err.Error(), "SETTINGS frame payload length") && strings.Contains(err.Error(), "is not a multiple of") {
+			return nil, NewConnectionError(ErrCodeFrameSizeError, err.Error())
+		}
+
+		// If err is already a StreamError or ConnectionError, return it directly.
+		// This is important because ParsePayload for several frames already returns these typed errors.
+		if _, ok := err.(*StreamError); ok {
+			return nil, err
+		}
+		if _, ok := err.(*ConnectionError); ok {
+			return nil, err
+		}
+
+		// If not specifically converted or already typed, wrap generically.
 		return nil, fmt.Errorf("parsing %s payload: %w", fh.Type, err)
 	}
 	return frame, nil

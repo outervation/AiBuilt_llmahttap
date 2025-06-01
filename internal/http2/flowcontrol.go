@@ -106,21 +106,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 			return fcw.err // Return the error that was just set.
 		}
 
-		if fcw.available < 0 {
-			// This state implies a flow control violation has already occurred.
-			// fcw.err should ideally be set by the operation that caused this.
-			// This is a fallback error if fcw.err wasn't set.
-			var e error
-			msg := fmt.Sprintf("flow control: window is negative (%d) (conn: %v, stream: %d)", fcw.available, fcw.isConnection, fcw.streamID)
-			if fcw.isConnection {
-				e = NewConnectionError(ErrCodeFlowControlError, msg)
-			} else {
-				e = NewStreamError(fcw.streamID, ErrCodeFlowControlError, msg)
-			}
-			fcw.setErrorLocked(e) // Ensure fcw.err is set
-			return fcw.err
-		}
-
 		if fcw.available >= int64(n) {
 			fcw.available -= int64(n)
 			return nil

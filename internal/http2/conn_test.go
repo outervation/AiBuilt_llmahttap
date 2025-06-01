@@ -2441,6 +2441,26 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 			expectConnectionError:      false,
 			expectedRSTStreamID:        29, // Updated
 			expectedRSTStreamErrorCode: ErrCodeProtocolError,
+
+			{
+				name: "Malformed Headers: Connection-specific header (Keep-Alive)",
+				framesToFeed: func(t *testing.T) [][]byte {
+					malformedHeaders := []hpack.HeaderField{
+						{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+						{Name: "keep-alive", Value: "timeout=5"},
+					}
+					hpackPayload := encodeHeadersForTest(t, malformedHeaders)
+					headersFrame := &HeadersFrame{
+						FrameHeader:         FrameHeader{Type: FrameHeaders, Flags: FlagHeadersEndHeaders | FlagHeadersEndStream, StreamID: 33, Length: uint32(len(hpackPayload))},
+						HeaderBlockFragment: hpackPayload,
+					}
+					return [][]byte{frameToBytes(t, headersFrame)}
+				},
+				expectDispatcherCall:       false,
+				expectConnectionError:      false,
+				expectedRSTStreamID:        33,
+				expectedRSTStreamErrorCode: ErrCodeProtocolError,
+			},
 		},
 		{
 			name: "Malformed Headers: Invalid TE header value",

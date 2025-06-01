@@ -195,11 +195,11 @@ func GenerateGoAwayFrame(lastStreamID uint32, errCode ErrorCode, debugStr string
 		codeToUse = ce.Code                 // Already set before this block if not *ConnectionError
 
 		if len(ce.DebugData) > 0 {
-			debugDataBytes = ce.DebugData // Prio 1 for ConnectionError
+			debugDataBytes = ce.DebugData
+		} else if debugStr != "" { // debugStrArg takes precedence over ce.Msg if ce.DebugData is empty
+			debugDataBytes = []byte(debugStr)
 		} else if ce.Msg != "" {
-			debugDataBytes = []byte(ce.Msg) // Prio 2 for ConnectionError
-		} else {
-			debugDataBytes = []byte(debugStr) // Prio 3 for ConnectionError (fallback to arg)
+			debugDataBytes = []byte(ce.Msg)
 		}
 	} else {
 		debugDataBytes = []byte(debugStr) // If not ConnectionError, use debugStrArg
