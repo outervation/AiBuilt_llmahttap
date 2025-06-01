@@ -1762,25 +1762,26 @@ func (c *Connection) dispatchRSTStreamFrame(frame *RSTStreamFrame) error {
 		// RFC 7540, Section 6.4: "An endpoint that receives a RST_STREAM frame on a closed stream MUST ignore it."
 		// This also covers "idle" streams that were never opened or were numbers higher than previously opened.
 		// For idle streams (higher than previously seen), h2spec 5.1/2 and 6.4/2 say this should be PROTOCOL_ERROR (connection error).
-		// Let's check highestPeerInitiatedStreamID for this.
 
-		// c.streamsMu.RLock() // RLock to safely read lastProcessedStreamID
-		// highestPeerID := c.highestPeerInitiatedStreamID // REMOVED as unused
-		// lastProcID := c.lastProcessedStreamID // REMOVED as unused
-		// c.streamsMu.RUnlock()
+		c.streamsMu.RLock()
+		highestPeerID := c.highestPeerInitiatedStreamID
+		isClientConn := c.isClient // Capture this under lock if it could change, though unlikely for conn.
+		c.streamsMu.RUnlock()
 
-		// isTrulyIdleAndHigher := streamID > highestPeerID && streamID > lastProcID && !c.isClient // Server-side check  // REMOVED due to being unused
-
-		// if isTrulyIdleAndHigher { // MODIFIED: Commented out this block to align with unit test expectation.
-		// 	// RST_STREAM on an idle stream (numerically higher than any previous peer-initiated stream)
-		// 	// is a connection error of type PROTOCOL_ERROR.
-		// 	errMsg := fmt.Sprintf("RST_STREAM received for idle stream %d (higher than highest peer-initiated %d or last processed %d)", streamID, highestPeerID, lastProcID)
-		// 	c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
-		// 	return NewConnectionError(ErrCodeProtocolError, errMsg)
-		// }
+		// A stream is "truly idle" if its ID is greater than any ID the peer has initiated.
+		// This check is primarily for servers receiving RST_STREAM from clients.
+		// Clients usually send RST_STREAM for streams they initiated or server pushed streams they accepted.
+		if !isClientConn && streamID > highestPeerID {
+			// RST_STREAM on an idle stream (numerically higher than any previous peer-initiated stream)
+			// is a connection error of type PROTOCOL_ERROR.
+			errMsg := fmt.Sprintf("RST_STREAM received for idle stream %d (higher than highest peer-initiated %d)", streamID, highestPeerID)
+			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "highest_peer_initiated_stream_id": highestPeerID})
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
+		}
 
 		// Otherwise, it's for a stream that was known and is now closed, or an idle stream that
 		// might have been implicitly closed by GOAWAY, or is lower than one already seen.
+		// Or it's a client receiving RST_STREAM for a stream it initiated but server doesn't know/already closed.
 		// In these cases, ignoring is fine.
 		c.log.Warn("RST_STREAM received for unknown, closed, or ignorable idle stream, ignoring.",
 			logger.LogFields{
