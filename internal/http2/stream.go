@@ -128,9 +128,8 @@ type Stream struct {
 
 	// Request handling
 	requestHeaders    []hpack.HeaderField
-	requestTrailers   []hpack.HeaderField // For storing received trailer headers
-	requestBodyReader *io.PipeReader      // For handler to read incoming DATA frames
-	requestBodyWriter *io.PipeWriter      // For stream to write incoming DATA frames into
+	requestBodyReader *io.PipeReader // For handler to read incoming DATA frames
+	requestBodyWriter *io.PipeWriter // For stream to write incoming DATA frames into
 
 	// Response handling (Stream implements ResponseWriter or provides one)
 	responseHeadersSent bool                // True if response HEADERS frame has been sent
@@ -144,9 +143,10 @@ type Stream struct {
 	pendingRSTCode              *ErrorCode         // If non-nil, an RST_STREAM with this code needs to be sent (or was received)
 	initiatedByPeer             bool               // True if this stream was initiated by the peer
 
-	initialHeadersProcessed bool   // True if the initial request HEADERS have been processed
-	parsedContentLength     *int64 // Parsed Content-Length from request headers
-	receivedDataBytes       uint64 // Accumulates received DATA frame payload sizes
+	initialHeadersProcessed bool                // True once the first HEADERS frame (request/response) has been processed
+	requestTrailers         []hpack.HeaderField // Stores received trailer headers, if any
+	parsedContentLength     *int64              // Parsed Content-Length from request headers
+	receivedDataBytes       uint64              // Accumulates received DATA frame payload sizes
 	// Channels for internal coordination (examples, might evolve)
 	// headersComplete chan struct{} // Signals that all request headers (and CONTINUATIONs) have been received
 	// dataAvailable   *sync.Cond  // Signals new data in requestBodyWriter or error
@@ -820,20 +820,90 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
+	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
+
 	if dispatcher == nil {
 		s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Dispatcher is nil, cannot proceed.", logger.LogFields{"stream_id": s.id})
-		_ = s.sendRSTStream(ErrCodeInternalError)
-		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil")
+		// Attempt to RST the stream. If this fails, the error will propagate up from Close.
+		// This is an internal server error, so the connection might be torn down by the caller of Serve.
+		_ = s.Close(NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil"))
+		return NewStreamError(s.id, ErrCodeInternalError, "dispatcher is nil") // Signal error to caller
 	}
+
+	// --- BEGIN New Header Validations (Task Items 1a, 1b, 1c, 1d) ---
+	s.mu.RLock()
+	// isPotentiallyTrailers: true if initial headers were already processed AND current HEADERS frame has END_STREAM.
+	isPotentiallyTrailers := s.initialHeadersProcessed && endStream
+	s.mu.RUnlock()
+
+	for _, hf := range headers { // 'headers' are the full hpack.HeaderFields for this block
+		// 1.a Uppercase header field names (h2spec 8.1.2 #1)
+		// HTTP/2 header field names MUST be lowercase.
+		for _, char := range hf.Name {
+			if char >= 'A' && char <= 'Z' {
+				errMsg := fmt.Sprintf("invalid header field name '%s' contains uppercase characters", hf.Name)
+				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
+				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+					return sendErr // Propagate connection error if RST send failed
+				}
+				return nil // Stream error handled by RST
+			}
+		}
+
+		lowerName := hf.Name // Already lowercase from hpack library or prior processing if that's the case.
+		// However, the check above is for ANY uppercase. Here, use ToLower for switch consistency.
+		lowerName = strings.ToLower(hf.Name)
+
+		// 1.b Forbidden connection-specific headers (h2spec 8.1.2.2 #1)
+		// HTTP/2 RFC 7540, Section 8.1.2.2.
+		switch lowerName {
+		case "connection", "proxy-connection", "keep-alive", "upgrade", "transfer-encoding":
+			// Note: "transfer-encoding" is listed as connection-specific and forbidden.
+			// The TE header field is an exception but handled separately.
+			errMsg := fmt.Sprintf("connection-specific header field '%s' is forbidden in HTTP/2", hf.Name)
+			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
+			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+				return sendErr
+			}
+			return nil
+		}
+
+		// 1.c TE header validation (h2spec 8.1.2.2 #2)
+		if lowerName == "te" {
+			if strings.ToLower(hf.Value) != "trailers" {
+				errMsg := fmt.Sprintf("TE header field contains invalid value '%s', must be 'trailers'", hf.Value)
+				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_value": hf.Value})
+				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+					return sendErr
+				}
+				return nil
+			}
+		}
+
+		// 1.d Pseudo-headers in trailers (h2spec 8.1.2.1 #3)
+		// A HEADERS frame carrying trailers MUST NOT contain pseudo-header fields.
+		if isPotentiallyTrailers && strings.HasPrefix(hf.Name, ":") {
+			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
+			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
+			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+				return sendErr
+			}
+			return nil
+		}
+	}
+	// --- END New Header Validations ---
 
 	var clHeaderValue string
 	var clHeaderFound bool
 	for _, hf := range headers {
+		// Use ToLower for case-insensitive match, as per HTTP semantics.
 		if strings.ToLower(hf.Name) == "content-length" {
 			if clHeaderFound { // Duplicate content-length header
 				s.conn.log.Error("Duplicate content-length header found", logger.LogFields{"stream_id": s.id, "value1": clHeaderValue, "value2": hf.Value})
-				_ = s.sendRSTStream(ErrCodeProtocolError)
-				return NewStreamError(s.id, ErrCodeProtocolError, "duplicate content-length header")
+				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+					return sendErr
+				}
+				return nil // Stream error handled by RST
 			}
 			clHeaderValue = hf.Value
 			clHeaderFound = true
@@ -845,51 +915,77 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		val, err := strconv.ParseInt(clHeaderValue, 10, 64)
 		if err != nil || val < 0 { // Invalid format or negative value
 			s.conn.log.Error("Invalid content-length header value", logger.LogFields{"stream_id": s.id, "value": clHeaderValue, "parse_error": err})
-			_ = s.sendRSTStream(ErrCodeProtocolError)
-			return NewStreamError(s.id, ErrCodeProtocolError, fmt.Sprintf("invalid content-length value: %s", clHeaderValue))
+			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+				return sendErr
+			}
+			return nil // Stream error handled by RST
 		}
 		parsedCL = &val
 	}
 
-	s.mu.Lock()
+	s.mu.Lock() // Lock for s.requestHeaders, s.parsedContentLength, s.initialHeadersProcessed
 
 	// Task: Content-length validation if END_STREAM on HEADERS (h2spec 8.1.2.6 #1)
 	// If END_STREAM is on HEADERS, payload length must be zero.
 	// If content-length is present and non-zero, it's a PROTOCOL_ERROR.
-	if endStream { // endStream is an argument to processRequestHeadersAndDispatch
-		// parsedCL is the local variable holding the parsed content length value from headers
+	// 'endStream' is an argument to processRequestHeadersAndDispatch reflecting the flag on the current HEADERS frame.
+	if endStream {
+		// 'parsedCL' is the local variable holding the parsed content length value from headers.
 		if parsedCL != nil && *parsedCL != 0 {
 			errMsg := fmt.Sprintf("HEADERS frame with END_STREAM set and non-zero content-length (%d)", *parsedCL)
 			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id})
-			// s.sendRSTStream manages its own locking for state changes.
-			_ = s.sendRSTStream(ErrCodeProtocolError)
-			return NewStreamError(s.id, ErrCodeProtocolError, errMsg)
+			s.mu.Unlock() // Unlock before sendRSTStream
+			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
+				return sendErr
+			}
+			return nil // Stream error handled by RST
 		}
 	}
 	s.requestHeaders = headers
 	s.parsedContentLength = parsedCL // Store the parsed content length (or nil if not present)
-	s.mu.Unlock()
 
+	if !s.initialHeadersProcessed {
+		s.initialHeadersProcessed = true
+	}
+	s.mu.Unlock() // Unlock after modifying stream fields
+
+	// 'headers' arg to extractPseudoHeaders is the full list from hpackAdapter.
+	// It is expected to validate pseudo-header presence, order, and specific values (like :path).
+	// If extractPseudoHeaders finds an error, it currently returns a ConnectionError.
+	// This needs to be reconciled: pseudo-header errors are usually stream errors.
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
 	if pseudoErr != nil {
-		s.conn.log.Error("Failed to extract pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
-		_ = s.sendRSTStream(ErrCodeProtocolError)
-		return pseudoErr
+		s.conn.log.Error("Failed to extract/validate pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
+		// Send RST_STREAM first for the stream error
+		if rstSendErr := s.sendRSTStream(ErrCodeProtocolError); rstSendErr != nil {
+			// If sending RST_STREAM fails, this is a more severe issue.
+			// Propagate the error from sending RST_STREAM.
+			return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to send RST_STREAM for pseudo-header error, then failed to return ConnectionError: "+rstSendErr.Error(), rstSendErr)
+		}
+		// Then, return a ConnectionError to signal the connection should be torn down with GOAWAY.
+		// The original pseudoErr might be a fmt.Errorf, so wrap it.
+		return NewConnectionErrorWithCause(ErrCodeProtocolError, "pseudo-header validation failed: "+pseudoErr.Error(), pseudoErr)
 	}
 
 	reqURL := &url.URL{
 		Scheme: pseudoScheme,
 		Host:   pseudoAuthority,
-		Path:   pseudoPath,
+		Path:   pseudoPath, // pseudoPath already contains path and query
 	}
+	// The pseudoPath should already be correctly formed by extractPseudoHeaders
+	// (e.g. path and query separation is implicitly handled by net/url.Parse or RequestURI)
+	// If pseudoPath contains '?', url.Parse (which http.NewRequest uses implicitly) will split it.
+	// For direct construction:
 	if idx := strings.Index(pseudoPath, "?"); idx != -1 {
 		reqURL.Path = pseudoPath[:idx]
 		reqURL.RawQuery = pseudoPath[idx+1:]
+	} else {
+		reqURL.Path = pseudoPath // No query string
 	}
 
 	httpHeaders := make(http.Header)
 	for _, hf := range headers {
-		if !strings.HasPrefix(hf.Name, ":") {
+		if !strings.HasPrefix(hf.Name, ":") { // Filter out pseudo-headers
 			httpHeaders.Add(hf.Name, hf.Value)
 		}
 	}
@@ -901,21 +997,24 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		ProtoMajor: 2,
 		ProtoMinor: 0,
 		Header:     httpHeaders,
-		Body:       s.requestBodyReader,
+		Body:       s.requestBodyReader, // Reader part of the pipe
 		Host:       pseudoAuthority,
-		RemoteAddr: s.conn.remoteAddrStr,
-		RequestURI: pseudoPath,
+		RemoteAddr: s.conn.remoteAddrStr, // From connection
+		RequestURI: pseudoPath,           // Full path + query from :path
 	}
 	if parsedCL != nil { // Set ContentLength on http.Request if parsed
 		req.ContentLength = *parsedCL
-	} else if clHeaderFound { // If header was present but couldn't parse (should have been caught above, but defensive)
+	} else if clHeaderFound { // If header was present but couldn't parse (should have been caught above)
 		req.ContentLength = -1 // Indicate unknown or problematic
 	}
 
-	req = req.WithContext(s.ctx)
+	req = req.WithContext(s.ctx) // Associate stream's context with the request
 
 	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
 
+	// Spawn a new goroutine for each request handler.
+	// This allows multiplexing: the connection's reader loop can continue processing
+	// frames for other streams while this handler runs.
 	s.conn.log.Debug("Stream: PRE-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
 	go func() {
 		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-PANIC-DEFER", logger.LogFields{"stream_id": s.id})
@@ -924,19 +1023,21 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			if r := recover(); r != nil {
 				s.conn.log.Error("Panic in stream handler goroutine", logger.LogFields{
 					"stream_id": s.id,
-					"panic_val": fmt.Sprintf("%v", r), // Use fmt.Sprintf for potentially complex panic values
+					"panic_val": fmt.Sprintf("%v", r),
 					"stack":     string(debug.Stack()),
 				})
-				// Try to send RST_STREAM if the stream/connection might still be partly alive.
-				// This is a best-effort.
+				// Attempt to RST_STREAM the stream if a panic occurs in the handler.
+				// This is a best-effort; if the connection is also failing, it might not succeed.
 				_ = s.sendRSTStream(ErrCodeInternalError)
 			}
+			// Signal that this handler has finished its processing for this stream.
+			// This might be used by the connection to manage active handler counts for graceful shutdown.
 			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-HANDLER-DONE", logger.LogFields{"stream_id": s.id})
-			s.conn.streamHandlerDone(s)
+			s.conn.streamHandlerDone(s) // Ensure this method exists and is meaningful on Connection
 			s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - POST-HANDLER-DONE", logger.LogFields{"stream_id": s.id})
 		}()
 		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - PRE-DISPATCHER-CALL", logger.LogFields{"stream_id": s.id})
-		dispatcher(s, req)
+		dispatcher(s, req) // Call the actual application handler
 		s.conn.log.Debug("Stream: INSIDE DISPATCH GOROUTINE - POST-DISPATCHER-CALL", logger.LogFields{"stream_id": s.id})
 	}()
 	s.conn.log.Debug("Stream: POST-DISPATCH GOROUTINE SPAWN", logger.LogFields{"stream_id": s.id})
