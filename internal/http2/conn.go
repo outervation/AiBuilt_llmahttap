@@ -1380,9 +1380,16 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			// This is a connection error as per RFC 7540, Section 5.1.1.
 			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		}
-		// If streamID > c.highestPeerInitiatedStreamID, it's a genuinely new stream ID.
-		c.highestPeerInitiatedStreamID = streamID
-		c.log.Debug("Updated highestPeerInitiatedStreamID for new stream", logger.LogFields{"stream_id": streamID, "new_highest_peer_id": c.highestPeerInitiatedStreamID})
+
+		// If streamID > c.highestPeerInitiatedStreamID, it's a genuinely new stream ID,
+		// but only update if the stream was not found (truly new) and not peer-RST'd.
+		// The check for !peerHasRSTDThisStream and !streamFound should gate this.
+		// The actual numeric check (streamID <= c.highestPeerInitiatedStreamID) should have already
+		// returned a PROTOCOL_ERROR if violated for a non-peer-RST'd stream.
+		if streamID > c.highestPeerInitiatedStreamID { // This check is now more of an assertion given previous logic
+			c.highestPeerInitiatedStreamID = streamID
+			c.log.Debug("Updated highestPeerInitiatedStreamID for new stream (post-validation)", logger.LogFields{"stream_id": streamID, "new_highest_peer_id": c.highestPeerInitiatedStreamID})
+		}
 		c.streamsMu.Unlock()
 
 		// Create the stream generically first.
