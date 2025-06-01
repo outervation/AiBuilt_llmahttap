@@ -1303,6 +1303,11 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 						errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block for stream %d", hf.Name, streamID)
 						c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "header_name": hf.Name})
 						// Per h2spec 8.1.2.1/3, this should be a connection error.
+						// Send RST_STREAM(PROTOCOL_ERROR) as per h2spec expectation.
+						if rstErr := c.sendRSTStreamFrame(streamID, ErrCodeProtocolError); rstErr != nil {
+							c.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation", logger.LogFields{"stream_id": streamID, "error": rstErr.Error()})
+							// If RST_STREAM send fails, the ConnectionError below will still be returned, leading to GOAWAY.
+						}
 						return NewConnectionError(ErrCodeProtocolError, errMsg)
 					}
 				}
