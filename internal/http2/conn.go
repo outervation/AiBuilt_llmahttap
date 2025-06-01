@@ -1019,10 +1019,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 
 	// ----- BEGIN HEADER CONTENT VALIDATION (Task Item 6) -----
 	// This validation occurs *after* HPACK decoding and *before* MAX_HEADER_LIST_SIZE (uncompressed) check.
-	// If a validation fails here, we send RST_STREAM for the specific stream.
-	isTrailerBlock := false // Assume not trailers unless initial frame was HEADERS with !END_STREAM and now this is the second HEADERS block
-	// TODO: Determine if this is a trailer block. For now, assume initial HEADERS.
-	// A more robust check would involve tracking stream state to see if it's expecting trailers.
+	// The check for pseudo-headers in trailers is now done in handleIncomingCompleteHeaders.
 
 	for _, hf := range decodedHeaders {
 		// 1. Check for uppercase letters in header names (RFC 7540, 8.1.2)
@@ -1049,16 +1046,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 			}
 		}
 
-		// 2. Check for pseudo-header fields in trailers (RFC 7540, 8.1.2.1)
-		if isTrailerBlock && strings.HasPrefix(hf.Name, ":") {
-			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
-			c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
-			_ = c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError)
-			c.resetHeaderAssemblyState()
-			return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.1/3
-		}
-
-		// 3. Check for forbidden connection-specific header fields (RFC 7540, 8.1.2.2)
+		// 2. Check for forbidden connection-specific header fields (RFC 7540, 8.1.2.2)
 		// Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding, Upgrade
 		lowerName := strings.ToLower(hf.Name)
 		switch lowerName {
