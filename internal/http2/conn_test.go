@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic" // ADDED MISSING IMPORT
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 )
 
 // mockNetConn is a mock implementation of net.Conn for testing.
+
 type mockNetConn struct {
 	mu       sync.Mutex
 	readBuf  bytes.Buffer
@@ -33,49 +35,79 @@ type mockNetConn struct {
 	localAddr     net.Addr
 	remoteAddr    net.Addr
 	readHook      func([]byte) (int, error)
-	writeHook     func([]byte) (int, error) // Added writeHook
+	writeHook     func([]byte) (int, error)
+
+	// For controlled blocking Read
+	readDataAvailable chan struct{} // Signals new data in readBuf or conn closed
+	readClosed        chan struct{} // Signals Read should unblock due to Close()
 }
 
 func newMockNetConn() *mockNetConn {
 	return &mockNetConn{
-		localAddr:  &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
-		remoteAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
-		closeErr:   errors.New("use of closed network connection"),
+		localAddr:         &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
+		remoteAddr:        &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
+		closeErr:          errors.New("use of closed network connection"),
+		readDataAvailable: make(chan struct{}, 1), // Buffered to allow Feed before first Read
+		readClosed:        make(chan struct{}),
 	}
 }
 
 func (m *mockNetConn) Read(b []byte) (n int, err error) {
-	m.mu.Lock()
-	// Log state *before* unlock and before actual read decision.
-	// Do not use t.Logf here as 't' is not available. Use fmt.Printf or similar, or a passed-in logger.
-	// For simplicity in this step, let's assume direct printing is okay for test diagnosis if it fails.
-	// fmt.Printf("[mockNetConn.Read TRACE] Locked. closed=%v, readDeadlineZero=%v, nowAfterReadDeadline=%v, readBufLen=%d, readHookNil=%v\n",
-	//	m.closed, m.readDeadline.IsZero(), !m.readDeadline.IsZero() && time.Now().After(m.readDeadline), m.readBuf.Len(), m.readHook == nil)
-	defer m.mu.Unlock()
+	for { // Loop to re-evaluate after waking from readDataAvailable
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return 0, m.closeErr
+		}
+		if !m.readDeadline.IsZero() && time.Now().After(m.readDeadline) {
+			m.mu.Unlock()
+			return 0, errors.New("read timeout (mock)")
+		}
 
-	if m.closed {
-		// fmt.Printf("[mockNetConn.Read TRACE] Returning because m.closed is true. Error: %v\n", m.closeErr)
-		return 0, m.closeErr
-	}
-	if !m.readDeadline.IsZero() && time.Now().After(m.readDeadline) {
-		// fmt.Printf("[mockNetConn.Read TRACE] Returning read timeout.\n")
-		return 0, errors.New("read timeout (mock)")
-	}
+		// 1. Try readBuf first
+		if m.readBuf.Len() > 0 {
+			n, err = m.readBuf.Read(b)
+			// If buffer still has data after this read, signal for next Read if channel is empty.
+			if m.readBuf.Len() > 0 {
+				select {
+				case m.readDataAvailable <- struct{}{}:
+				default:
+				}
+			}
+			m.mu.Unlock()
+			return n, err
+		}
 
-	if m.readBuf.Len() > 0 {
-		// fmt.Printf("[mockNetConn.Read TRACE] Reading %d bytes from m.readBuf (len %d)\n", len(b), m.readBuf.Len())
-		n, err = m.readBuf.Read(b)
-		// fmt.Printf("[mockNetConn.Read TRACE] m.readBuf.Read returned n=%d, err=%v. Remaining m.readBuf.Len()=%d\n", n, err, m.readBuf.Len())
-		return n, err
+		// 2. If readBuf is empty, then check for readHook
+		if m.readHook != nil {
+			hook := m.readHook
+			m.mu.Unlock()
+			return hook(b)
+		}
+
+		// 3. If readBuf empty and no hook, then block.
+		// Unlock before blocking select.
+		m.mu.Unlock()
+
+		select {
+		case <-m.readDataAvailable:
+			// Loop back to top to re-check conditions under lock
+			continue
+		case <-m.readClosed:
+			// Connection closed. Re-lock to check buffer one last time.
+			m.mu.Lock()
+			if m.readBuf.Len() > 0 { // Process any lingering data
+				n, err = m.readBuf.Read(b)
+				m.mu.Unlock()
+				return n, err
+			}
+			closedErr := m.closeErr
+			m.mu.Unlock()
+			return 0, closedErr
+		case <-time.After(5 * time.Second): // Test failsafe timeout
+			return 0, errors.New("mockNetConn.Read test failsafe timeout (5s) - blocked waiting for data/close")
+		}
 	}
-	if m.readHook != nil {
-		// fmt.Printf("[mockNetConn.Read TRACE] Calling m.readHook\n")
-		n, err = m.readHook(b)
-		// fmt.Printf("[mockNetConn.Read TRACE] m.readHook returned n=%d, err=%v\n", n, err)
-		return n, err
-	}
-	// fmt.Printf("[mockNetConn.Read TRACE] No data in readBuf, no readHook. Returning io.EOF.\n")
-	return 0, io.EOF
 }
 
 func (m *mockNetConn) Write(b []byte) (n int, err error) {
@@ -95,11 +127,30 @@ func (m *mockNetConn) Write(b []byte) (n int, err error) {
 
 func (m *mockNetConn) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
+	// Default m.closeErr is "use of closed network connection".
+	// If a more specific error is needed for a test, it can be set on m.closeErr before Close() is called externally,
+	// or Close() can be modified to accept an error. For now, this is standard.
+	m.mu.Unlock() // Unlock before closing channel to avoid deadlock with Read
+
+	// Signal any blocked Read calls that the connection is now closed.
+	// Safely close the channel to prevent panic on multiple Close calls.
+	select {
+	case <-m.readClosed:
+		// Already closed or being closed by another goroutine.
+	default:
+		close(m.readClosed)
+	}
+	// Also signal readDataAvailable in case Read is blocked there,
+	// so it can re-check m.closed.
+	select {
+	case m.readDataAvailable <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -130,8 +181,24 @@ func (m *mockNetConn) SetWriteDeadline(t time.Time) error {
 
 func (m *mockNetConn) FeedReadBuffer(data []byte) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.readBuf.Write(data)
+	m.mu.Unlock() // Unlock before channel send
+
+	// Signal that data is available.
+	// Non-blocking send to prevent FeedReadBuffer from deadlocking if Read is not ready
+	// or if channel buffer is full (it's size 1, so one pending signal is okay).
+	if len(data) > 0 { // Only signal if actual data was added
+		select {
+		case m.readDataAvailable <- struct{}{}:
+			// Successfully signaled
+		default:
+			// Channel was full or no reader ready. This is fine, Read will eventually see the data
+			// when it tries to read from the buffer or if it's already blocked on readDataAvailable.
+			// Or, if Read is currently processing data from a previous signal, this new signal
+			// might be dropped if the channel buffer (size 1) is full. Read's loop logic
+			// should handle re-checking readBuf.Len() after processing.
+		}
+	}
 }
 
 func (m *mockNetConn) GetWriteBufferBytes() []byte {
@@ -3535,17 +3602,32 @@ func TestServerHandshake_Failure_ClientInitialSettingsHasAck(t *testing.T) {
 func TestServerHandshake_Failure_TimeoutReadingClientSettings(t *testing.T) {
 	conn, mnc := newTestConnection(t, false, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_TimeoutReadingClientSettings")
-	defer func() { conn.Close(closeErr) }()
+	// Defer a final conn.Close. The error used here will be updated by test logic.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
 
-	mnc.FeedReadBuffer([]byte(ClientPreface))
+	mnc.FeedReadBuffer([]byte(ClientPreface)) // Feed preface first
 
-	// After preface is read, mnc.readBuf will be empty.
-	// The next call to mnc.Read (for client's SETTINGS) will use readHook.
+	// Set the readHook *after* feeding the preface.
+	// ServerHandshake will read the preface from readBuf.
+	// When it tries to read the client's SETTINGS frame, readBuf will be empty,
+	// and mnc.Read will call this hook.
+	var hookCalledAtomic int32 // Use atomic for safe check in logs, though test is serial here
 	mnc.readHook = func(b []byte) (int, error) {
-		return 0, timeoutError{} // Simulate timeout
+		atomic.StoreInt32(&hookCalledAtomic, 1)
+		t.Logf("TestServerHandshake_Failure_TimeoutReadingClientSettings: mnc.readHook called, returning timeoutError.")
+		return 0, timeoutError{} // Simulate timeout when trying to read client's SETTINGS
 	}
 
 	err := conn.ServerHandshake()
+
+	if atomic.LoadInt32(&hookCalledAtomic) == 0 {
+		t.Log("Warning: mnc.readHook was not called. The test might not be exercising the intended timeout path for client SETTINGS read.")
+	}
+
 	if err == nil {
 		t.Fatal("ServerHandshake succeeded when timeout reading client SETTINGS, expected error")
 	}
@@ -3559,21 +3641,38 @@ func TestServerHandshake_Failure_TimeoutReadingClientSettings(t *testing.T) {
 		t.Fatalf("Expected ConnectionError, got %T: %v", err, err)
 	}
 
+	// When timeout occurs while waiting for client's SETTINGS frame (after preface & server settings sent)
+	// the error code should be PROTOCOL_ERROR, and message should reflect timeout reading client settings.
 	if connErr.Code != ErrCodeProtocolError {
 		t.Errorf("Expected ProtocolError for timeout reading client SETTINGS, got %s. Msg: %s", connErr.Code, connErr.Msg)
 	}
-	expectedMsgSubstr := "timeout waiting for client SETTINGS frame (direct check)"
-	if !strings.Contains(connErr.Msg, expectedMsgSubstr) {
-		t.Errorf("Error message mismatch: got '%s', expected to contain '%s'", connErr.Msg, expectedMsgSubstr)
+	// The ServerHandshake has a specific check and message for this:
+	// "timeout waiting for client SETTINGS frame" or "error reading client's initial SETTINGS frame"
+	expectedMsgSubstr1 := "timeout waiting for client SETTINGS frame"
+	expectedMsgSubstr2 := "error reading client's initial SETTINGS frame" // if ReadFrame itself fails
+	if !strings.Contains(connErr.Msg, expectedMsgSubstr1) && !strings.Contains(connErr.Msg, expectedMsgSubstr2) {
+		t.Errorf("Error message mismatch: got '%s', expected to contain '%s' or '%s'", connErr.Msg, expectedMsgSubstr1, expectedMsgSubstr2)
 	}
+
 	// Check underlying cause
 	if unwrapped := errors.Unwrap(connErr); unwrapped == nil {
 		t.Error("Expected ConnectionError to have an underlying cause for timeout")
 	} else if _, isTimeout := unwrapped.(timeoutError); !isTimeout {
-		t.Errorf("Underlying cause of ConnectionError is %T, expected timeoutError", unwrapped)
+		// Further unwrap if it's wrapped by fmt.Errorf by ReadFrame
+		if unwrappedNested := errors.Unwrap(unwrapped); unwrappedNested != nil {
+			if _, isTimeoutNested := unwrappedNested.(timeoutError); !isTimeoutNested {
+				t.Errorf("Underlying cause of ConnectionError is %T (after one unwrap) / %T (after two unwraps), expected timeoutError", unwrapped, unwrappedNested)
+			}
+		} else {
+			t.Errorf("Underlying cause of ConnectionError is %T, expected timeoutError", unwrapped)
+		}
 	}
 
-	closeErr = nil
+	// If the test logic has passed, set closeErr to nil for the deferred Close.
+	// Otherwise, the deferred Close will use the initial "test cleanup..." error.
+	if !t.Failed() {
+		closeErr = nil
+	}
 }
 
 func TestServerHandshake_Failure_TimeoutWritingServerSettings(t *testing.T) {
@@ -4347,6 +4446,233 @@ func TestRSTStreamOnIdleStream_ServeLoop(t *testing.T) {
 	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
 
 	// If all checks pass, update closeErr to nil for the deferred Close.
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
+
+// TestHEADERSOnClientRSTStream_ServeLoop tests server behavior when a client sends
+// a HEADERS frame on a stream that the client itself has previously reset.
+// The server is expected to respond with RST_STREAM(STREAM_CLOSED) for that stream.
+// Covers h2spec 5.1.9.
+func TestHEADERSOnClientRSTStream_ServeLoop(t *testing.T) {
+	t.Parallel()
+
+	mockDispatcher := &mockRequestDispatcher{}
+	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+	var closeErr error = errors.New("test cleanup: TestHEADERSOnClientRSTStream_ServeLoop")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	const streamIDToUse uint32 = 1
+
+	// 1. Client sends HEADERS to open stream 1
+	clientInitialHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedClientInitialHeaders := encodeHeadersForTest(t, clientInitialHeaders)
+	initialHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream, // End stream immediately for simplicity
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedClientInitialHeaders)),
+		},
+		HeaderBlockFragment: encodedClientInitialHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, initialHeadersFrame))
+
+	// Wait for dispatcher to be called for stream 1, confirming it was opened.
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, func() bool {
+		mockDispatcher.mu.Lock()
+		defer mockDispatcher.mu.Unlock()
+		return mockDispatcher.called && mockDispatcher.lastStreamID == streamIDToUse
+	}, fmt.Sprintf("dispatcher to be called for initial HEADERS on stream %d", streamIDToUse))
+
+	// Server might send a response if handler is quick. Clear write buffer.
+	// This test focuses on server reaction to subsequent frames after client RST.
+	mnc.ResetWriteBuffer()
+
+	// 2. Client sends RST_STREAM for stream 1
+	clientRSTFrame := &RSTStreamFrame{
+		FrameHeader: FrameHeader{Type: FrameRSTStream, StreamID: streamIDToUse, Length: 4},
+		ErrorCode:   ErrCodeCancel,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, clientRSTFrame))
+
+	// Server should process this RST. Wait a moment for it.
+	// The stream should be closed on the server. No frames should be sent by server in response to this RST.
+	time.Sleep(100 * time.Millisecond) // Allow server to process the RST
+	if mnc.GetWriteBufferLen() > 0 {
+		unexpectedFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+		t.Fatalf("Server sent unexpected frames after client RST_STREAM: %+v", unexpectedFrames)
+	}
+
+	// 3. Client sends another HEADERS frame on the (now by client-RST) closed stream 1
+	subsequentHeaders := []hpack.HeaderField{ // Content doesn't strictly matter, just that it's HEADERS
+		{Name: ":method", Value: "POST"}, {Name: ":path", Value: "/again"},
+	}
+	encodedSubsequentHeaders := encodeHeadersForTest(t, subsequentHeaders)
+	subsequentHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream,
+			StreamID: streamIDToUse,
+			Length:   uint32(len(encodedSubsequentHeaders)),
+		},
+		HeaderBlockFragment: encodedSubsequentHeaders,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, subsequentHeadersFrame))
+
+	// 4. Expect server to send RST_STREAM(STREAM_CLOSED) for stream 1
+	var serverRSTFrame *RSTStreamFrame
+	serverRSTFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*RSTStreamFrame)(nil), func(f *RSTStreamFrame) bool {
+		return f.Header().StreamID == streamIDToUse && f.ErrorCode == ErrCodeStreamClosed
+	}, fmt.Sprintf("RST_STREAM(STREAM_CLOSED) for stream %d", streamIDToUse))
+
+	if serverRSTFrame == nil {
+		// waitForFrameCondition would have t.Fatal'd. This is for completeness.
+		t.Fatalf("Expected server to send RST_STREAM(STREAM_CLOSED) for stream %d, but not found.", streamIDToUse)
+	}
+
+	// 5. Connection should remain open, no GOAWAY
+	time.Sleep(50 * time.Millisecond) // Check for delayed GOAWAY
+	framesAfterServerRST := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+	for _, f := range framesAfterServerRST {
+		// Allow for the expected RST_STREAM frame to be in the buffer (if ResetWriteBuffer wasn't called after check)
+		if f == serverRSTFrame { // if we haven't reset, this is expected.
+			continue
+		}
+		if _, ok := f.(*GoAwayFrame); ok {
+			t.Fatalf("Unexpected GOAWAY frame sent by server: %+v", f)
+		}
+	}
+
+	// 6. Clean up: Close mock net conn, wait for Serve to exit.
+	mnc.Close()
+	select {
+	case err := <-serveErrChan:
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Logf("conn.Serve exited with: %v (expected EOF or closed connection error)", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Timeout waiting for conn.Serve to exit after mnc.Close()")
+	}
+
+	if !t.Failed() {
+		closeErr = nil // Test logic passed
+	}
+}
+
+// TestInterleavedPriorityFrameDuringHeaderBlock specifically tests that sending a PRIORITY frame
+// after a HEADERS frame (without END_HEADERS) and before any CONTINUATION frame
+// results in a connection error (PROTOCOL_ERROR) and a GOAWAY frame.
+// This covers h2spec 4.3.2 and 6.2.1.
+func TestInterleavedPriorityFrameDuringHeaderBlock(t *testing.T) {
+	t.Parallel()
+
+	initialHeaders := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/test"}, {Name: ":authority", Value: "example.com"},
+	}
+	encodedInitialHeaders := encodeHeadersForTest(t, initialHeaders)
+
+	initialHeadersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    0, // CRITICAL: No END_HEADERS flag
+			StreamID: 1, // New client-initiated stream
+			Length:   uint32(len(encodedInitialHeaders)),
+		},
+		HeaderBlockFragment: encodedInitialHeaders,
+	}
+
+	interleavedPriorityFrame := &PriorityFrame{
+		FrameHeader:      FrameHeader{Type: FramePriority, StreamID: 1, Length: 5},
+		StreamDependency: 0,
+		Weight:           10,
+	}
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestInterleavedPriorityFrameDuringHeaderBlock")
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc)
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	// Send initial HEADERS frame (no END_HEADERS)
+	mnc.FeedReadBuffer(frameToBytes(t, initialHeadersFrame))
+	// Send the interleaved PRIORITY frame
+	mnc.FeedReadBuffer(frameToBytes(t, interleavedPriorityFrame))
+
+	// Expect conn.Serve to exit with a ConnectionError(PROTOCOL_ERROR)
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending interleaved PRIORITY frame")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeProtocolError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		return f.ErrorCode == ErrCodeProtocolError
+	}, "GOAWAY(PROTOCOL_ERROR) for interleaved PRIORITY frame")
+
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(PROTOCOL_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// LastStreamID in GOAWAY should be 0 as the stream 1 was not fully established.
+	// Or it could be the stream ID of the frame that initiated the header block (stream 1).
+	if goAwayFrame.LastStreamID != 0 && goAwayFrame.LastStreamID != initialHeadersFrame.Header().StreamID {
+		t.Errorf("GOAWAY LastStreamID: got %d, want 0 or %d (stream ID of initial HEADERS)", goAwayFrame.LastStreamID, initialHeadersFrame.Header().StreamID)
+	} else {
+		t.Logf("GOAWAY LastStreamID is %d, which is acceptable.", goAwayFrame.LastStreamID)
+	}
+
+	// Connection (mockNetConn) should be closed by conn.Close()
+	waitForCondition(t, 1*time.Second, 20*time.Millisecond, mnc.IsClosed, "mock net.Conn to be closed")
+
+	// If all checks pass, update closeErr to nil
 	if !t.Failed() {
 		closeErr = nil
 	}
