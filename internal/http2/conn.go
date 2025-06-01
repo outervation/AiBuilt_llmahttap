@@ -987,6 +987,11 @@ func (c *Connection) processContinuationFrame(frame *ContinuationFrame) error {
 // has been received (indicated by END_HEADERS flag). It concatenates fragments, decodes,
 // validates, and then dispatches the headers.
 func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *streamDependencyInfo) error {
+	var streamID uint32
+	var initialType FrameType
+	var promisedID uint32
+	var endStreamFlag bool
+
 	if c.activeHeaderBlockStreamID == 0 || len(c.headerFragments) == 0 {
 		// Should not happen if called correctly.
 		c.resetHeaderAssemblyState() // Ensure clean state even if this happens
@@ -1019,7 +1024,6 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 
 	// ----- BEGIN HEADER CONTENT VALIDATION (Task Item 6) -----
 	// This validation occurs *after* HPACK decoding and *before* MAX_HEADER_LIST_SIZE (uncompressed) check.
-	// The check for pseudo-headers in trailers is now done in handleIncomingCompleteHeaders.
 
 	for _, hf := range decodedHeaders {
 		// 1. Check for uppercase letters in header names (RFC 7540, 8.1.2)
@@ -1029,15 +1033,13 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_name": hf.Name})
 				if rstErr := c.sendRSTStreamFrame(c.activeHeaderBlockStreamID, ErrCodeProtocolError); rstErr != nil {
 					c.log.Error("Failed to send RST_STREAM for uppercase header name violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
-					// The original ConnectionError is still the primary reason for connection termination.
 				}
 				c.resetHeaderAssemblyState()
-				return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2/1
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
 			}
 		}
 
 		// 2. Check for forbidden connection-specific header fields (RFC 7540, 8.1.2.2)
-		// Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding, Upgrade
 		lowerName := strings.ToLower(hf.Name)
 		switch lowerName {
 		case "connection", "proxy-connection", "keep-alive", "upgrade", "transfer-encoding":
@@ -1047,9 +1049,8 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 				c.log.Error("Failed to send RST_STREAM for forbidden connection-specific header violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
 			}
 			c.resetHeaderAssemblyState()
-			return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/1
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		case "te":
-			// TE header field MUST NOT contain any value other than "trailers".
 			if strings.ToLower(hf.Value) != "trailers" {
 				errMsg := fmt.Sprintf("TE header field contains invalid value '%s'", hf.Value)
 				c.log.Error(errMsg, logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "header_value": hf.Value})
@@ -1057,7 +1058,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 					c.log.Error("Failed to send RST_STREAM for invalid TE header value violation", logger.LogFields{"stream_id": c.activeHeaderBlockStreamID, "error": rstErr.Error()})
 				}
 				c.resetHeaderAssemblyState()
-				return NewConnectionError(ErrCodeProtocolError, errMsg) // Per h2spec 8.1.2.2/2
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
 			}
 		}
 	}
@@ -1078,31 +1079,22 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 			uncompressedSize, actualMaxHeaderListSize, c.activeHeaderBlockStreamID)
 		c.log.Error(msg, logger.LogFields{})
 		c.resetHeaderAssemblyState()
-		// This is a resource limit violation. ENHANCE_YOUR_CALM or PROTOCOL_ERROR.
 		return NewConnectionError(ErrCodeEnhanceYourCalm, msg)
 	}
 
 	// ----- BEGIN TRAILER-SPECIFIC HEADER VALIDATION -----
-	// This check is performed if the current header block is identified as trailers.
-	// It specifically looks for pseudo-header fields in trailers, which are forbidden.
 	streamIDForTrailerCheck := c.activeHeaderBlockStreamID
 	isCurrentBlockPotentiallyTrailers := false
 
 	if c.headerFragmentInitialType == FrameHeaders {
-		// Trailers must have END_STREAM on the current HEADERS block.
 		currentBlockHasEndStream := c.headerFragmentEndStream
-		if currentBlockHasEndStream { // Condition for trailers
+		if currentBlockHasEndStream {
 			stream, streamExists := c.getStream(streamIDForTrailerCheck)
 			if streamExists {
 				stream.mu.RLock()
 				initialHeadersProcessedOnStream := stream.requestHeaders != nil
 				endStreamPreviouslyReceivedOnStream := stream.endStreamReceivedFromClient
 				stream.mu.RUnlock()
-
-				// A block is trailers if:
-				// 1. It's for an existing stream where initial headers were processed.
-				// 2. The client hadn't already sent END_STREAM on that stream.
-				// 3. The current header block itself has END_STREAM (already checked by currentBlockHasEndStream).
 				if initialHeadersProcessedOnStream && !endStreamPreviouslyReceivedOnStream {
 					isCurrentBlockPotentiallyTrailers = true
 				}
@@ -1118,14 +1110,11 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 				errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block for stream %d", hf.Name, streamIDForTrailerCheck)
 				c.log.Error(errMsg, logger.LogFields{"stream_id": streamIDForTrailerCheck, "header_name": hf.Name})
 
-				c.resetHeaderAssemblyState() // Reset assembly state before returning an error.
-				// Send RST_STREAM(PROTOCOL_ERROR) as per h2spec expectation.
+				c.resetHeaderAssemblyState()
 				if rstErr := c.sendRSTStreamFrame(streamIDForTrailerCheck, ErrCodeProtocolError); rstErr != nil {
 					c.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation (in finalizeHeaderBlockAndDispatch)",
 						logger.LogFields{"stream_id": streamIDForTrailerCheck, "error": rstErr.Error()})
-					// If sending RST_STREAM fails, the ConnectionError below is still the primary issue.
 				}
-				// Return ConnectionError to trigger GOAWAY, aligning with h2spec 8.1.2.1/3.
 				return NewConnectionError(ErrCodeProtocolError, errMsg)
 			}
 		}
@@ -1134,13 +1123,10 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 	// ----- END TRAILER-SPECIFIC HEADER VALIDATION -----
 
 	// Store relevant state before resetting, as dispatch might be complex.
-	streamID := c.activeHeaderBlockStreamID
-	initialType := c.headerFragmentInitialType
-	promisedID := c.headerFragmentPromisedID
-	endStreamFlag := c.headerFragmentEndStream // This flag is from the *initial* HEADERS frame.
-
-	// The prioInfo passed to this function is from the initial frame.
-	// It's `initialFramePrioInfo`.
+	streamID = c.activeHeaderBlockStreamID
+	initialType = c.headerFragmentInitialType
+	promisedID = c.headerFragmentPromisedID
+	endStreamFlag = c.headerFragmentEndStream // This flag is from the *initial* HEADERS frame.
 
 	c.resetHeaderAssemblyState() // Reset state *before* dispatching.
 
@@ -1155,13 +1141,7 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 	case FramePushPromise:
 		c.log.Debug("Dispatching assembled PUSH_PROMISE", logger.LogFields{"associated_stream_id": streamID, "promised_stream_id": promisedID, "num_headers": len(decodedHeaders)})
 		// TODO: Implement client-side PUSH_PROMISE handling.
-		// This involves:
-		// 1. Validating promisedID.
-		// 2. Creating a new stream in "reserved (remote)" state for promisedID.
-		// 3. Storing the pushed request headers.
-		// 4. Client application logic decides whether to accept or RST_STREAM(CANCEL) the pushed stream.
 	default:
-		// This should be unreachable if state is managed correctly.
 		return NewConnectionError(ErrCodeInternalError, fmt.Sprintf("invalid initial frame type %v in finalizeHeaderBlockAndDispatch", initialType))
 	}
 
