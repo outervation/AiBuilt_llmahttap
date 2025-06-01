@@ -818,6 +818,22 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // and dispatches it via the provided router.
 
 func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
+
+	s.mu.RLock()
+	currentState := s.state
+	s.mu.RUnlock()
+
+	if currentState == StreamStateClosed {
+		s.conn.log.Warn("Stream.processRequestHeadersAndDispatch: Attempt to process headers on an already closed stream.", logger.LogFields{"stream_id": s.id})
+		// As per h2spec 5.1 Stream States #9 (closed: Sends a HEADERS frame after sending RST_STREAM frame)
+		// "The endpoint MUST treat this as a stream error of type STREAM_CLOSED."
+		if err := s.sendRSTStream(ErrCodeStreamClosed); err != nil {
+			s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Failed to send RST_STREAM for closed stream.", logger.LogFields{"stream_id": s.id, "error": err})
+			return err // Propagate error if sending RST_STREAM fails
+		}
+		return nil // Stream error handled by RST
+	}
+
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
 
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
