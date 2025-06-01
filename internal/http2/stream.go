@@ -833,6 +833,20 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 	}
 
 	s.mu.Lock()
+
+	// Task: Content-length validation if END_STREAM on HEADERS (h2spec 8.1.2.6 #1)
+	// If END_STREAM is on HEADERS, payload length must be zero.
+	// If content-length is present and non-zero, it's a PROTOCOL_ERROR.
+	if endStream { // endStream is an argument to processRequestHeadersAndDispatch
+		// parsedCL is the local variable holding the parsed content length value from headers
+		if parsedCL != nil && *parsedCL != 0 {
+			errMsg := fmt.Sprintf("HEADERS frame with END_STREAM set and non-zero content-length (%d)", *parsedCL)
+			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id})
+			// s.sendRSTStream manages its own locking for state changes.
+			_ = s.sendRSTStream(ErrCodeProtocolError)
+			return NewStreamError(s.id, ErrCodeProtocolError, errMsg)
+		}
+	}
 	s.requestHeaders = headers
 	s.parsedContentLength = parsedCL // Store the parsed content length (or nil if not present)
 	s.mu.Unlock()
