@@ -706,14 +706,18 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 
 	// 1. Stream-level flow control
 	payloadLen := uint32(len(frame.Data)) // Assumes frame.Data is the actual payload after any depadding
+	// Accumulate received data bytes for content-length validation.
+	// This happens regardless of subsequent flow control success/failure for these bytes,
+	// as content-length refers to the declared length of the body being transmitted.
+	if payloadLen > 0 {
+		s.receivedDataBytes += uint64(payloadLen)
+	}
+
 	if err := s.fcManager.DataReceived(payloadLen); err != nil {
 		s.mu.Unlock()
 		s.conn.log.Error("Stream flow control error on DATA frame",
 			logger.LogFields{"stream_id": s.id, "payload_len": payloadLen, "error": err.Error()})
 		// This error from sfcm.DataReceived should be a *StreamError with ErrCodeFlowControlError
-
-		// Accumulate received data bytes for content-length validation.
-		s.receivedDataBytes += uint64(payloadLen)
 		// The connection will then RST the stream.
 		return err
 	}
