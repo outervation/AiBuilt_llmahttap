@@ -3996,3 +3996,131 @@ func TestFrameSizeExceeded_DATA(t *testing.T) {
 		}
 	})
 }
+
+// TestFrameSizeExceeded_HEADERS tests server behavior when receiving HEADERS frames
+// that exceed the advertised SETTINGS_MAX_FRAME_SIZE.
+// Covers h2spec 4.2.3 (HEADERS frame exceeds SETTINGS_MAX_FRAME_SIZE).
+func TestFrameSizeExceeded_HEADERS(t *testing.T) {
+	t.Parallel()
+
+	// Server's default advertised max frame size in tests (from conn.sendInitialSettings)
+	serverAnnouncedMaxFrameSize := DefaultSettingsMaxFrameSize // Typically 16384
+
+	// Create a header block fragment that will be larger than max frame size when encoded.
+	// A single large header value is sufficient.
+	var largeHeaderValue strings.Builder
+	for i := 0; i < int(serverAnnouncedMaxFrameSize)+100; i++ { // Make it clearly oversized
+		largeHeaderValue.WriteByte('a')
+	}
+
+	headersToEncode := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: "x-oversized-header", Value: largeHeaderValue.String()},
+	}
+	// The hpack encoding itself might not exceed the frame size limit if compression is very effective.
+	// However, the *frame's Length field* is what matters. We will set this to be oversized.
+	// The actual content of HeaderBlockFragment doesn't strictly need to be > MAX_FRAME_SIZE
+	// if the frame's Length field *claims* it is.
+	// For this test, we'll make a realistic hpackPayload and then set the FrameHeader.Length
+	// to be > serverAnnouncedMaxFrameSize.
+	// Let's make the actual payload *also* oversized to be certain.
+	hpackPayload := encodeHeadersForTest(t, headersToEncode)
+	oversizedFrameLength := serverAnnouncedMaxFrameSize + 1 // This is the crucial part for the frame header
+
+	if uint32(len(hpackPayload)) < oversizedFrameLength {
+		// If HPACK made it too small, pad it out to ensure the payload itself matches the claimed length.
+		// This makes the test more robust against highly efficient HPACK for small # of headers.
+		padding := make([]byte, int(oversizedFrameLength)-len(hpackPayload))
+		hpackPayload = append(hpackPayload, padding...)
+	}
+	// Trim if actual hpackPayload became larger than intended oversizedFrameLength (unlikely with padding logic)
+	if uint32(len(hpackPayload)) > oversizedFrameLength {
+		hpackPayload = hpackPayload[:oversizedFrameLength]
+	}
+
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_HEADERS")
+	// Defer a final conn.Close. The error used here will be updated if the test passes.
+	defer func() {
+		if conn != nil {
+			conn.Close(closeErr)
+		}
+	}()
+
+	performHandshakeForTest(t, conn, mnc) // Server sends its SETTINGS_MAX_FRAME_SIZE
+	mnc.ResetWriteBuffer()
+
+	serveErrChan := make(chan error, 1)
+	go func() {
+		err := conn.Serve(context.Background())
+		serveErrChan <- err
+	}()
+
+	// Send oversized HEADERS frame
+	headersFrame := &HeadersFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameHeaders,
+			Flags:    FlagHeadersEndHeaders | FlagHeadersEndStream, // Simplest case, single HEADERS frame
+			StreamID: 1,                                            // New client-initiated stream
+			Length:   oversizedFrameLength,                         // This length exceeds server's SETTINGS_MAX_FRAME_SIZE
+		},
+		HeaderBlockFragment: hpackPayload,
+	}
+	mnc.FeedReadBuffer(frameToBytes(t, headersFrame))
+
+	// Expect GOAWAY(FRAME_SIZE_ERROR)
+	// Expect conn.Serve to exit with a ConnectionError
+	var serveExitError error
+	select {
+	case serveExitError = <-serveErrChan:
+		// Good, Serve exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for conn.Serve to exit after sending oversized HEADERS frame")
+	}
+
+	if serveExitError == nil {
+		t.Fatal("conn.Serve exited with nil error, expected ConnectionError")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(serveExitError, &connErr) {
+		t.Fatalf("conn.Serve error type: expected to contain *ConnectionError, got %T. Err: %v", serveExitError, serveExitError)
+	}
+
+	if connErr.Code != ErrCodeFrameSizeError {
+		t.Errorf("conn.Serve ConnectionError code: got %s, want %s. Msg: %s", connErr.Code, ErrCodeFrameSizeError, connErr.Msg)
+	}
+
+	// Explicitly call conn.Close with the error from Serve to trigger GOAWAY, if Serve didn't already.
+	// conn.Close is idempotent.
+	_ = conn.Close(serveExitError)
+
+	// Now check for the GOAWAY frame.
+	var goAwayFrame *GoAwayFrame
+	goAwayFrame = waitForFrameCondition(t, 1*time.Second, 20*time.Millisecond, mnc, (*GoAwayFrame)(nil), func(f *GoAwayFrame) bool {
+		if f.ErrorCode == ErrCodeFrameSizeError {
+			return true
+		}
+		return false
+	}, "GOAWAY(FRAME_SIZE_ERROR) for oversized HEADERS frame")
+
+	// waitForFrameCondition will t.Fatal on timeout.
+	if goAwayFrame == nil {
+		t.Fatalf("GOAWAY(FRAME_SIZE_ERROR) not received. Last raw buffer (len %d): %s", len(mnc.GetWriteBufferBytes()), hex.EncodeToString(mnc.GetWriteBufferBytes()))
+	}
+
+	// Check LastStreamID. Since the HEADERS frame on stream 1 was problematic *before* the stream could be fully established
+	// or processed, the LastStreamID in GOAWAY should typically be 0 or the last successfully processed stream ID
+	// from a previous interaction (if any). In this isolated test, it's likely 0.
+	if goAwayFrame.LastStreamID > 0 { // Allow 0
+		t.Logf("GOAWAY LastStreamID: got %d. This might be acceptable if stream 1 was partially processed before error.", goAwayFrame.LastStreamID)
+	}
+
+	// If all checks pass, update closeErr to nil so the deferred Close is a no-op or clean.
+	if !t.Failed() {
+		closeErr = nil
+	}
+}
