@@ -5489,14 +5489,3 @@ func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
 		closeErr = nil
 	}
 }
-
-// TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength tests server behavior
-// when HEADERS frame has END_STREAM set and a non-zero Content-Length.
-// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 1.
-// "An HTTP/2 request or response is malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the body,
-// or if it contains a content-length header field and the END_STREAM flag is set on the header block."
-
-// TestMalformedContentLength_DATA_DoesNotMatch_EndStream tests server behavior
-// when DATA frames' total payload length does not match the Content-Length header,
-// and END_STREAM is received.
-// Corresponds to h2spec 8.1.2.6 "Semantic Errors", specifically item 2.
