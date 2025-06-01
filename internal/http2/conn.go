@@ -1305,42 +1305,49 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 		if streamFound {
 			// Stream already exists. This HEADERS frame is either an error or trailers.
-			// The task is about erroring on "second HEADERS (not trailers)".
 			existingStream.mu.RLock()
 			state := existingStream.state
 			existingStream.mu.RUnlock()
 
 			c.log.Debug("handleIncomingCompleteHeaders: Existing stream found for incoming HEADERS", logger.LogFields{"stream_id": streamID, "state": state.String()})
 
+			// Task Item 8: Handle subsequent HEADERS frames
 			if state == StreamStateOpen || state == StreamStateHalfClosedLocal {
-				// Task: If a HEADERS frame (that is not for trailers) is received for a stream that is
-				// already in state Open or HalfClosedLocal, it's a protocol violation; send RST_STREAM(PROTOCOL_ERROR).
-				c.log.Warn("Server received subsequent HEADERS for an Open/HalfClosedLocal stream. Sending RST_STREAM(PROTOCOL_ERROR).",
-					logger.LogFields{"stream_id": streamID, "state": state.String()})
-				if errRST := c.sendRSTStreamFrame(streamID, ErrCodeProtocolError); errRST != nil {
-					// If sending RST_STREAM itself fails, that's a more severe connection issue.
-					return errRST
+				// If a HEADERS frame (not trailers) is received on an open/half-closed-local stream,
+				// it's a PROTOCOL_ERROR (h2spec 8.1/1).
+				// `endStream` refers to the END_STREAM flag on *this* incoming HEADERS frame.
+				// If !endStream, it's definitely not trailers and thus an error.
+				if !endStream { // This condition specifically matches h2spec 8.1/1
+					c.log.Warn("Server received subsequent HEADERS (without END_STREAM) for an Open/HalfClosedLocal stream. Sending RST_STREAM(PROTOCOL_ERROR).",
+						logger.LogFields{"stream_id": streamID, "state": state.String()})
+					if errRST := c.sendRSTStreamFrame(streamID, ErrCodeProtocolError); errRST != nil {
+						return errRST // If sending RST fails, propagate connection error
+					}
+					return nil // RST_STREAM sent, stream error handled.
 				}
-				return nil // Error handled at stream level, connection continues.
+				// If endStream is true, it *could* be trailers.
+				// Let stream.processRequestHeadersAndDispatch handle it.
+				// If it's not valid trailers, stream processing should error out.
+				c.log.Debug("Server received subsequent HEADERS (with END_STREAM) for Open/HalfClosedLocal stream. Delegating to stream for potential trailer processing or error.",
+					logger.LogFields{"stream_id": streamID, "state": state.String()})
+				return existingStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
+
 			} else if state == StreamStateClosed {
-				// Task: If the stream is in state Closed, send RST_STREAM(STREAM_CLOSED).
+				// HEADERS on a closed stream is an error (h2spec 5.1/9 - "closed: Sends a HEADERS frame after sending RST_STREAM frame" -> STREAM_CLOSED).
 				c.log.Warn("Server received HEADERS for a Closed stream. Sending RST_STREAM(STREAM_CLOSED).",
 					logger.LogFields{"stream_id": streamID, "state": state.String()})
 				if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
 					return errRST
 				}
-				return nil // Error handled at stream level, connection continues.
+				return nil // RST_STREAM sent, stream error handled.
 			}
+
 			// For other states of an existing stream (e.g., HalfClosedRemote, ReservedLocal),
-			// the original behavior was a ConnectionError.
-			// To adhere to "Do NOT make other changes yet," we fall back to that for now.
-			// This path will be hit if an existing stream receives HEADERS and is not Open, HalfClosedLocal, or Closed.
-			// Example: HalfClosedRemote receiving trailers (which would have endStream == true). This would
-			// currently result in a ConnectionError here, which is not ideal for valid trailers.
-			// However, the task's scope is limited.
-			c.log.Error("Server received HEADERS for an already existing stream ID from client (unhandled state for specific RST logic)",
+			// receiving subsequent HEADERS might be trailers or a protocol error.
+			// We delegate to the stream's processing logic to make the final determination.
+			c.log.Debug("Server received HEADERS for existing stream in other state (e.g. HalfClosedRemote, Reserved), passing to stream processing",
 				logger.LogFields{"stream_id": streamID, "state": state.String()})
-			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("client attempted to send HEADERS on existing stream %d in state %s", streamID, state.String()))
+			return existingStream.processRequestHeadersAndDispatch(headers, endStream, c.dispatcher)
 		}
 
 		// Validate stream ID ordering for client-initiated streams.
