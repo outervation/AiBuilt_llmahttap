@@ -1391,3 +1391,139 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ThresholdOne(t *testin
 	require.NoError(t, err)
 	assert.Equal(t, uint32(0), increment, "Consuming 0 bytes should not generate a WINDOW_UPDATE")
 }
+
+func TestStreamFlowControlManager_SendWindow_NegativeBySettings_PositiveBySettings_Acquire(t *testing.T) {
+	const streamIDForTest uint32 = 123
+	const initialPeerSize uint32 = 100
+	const ourInitialSize uint32 = 200 // Not directly relevant for send window part
+
+	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, ourInitialSize, initialPeerSize)
+	require.Equal(t, int64(initialPeerSize), sfcm.GetStreamSendAvailable(), "Initial send window should match peer's initial setting")
+	require.Equal(t, initialPeerSize, sfcm.sendWindow.initialWindowSize)
+
+	// Step 1: Acquire some data to make 'available' different from 'initialWindowSize'
+	acquireAmount1 := uint32(20)
+	err := sfcm.AcquireSendSpace(acquireAmount1)
+	require.NoError(t, err)
+	require.Equal(t, int64(initialPeerSize-acquireAmount1), sfcm.GetStreamSendAvailable()) // Available = 100 - 20 = 80
+
+	// Step 2: Change peer's SETTINGS_INITIAL_WINDOW_SIZE to drive the send window negative
+	// Old initialWindowSize for sendWindow = 100. Current available = 80.
+	// New peer's initial setting = 0. Delta = 0 - 100 = -100.
+	// New available = 80 (current) + (-100) (delta) = -20.
+	// New initialWindowSize for sendWindow becomes 0.
+	newPeerInitialSize1 := uint32(0)
+	err = sfcm.HandlePeerSettingsInitialWindowSizeChange(newPeerInitialSize1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-20), sfcm.GetStreamSendAvailable(), "Send window should be negative after settings change")
+	assert.Equal(t, newPeerInitialSize1, sfcm.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be updated")
+
+	// Step 3: Attempt to acquire space, which should block
+	var wg sync.WaitGroup
+	wg.Add(1)
+	acquired := false
+	var acquireErr error
+	acquireAmount2 := uint32(10) // Amount to acquire after window becomes positive
+
+	go func() {
+		defer wg.Done()
+		t.Logf("Goroutine: Attempting to acquire %d bytes from negative window...", acquireAmount2)
+		acquireErr = sfcm.AcquireSendSpace(acquireAmount2)
+		if acquireErr == nil {
+			acquired = true
+			t.Logf("Goroutine: Successfully acquired %d bytes.", acquireAmount2)
+		} else {
+			t.Logf("Goroutine: Acquire error: %v", acquireErr)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond) // Give goroutine time to block
+	assert.False(t, acquired, "AcquireSendSpace should be blocking on negative window")
+
+	// Step 4: Change peer's SETTINGS_INITIAL_WINDOW_SIZE again to make the window positive
+	// Current available = -20. Current initialWindowSize for sendWindow = 0.
+	// We need newAvailable = current_available + (new_setting - old_setting_now_0) >= acquireAmount2 (10)
+	// -20 + (new_setting_2 - 0) >= 10  => new_setting_2 >= 30.
+	// Let newPeerInitialSize2 = 50. Delta = 50 - 0 = 50.
+	// New available = -20 + 50 = 30.
+	// New initialWindowSize for sendWindow becomes 50.
+	newPeerInitialSize2 := uint32(50)
+	t.Logf("Main: Updating peer initial window size to %d to make window positive.", newPeerInitialSize2)
+	err = sfcm.HandlePeerSettingsInitialWindowSizeChange(newPeerInitialSize2)
+	require.NoError(t, err)
+	t.Logf("Main: Window updated by settings. Available now: %d", sfcm.GetStreamSendAvailable()) // Should be 30 before goroutine acquires
+
+	wg.Wait() // Wait for goroutine to complete
+
+	assert.True(t, acquired, "AcquireSendSpace should have unblocked and succeeded")
+	require.NoError(t, acquireErr, "AcquireSendSpace error")
+
+	// Expected final available: 30 (after settings update) - 10 (acquired) = 20
+	assert.Equal(t, int64(20), sfcm.GetStreamSendAvailable(), "Final send window is incorrect")
+	assert.Equal(t, newPeerInitialSize2, sfcm.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should be the latest setting")
+}
+
+func TestStreamFlowControlManager_SendWindow_NegativeBySettings_PositiveByWindowUpdate_Acquire(t *testing.T) {
+	const streamIDForTest uint32 = 456
+	const initialPeerSize uint32 = 100
+	const ourInitialSize uint32 = 200 // Not relevant for send window
+
+	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, ourInitialSize, initialPeerSize)
+	require.Equal(t, int64(initialPeerSize), sfcm.GetStreamSendAvailable())
+
+	// Step 1: Acquire some data
+	acquireAmount1 := uint32(20)
+	err := sfcm.AcquireSendSpace(acquireAmount1)
+	require.NoError(t, err)
+	require.Equal(t, int64(initialPeerSize-acquireAmount1), sfcm.GetStreamSendAvailable()) // Available = 80
+
+	// Step 2: Change peer's SETTINGS_INITIAL_WINDOW_SIZE to drive the send window negative
+	// Old initialWindowSize = 100. Current available = 80.
+	// New peer's initial setting = 0. Delta = 0 - 100 = -100.
+	// New available = 80 + (-100) = -20.
+	newPeerInitialSize1 := uint32(0)
+	err = sfcm.HandlePeerSettingsInitialWindowSizeChange(newPeerInitialSize1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-20), sfcm.GetStreamSendAvailable(), "Send window should be negative")
+
+	// Step 3: Attempt to acquire space, which should block
+	var wg sync.WaitGroup
+	wg.Add(1)
+	acquired := false
+	var acquireErr error
+	acquireAmount2 := uint32(10)
+
+	go func() {
+		defer wg.Done()
+		t.Logf("Goroutine: Attempting to acquire %d bytes from negative window...", acquireAmount2)
+		acquireErr = sfcm.AcquireSendSpace(acquireAmount2)
+		if acquireErr == nil {
+			acquired = true
+			t.Logf("Goroutine: Successfully acquired %d bytes.", acquireAmount2)
+		} else {
+			t.Logf("Goroutine: Acquire error: %v", acquireErr)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond) // Give goroutine time to block
+	assert.False(t, acquired, "AcquireSendSpace should be blocking on negative window")
+
+	// Step 4: Send a WINDOW_UPDATE from peer to make the window positive
+	// Current available = -20. We need it to be >= 10 for acquireAmount2.
+	// Increment by 40: New available = -20 + 40 = 20.
+	windowUpdateIncrement := uint32(40)
+	t.Logf("Main: Sending WINDOW_UPDATE with increment %d to make window positive.", windowUpdateIncrement)
+	err = sfcm.HandleWindowUpdateFromPeer(windowUpdateIncrement)
+	require.NoError(t, err)
+	t.Logf("Main: Window updated by WINDOW_UPDATE. Available now: %d", sfcm.GetStreamSendAvailable()) // Should be 20 before goroutine acquires
+
+	wg.Wait() // Wait for goroutine to complete
+
+	assert.True(t, acquired, "AcquireSendSpace should have unblocked and succeeded")
+	require.NoError(t, acquireErr, "AcquireSendSpace error")
+
+	// Expected final available: 20 (after WINDOW_UPDATE) - 10 (acquired) = 10
+	assert.Equal(t, int64(10), sfcm.GetStreamSendAvailable(), "Final send window is incorrect")
+	// initialWindowSize for sendWindow should remain what the last SETTINGS set it to (0)
+	assert.Equal(t, newPeerInitialSize1, sfcm.sendWindow.initialWindowSize, "sendWindow.initialWindowSize should not be affected by WINDOW_UPDATE")
+}
