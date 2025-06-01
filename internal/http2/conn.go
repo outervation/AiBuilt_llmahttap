@@ -153,6 +153,7 @@ type Connection struct {
 // srvSettingsOverride: For server-side, specific HTTP/2 settings overrides. Can be nil.
 //
 //	These would typically come from config.Config.Server.Http2Settings.
+
 func NewConnection(
 	nc net.Conn,
 	lg *logger.Logger,
@@ -185,10 +186,11 @@ func NewConnection(
 		initialSettingsWritten:       make(chan struct{}), // Initialize the new channel
 		peerSettings:                 make(map[SettingID]uint32),
 		remoteAddrStr:                nc.RemoteAddr().String(),
-		dispatcher:                   dispatcher,     // Store dispatcher func
-		peerReportedLastStreamID:     0xffffffff,     // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
-		peerReportedErrorCode:        ErrCodeNoError, // Initialize to NoError
-		highestPeerInitiatedStreamID: 0,              // Initialize new field
+		dispatcher:                   dispatcher,                 // Store dispatcher func
+		peerReportedLastStreamID:     0xffffffff,                 // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
+		peerReportedErrorCode:        ErrCodeNoError,             // Initialize to NoError
+		highestPeerInitiatedStreamID: 0,                          // Initialize new field
+		peerRstStreamTimes:           make(map[uint32]time.Time), // Initialize the new map
 	}
 
 	lg.Debug("NewConnection: Post-initialization. Dumping conn.ourSettings before applyOurSettings", logger.LogFields{"conn_ourSettingsDump_before_apply": fmt.Sprintf("%#v", conn.ourSettings)})
@@ -263,75 +265,7 @@ func NewConnection(
 	peerHpackTableSize := conn.peerSettings[SettingHeaderTableSize]
 	conn.hpackAdapter.SetMaxEncoderDynamicTableSize(peerHpackTableSize)
 
-	// Start the writer goroutine as soon as the connection object is created.
-	// This ensures it's ready to process frames queued during handshake (e.g. initial SETTINGS).
 	go conn.writerLoop()
-	// The line above was removed. Re-adding for test stability based on spec note about fast startup.
-	// However, the primary guard against this is ServerHandshakeSettingsWriteTimeout.
-	// If tests still fail, this isn't the root cause for a 2s timeout.
-	// For now, let's assume the test harness constraints imply we should ensure it's scheduled.
-
-	// The initialSettingsWritten channel is critical.
-	// ServerHandshake blocks on it for up to ServerHandshakeSettingsWriteTimeout (2s).
-	// If writerLoop doesn't close it, that timeout hits.
-
-	// Re-examine sendInitialSettings and writerLoop for this signal.
-	// sendInitialSettings: queues the frame, starts an ACK timer. Correct.
-	// writerLoop: picks frame, writes it, THEN signals initialSettingsWritten. Correct.
-
-	// The most likely issue is that writerLoop is not getting scheduled and running
-	// to the point of processing that first frame AND signaling within 2s.
-	// The 50ms sleep in newTestConnection is meant to help, but might not be enough.
-	// This looks like a genuine race condition where the test proceeds faster than the goroutine starts.
-
-	// The constraint is "DO NOT try increasing the timeout".
-	// What if initialSettingsWritten is initialized but never closed by writerLoop?
-	// writerLoop closes it here:
-	//   if c.initialSettingsWritten != nil { close(c.initialSettingsWritten) }
-	// This happens after:
-	//   if !c.isClient { if sfCheck, okCheck := frame.(*SettingsFrame); okCheck && (sfCheck.Header().Flags&FlagSettingsAck == 0) { ... } }
-
-	// The logging from previous attempts showed ServerHandshake timing out at its internal 2s timeout.
-	// It also showed that "Writer loop: Top of main for-loop." logs were MISSING from test output.
-	// This strongly implies writerLoop isn't even entering its for-loop.
-
-	// What's before the for-loop in writerLoop?
-	// func (c *Connection) writerLoop() {
-	// 	c.log.Debug("Writer loop starting.", ...)  <-- Log 1
-	// 	defer func() { ... }()
-	// 	c.log.Debug("Writer loop started.", ...)   <-- Log 2
-	// 	for {                                      <-- Loop starts
-	// 		c.log.Debug("Writer loop: Top of main for-loop.", ...) <-- Log 3 (Missing)
-
-	// If Log 1 or Log 2 blocks, or the defer setup blocks, Log 3 isn't reached.
-	// With DiscardLogger, log calls shouldn't block. Defer setup is standard.
-
-	// Let's make the test's sleep in newTestConnection a bit longer.
-	// This is a test-side change, not a server-side timeout increase.
-	// The spec says "server startup shouldn't take more than a second".
-	// A 200ms sleep in a test helper for goroutine scheduling is acceptable if it makes tests stable.
-
-	// NO, the issue is likely in ServerHandshake().
-	// When sendInitialSettings() is called, it queues the frame.
-	// Then ServerHandshake waits on `initialSettingsWritten`.
-	// If the writerLoop has not yet started, or is slow to start, this wait will timeout.
-	// The `initialSettingsWritten` channel *itself* needs to be used as the sync point.
-
-	// The sequence is:
-	// 1. NewConnection: `go conn.writerLoop()`
-	// 2. ServerHandshake: `sendInitialSettings()` -> queues frame to `writerChan`
-	// 3. ServerHandshake: `select { case <-initialSettingsWritten: ... }`
-	// 4. writerLoop: `frame := <-writerChan`, `writeFrame(frame)`, `close(initialSettingsWritten)`
-
-	// This is the correct pattern. The timeout means step 4 is not completing in 2s.
-	// The *only* reason for this in a unit test with mocks should be scheduling.
-	// The prompt said "DO NOT try increasing the timeout, when an end-to-end test times out at 10+ seconds".
-	// This is an internal 2s timeout.
-
-	// Let's re-add the time.Sleep in `newTestConnection`, but make it slightly longer.
-	// This is the *least invasive change* that directly addresses goroutine scheduling for tests.
-	// This is in conn_test.go not conn.go
-	// Reverting THIS change. The fix will be in conn_test.go
 
 	return conn
 }
