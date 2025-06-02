@@ -774,10 +774,12 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 	baseHeader := http2.FrameHeader{Type: http2.FrameData, StreamID: 1}
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string // Substring of the expected error
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedMsgSubstring string // Substring for error messages (generic or ConnectionError.Msg)
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "PADDED flag set, PadLength octet missing",
@@ -787,30 +789,35 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 0 // PadLength itself is 1 byte, so 0 means it's missing
 				return h
 			}(),
-			payload:     []byte{}, // No data to provide the PadLength octet
-			expectedErr: "reading pad length: EOF",
+			payload:              []byte{}, // No data to provide the PadLength octet
+			expectConnError:      false,
+			expectedMsgSubstring: "reading pad length: EOF",
 		},
 		{
-			name: "PadLength too large for payload (PadLength only)",
+			name: "PadLength too large for payload (PadLength only)", // PadLength value >= FrameHeader.Length (5 >= 1)
 			header: func() http2.FrameHeader {
 				h := baseHeader
 				h.Flags = http2.FlagDataPadded
 				h.Length = 1 // Length for PadLength field itself
 				return h
 			}(),
-			payload:     []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
-			expectedErr: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream 1",
+			payload:              []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeProtocolError,
+			expectedMsgSubstring: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream 1",
 		},
 		{
-			name: "PadLength too large for payload (PadLength + some data)",
+			name: "PadLength too large for payload (PadLength + some data)", // PadLength value >= FrameHeader.Length (10 >= 3)
 			header: func() http2.FrameHeader {
 				h := baseHeader
 				h.Flags = http2.FlagDataPadded
 				h.Length = 1 + 2 // PadLength + 2 bytes of (supposed) data
 				return h
 			}(),
-			payload:     []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
-			expectedErr: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
+			payload:              []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeProtocolError,
+			expectedMsgSubstring: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
 		},
 		{
 			name: "error reading data (PADDED)",
@@ -820,8 +827,9 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 1 + 5 + 2 // PadLength(1) + Data(5) + Padding(2)
 				return h
 			}(),
-			payload:     []byte{2, 'd', 'a', 't'}, // PadLength=2, Data should be 5, but only 3 'dat' provided
-			expectedErr: "reading data: unexpected EOF",
+			payload:              []byte{2, 'd', 'a', 't'}, // PadLength=2, Data should be 5, but only 3 'dat' provided
+			expectConnError:      false,
+			expectedMsgSubstring: "reading data: unexpected EOF",
 		},
 		{
 			name: "error reading data (not PADDED)",
@@ -831,8 +839,9 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 5 // Data(5)
 				return h
 			}(),
-			payload:     []byte{'d', 'a', 't'}, // Data should be 5, but only 3 'dat' provided
-			expectedErr: "reading data: unexpected EOF",
+			payload:              []byte{'d', 'a', 't'}, // Data should be 5, but only 3 'dat' provided
+			expectConnError:      false,
+			expectedMsgSubstring: "reading data: unexpected EOF",
 		},
 		{
 			name: "error reading padding",
@@ -842,36 +851,35 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 1 + 2 + 5 // PadLength(1) + Data(2) + Padding(5)
 				return h
 			}(),
-			payload:     []byte{5, 'd', 'a', 'p', 'a', 'd'}, // PadLength=5, Data='da', Padding should be 5, but only 3 'pad' provided
-			expectedErr: "reading padding: unexpected EOF",
+			payload:              []byte{5, 'd', 'a', 'p', 'a', 'd'}, // PadLength=5, Data='da', Padding should be 5, but only 3 'pad' provided
+			expectConnError:      false,
+			expectedMsgSubstring: "reading padding: unexpected EOF",
 		},
-
 		{
-			name: "PadLength equals FrameHeader.Length (invalid)",
+			name: "PadLength equals FrameHeader.Length (invalid)", // PadLength value >= FrameHeader.Length (5 >= 5)
 			header: func() http2.FrameHeader {
 				h := baseHeader
 				h.Flags = http2.FlagDataPadded
 				h.Length = 5 // PadLength(1) + Data(0) + Padding(4 according to PadLength field)
 				return h
 			}(),
-			// PadLength field value is 5. FrameHeader.Length is 5. 5 >= 5 is true.
-			// This means 1 (PadLength field) + DataLen + PadOctets = 5
-			// And PadOctets = 5 (from PadLength field value).
-			// So, 1 + DataLen + 5 = 5  => DataLen = -1, which is invalid.
-			payload:     []byte{5}, // PadLength field says 5. No data, no padding bytes follow.
-			expectedErr: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream 1",
+			payload:              []byte{5}, // PadLength field says 5.
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeProtocolError,
+			expectedMsgSubstring: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream 1",
 		},
 		{
-			name: "PadLength greater than FrameHeader.Length (invalid)",
+			name: "PadLength greater than FrameHeader.Length (invalid)", // PadLength value >= FrameHeader.Length (10 >= 3)
 			header: func() http2.FrameHeader {
 				h := baseHeader
 				h.Flags = http2.FlagDataPadded
-				h.Length = 3 // PadLength(1) + Data(0) + Padding(2 according to PadLength field)
+				h.Length = 3 // FrameHeader.Length = 3
 				return h
 			}(),
-			// PadLength field value is 10. FrameHeader.Length is 3. 10 >= 3 is true.
-			payload:     []byte{10}, // PadLength field says 10.
-			expectedErr: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
+			payload:              []byte{10}, // PadLength field says 10.
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeProtocolError,
+			expectedMsgSubstring: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
 		},
 	}
 
@@ -882,11 +890,31 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				if tt.expectConnError || tt.expectedMsgSubstring != "" {
+					t.Fatalf("ParsePayload expected an error, got nil. Test case: %s", tt.name)
+				}
+				return // No error occurred, and none was expected.
 			}
-			if !matchErr(err, tt.expectedErr) {
-				// Allow direct match or substring match because of potential fmt.Errorf wrapping
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+
+			if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				// Check message substring if provided
+				if tt.expectedMsgSubstring != "" && !strings.Contains(err.Error(), tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload ConnectionError message mismatch: error '%v' does not contain '%s'. Test case: %s", err, tt.expectedMsgSubstring, tt.name)
+				}
+			} else { // Not expecting ConnectionError, but some other error (e.g., IO error)
+				if tt.expectedMsgSubstring == "" {
+					t.Fatalf("Test logic error: error occurred (%v), but no expectedMsgSubstring provided for non-ConnectionError. Test case: %s", err, tt.name)
+				}
+				if !strings.Contains(err.Error(), tt.expectedMsgSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedMsgSubstring, err, tt.name)
+				}
 			}
 		})
 	}
