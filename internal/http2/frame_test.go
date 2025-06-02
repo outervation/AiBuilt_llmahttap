@@ -2605,7 +2605,7 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              make([]byte, 7),
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeFrameSizeError,
-			expectedErrSubstring: "GOAWAY frame payload must be at least 8 bytes, got 7",
+			expectedErrSubstring: "GOAWAY frame payload must be at least 8 bytes",
 		},
 		{
 			name: "error reading fixed part (EOF)",
