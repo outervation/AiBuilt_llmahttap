@@ -1153,6 +1153,25 @@ func TestHTTPRequestHeaderValidation(t *testing.T) {
 			},
 			Expected: html400Error,
 		},
+		// 1. Uppercase header field name
+		{
+			Name: "Uppercase Header Name - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"X-ALLCAPS-NAME": []string{"value"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "Uppercase Header Name - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"X-ALLCAPS-NAME": []string{"value"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
 
 		// 2. Forbidden connection-specific header fields
 		// Connection: keep-alive
