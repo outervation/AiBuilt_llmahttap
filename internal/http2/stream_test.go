@@ -533,12 +533,12 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 					if streamErr, ok := err.(*StreamError); ok {
 						// Check if the StreamError's code matches the test's expected RST code.
 						if streamErr.Code == tc.expectedRSTCode {
-							t.Logf("Test: Simulating connection sending RST_STREAM(Code: %s) for StreamID %d due to StreamError from dispatch.", streamErr.Code, stream.id)
+							t.Logf("Test: Simulating connection sending RST_STREAM(Code: %s, IntVal: %d) for StreamID %d due to StreamError from dispatch.", streamErr.Code, streamErr.Code, stream.id)
 							if rstSendErr := conn.sendRSTStreamFrame(stream.id, streamErr.Code); rstSendErr != nil {
 								t.Fatalf("Test: Failed to simulate conn.sendRSTStreamFrame: %v", rstSendErr)
 							}
 						} else {
-							t.Logf("Test: StreamError code %s from dispatch did not match expectedRSTCode %s. Not simulating RST via conn.sendRSTStreamFrame.", streamErr.Code, tc.expectedRSTCode)
+							t.Logf("Test: StreamError code %s (IntVal: %d) from dispatch did not match expectedRSTCode %s (IntVal: %d). Not simulating RST via conn.sendRSTStreamFrame.", streamErr.Code, streamErr.Code, tc.expectedRSTCode, tc.expectedRSTCode)
 						}
 					} else {
 						t.Logf("Test: Error from dispatch was not a StreamError (%T), so cannot simulate RST via conn.sendRSTStreamFrame.", err)
