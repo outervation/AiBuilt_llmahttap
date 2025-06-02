@@ -525,6 +525,32 @@ func TestStream_handleDataFrame(t *testing.T) {
 			expectPipeWriterClosed:      true,
 			expectedFcRecvWindowReduced: true,
 		},
+
+		{
+			name:                 "Content-Length < actual, DATA without END_STREAM, causes error",
+			initialStreamState:   StreamStateOpen,
+			initialOurWindowSize: 100,
+			frameData:            []byte("exceeds"), // M2 = 7 bytes
+			frameEndStream:       false,             // Key: END_STREAM is false
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				declaredLength := int64(10) // N = 10
+				s.parsedContentLength = &declaredLength
+				// Simulate 5 bytes (M1) already received before this frameData.
+				// Total actual received with this frame will be M1 + len(frameData) = 5 + 7 = 12.
+				// Content-Length (10) < Actual (12).
+				s.receivedDataBytes = 5 // M1 = 5
+				s.mu.Unlock()
+			},
+			expectError:                 true,
+			expectedErrorCode:           ErrCodeProtocolError,
+			expectedErrorContains:       "data received (12 with current frame) exceeds declared content-length (10)",
+			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
+			expectedEndStreamReceived:   false,             // END_STREAM was not on this frame
+			expectedDataInPipe:          nil,               // Data from erroring frame is NOT written
+			expectPipeWriterClosed:      true,              // Stream closes on error
+			expectedFcRecvWindowReduced: true,              // FC acquire happens before CL check
+		},
 	}
 
 	for _, tc := range testCases {

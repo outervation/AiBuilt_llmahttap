@@ -998,15 +998,10 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
 	if pseudoErr != nil {
 		s.conn.log.Error("Failed to extract/validate pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
-		// Send RST_STREAM first for the stream error
-		if rstSendErr := s.sendRSTStream(ErrCodeProtocolError); rstSendErr != nil {
-			// If sending RST_STREAM fails, this is a more severe issue.
-			// Propagate the error from sending RST_STREAM.
-			return NewConnectionErrorWithCause(ErrCodeInternalError, "failed to send RST_STREAM for pseudo-header error, then failed to return ConnectionError: "+rstSendErr.Error(), rstSendErr)
-		}
-		// Then, return a ConnectionError to signal the connection should be torn down with GOAWAY.
-		// The original pseudoErr might be a fmt.Errorf, so wrap it.
-		return NewConnectionErrorWithCause(ErrCodeProtocolError, "pseudo-header validation failed: "+pseudoErr.Error(), pseudoErr)
+		// RFC 7540, 8.1.2.6 specifies this as a stream error of type PROTOCOL_ERROR.
+		// The method should return this StreamError. The caller (Connection's dispatchFrame)
+		// is responsible for initiating the RST_STREAM frame based on this error.
+		return NewStreamErrorWithCause(s.id, ErrCodeProtocolError, "pseudo-header validation failed: "+pseudoErr.Error(), pseudoErr)
 	}
 
 	reqURL := &url.URL{
