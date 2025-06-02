@@ -708,112 +708,114 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// RFC 7540, 6.1: DATA frames MUST be associated with a stream. If a DATA frame is received whose stream identifier field is 0x0,
-	// the recipient MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
-	// This check should ideally be done at the connection level before dispatching to stream.
-	// Assuming stream ID is valid by the time it reaches here.
-
-	// RFC 7540, 5.1: DATA frames can only be sent on streams in "open" or "half-closed (local)" state.
-	// Receiving DATA on "half-closed (remote)" or "closed" is a stream error.
 	if s.state == StreamStateHalfClosedRemote || s.state == StreamStateClosed {
 		msg := fmt.Sprintf("DATA frame on closed/half-closed-remote stream %d", s.id)
 		s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-		// This error will lead to an RST_STREAM being sent by the connection management logic
-		// after this function returns an error.
-		// The stream should transition to closed if not already.
-		// s._setState(StreamStateClosed) // _setState is called by conn logic after error
 		return NewStreamError(s.id, ErrCodeStreamClosed, msg)
 	}
 
-	// Account for data with flow control
-	// Connection-level flow control is handled by the connection before calling this.
-	// Stream-level flow control:
 	dataLen := uint32(len(frame.Data))
+	hasEndStreamFlag := frame.Header().Flags&FlagDataEndStream != 0
+
+	// Stream-level flow control
 	if err := s.fcManager.DataReceived(dataLen); err != nil {
-		// Flow control violation
 		s.conn.log.Error("Stream flow control error on receive", logger.LogFields{
 			"stream_id": s.id,
 			"data_len":  dataLen,
-			"window":    s.fcManager.GetStreamReceiveAvailable(), // Window after error (might be negative)
+			"window":    s.fcManager.GetStreamReceiveAvailable(),
 			"error":     err.Error(),
 		})
-		// s._setState(StreamStateClosed) // _setState is called by conn logic after error
-		return err // err should be a *StreamError with ErrCodeFlowControlError
+		// If END_STREAM was on this frame, still mark it as received and close pipe.
+		if hasEndStreamFlag {
+			s.endStreamReceivedFromClient = true
+			_ = s.requestBodyWriter.Close() // Close with EOF as data wasn't processed.
+		}
+		return err
 	}
 
-	// Account for data with flow control (already done before this block)
-
-	// dataLen is already declared: uint32(len(frame.Data))
-
-	// If END_STREAM is set, we need to perform the content-length check *before* writing to the pipe,
-	// as a mismatch should lead to an error without processing the data further (like writing to pipe).
-	if frame.Header().Flags&FlagDataEndStream != 0 {
-		s.conn.log.Debug("END_STREAM received on DATA frame. Performing pre-pipe-write checks.", logger.LogFields{"stream_id": s.id})
-		s.endStreamReceivedFromClient = true
-
-		// Conceptual total received if this frame is included
+	// Content-Length validation logic:
+	if s.parsedContentLength != nil {
 		potentialTotalReceived := s.receivedDataBytes + uint64(dataLen)
+		s.conn.log.Debug("Content-Length check (every DATA frame)", logger.LogFields{
+			"stream_id":                s.id,
+			"parsedContentLength":      *s.parsedContentLength,
+			"currentReceivedDataBytes": s.receivedDataBytes,
+			"currentFrameDataLen":      dataLen,
+			"potentialTotalReceived":   potentialTotalReceived,
+			"hasEndStreamFlag":         hasEndStreamFlag,
+		})
 
-		if s.parsedContentLength != nil {
-			s.conn.log.Debug("Content-Length check (pre-pipe-write for END_STREAM)", logger.LogFields{
-				"stream_id":                s.id,
-				"parsedContentLength":      *s.parsedContentLength,
-				"potentialTotalReceived":   potentialTotalReceived,
-				"currentReceivedDataBytes": s.receivedDataBytes,
-				"currentFrameDataLen":      dataLen,
-			})
-			if *s.parsedContentLength != int64(potentialTotalReceived) {
-				msg := fmt.Sprintf("content-length mismatch on END_STREAM: declared %d, received %d (current frame %d bytes, previously %d bytes)",
-					*s.parsedContentLength, potentialTotalReceived, dataLen, s.receivedDataBytes)
-				s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id, "state": s.state.String()})
-				// Do not write to pipe. Return error.
-				return NewStreamError(s.id, ErrCodeProtocolError, msg)
+		protocolErrorMsg := ""
+
+		// Prioritize END_STREAM specific check if the flag is present
+		if hasEndStreamFlag && (*s.parsedContentLength != int64(potentialTotalReceived)) {
+			protocolErrorMsg = fmt.Sprintf("content-length mismatch on END_STREAM: declared %d, received %d (current frame %d bytes, previously %d bytes)",
+				*s.parsedContentLength, potentialTotalReceived, dataLen, s.receivedDataBytes)
+		} else if int64(potentialTotalReceived) > *s.parsedContentLength { // Check for exceeding CL if not an END_STREAM mismatch
+			protocolErrorMsg = fmt.Sprintf("data received (%d with current frame) exceeds declared content-length (%d)",
+				potentialTotalReceived, *s.parsedContentLength)
+		}
+
+		if protocolErrorMsg != "" {
+			// Even with error, if END_STREAM was present, mark it and close pipe.
+			if hasEndStreamFlag {
+				s.endStreamReceivedFromClient = true
+				// Close with an error reflecting the problem for the reader.
+				_ = s.requestBodyWriter.CloseWithError(NewStreamError(s.id, ErrCodeProtocolError, protocolErrorMsg))
 			}
+			return NewStreamError(s.id, ErrCodeProtocolError, protocolErrorMsg)
 		}
 	}
 
-	// Write data to the pipe for the handler to read, if there's data.
+	// If Content-Length validation passed (or no CL was set), write data to pipe.
 	if dataLen > 0 {
 		if _, err := s.requestBodyWriter.Write(frame.Data); err != nil {
-			// This typically means the reader (handler) side of the pipe was closed.
 			s.conn.log.Error("Error writing to stream requestBodyWriter", logger.LogFields{
 				"stream_id": s.id,
 				"error":     err.Error(),
 			})
+			// If pipe write fails, and END_STREAM was on this frame, mark it.
+			if hasEndStreamFlag {
+				s.endStreamReceivedFromClient = true
+				// Close with the pipe error.
+				_ = s.requestBodyWriter.CloseWithError(err)
+			}
 			return NewStreamError(s.id, ErrCodeCancel, fmt.Sprintf("pipe write failed for stream %d: %v", s.id, err))
 		}
-		s.receivedDataBytes += uint64(dataLen) // Update after successful write
+		s.receivedDataBytes += uint64(dataLen)
 		s.conn.log.Debug("Wrote DATA to pipe", logger.LogFields{"stream_id": s.id, "bytes": dataLen, "total_received_on_stream": s.receivedDataBytes})
 	}
 
-	// Handle END_STREAM flag actions (if no CL error occurred before for END_STREAM)
-	if frame.Header().Flags&FlagDataEndStream != 0 {
-		// s.endStreamReceivedFromClient was already set above if END_STREAM is present.
-		s.conn.log.Debug("Processing END_STREAM post-pipe-write actions.", logger.LogFields{"stream_id": s.id})
+	if hasEndStreamFlag {
+		s.endStreamReceivedFromClient = true
+		s.conn.log.Debug("Processing END_STREAM flag actions for DATA frame.", logger.LogFields{"stream_id": s.id})
 
-		// Close the writer end of the pipe to signal EOF to the handler.
-		if err := s.requestBodyWriter.Close(); err != nil {
-			s.conn.log.Error("Error closing requestBodyWriter after END_STREAM (post-CL-check)", logger.LogFields{
+		// Close the writer. If dataLen was 0, this effectively sends EOF.
+		// If data was written, this signals no more data will follow.
+		if err := s.requestBodyWriter.Close(); err != nil { // Use Close() for normal EOF scenario
+			s.conn.log.Error("Error closing requestBodyWriter after END_STREAM", logger.LogFields{
 				"stream_id": s.id,
 				"error":     err.Error(),
 			})
+			// This is an internal error, but stream processing might continue to state transition.
+			// However, if pipe close fails, it's safer to return an error.
 			return NewStreamError(s.id, ErrCodeInternalError, fmt.Sprintf("pipe close failed for stream %d: %v", s.id, err))
 		}
 
-		// Transition stream state
 		switch s.state {
 		case StreamStateOpen:
 			s._setState(StreamStateHalfClosedRemote)
 		case StreamStateHalfClosedLocal:
 			s._setState(StreamStateClosed)
 		default:
-			s.conn.log.Error("Received END_STREAM on DATA frame in unexpected stream state (post-CL-check)", logger.LogFields{
+			s.conn.log.Error("Received END_STREAM on DATA frame in unexpected stream state", logger.LogFields{
 				"stream_id": s.id,
 				"state":     s.state.String(),
 			})
 			return NewStreamError(s.id, ErrCodeProtocolError, fmt.Sprintf("END_STREAM on DATA in unexpected state %s for stream %d", s.state, s.id))
 		}
 	}
+
 	return nil
 }
 
@@ -822,7 +824,6 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 // and dispatches it via the provided router.
 
 func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, endStream bool, dispatcher func(sw StreamWriter, req *http.Request)) error {
-
 	s.mu.RLock()
 	currentState := s.state
 	// Capture the state of s.initialHeadersProcessed *before* this header block potentially modifies it.
@@ -833,14 +834,20 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		s.conn.log.Warn("Stream.processRequestHeadersAndDispatch: Attempt to process headers on an already closed stream.", logger.LogFields{"stream_id": s.id})
 		// As per h2spec 5.1 Stream States #9 (closed: Sends a HEADERS frame after sending RST_STREAM frame)
 		// "The endpoint MUST treat this as a stream error of type STREAM_CLOSED."
+		// An RST_STREAM should be sent by the connection management logic if this function returns an error.
+		// However, sending one here explicitly aligns with the immediate detection of the error.
 		if err := s.sendRSTStream(ErrCodeStreamClosed); err != nil {
 			s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Failed to send RST_STREAM for closed stream.", logger.LogFields{"stream_id": s.id, "error": err})
-			return err // Propagate error if sending RST_STREAM fails
+			// If sending RST_STREAM fails, it's a more severe problem, possibly a connection error.
+			// Propagate this error.
+			return err
 		}
-		return nil // Stream error handled by RST
+		// Return a StreamError so the caller (Connection) knows this specific stream had an issue.
+		// The RST_STREAM has been initiated.
+		return NewStreamError(s.id, ErrCodeStreamClosed, "headers received on closed stream")
 	}
 
-	// NEW CHECK for h2spec 8.1/1 (Task Item 3.b)
+	// NEW CHECK for h2spec 8.1/1
 	// If a second HEADERS frame is received for a stream that is currently in StreamStateOpen
 	// (i.e., the first HEADERS frame for the request did not have END_STREAM set, which is implied by StreamStateOpen),
 	// and this second HEADERS frame also does not have END_STREAM set, it MUST be treated as a stream error of type PROTOCOL_ERROR.
