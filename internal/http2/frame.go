@@ -242,6 +242,11 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		// So, Data_Length = FrameHeader.Length - 1 - f.PadLength_value.
 		// If f.PadLength_value >= FrameHeader.Length, then Data_Length <= -1, which is invalid.
 		if uint32(f.PadLength) >= f.FrameHeader.Length {
+			// As per RFC 7540, Section 6.1: "If the length of the padding is the length of the
+			// frame payload or greater, the recipient MUST treat this as a connection
+			// error [HTTP/2] of type PROTOCOL_ERROR."
+			// FrameHeader.Length is the total payload length.
+			// If PadLength itself takes up this much or more, it's invalid.
 			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame invalid: PadLength %d is invalid relative to FrameHeader.Length %d for stream %d", f.PadLength, f.FrameHeader.Length, header.StreamID))
 		}
 
