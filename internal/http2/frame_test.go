@@ -799,7 +799,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
-			expectedErr: "pad length 5 exceeds payload length 0",
+			expectedErr: "DATA frame invalid pad length: pad length 5 > remaining payload (Data+Padding) 0",
 		},
 		{
 			name: "PadLength too large for payload (PadLength + some data)",
@@ -810,7 +810,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
-			expectedErr: "pad length 10 exceeds payload length 2",
+			expectedErr: "DATA frame invalid pad length: pad length 10 > remaining payload (Data+Padding) 2",
 		},
 		{
 			name: "error reading data (PADDED)",
