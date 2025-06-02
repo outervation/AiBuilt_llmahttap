@@ -2588,10 +2588,12 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 	validFixedPart := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00} // LastStreamID=1, ErrorCode=NoError
 
 	tests := []struct {
-		name        string
-		header      http2.FrameHeader
-		payload     []byte
-		expectedErr string
+		name                 string
+		header               http2.FrameHeader
+		payload              []byte
+		expectedErrSubstring string // Used for generic errors or specific messages in ConnectionError
+		expectConnError      bool
+		expectedCode         http2.ErrorCode
 	}{
 		{
 			name: "payload too short (less than 8 bytes for fixed part)",
@@ -2600,8 +2602,10 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 7 // GOAWAY must be at least 8 bytes
 				return h
 			}(),
-			payload:     make([]byte, 7),
-			expectedErr: "GOAWAY frame payload must be at least 8 bytes, got 7",
+			payload:              make([]byte, 7),
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeFrameSizeError,
+			expectedErrSubstring: "GOAWAY frame payload must be at least 8 bytes, got 7",
 		},
 		{
 			name: "error reading fixed part (EOF)",
@@ -2610,8 +2614,9 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 8 // Length for fixed part only
 				return h
 			}(),
-			payload:     make([]byte, 5), // Provide only 5 of 8 bytes for fixed part
-			expectedErr: "reading GOAWAY fixed part: unexpected EOF",
+			payload:              make([]byte, 5), // Provide only 5 of 8 bytes for fixed part
+			expectConnError:      false,           // This is an io.EOF, not a ConnectionError from frame validation
+			expectedErrSubstring: "reading GOAWAY fixed part: unexpected EOF",
 		},
 		{
 			name: "error reading additional debug data (EOF)",
@@ -2620,8 +2625,9 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 				h.Length = 8 + 10 // Fixed part (8) + Debug data (10)
 				return h
 			}(),
-			payload:     append(validFixedPart, make([]byte, 5)...), // Fixed part + 5 bytes of debug data
-			expectedErr: "reading GOAWAY additional debug data: unexpected EOF",
+			payload:              append(validFixedPart, make([]byte, 5)...), // Fixed part + 5 bytes of debug data
+			expectConnError:      false,                                      // This is an io.EOF
+			expectedErrSubstring: "reading GOAWAY additional debug data: unexpected EOF",
 		},
 	}
 
@@ -2632,10 +2638,32 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 			err := frame.ParsePayload(r, tt.header)
 
 			if err == nil {
-				t.Fatalf("ParsePayload expected an error containing '%s', got nil", tt.expectedErr)
+				if tt.expectConnError || tt.expectedErrSubstring != "" {
+					t.Fatalf("ParsePayload expected an error, got nil. Test case: %s", tt.name)
+				}
+				return // No error occurred, and none was expected.
 			}
-			if !matchErr(err, tt.expectedErr) {
-				t.Errorf("ParsePayload error mismatch:\nExpected to contain: %s\nGot: %v", tt.expectedErr, err)
+
+			if tt.expectConnError {
+				var connErr *http2.ConnectionError
+				if !errors.As(err, &connErr) {
+					t.Fatalf("ParsePayload expected a *http2.ConnectionError, got %T: %v. Test case: %s", err, err, tt.name)
+				}
+				if connErr.Code != tt.expectedCode {
+					t.Errorf("ParsePayload ConnectionError code mismatch: expected %s, got %s. Test case: %s", tt.expectedCode, connErr.Code, tt.name)
+				}
+				// Check message substring if provided
+				if tt.expectedErrSubstring != "" && !strings.Contains(connErr.Msg, tt.expectedErrSubstring) {
+					// Note: For ConnectionError, we check against connErr.Msg, not err.Error() which might be wrapped.
+					t.Errorf("ParsePayload ConnectionError message mismatch: expected Msg to contain '%s', got '%s'. Test case: %s", tt.expectedErrSubstring, connErr.Msg, tt.name)
+				}
+			} else { // Not expecting ConnectionError, but some other error (e.g., IO error)
+				if tt.expectedErrSubstring == "" {
+					t.Fatalf("Test logic error: error occurred (%v), but no expectedErrSubstring provided for non-ConnectionError. Test case: %s", err, tt.name)
+				}
+				if !strings.Contains(err.Error(), tt.expectedErrSubstring) {
+					t.Errorf("ParsePayload error mismatch:\nExpected error string to contain: %s\nGot: %v. Test case: %s", tt.expectedErrSubstring, err, tt.name)
+				}
 			}
 		})
 	}
