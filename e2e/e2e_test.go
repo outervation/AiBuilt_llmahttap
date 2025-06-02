@@ -1108,7 +1108,7 @@ func TestHTTPRequestHeaderValidation(t *testing.T) {
 		Logging: &config.LoggingConfig{
 			LogLevel:  config.LogLevelDebug,
 			AccessLog: &config.AccessLogConfig{Enabled: boolPtr(false)}, // Disable for cleaner test logs
-			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stderr")}, // Capture server errors
+ 			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stderr")},
 		},
 	}
 
@@ -1213,6 +1213,48 @@ func TestHTTPRequestHeaderValidation(t *testing.T) {
 			},
 			Expected: html400Error,
 		},
+		// TE: compress, gzip (multiple invalid values)
+		{
+			Name: "TE Compress Gzip Header - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"compress, gzip"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "TE Compress Gzip Header - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"compress, gzip"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
+
+		// TE: trailers, compress (valid + invalid value)
+		// RFC 7540 Section 8.1.2.2: "A request containing the TE header field with any value other than "trailers" MUST be treated as malformed"
+		// This implies that if "trailers" is present alongside an invalid value, it's still malformed.
+		{
+			Name: "TE Trailers Compress Header - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"trailers, compress"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "TE Trailers Compress Header - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"trailers, compress"}, "Accept": []string{"text/html"}},
+
+			},
+			Expected: html400Error,
+		},
 		{
 			Name: "TE Trailers Header (Valid) - Expect 200 OK",
 			Request: testutil.TestRequest{
@@ -1226,7 +1268,6 @@ func TestHTTPRequestHeaderValidation(t *testing.T) {
 			},
 		},
 	}
-
 	testDef := testutil.E2ETestDefinition{
 		Name:                "HTTPRequestHeaderValidation",
 		ServerBinaryPath:    serverBinaryPath,
