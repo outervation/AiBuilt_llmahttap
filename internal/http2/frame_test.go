@@ -2591,7 +2591,7 @@ func TestGoAwayFrame_ParsePayload_Errors(t *testing.T) {
 		name                 string
 		header               http2.FrameHeader
 		payload              []byte
-		expectedErrSubstring string // Used for generic errors or specific messages in ConnectionError
+		expectedErrSubstring string // Substring for error messages (generic or ConnectionError.Msg)
 		expectConnError      bool
 		expectedCode         http2.ErrorCode
 	}{
