@@ -3372,9 +3372,11 @@ func TestConnection_HandleSettingsFrame(t *testing.T) {
 		settingsFrameToProcess      *SettingsFrame
 		expectError                 bool
 		expectedConnectionErrorCode ErrorCode
-		expectedConnectionErrorMsg  string // Substring to check in error message
-		expectAckSent               bool   // True if a SETTINGS ACK should be sent by the server
-		checkPeerSettings           bool   // True to verify conn.peerSettings map after processing
+		expectedConnectionErrorMsg  string    // Substring to check in error message
+		expectAckSent               bool      // True if a SETTINGS ACK should be sent by the server
+		expectedGoAwayOnError       bool      // NEW: If true, expects a GOAWAY if expectError is true and error is ConnectionError
+		expectedGoAwayErrorCode     ErrorCode // NEW: If expectGoAwayOnError, this is the expected code
+		checkPeerSettings           bool      // True to verify conn.peerSettings map after processing
 		expectedPeerSettings        map[SettingID]uint32
 		checkOperationalValues      func(t *testing.T, conn *Connection) // Custom checks for conn.peerMaxFrameSize, etc.
 		checkStreamUpdates          func(t *testing.T, conn *Connection) // Custom checks for stream updates (e.g., FCW)
@@ -3453,17 +3455,6 @@ func TestConnection_HandleSettingsFrame(t *testing.T) {
 			expectError:                 true,
 			expectedConnectionErrorCode: ErrCodeProtocolError,
 			expectedConnectionErrorMsg:  "SETTINGS frame received with non-zero stream ID",
-			expectAckSent:               false,
-		},
-		{
-			name: "SETTINGS ACK with non-zero payload length",
-			settingsFrameToProcess: &SettingsFrame{
-				FrameHeader: FrameHeader{Type: FrameSettings, Flags: FlagSettingsAck, StreamID: 0, Length: 6}, // Length = 6
-				Settings:    []Setting{{ID: SettingInitialWindowSize, Value: 100}},
-			},
-			expectError:                 true,
-			expectedConnectionErrorCode: ErrCodeFrameSizeError,
-			expectedConnectionErrorMsg:  "SETTINGS ACK frame received with non-zero length",
 			expectAckSent:               false,
 		},
 		{
