@@ -1191,6 +1191,7 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 				t.Logf("Server started successfully for valid configuration, as expected.")
 			}
 		})
+
 	}
 }
 
