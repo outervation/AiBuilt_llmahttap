@@ -799,7 +799,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
-			expectedErr: "DATA frame invalid pad length: pad length 5 > remaining payload (Data+Padding) 0",
+			expectedErr: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream 1",
 		},
 		{
 			name: "PadLength too large for payload (PadLength + some data)",
@@ -810,7 +810,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:     []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
-			expectedErr: "DATA frame invalid pad length: pad length 10 > remaining payload (Data+Padding) 2",
+			expectedErr: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
 		},
 		{
 			name: "error reading data (PADDED)",
@@ -844,6 +844,34 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:     []byte{5, 'd', 'a', 'p', 'a', 'd'}, // PadLength=5, Data='da', Padding should be 5, but only 3 'pad' provided
 			expectedErr: "reading padding: unexpected EOF",
+		},
+
+		{
+			name: "PadLength equals FrameHeader.Length (invalid)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 5 // PadLength(1) + Data(0) + Padding(4 according to PadLength field)
+				return h
+			}(),
+			// PadLength field value is 5. FrameHeader.Length is 5. 5 >= 5 is true.
+			// This means 1 (PadLength field) + DataLen + PadOctets = 5
+			// And PadOctets = 5 (from PadLength field value).
+			// So, 1 + DataLen + 5 = 5  => DataLen = -1, which is invalid.
+			payload:     []byte{5}, // PadLength field says 5. No data, no padding bytes follow.
+			expectedErr: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream 1",
+		},
+		{
+			name: "PadLength greater than FrameHeader.Length (invalid)",
+			header: func() http2.FrameHeader {
+				h := baseHeader
+				h.Flags = http2.FlagDataPadded
+				h.Length = 3 // PadLength(1) + Data(0) + Padding(2 according to PadLength field)
+				return h
+			}(),
+			// PadLength field value is 10. FrameHeader.Length is 3. 10 >= 3 is true.
+			payload:     []byte{10}, // PadLength field says 10.
+			expectedErr: "DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream 1",
 		},
 	}
 
