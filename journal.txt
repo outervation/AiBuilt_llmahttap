@@ -12,3 +12,10 @@ The fix for FlowControlWindow.Acquire (to correctly block on negative window) is
   `Expected: DATA frame`
   `Actual: HEADERS Frame (length:77, flags:0x04, stream_id:1)`
 Verifying this h2spec test passes after the change will be a key validation point.
+The diagnostic changes made in `FlowControlWindow.Acquire` (Path Y, lines 88-104) to return specific error types like `StreamError` or `ConnectionError` instead of `fmt.Errorf` were intended to help trace if this specific error path was being hit and if the type of error returned was appropriate for upstream handlers. The goal is to ensure that errors from `Acquire` lead to correct termination of operations (e.g., stream reset) rather than unexpected behavior like sending premature HEADERS frames.
+
+h2spec failures showing "Actual: HEADERS Frame" where "DATA frame" was expected, or timeouts, often point to issues where:
+1. The server incorrectly closes a stream or its flow control window, preventing it from accepting valid subsequent frames (like WINDOW_UPDATE on a half-closed (remote) stream).
+2. `FlowControlWindow.Acquire` does not block correctly (e.g., when the window is negative or insufficient), or returns an error that is mishandled, leading the server to send an erroneous HEADERS frame instead of waiting or sending DATA.
+3. The server does not send WINDOW_UPDATE frames in a timely manner, causing the peer to stall (leading to DATA frame timeouts from the test client).
+4. The server fails to process incoming DATA/HEADERS correctly due to internal errors (possibly related to flow control state), leading to no response or an incorrect response.
