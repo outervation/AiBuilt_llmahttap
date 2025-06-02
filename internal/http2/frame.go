@@ -230,9 +230,15 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 			return fmt.Errorf("reading pad length: %w", err)
 		}
 		f.PadLength = padLenBuf[0]
-		payloadLen-- // Subtract pad length octet
-		if uint32(f.PadLength) > payloadLen {
-			return NewStreamError(header.StreamID, ErrCodeProtocolError, fmt.Sprintf("pad length %d exceeds payload length %d", f.PadLength, payloadLen))
+		payloadLen--                          // Subtract pad length octet
+		if uint32(f.PadLength) > payloadLen { // Corrected based on RFC 7540 Errata 4254
+			// RFC 7540, Section 6.1 (as per Errata 4254):
+			// "A receiver MUST treat a DATA frame that contains padding that is longer than
+			// the frame payload remaining after the Pad Length field has been removed
+			// as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+			// 'payloadLen' here is (FrameHeader.Length - 1), which is (Data + Padding).
+			// So, if f.PadLength > (Data + Padding), it implies Data length < 0.
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame invalid pad length: pad length %d > remaining payload (Data+Padding) %d for stream %d", f.PadLength, payloadLen, header.StreamID))
 		}
 	}
 
