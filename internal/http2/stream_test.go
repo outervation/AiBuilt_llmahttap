@@ -190,6 +190,231 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			expectRST:           true,
 			expectedRSTCode:     ErrCodeInternalError, // RST from panic recovery
 		},
+
+		// --- NEW TEST CASES FOR INVALID HEADERS (TASK 1) ---
+		{
+			name: "invalid: uppercase header field name",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "X-Custom-Header", Value: "uppercase-fail"}, // Invalid
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for uppercase header name, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: pseudo-header in trailer block",
+			headers: []hpack.HeaderField{
+				{Name: ":status", Value: "200"}, // Example pseudo-header
+				{Name: "trailer-field", Value: "value"},
+			},
+			endStream: true, // Trailers imply endStream
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.initialHeadersProcessed = true
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for pseudo-header in trailers, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: connection-specific header (Connection)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Connection", Value: "keep-alive"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for 'Connection' header, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: connection-specific header (Keep-Alive)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Keep-Alive", Value: "timeout=5"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for 'Keep-Alive' header, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: connection-specific header (Proxy-Connection)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Proxy-Connection", Value: "close"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for 'Proxy-Connection' header, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: connection-specific header (Transfer-Encoding)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "POST"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Transfer-Encoding", Value: "chunked"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for 'Transfer-Encoding' header, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: connection-specific header (Upgrade)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Upgrade", Value: "websocket"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for 'Upgrade' header, expected not called.")
+				}
+			},
+		},
+		{
+			name: "invalid: TE header with value other than 'trailers'",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "te", Value: "gzip"}, // Invalid value
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for invalid 'te' header value, expected not called.")
+				}
+			},
+		},
+		{
+
+			name: "valid: TE header with 'trailers'",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "te", Value: "trailers"},
+			},
+			endStream: false,
+			dispatcher: func(sw StreamWriter, req *http.Request) {
+				defer wg.Done()
+				if req.Header.Get("te") != "trailers" {
+					t.Errorf("Dispatcher: te header mismatch, got %s", req.Header.Get("te"))
+				}
+			},
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			expectErrorFromFunc: false,
+			expectRST:           false,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() == 0 {
+					t.Error("Dispatcher was not called for valid te header, expected called.")
+				} else if mrd.CalledCount() > 1 {
+					t.Errorf("Dispatcher was called %d times for valid te header, expected 1.", mrd.CalledCount())
+				}
+			},
+		},
+		// --- END NEW TEST CASES FOR INVALID HEADERS ---
 		// --- NEW TEST CASES FOR INVALID HEADERS (TASK 1) ---
 		{
 			name: "invalid: uppercase header field name",
