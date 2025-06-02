@@ -878,13 +878,12 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
 					return sendErr // Propagate connection error if RST send failed
 				}
-				return nil // Stream error handled by RST
+				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 			}
 		}
 
-		lowerName := hf.Name // Already lowercase from hpack library or prior processing if that's the case.
-		// However, the check above is for ANY uppercase. Here, use ToLower for switch consistency.
-		lowerName = strings.ToLower(hf.Name)
+		// Use ToLower for switch consistency. Note that the check above is for ANY uppercase.
+		lowerName := strings.ToLower(hf.Name)
 
 		// 1.b Forbidden connection-specific headers (h2spec 8.1.2.2 #1)
 		// HTTP/2 RFC 7540, Section 8.1.2.2.
@@ -897,7 +896,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
 				return sendErr
 			}
-			return nil
+			return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 		}
 
 		// 1.c TE header validation (h2spec 8.1.2.2 #2)
@@ -908,7 +907,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
 					return sendErr
 				}
-				return nil
+				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 			}
 		}
 
@@ -917,16 +916,14 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		if isPotentiallyTrailers && strings.HasPrefix(hf.Name, ":") {
 			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
 			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
-			// Attempt to RST the stream first, as per h2spec expecting RST_STREAM.
 			if rstSendErr := s.sendRSTStream(ErrCodeProtocolError); rstSendErr != nil {
 				s.conn.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation (stream.go)", logger.LogFields{"stream_id": s.id, "error": rstSendErr.Error()})
-				// Even if RST_STREAM fails, the spec mandates a connection error.
-				// The error from sending RST might itself be a ConnectionError (e.g., writer problem).
-				// We will return the ConnectionError for the protocol violation below.
-				// If rstSendErr is critical (like a conn write error), it will likely surface when trying to send GOAWAY.
+				return rstSendErr
 			}
-			// Spec 8.1.2.1 mandates a connection error for pseudo-headers in trailers.
-			return NewConnectionError(ErrCodeProtocolError, errMsg)
+			// The spec (RFC 7540, 8.1.2.1) says "Endpoints MUST treat a request or response that contains a pseudo-header field in a trailer section as malformed (Section 8.1.2.6)."
+			// Section 8.1.2.6 says "A request or response is also malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the body. A response that is defined as malformed is treated as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
+			// So, this should be a stream error.
+			return NewStreamError(s.id, ErrCodeProtocolError, errMsg)
 		}
 	}
 	// --- END Original Header Validations ---
