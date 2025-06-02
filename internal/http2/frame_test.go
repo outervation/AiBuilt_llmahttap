@@ -790,8 +790,9 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 				return h
 			}(),
 			payload:              []byte{}, // No data to provide the PadLength octet
-			expectConnError:      false,
-			expectedMsgSubstring: "reading pad length: EOF",
+			expectConnError:      true,
+			expectedCode:         http2.ErrCodeProtocolError,
+			expectedMsgSubstring: fmt.Sprintf("DATA frame too short to contain PadLength field for stream %d: EOF", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength too large for payload (PadLength only)", // PadLength value >= FrameHeader.Length (5 >= 1)
