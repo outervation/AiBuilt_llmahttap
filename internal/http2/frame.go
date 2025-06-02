@@ -229,7 +229,11 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	if f.Flags&FlagDataPadded != 0 {
 		var padLenFieldAsByte [1]byte
 		if _, err := io.ReadFull(r, padLenFieldAsByte[:]); err != nil {
-			return fmt.Errorf("reading pad length: %w", err)
+			// RFC 7540, Section 6.1: "If the length of the padding is the length of the
+			// frame payload or greater, the recipient MUST treat this as a connection
+			// error [HTTP/2] of type PROTOCOL_ERROR."
+			// This specific case is where the PadLength field itself cannot be read.
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame too short to contain PadLength field for stream %d: %v", header.StreamID, err))
 		}
 		f.PadLength = padLenFieldAsByte[0] // Store the PadLength *value* from the 1-byte field
 
