@@ -1070,6 +1070,176 @@ func TestRouting_MatchingLogic(t *testing.T) {
 }
 
 // TestRouting_ConfigValidationFailures tests server startup failures due to invalid routing configurations
+
+// TestHTTPRequestHeaderValidation verifies server behavior for requests with invalid headers
+// as per RFC 7540 Section 8.1.2.
+func TestHTTPRequestHeaderValidation(t *testing.T) {
+	t.Parallel()
+	if serverBinaryMissing {
+		t.Skipf("Skipping E2E test: server binary not found or not executable at '%s'", serverBinaryPath)
+	}
+
+	docRoot, cleanupDocRoot, err := setupTempFiles(t, map[string]string{
+		"valid.txt": "This is a valid file.",
+	})
+	if err != nil {
+		t.Fatalf("Failed to set up temp files for header validation test: %v", err)
+	}
+	defer cleanupDocRoot()
+
+	baseConfig := &config.Config{
+		Server: &config.ServerConfig{
+			Address: strPtr("127.0.0.1:0"),
+		},
+		Routing: &config.RoutingConfig{
+			Routes: []config.Route{
+				{
+					PathPattern: "/testpath/",
+					MatchType:   config.MatchTypePrefix,
+					HandlerType: "StaticFileServer",
+					HandlerConfig: testutil.ToRawMessageWrapper(t, config.StaticFileServerConfig{
+						DocumentRoot:          docRoot,
+						IndexFiles:            []string{"valid.txt"},
+						ServeDirectoryListing: boolPtr(false),
+					}),
+				},
+			},
+		},
+		Logging: &config.LoggingConfig{
+			LogLevel:  config.LogLevelDebug,
+			AccessLog: &config.AccessLogConfig{Enabled: boolPtr(false)}, // Disable for cleaner test logs
+			ErrorLog:  &config.ErrorLogConfig{Target: strPtr("stderr")}, // Capture server errors
+		},
+	}
+
+	json400Error := testutil.ExpectedResponse{
+		StatusCode: http.StatusBadRequest,
+		Headers:    testutil.HeaderMatcher{"content-type": "application/json; charset=utf-8"},
+		BodyMatcher: &testutil.JSONFieldsBodyMatcher{
+			ExpectedFields: map[string]interface{}{
+				"error": map[string]interface{}{
+					"status_code": 400.0, // JSON numbers are float64
+					"message":     "Bad Request",
+				},
+			},
+		},
+	}
+
+	html400Error := testutil.ExpectedResponse{
+		StatusCode: http.StatusBadRequest,
+		Headers:    testutil.HeaderMatcher{"content-type": "text/html; charset=utf-8"},
+		BodyMatcher: &testutil.StringContainsBodyMatcher{
+			Substring: "<h1>Bad Request</h1>",
+		},
+	}
+
+	testCases := []testutil.E2ETestCase{
+		// 1. Uppercase header field name
+		{
+			Name: "Uppercase Header Name - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"X-ALLCAPS-NAME": []string{"value"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "Uppercase Header Name - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"X-ALLCAPS-NAME": []string{"value"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
+
+		// 2. Forbidden connection-specific header fields
+		// Connection: keep-alive
+		{
+			Name: "Connection Keep-Alive Header - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"Connection": []string{"keep-alive"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "Connection Keep-Alive Header - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"Connection": []string{"keep-alive"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
+		// Proxy-Connection: keep-alive
+		{
+			Name: "Proxy-Connection Keep-Alive Header - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"Proxy-Connection": []string{"keep-alive"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "Proxy-Connection Keep-Alive Header - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"Proxy-Connection": []string{"keep-alive"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
+
+		// 3. TE header field with value other than "trailers"
+		{
+			Name: "TE Compress Header - JSON",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"compress"}, "Accept": []string{"application/json"}},
+			},
+			Expected: json400Error,
+		},
+		{
+			Name: "TE Compress Header - HTML",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"compress"}, "Accept": []string{"text/html"}},
+			},
+			Expected: html400Error,
+		},
+		{
+			Name: "TE Trailers Header (Valid) - Expect 200 OK",
+			Request: testutil.TestRequest{
+				Method:  "GET",
+				Path:    "/testpath/valid.txt",
+				Headers: http.Header{"TE": []string{"trailers"}},
+			},
+			Expected: testutil.ExpectedResponse{
+				StatusCode:  http.StatusOK,
+				BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("This is a valid file.")},
+			},
+		},
+	}
+
+	testDef := testutil.E2ETestDefinition{
+		Name:                "HTTPRequestHeaderValidation",
+		ServerBinaryPath:    serverBinaryPath,
+		ServerConfigData:    baseConfig,
+		ServerConfigFormat:  "json",
+		ServerConfigArgName: "-config",
+		ServerListenAddress: *baseConfig.Server.Address,
+		TestCases:           testCases,
+		CurlPath:            defaultCurlPath,
+	}
+	testutil.RunE2ETest(t, testDef)
+}
+
 // as per spec 1.2.3 (PathPattern validation) and 1.2.4 (Ambiguity).
 func TestRouting_ConfigValidationFailures(t *testing.T) {
 	t.Parallel()
