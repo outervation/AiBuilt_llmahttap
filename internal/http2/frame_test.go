@@ -867,7 +867,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{5}, // PadLength field says 5.
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream 1",
+			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream %d", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength greater than FrameHeader.Length (invalid)", // PadLength value >= FrameHeader.Length (10 >= 3)
