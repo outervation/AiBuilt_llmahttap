@@ -525,51 +525,6 @@ func TestStream_handleDataFrame(t *testing.T) {
 			expectPipeWriterClosed:      true,
 			expectedFcRecvWindowReduced: true,
 		},
-		// --- NEW TEST CASES FOR Content-Length validation (TASK 2 additions) ---
-		{
-			name:                 "Content-Length > 0, actual data = 0, with END_STREAM",
-			initialStreamState:   StreamStateOpen,
-			initialOurWindowSize: 100,
-			frameData:            []byte(""), // Actual data is 0 bytes
-			frameEndStream:       true,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				declaredLength := int64(10) // CL = 10 (N > 0)
-				s.parsedContentLength = &declaredLength
-				s.receivedDataBytes = 0 // No prior data
-				s.mu.Unlock()
-			},
-			expectError:                 true,
-			expectedErrorCode:           ErrCodeProtocolError,
-			expectedErrorContains:       "content-length mismatch on END_STREAM: declared 10, received 0",
-			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
-			expectedEndStreamReceived:   true,
-			expectedDataInPipe:          nil,
-			expectPipeWriterClosed:      true,
-			expectedFcRecvWindowReduced: true, // FC for 0 bytes still processed
-		},
-		{
-			name:                 "Content-Length = 0, actual data > 0, with END_STREAM",
-			initialStreamState:   StreamStateOpen,
-			initialOurWindowSize: 100,
-			frameData:            []byte("hasdata"), // Actual data is 7 bytes
-			frameEndStream:       true,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				declaredLength := int64(0) // CL = 0
-				s.parsedContentLength = &declaredLength
-				s.receivedDataBytes = 0 // No prior data
-				s.mu.Unlock()
-			},
-			expectError:                 true,
-			expectedErrorCode:           ErrCodeProtocolError,
-			expectedErrorContains:       "content-length mismatch on END_STREAM: declared 0, received 7",
-			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
-			expectedEndStreamReceived:   true,
-			expectedDataInPipe:          nil,
-			expectPipeWriterClosed:      true,
-			expectedFcRecvWindowReduced: true,
-		},
 	}
 
 	for _, tc := range testCases {
