@@ -836,14 +836,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		// "The endpoint MUST treat this as a stream error of type STREAM_CLOSED."
 		// An RST_STREAM should be sent by the connection management logic if this function returns an error.
 		// However, sending one here explicitly aligns with the immediate detection of the error.
-		if err := s.sendRSTStream(ErrCodeStreamClosed); err != nil {
-			s.conn.log.Error("Stream.processRequestHeadersAndDispatch: Failed to send RST_STREAM for closed stream.", logger.LogFields{"stream_id": s.id, "error": err})
-			// If sending RST_STREAM fails, it's a more severe problem, possibly a connection error.
-			// Propagate this error.
-			return err
-		}
-		// Return a StreamError so the caller (Connection) knows this specific stream had an issue.
-		// The RST_STREAM has been initiated.
+
 		return NewStreamError(s.id, ErrCodeStreamClosed, "headers received on closed stream")
 	}
 
