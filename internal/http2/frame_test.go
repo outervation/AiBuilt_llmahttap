@@ -805,7 +805,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: "DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream 1",
+			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream %d", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength too large for payload (PadLength + some data)", // PadLength value >= FrameHeader.Length (10 >= 3)
