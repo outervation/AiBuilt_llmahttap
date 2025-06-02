@@ -266,7 +266,7 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 				return fmt.Errorf("reading padding: %w", err)
 			}
 		} else {
-			f.Padding = []byte{} // PadLength field was 0, so empty padding
+			f.Padding = []byte{} // PadLength field was 0, so an empty non-nil slice for padding.
 		}
 	} else {
 		f.Padding = nil // Not padded, so no padding bytes
