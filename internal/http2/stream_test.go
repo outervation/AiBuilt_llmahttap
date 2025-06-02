@@ -596,9 +596,30 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "invalid: multiple connection-specific headers",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":path", Value: "/"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "Connection", Value: "close"},          // Connection-specific
+				{Name: "Keep-Alive", Value: "timeout=10"},     // Connection-specific
+				{Name: "Transfer-Encoding", Value: "chunked"}, // Connection-specific
+			},
+
+			expectErrorFromFunc: true,
+			expectRST:           true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for multiple connection-specific headers, expected not called.")
+				}
+			},
+		},
 		// --- NEW TEST CASE FOR HEADERS ON CLOSED STREAM (TASK 3) ---
 		{
-			name:      "invalid: HEADERS on already closed stream",
+		name:      "invalid: HEADERS on already closed stream",
 			headers:   baseHeaders,
 			endStream: false, // Flag on this HEADERS frame doesn't matter much here
 			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
@@ -627,7 +648,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 		},
 		// --- NEW TEST CASE FOR HEADERS ON CLOSED STREAM (TASK 3) ---
 		{
-			name:      "invalid: HEADERS on already closed stream#01", // Variant with pendingRSTCode
+		name:      "invalid: HEADERS on already closed stream#01", // Variant with pendingRSTCode
 			headers:   baseHeaders,
 			endStream: false,
 			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
@@ -655,7 +676,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 		},
 		{
 
-			name: "valid: TE header with 'trailers'",
+		name: "valid: TE header with 'trailers'",
 			headers: []hpack.HeaderField{
 				{Name: ":method", Value: "GET"},
 				{Name: ":scheme", Value: "https"},
@@ -688,272 +709,272 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 		// --- END NEW TEST CASES FOR INVALID HEADERS ---
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.dispatcher != nil { // Only Add if a dispatcher function (which calls Done) is provided for the test case
-				wg.Add(1)
-			}
+for _, tc := range tests {
+	t.Run(tc.name, func(t *testing.T) {
+		if tc.dispatcher != nil { // Only Add if a dispatcher function (which calls Done) is provided for the test case
+			wg.Add(1)
+		}
 
-			// mockRequestDispatcher is defined in conn_test.go
-			mrd := &mockRequestDispatcher{}
-			if tc.dispatcher != nil { // tc.dispatcher is func(sw StreamWriter, req *http.Request)
-				mrd.fn = tc.dispatcher
-			} else if !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") {
-				// Default dispatcher for non-nil, non-panic tests if not provided
-				mrd.fn = func(sw StreamWriter, req *http.Request) {
-					defer wg.Done() // wg is defined in the outer TestStream_processRequestHeadersAndDispatch
-					// Default no-op, or basic validation
-					if req == nil {
-						t.Errorf("Default dispatcher: received nil *http.Request on stream %d", sw.ID())
-					}
+		// mockRequestDispatcher is defined in conn_test.go
+		mrd := &mockRequestDispatcher{}
+		if tc.dispatcher != nil { // tc.dispatcher is func(sw StreamWriter, req *http.Request)
+			mrd.fn = tc.dispatcher
+		} else if !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") {
+			// Default dispatcher for non-nil, non-panic tests if not provided
+			mrd.fn = func(sw StreamWriter, req *http.Request) {
+				defer wg.Done() // wg is defined in the outer TestStream_processRequestHeadersAndDispatch
+				// Default no-op, or basic validation
+				if req == nil {
+					t.Errorf("Default dispatcher: received nil *http.Request on stream %d", sw.ID())
 				}
 			}
+		}
 
-			// newTestConnection is from conn_test.go
-			// It sets up a real Connection with a mockNetConn and the provided dispatcher (mrd.Dispatch)
-			// The dispatcher set on the connection (conn.dispatcher) will be used by newStream
-			// if no specific dispatcher is given to a stream later.
-			// However, processRequestHeadersAndDispatch takes a dispatcher func directly.
-			conn, mnc := newTestConnection(t, false /*isClient*/, mrd)
+		// newTestConnection is from conn_test.go
+		// It sets up a real Connection with a mockNetConn and the provided dispatcher (mrd.Dispatch)
+		// The dispatcher set on the connection (conn.dispatcher) will be used by newStream
+		// if no specific dispatcher is given to a stream later.
+		// However, processRequestHeadersAndDispatch takes a dispatcher func directly.
+		conn, mnc := newTestConnection(t, false /*isClient*/, mrd)
 
-			// Crucial: Ensure conn.cfgRemoteAddrStr is set for http.Request.RemoteAddr
-			// newTestConnection does not explicitly set this. We set it on the mockNetConn's remoteAddr.
-			// conn.remoteAddrStr is derived from conn.netConn.RemoteAddr().String()
-			// So, ensuring mnc.remoteAddr is sensible is enough.
-			// Example: mnc.remoteAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} (done in newMockNetConn)
-			// Let's ensure cfgRemoteAddrStr on the actual *Connection object is also updated if stream.go uses it.
-			// The current stream.go uses req.RemoteAddr which is populated from s.conn.remoteAddrStr
-			conn.remoteAddrStr = mnc.RemoteAddr().String() // Ensure conn.remoteAddrStr is explicitly set from mnc.
-			conn.maxFrameSize = DefaultMaxFrameSize        // Ensure this is set for tests.
+		// Crucial: Ensure conn.cfgRemoteAddrStr is set for http.Request.RemoteAddr
+		// newTestConnection does not explicitly set this. We set it on the mockNetConn's remoteAddr.
+		// conn.remoteAddrStr is derived from conn.netConn.RemoteAddr().String()
+		// So, ensuring mnc.remoteAddr is sensible is enough.
+		// Example: mnc.remoteAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} (done in newMockNetConn)
+		// Let's ensure cfgRemoteAddrStr on the actual *Connection object is also updated if stream.go uses it.
+		// The current stream.go uses req.RemoteAddr which is populated from s.conn.remoteAddrStr
+		conn.remoteAddrStr = mnc.RemoteAddr().String() // Ensure conn.remoteAddrStr is explicitly set from mnc.
+		conn.maxFrameSize = DefaultMaxFrameSize        // Ensure this is set for tests.
 
-			// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
-			performHandshakeForTest(t, conn, mnc) // from conn_test.go
-			mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
+		// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
+		performHandshakeForTest(t, conn, mnc) // from conn_test.go
+		mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
 
-			// Create stream using the real connection.
-			// Pass 0 for window sizes so newTestStream uses the connection's default/negotiated ones.
-			stream := newTestStream(t, testStreamID, conn, true /*isPeerInitiated*/, 0, 0)
+		// Create stream using the real connection.
+		// Pass 0 for window sizes so newTestStream uses the connection's default/negotiated ones.
+		stream := newTestStream(t, testStreamID, conn, true /*isPeerInitiated*/, 0, 0)
 
-			if tc.preFunc != nil {
-				tc.preFunc(stream, t, struct{ endStream bool }{tc.endStream})
+		if tc.preFunc != nil {
+			tc.preFunc(stream, t, struct{ endStream bool }{tc.endStream})
+		} else {
+			stream.mu.Lock()
+			if tc.endStream { // If HEADERS has END_STREAM
+				stream.state = StreamStateIdle // Will transition to HalfClosedRemote in processRequestHeadersAndDispatch
+				// stream.endStreamReceivedFromClient will be set by processRequestHeadersAndDispatch
+				// stream.requestBodyWriter will be closed by processRequestHeadersAndDispatch
 			} else {
-				stream.mu.Lock()
-				if tc.endStream { // If HEADERS has END_STREAM
-					stream.state = StreamStateIdle // Will transition to HalfClosedRemote in processRequestHeadersAndDispatch
-					// stream.endStreamReceivedFromClient will be set by processRequestHeadersAndDispatch
-					// stream.requestBodyWriter will be closed by processRequestHeadersAndDispatch
-				} else {
-					stream.state = StreamStateIdle // Will transition to Open
-				}
-				stream.mu.Unlock()
+				stream.state = StreamStateIdle // Will transition to Open
+			}
+			stream.mu.Unlock()
+		}
+
+		var dispatcherToUse func(StreamWriter, *http.Request)
+		if !tc.isDispatcherNilTest {
+			dispatcherToUse = mrd.Dispatch // Use the mock dispatcher's method
+		} else {
+		}
+
+		err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
+
+		if tc.expectErrorFromFunc {
+			if err == nil {
+				t.Fatalf("Expected an error from processRequestHeadersAndDispatch, but got nil")
+			}
+			t.Logf("Got expected error from processRequestHeadersAndDispatch: %v", err)
+
+			// Verify the error is a StreamError with the expected code and stream ID
+			streamErr, ok := err.(*StreamError)
+			if !ok {
+				t.Fatalf("Expected a StreamError from processRequestHeadersAndDispatch, got %T: %v", err, err)
+			}
+			if streamErr.Code != tc.expectedRSTCode {
+				t.Errorf("Expected StreamError code %s from processRequestHeadersAndDispatch, got %s", tc.expectedRSTCode, streamErr.Code)
+			}
+			if streamErr.StreamID != stream.id {
+				t.Errorf("Expected StreamError StreamID %d from processRequestHeadersAndDispatch, got %d", stream.id, streamErr.StreamID)
 			}
 
-			var dispatcherToUse func(StreamWriter, *http.Request)
-			if !tc.isDispatcherNilTest {
-				dispatcherToUse = mrd.Dispatch // Use the mock dispatcher's method
-			} else {
+			// The RST_STREAM frame itself is checked later by tc.expectRST block,
+			// which verifies it was written to the mock net.Conn by the SUT (stream.processRequestHeadersAndDispatch
+			// calling s.sendRSTStream).
+			// The previous simulation of conn.sendRSTStreamFrame here was redundant for these cases.
+		} else {
+			if err != nil {
+				// If no error was expected, but we got one, fail the test.
+				t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
 			}
+		}
 
-			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
-
-			if tc.expectErrorFromFunc {
-				if err == nil {
-					t.Fatalf("Expected an error from processRequestHeadersAndDispatch, but got nil")
-				}
-				t.Logf("Got expected error from processRequestHeadersAndDispatch: %v", err)
-
-				// Verify the error is a StreamError with the expected code and stream ID
-				streamErr, ok := err.(*StreamError)
-				if !ok {
-					t.Fatalf("Expected a StreamError from processRequestHeadersAndDispatch, got %T: %v", err, err)
-				}
-				if streamErr.Code != tc.expectedRSTCode {
-					t.Errorf("Expected StreamError code %s from processRequestHeadersAndDispatch, got %s", tc.expectedRSTCode, streamErr.Code)
-				}
-				if streamErr.StreamID != stream.id {
-					t.Errorf("Expected StreamError StreamID %d from processRequestHeadersAndDispatch, got %d", stream.id, streamErr.StreamID)
-				}
-
-				// The RST_STREAM frame itself is checked later by tc.expectRST block,
-				// which verifies it was written to the mock net.Conn by the SUT (stream.processRequestHeadersAndDispatch
-				// calling s.sendRSTStream).
-				// The previous simulation of conn.sendRSTStreamFrame here was redundant for these cases.
-			} else {
-				if err != nil {
-					// If no error was expected, but we got one, fail the test.
-					t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
-				}
-			}
-
-			if tc.expectRST {
-				// Instead of reading from conn.writerChan:
-				var rstFrameFound *RSTStreamFrame
-				// Use a slightly longer timeout to give writerLoop and panic recovery ample time.
-				// The log shows the RST is written quickly, but test environments can vary.
-				waitForCondition(t, 250*time.Millisecond, 20*time.Millisecond, func() bool {
-					// Reset buffer before reading to ensure we only see frames from this specific action
-					// mnc.ResetWriteBuffer() // NO! This is wrong here. We need to accumulate.
-					// We are checking mnc's buffer which accumulates all writes.
-					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-					for _, f := range frames {
-						if rst, ok := f.(*RSTStreamFrame); ok {
-							if rst.Header().StreamID == stream.id { // Ensure it's for the correct stream
-								rstFrameFound = rst
-								return true
-							}
-						}
-					}
-					return false
-				}, fmt.Sprintf("RST_STREAM frame for stream %d (code %s) to be written to mock net.Conn (Test: %s)", stream.id, tc.expectedRSTCode, tc.name))
-
-				if rstFrameFound == nil {
-					// Log frames actually found for debugging
-					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-					var frameSummaries []string
-					for _, fr := range allFrames {
-						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
-					}
-					t.Logf("Frames found on mock net.conn for test '%s', stream %d: %v", tc.name, stream.id, frameSummaries)
-					t.Fatalf("Expected RSTStreamFrame for stream %d on mock net.Conn, but none found (Test: %s)", stream.id, tc.name)
-				}
-
-				// rstFrameFound is now populated
-				if rstFrameFound.ErrorCode != tc.expectedRSTCode {
-					t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s (Test: %s, Stream: %d)", rstFrameFound.ErrorCode, tc.expectedRSTCode, tc.name, stream.id)
-				}
-				// We've found the RST. We should clear the mnc buffer *after* this sub-test's check,
-				// so the next sub-test starts fresh.
-				// However, mnc.ResetWriteBuffer() is already called after performHandshakeForTest at the start of each sub-test run.
-				// So, we don't strictly need to clear it here again, unless multiple RSTs could be sent by one action.
-				// For safety, let's clear it if an RST was expected and found.
-				mnc.ResetWriteBuffer()
-			} else { // No RST expected from the specific action being tested
-				// Give a very brief moment for any unexpected frames to be written by writerLoop
-				time.Sleep(50 * time.Millisecond)
+		if tc.expectRST {
+			// Instead of reading from conn.writerChan:
+			var rstFrameFound *RSTStreamFrame
+			// Use a slightly longer timeout to give writerLoop and panic recovery ample time.
+			// The log shows the RST is written quickly, but test environments can vary.
+			waitForCondition(t, 250*time.Millisecond, 20*time.Millisecond, func() bool {
+				// Reset buffer before reading to ensure we only see frames from this specific action
+				// mnc.ResetWriteBuffer() // NO! This is wrong here. We need to accumulate.
+				// We are checking mnc's buffer which accumulates all writes.
 				frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-
-				unexpectedActionFrames := []Frame{}
-
-				// isCleanupRSTPresent was here, removed as unused.
-
 				for _, f := range frames {
-					// Check if it's an RST frame that could be from the stream's cleanup (called by newTestStream's t.Cleanup)
-					if rstFrame, ok := f.(*RSTStreamFrame); ok && rstFrame.Header().StreamID == stream.id {
-						// If this is the *only* frame, or if other frames are also just cleanup related, it might be OK.
-						// This check is tricky. A simple heuristic: if an RST for *this* stream is found,
-						// and no RST was expected by tc.expectRST, it's suspicious unless it's clearly cleanup.
-						// The t.Cleanup runs *after* the test logic. If we see an RST here, it's likely from the test logic itself.
-						t.Logf("Unexpected RSTStreamFrame found for stream %d when no RST was expected by test case '%s'. Code: %s. This might be an issue or overly aggressive cleanup simulation.", stream.id, tc.name, rstFrame.ErrorCode)
-						unexpectedActionFrames = append(unexpectedActionFrames, f)
-						// Don't set isCleanupRSTPresent = true here, as we are checking for *unexpected* frames from the action.
-					} else {
-						unexpectedActionFrames = append(unexpectedActionFrames, f)
+					if rst, ok := f.(*RSTStreamFrame); ok {
+						if rst.Header().StreamID == stream.id { // Ensure it's for the correct stream
+							rstFrameFound = rst
+							return true
+						}
 					}
 				}
+				return false
+			}, fmt.Sprintf("RST_STREAM frame for stream %d (code %s) to be written to mock net.Conn (Test: %s)", stream.id, tc.expectedRSTCode, tc.name))
 
-				if len(unexpectedActionFrames) > 0 {
-					var frameSummaries []string
-					for _, fr := range unexpectedActionFrames {
-						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
-					}
-					t.Errorf("Did not expect frames from test logic on mock net.Conn for test '%s' (stream %d), but got: %v", tc.name, stream.id, frameSummaries)
+			if rstFrameFound == nil {
+				// Log frames actually found for debugging
+				allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
+				var frameSummaries []string
+				for _, fr := range allFrames {
+					frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
 				}
-				// Clear the buffer regardless, so subsequent sub-tests don't see these frames.
-				// This is important because ResetWriteBuffer is called at the start of the sub-test (line 1562)
-				// AFTER performHandshake, so frames from one sub-test's action might linger if not cleared here.
-				mnc.ResetWriteBuffer()
+				t.Logf("Frames found on mock net.conn for test '%s', stream %d: %v", tc.name, stream.id, frameSummaries)
+				t.Fatalf("Expected RSTStreamFrame for stream %d on mock net.Conn, but none found (Test: %s)", stream.id, tc.name)
 			}
 
-			// This block checks dispatcher call and request properties.
-			// It should only run if the function itself didn't error, isn't a nil dispatcher test,
-			// and isn't the panic test (as panic recovery sends RST but dispatcher won't complete normally).
-			if !tc.expectErrorFromFunc && !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") && tc.expectedReq != nil {
-				// Wait a bit for the dispatcher goroutine to run.
-				// The dispatcher itself (mrd.fn) might do assertions.
-				var dispatcherCalled bool
-				var lastReqReceived *http.Request
+			// rstFrameFound is now populated
+			if rstFrameFound.ErrorCode != tc.expectedRSTCode {
+				t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s (Test: %s, Stream: %d)", rstFrameFound.ErrorCode, tc.expectedRSTCode, tc.name, stream.id)
+			}
+			// We've found the RST. We should clear the mnc buffer *after* this sub-test's check,
+			// so the next sub-test starts fresh.
+			// However, mnc.ResetWriteBuffer() is already called after performHandshakeForTest at the start of each sub-test run.
+			// So, we don't strictly need to clear it here again, unless multiple RSTs could be sent by one action.
+			// For safety, let's clear it if an RST was expected and found.
+			mnc.ResetWriteBuffer()
+		} else { // No RST expected from the specific action being tested
+			// Give a very brief moment for any unexpected frames to be written by writerLoop
+			time.Sleep(50 * time.Millisecond)
+			frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
 
-				// Poll for dispatcher call, with a timeout
-				timeout := time.After(150 * time.Millisecond) // Increased timeout
-				ticker := time.NewTicker(10 * time.Millisecond)
-				defer ticker.Stop()
+			unexpectedActionFrames := []Frame{}
 
-			pollLoop:
-				for {
-					select {
-					case <-timeout:
-						t.Errorf("Timeout waiting for dispatcher to be called (Test: %s)", tc.name)
+			// isCleanupRSTPresent was here, removed as unused.
+
+			for _, f := range frames {
+				// Check if it's an RST frame that could be from the stream's cleanup (called by newTestStream's t.Cleanup)
+				if rstFrame, ok := f.(*RSTStreamFrame); ok && rstFrame.Header().StreamID == stream.id {
+					// If this is the *only* frame, or if other frames are also just cleanup related, it might be OK.
+					// This check is tricky. A simple heuristic: if an RST for *this* stream is found,
+					// and no RST was expected by tc.expectRST, it's suspicious unless it's clearly cleanup.
+					// The t.Cleanup runs *after* the test logic. If we see an RST here, it's likely from the test logic itself.
+					t.Logf("Unexpected RSTStreamFrame found for stream %d when no RST was expected by test case '%s'. Code: %s. This might be an issue or overly aggressive cleanup simulation.", stream.id, tc.name, rstFrame.ErrorCode)
+					unexpectedActionFrames = append(unexpectedActionFrames, f)
+					// Don't set isCleanupRSTPresent = true here, as we are checking for *unexpected* frames from the action.
+				} else {
+					unexpectedActionFrames = append(unexpectedActionFrames, f)
+				}
+			}
+
+			if len(unexpectedActionFrames) > 0 {
+				var frameSummaries []string
+				for _, fr := range unexpectedActionFrames {
+					frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
+				}
+				t.Errorf("Did not expect frames from test logic on mock net.Conn for test '%s' (stream %d), but got: %v", tc.name, stream.id, frameSummaries)
+			}
+			// Clear the buffer regardless, so subsequent sub-tests don't see these frames.
+			// This is important because ResetWriteBuffer is called at the start of the sub-test (line 1562)
+			// AFTER performHandshake, so frames from one sub-test's action might linger if not cleared here.
+			mnc.ResetWriteBuffer()
+		}
+
+		// This block checks dispatcher call and request properties.
+		// It should only run if the function itself didn't error, isn't a nil dispatcher test,
+		// and isn't the panic test (as panic recovery sends RST but dispatcher won't complete normally).
+		if !tc.expectErrorFromFunc && !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") && tc.expectedReq != nil {
+			// Wait a bit for the dispatcher goroutine to run.
+			// The dispatcher itself (mrd.fn) might do assertions.
+			var dispatcherCalled bool
+			var lastReqReceived *http.Request
+
+			// Poll for dispatcher call, with a timeout
+			timeout := time.After(150 * time.Millisecond) // Increased timeout
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+		pollLoop:
+			for {
+				select {
+				case <-timeout:
+					t.Errorf("Timeout waiting for dispatcher to be called (Test: %s)", tc.name)
+					break pollLoop
+				case <-ticker.C:
+					var wasCalled bool
+					var reqFromDispatcher *http.Request
+
+					mrd.mu.Lock() // Lock to safely read mrd.called and mrd.lastReq
+					wasCalled = mrd.called
+					if wasCalled {
+						reqFromDispatcher = mrd.lastReq
+					}
+					mrd.mu.Unlock()
+
+					if wasCalled {
+						dispatcherCalled = true
+						lastReqReceived = reqFromDispatcher
 						break pollLoop
-					case <-ticker.C:
-						var wasCalled bool
-						var reqFromDispatcher *http.Request
-
-						mrd.mu.Lock() // Lock to safely read mrd.called and mrd.lastReq
-						wasCalled = mrd.called
-						if wasCalled {
-							reqFromDispatcher = mrd.lastReq
-						}
-						mrd.mu.Unlock()
-
-						if wasCalled {
-							dispatcherCalled = true
-							lastReqReceived = reqFromDispatcher
-							break pollLoop
-						}
 					}
-				}
-
-				if !dispatcherCalled {
-					t.Fatalf("Dispatcher was not called (Test: %s)", tc.name)
-				}
-
-				if tc.expectedReq != nil && lastReqReceived != nil {
-					if lastReqReceived.Method != tc.expectedReq.Method {
-						t.Errorf("Request Method mismatch: got %s, want %s", lastReqReceived.Method, tc.expectedReq.Method)
-					}
-					if lastReqReceived.URL.String() != tc.expectedReq.URL.String() {
-						t.Errorf("Request URL mismatch: got %s, want %s", lastReqReceived.URL.String(), tc.expectedReq.URL.String())
-					}
-					if !reflect.DeepEqual(lastReqReceived.Header, tc.expectedReq.Header) {
-						t.Errorf("Request Headers mismatch: got %+v, want %+v", lastReqReceived.Header, tc.expectedReq.Header)
-					}
-					if lastReqReceived.Host != tc.expectedReq.Host {
-						t.Errorf("Request Host mismatch: got %s, want %s", lastReqReceived.Host, tc.expectedReq.Host)
-					}
-					if lastReqReceived.RequestURI != tc.expectedReq.RequestURI {
-						t.Errorf("RequestURI mismatch: got %s, want %s", lastReqReceived.RequestURI, tc.expectedReq.RequestURI)
-					}
-					if lastReqReceived.RemoteAddr != conn.remoteAddrStr {
-						t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, conn.remoteAddrStr)
-					}
-					if lastReqReceived.Body != stream.requestBodyReader {
-						t.Error("Request Body is not the stream's requestBodyReader")
-					}
-					if lastReqReceived.Context() != stream.ctx { // Compare underlying contexts if wrapped
-						if lastReqReceived.Context() == nil || stream.ctx == nil {
-							t.Error("One of the contexts is nil when comparing request context")
-						} else {
-							// This direct comparison might fail if context is wrapped.
-							// A more robust check would be if lastReqReceived.Context().Value() can retrieve values set on stream.ctx.
-							// For now, direct comparison is a basic check.
-							// t.Logf("Req ctx: %v, Stream ctx: %v", lastReqReceived.Context(), stream.ctx)
-						}
-					}
-
-					// The dispatcher mrd.fn for "valid headers, with endStream on HEADERS" case already checks body EOF.
 				}
 			}
 
-			if tc.customValidation != nil {
-				tc.customValidation(t, mrd, stream, conn)
+			if !dispatcherCalled {
+				t.Fatalf("Dispatcher was not called (Test: %s)", tc.name)
 			}
-			// Wait for the dispatcher goroutine to complete before the sub-test finishes.
-			// This ensures t.Logf and other t methods are not called on an invalid t.
-			// It also ensures that cleanup logic in newTestStream doesn't race with the dispatcher.
-			if tc.dispatcher != nil { // Only Wait if we Added to the WaitGroup
-				wg.Wait()
+
+			if tc.expectedReq != nil && lastReqReceived != nil {
+				if lastReqReceived.Method != tc.expectedReq.Method {
+					t.Errorf("Request Method mismatch: got %s, want %s", lastReqReceived.Method, tc.expectedReq.Method)
+				}
+				if lastReqReceived.URL.String() != tc.expectedReq.URL.String() {
+					t.Errorf("Request URL mismatch: got %s, want %s", lastReqReceived.URL.String(), tc.expectedReq.URL.String())
+				}
+				if !reflect.DeepEqual(lastReqReceived.Header, tc.expectedReq.Header) {
+					t.Errorf("Request Headers mismatch: got %+v, want %+v", lastReqReceived.Header, tc.expectedReq.Header)
+				}
+				if lastReqReceived.Host != tc.expectedReq.Host {
+					t.Errorf("Request Host mismatch: got %s, want %s", lastReqReceived.Host, tc.expectedReq.Host)
+				}
+				if lastReqReceived.RequestURI != tc.expectedReq.RequestURI {
+					t.Errorf("RequestURI mismatch: got %s, want %s", lastReqReceived.RequestURI, tc.expectedReq.RequestURI)
+				}
+				if lastReqReceived.RemoteAddr != conn.remoteAddrStr {
+					t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, conn.remoteAddrStr)
+				}
+				if lastReqReceived.Body != stream.requestBodyReader {
+					t.Error("Request Body is not the stream's requestBodyReader")
+				}
+				if lastReqReceived.Context() != stream.ctx { // Compare underlying contexts if wrapped
+					if lastReqReceived.Context() == nil || stream.ctx == nil {
+						t.Error("One of the contexts is nil when comparing request context")
+					} else {
+						// This direct comparison might fail if context is wrapped.
+						// A more robust check would be if lastReqReceived.Context().Value() can retrieve values set on stream.ctx.
+						// For now, direct comparison is a basic check.
+						// t.Logf("Req ctx: %v, Stream ctx: %v", lastReqReceived.Context(), stream.ctx)
+					}
+				}
+
+				// The dispatcher mrd.fn for "valid headers, with endStream on HEADERS" case already checks body EOF.
 			}
-			// newTestStream's t.Cleanup will handle stream.Close()
-		})
-	}
+		}
+
+		if tc.customValidation != nil {
+			tc.customValidation(t, mrd, stream, conn)
+		}
+		// Wait for the dispatcher goroutine to complete before the sub-test finishes.
+		// This ensures t.Logf and other t methods are not called on an invalid t.
+		// It also ensures that cleanup logic in newTestStream doesn't race with the dispatcher.
+		if tc.dispatcher != nil { // Only Wait if we Added to the WaitGroup
+			wg.Wait()
+		}
+		// newTestStream's t.Cleanup will handle stream.Close()
+	})
+}
 }
