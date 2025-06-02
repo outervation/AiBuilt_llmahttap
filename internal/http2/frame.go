@@ -222,42 +222,56 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	if header.StreamID == 0 {
 		return NewConnectionError(ErrCodeProtocolError, "received DATA on stream 0")
 	}
-	payloadLen := f.Length
+
+	var actualDataLength uint32
+	var paddingOctetsToRead uint32 // How many padding octets to read from the stream
 
 	if f.Flags&FlagDataPadded != 0 {
-		var padLenBuf [1]byte
-		if _, err := io.ReadFull(r, padLenBuf[:]); err != nil {
+		var padLenFieldAsByte [1]byte
+		if _, err := io.ReadFull(r, padLenFieldAsByte[:]); err != nil {
 			return fmt.Errorf("reading pad length: %w", err)
 		}
-		f.PadLength = padLenBuf[0]
-		payloadLen--                          // Subtract pad length octet
-		if uint32(f.PadLength) > payloadLen { // Corrected based on RFC 7540 Errata 4254
-			// RFC 7540, Section 6.1 (as per Errata 4254):
-			// "A receiver MUST treat a DATA frame that contains padding that is longer than
-			// the frame payload remaining after the Pad Length field has been removed
-			// as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
-			// 'payloadLen' here is (FrameHeader.Length - 1), which is (Data + Padding).
-			// So, if f.PadLength > (Data + Padding), it implies Data length < 0.
-			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame invalid pad length: pad length %d > remaining payload (Data+Padding) %d for stream %d", f.PadLength, payloadLen, header.StreamID))
+		f.PadLength = padLenFieldAsByte[0] // Store the PadLength *value* from the 1-byte field
+
+		// Validation: PadLength value must not be such that it implies negative data or consumes the whole frame.
+		// FrameHeader.Length = 1 (PadLength_field) + Data_Length + Padding_Octets_Length (which is f.PadLength value)
+		// So, Data_Length = FrameHeader.Length - 1 - f.PadLength_value.
+		// If f.PadLength_value >= FrameHeader.Length, then Data_Length <= -1, which is invalid.
+		if uint32(f.PadLength) >= f.FrameHeader.Length {
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame invalid: PadLength %d is invalid relative to FrameHeader.Length %d for stream %d", f.PadLength, f.FrameHeader.Length, header.StreamID))
+		}
+
+		// Now that f.PadLength value is validated, calculate lengths
+		actualDataLength = f.FrameHeader.Length - 1 - uint32(f.PadLength)
+		paddingOctetsToRead = uint32(f.PadLength)
+	} else {
+		actualDataLength = f.FrameHeader.Length
+		paddingOctetsToRead = 0
+		f.PadLength = 0 // Ensure f.PadLength struct field is 0 if not padded.
+	}
+
+	f.Data = make([]byte, actualDataLength)
+	if actualDataLength > 0 { // Only read if there's data to read
+		if _, err := io.ReadFull(r, f.Data); err != nil {
+			return fmt.Errorf("reading data: %w", err)
 		}
 	}
 
-	dataLen := payloadLen
+	// Read padding if PADDED flag was set and there are padding octets specified by f.PadLength
 	if f.Flags&FlagDataPadded != 0 {
-		dataLen -= uint32(f.PadLength)
-	}
-
-	f.Data = make([]byte, dataLen)
-	if _, err := io.ReadFull(r, f.Data); err != nil {
-		return fmt.Errorf("reading data: %w", err)
-	}
-
-	if f.Flags&FlagDataPadded != 0 {
-		f.Padding = make([]byte, f.PadLength)
-		if _, err := io.ReadFull(r, f.Padding); err != nil {
-			return fmt.Errorf("reading padding: %w", err)
+		if paddingOctetsToRead > 0 {
+			f.Padding = make([]byte, paddingOctetsToRead)
+			if _, err := io.ReadFull(r, f.Padding); err != nil {
+				// This is where "unexpected EOF" occurs in tests
+				return fmt.Errorf("reading padding: %w", err)
+			}
+		} else {
+			f.Padding = []byte{} // PadLength field was 0, so empty padding
 		}
+	} else {
+		f.Padding = nil // Not padded, so no padding bytes
 	}
+
 	return nil
 }
 
