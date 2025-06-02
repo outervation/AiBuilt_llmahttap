@@ -8,13 +8,16 @@ package http2
 import (
 	"context"
 	"fmt"
-
-	"errors"
 	"io"
+	"net/http"
+	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2/hpack"
 )
 
 // TestStream_Close_SendsRSTAndCleansUp tests the stream.Close() method.
