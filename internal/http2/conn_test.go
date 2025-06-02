@@ -5,7 +5,6 @@ package http2
    context compared to having just one big file open.
 */
 
-
 import (
 	"encoding/hex"
 	"errors"
@@ -18,7 +17,6 @@ import (
 
 	"example.com/llmahttap/v2/internal/logger"
 )
-
 
 func TestServerHandshake_Success(t *testing.T) {
 	conn, mnc := newTestConnection(t, false, nil) // Server-side
@@ -1327,4 +1325,3 @@ func TestConnection_DispatchWindowUpdateFrame_ConnLevel_Overflow(t *testing.T) {
 	}
 	closeErr = nil
 }
-

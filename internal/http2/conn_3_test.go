@@ -20,7 +20,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-
 func TestServerHandshake_Failure_TimeoutWritingServerSettings(t *testing.T) {
 	conn, mnc := newTestConnection(t, false, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_TimeoutWritingServerSettings")
@@ -1124,4 +1123,3 @@ func TestInterleavedUnknownFrameDuringHeaderBlock(t *testing.T) {
 		closeErr = nil
 	}
 }
-

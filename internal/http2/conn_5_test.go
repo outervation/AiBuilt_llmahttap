@@ -19,7 +19,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-
 // TestConnection_DispatchDataFrame tests the connection's dispatchDataFrame method.
 func TestConnection_DispatchDataFrame(t *testing.T) {
 	t.Parallel()

@@ -4,7 +4,7 @@ package http2
    NOTE: The stream tests are split into multiple files to reduce the load on LLM
    context compared to having just one big file open.
 */
-   
+
 import (
 	"context"
 	"fmt"
@@ -76,7 +76,6 @@ func TestStream_IDAndContext(t *testing.T) {
 		t.Error("stream context was not done after stream.Close(), expected done")
 	}
 }
-
 
 func TestStream_SendHeaders(t *testing.T) {
 	t.Parallel()

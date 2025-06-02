@@ -7,20 +7,15 @@ package http2
 
 import (
 	"context"
+	"errors"
 	"fmt"
-
 	"io"
-	"net/http"
-	"net/url"
-	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
-
 
 // TestStream_transitionStateOnSendEndStream tests the internal state transitions
 // when the server sends an END_STREAM flag.
@@ -522,8 +517,6 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 		})
 	}
 }
-
-
 
 // The original getPipeErrors has been removed as it was too complex and had side effects.
 // The checks are now done directly in TestStream_setState_GeneralTransitions.

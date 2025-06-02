@@ -15,7 +15,6 @@ import (
 	"time"
 )
 
-
 func TestConnection_DispatchPriorityFrame(t *testing.T) {
 	t.Parallel()
 
