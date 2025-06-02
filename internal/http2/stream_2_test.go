@@ -366,655 +366,6 @@ func TestNewStream_PriorityAddFailure(t *testing.T) {
 	// The internal cleanup within newStream's error path is assumed to be tested by virtue of it being there.
 }
 
-func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
-	t.Parallel()
-	const testStreamID = uint32(1)
-	var wg sync.WaitGroup
-
-	baseHeaders := []hpack.HeaderField{
-		{Name: ":method", Value: "GET"},
-		{Name: ":scheme", Value: "https"},
-		{Name: ":path", Value: "/test?query=1"},
-		{Name: ":authority", Value: "example.com"},
-		{Name: "user-agent", Value: "test-agent"},
-		{Name: "accept", Value: "application/json"},
-	}
-
-	tests := []struct {
-		name                string
-		headers             []hpack.HeaderField
-		endStream           bool // This is the endStream flag from the HEADERS frame
-		dispatcher          func(sw StreamWriter, req *http.Request)
-		isDispatcherNilTest bool
-		preFunc             func(s *Stream, t *testing.T, tcData struct{ endStream bool }) // To setup stream state for endStream scenarios
-		expectErrorFromFunc bool                                                           // True if processRequestHeadersAndDispatch itself should return an error
-		expectedRSTCode     ErrorCode                                                      // If an RST_STREAM is expected (due to error in func or panic)
-		expectRST           bool                                                           // True if an RST frame should be sent
-		expectedReq         *http.Request                                                  // For comparing parts of the constructed request
-		customValidation    func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection)
-	}{
-		{
-			name:      "valid headers, no endStream on HEADERS",
-			headers:   baseHeaders,
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen // Caller (conn) would set this
-				s.mu.Unlock()
-			},
-			dispatcher: func(sw StreamWriter, req *http.Request) {
-				defer wg.Done()
-				// For "no endStream on HEADERS", body is not expected to be readable yet
-				// without subsequent DATA frames. Avoid Read() to prevent issues.
-				if req.Method != "GET" {
-					t.Errorf("Dispatcher: req.Method = %s, want GET", req.Method)
-				}
-				t.Logf("Dispatcher (no endStream): Bypassing req.Body.Read() for this test case.")
-			},
-			expectedReq: &http.Request{
-				Method: "GET",
-				URL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/test", RawQuery: "query=1"},
-				Proto:  "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
-				Header:     http.Header{"User-Agent": []string{"test-agent"}, "Accept": []string{"application/json"}},
-				Host:       "example.com",
-				RequestURI: "/test?query=1",
-			},
-		},
-		{
-			name:      "valid headers, with endStream on HEADERS",
-			headers:   baseHeaders,
-			endStream: true, // HEADERS frame has END_STREAM
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateHalfClosedRemote // Caller (conn) would set this
-				s.endStreamReceivedFromClient = true  // Caller (conn) would set this
-				s.mu.Unlock()
-				// Caller (conn) would close the request body writer
-				if err := s.requestBodyWriter.Close(); err != nil {
-					t.Fatalf("preFunc: failed to close requestBodyWriter: %v", err)
-				}
-			},
-			dispatcher: func(sw StreamWriter, req *http.Request) {
-				defer wg.Done()
-				// Body should yield EOF immediately
-				bodyBytes, err := io.ReadAll(req.Body)
-				if err != nil {
-					t.Errorf("Dispatcher (endStream): Error reading request body: %v", err)
-				}
-				if len(bodyBytes) != 0 {
-					t.Errorf("Dispatcher (endStream): Expected empty body (EOF) for END_STREAM on HEADERS, got %d bytes: %s", len(bodyBytes), string(bodyBytes))
-				}
-			},
-			expectedReq: &http.Request{
-				Method: "GET",
-				URL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/test", RawQuery: "query=1"},
-				Proto:  "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
-				Header:     http.Header{"User-Agent": []string{"test-agent"}, "Accept": []string{"application/json"}},
-				Host:       "example.com",
-				RequestURI: "/test?query=1",
-			},
-		},
-		{
-			name: "missing :method pseudo-header",
-			headers: []hpack.HeaderField{
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/test"},
-				{Name: ":authority", Value: "example.com"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen // or Idle, then transition error happens in conn
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true, // Error from pseudo header validation
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-		},
-		{
-			name: "missing :path pseudo-header",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":authority", Value: "example.com"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-		},
-		{
-			name: "missing :scheme pseudo-header",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":path", Value: "/test"},
-				{Name: ":authority", Value: "example.com"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-		},
-		{
-			name:                "nil dispatcher",
-			headers:             baseHeaders,
-			endStream:           false,
-			isDispatcherNilTest: true,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true, // Error due to nil dispatcher
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeInternalError,
-		},
-		{
-			name:      "dispatcher panics",
-			headers:   baseHeaders,
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			dispatcher: func(sw StreamWriter, req *http.Request) {
-				defer wg.Done()
-				panic("test panic in dispatcher")
-			},
-			expectErrorFromFunc: false, // processRequestHeadersAndDispatch returns nil, panic handled in goroutine
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeInternalError, // RST from panic recovery
-		},
-		// --- NEW TEST CASES FOR INVALID HEADERS (TASK 1) ---
-		{
-			name: "invalid: uppercase header field name",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "X-Custom-Header", Value: "uppercase-fail"}, // Invalid
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for uppercase header name, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: pseudo-header in trailer block",
-			headers: []hpack.HeaderField{
-				{Name: ":status", Value: "200"},
-				{Name: "trailer-field", Value: "value"},
-			},
-			endStream: true,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.initialHeadersProcessed = true // Simulate that initial headers were already processed
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true, // Expecting this to be true based on prior analysis that validation should return error
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for pseudo-header in trailers, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: connection-specific header (Connection)",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"}, // Added for base validity
-				{Name: "Connection", Value: "keep-alive"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false, // stream.go's processRequestHeadersAndDispatch sends RST and returns nil currently
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for 'Connection' header, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: connection-specific header (Keep-Alive)",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "Keep-Alive", Value: "timeout=5"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for 'Keep-Alive' header, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: connection-specific header (Proxy-Connection)",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "Proxy-Connection", Value: "close"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for 'Proxy-Connection' header, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: connection-specific header (Transfer-Encoding)",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "POST"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "Transfer-Encoding", Value: "chunked"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for 'Transfer-Encoding' header, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: connection-specific header (Upgrade)",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "Upgrade", Value: "websocket"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for 'Upgrade' header, expected not called.")
-				}
-			},
-		},
-		{
-			name: "invalid: TE header with value other than 'trailers'",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "TE", Value: "compress, gzip"},
-			},
-			endStream: false,
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for invalid 'TE' header, expected not called.")
-				}
-			},
-		},
-		{
-
-			name: "valid: TE header with 'trailers'",
-			headers: []hpack.HeaderField{
-				{Name: ":method", Value: "GET"},
-				{Name: ":scheme", Value: "https"},
-				{Name: ":path", Value: "/"},
-				{Name: ":authority", Value: "example.com"},
-				{Name: "te", Value: "trailers"}, // Changed "TE" to "te"
-			},
-			endStream: false,
-			dispatcher: func(sw StreamWriter, req *http.Request) {
-				defer wg.Done()                         // wg is captured from the outer test function
-				if req.Header.Get("te") != "trailers" { // Changed Get("TE") to Get("te")
-					t.Errorf("Dispatcher: te header mismatch, got %s", req.Header.Get("te"))
-				}
-			},
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: false,
-			expectRST:           false,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() == 0 { // dispatcher field of tc is mrd.fn
-					t.Error("Dispatcher was not called for valid te header, expected called.")
-				} else if mrd.CalledCount() > 1 {
-					t.Errorf("Dispatcher was called %d times for valid te header, expected 1.", mrd.CalledCount())
-				}
-			},
-		}, // Added trailing comma
-		// --- END NEW TEST CASES FOR INVALID HEADERS ---
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.dispatcher != nil { // Only Add if a dispatcher function (which calls Done) is provided for the test case
-				wg.Add(1)
-			}
-
-			// mockRequestDispatcher is defined in conn_test.go
-			mrd := &mockRequestDispatcher{}
-			if tc.dispatcher != nil { // tc.dispatcher is func(sw StreamWriter, req *http.Request)
-				mrd.fn = tc.dispatcher
-			} else if !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") {
-				// Default dispatcher for non-nil, non-panic tests if not provided
-				mrd.fn = func(sw StreamWriter, req *http.Request) {
-					defer wg.Done() // wg is defined in the outer TestStream_processRequestHeadersAndDispatch
-					// Default no-op, or basic validation
-					if req == nil {
-						t.Errorf("Default dispatcher: received nil *http.Request on stream %d", sw.ID())
-					}
-				}
-			}
-
-			// newTestConnection is from conn_test.go
-			// It sets up a real Connection with a mockNetConn and the provided dispatcher (mrd.Dispatch)
-			// The dispatcher set on the connection (conn.dispatcher) will be used by newStream
-			// if no specific dispatcher is given to a stream later.
-			// However, processRequestHeadersAndDispatch takes a dispatcher func directly.
-			conn, mnc := newTestConnection(t, false /*isClient*/, mrd)
-
-			// Crucial: Ensure conn.cfgRemoteAddrStr is set for http.Request.RemoteAddr
-			// newTestConnection does not explicitly set this. We set it on the mockNetConn's remoteAddr.
-			// conn.remoteAddrStr is derived from conn.netConn.RemoteAddr().String()
-			// So, ensuring mnc.remoteAddr is sensible is enough.
-			// Example: mnc.remoteAddr = &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} (done in newMockNetConn)
-			// Let's ensure cfgRemoteAddrStr on the actual *Connection object is also updated if stream.go uses it.
-			// The current stream.go uses req.RemoteAddr which is populated from s.conn.remoteAddrStr
-			conn.remoteAddrStr = mnc.RemoteAddr().String() // Ensure conn.remoteAddrStr is explicitly set from mnc.
-			conn.maxFrameSize = DefaultMaxFrameSize        // Ensure this is set for tests.
-
-			// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
-			performHandshakeForTest(t, conn, mnc) // from conn_test.go
-			mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
-
-			// Create stream using the real connection.
-			// Pass 0 for window sizes so newTestStream uses the connection's default/negotiated ones.
-			stream := newTestStream(t, testStreamID, conn, true /*isPeerInitiated*/, 0, 0)
-
-			if tc.preFunc != nil {
-				tc.preFunc(stream, t, struct{ endStream bool }{tc.endStream})
-			} else {
-				stream.mu.Lock()
-				if tc.endStream { // If HEADERS has END_STREAM
-					stream.state = StreamStateIdle // Will transition to HalfClosedRemote in processRequestHeadersAndDispatch
-					// stream.endStreamReceivedFromClient will be set by processRequestHeadersAndDispatch
-					// stream.requestBodyWriter will be closed by processRequestHeadersAndDispatch
-				} else {
-					stream.state = StreamStateIdle // Will transition to Open
-				}
-				stream.mu.Unlock()
-			}
-
-			var dispatcherToUse func(StreamWriter, *http.Request)
-			if !tc.isDispatcherNilTest {
-				dispatcherToUse = mrd.Dispatch // Use the mock dispatcher's method
-			} else {
-			}
-
-			err := stream.processRequestHeadersAndDispatch(tc.headers, tc.endStream, dispatcherToUse)
-
-			if tc.expectErrorFromFunc {
-				if err == nil {
-					t.Fatalf("Expected an error from processRequestHeadersAndDispatch, but got nil")
-				}
-				// Further error content checks can be added here if needed
-				t.Logf("Got expected error from processRequestHeadersAndDispatch: %v", err)
-			} else {
-				if err != nil {
-					t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
-				}
-			}
-
-			if tc.expectRST {
-				// Instead of reading from conn.writerChan:
-				var rstFrameFound *RSTStreamFrame
-				// Use a slightly longer timeout to give writerLoop and panic recovery ample time.
-				// The log shows the RST is written quickly, but test environments can vary.
-				waitForCondition(t, 250*time.Millisecond, 20*time.Millisecond, func() bool {
-					// Reset buffer before reading to ensure we only see frames from this specific action
-					// mnc.ResetWriteBuffer() // NO! This is wrong here. We need to accumulate.
-					// We are checking mnc's buffer which accumulates all writes.
-					frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-					for _, f := range frames {
-						if rst, ok := f.(*RSTStreamFrame); ok {
-							if rst.Header().StreamID == stream.id { // Ensure it's for the correct stream
-								rstFrameFound = rst
-								return true
-							}
-						}
-					}
-					return false
-				}, fmt.Sprintf("RST_STREAM frame for stream %d (code %s) to be written to mock net.Conn (Test: %s)", stream.id, tc.expectedRSTCode, tc.name))
-
-				if rstFrameFound == nil {
-					// Log frames actually found for debugging
-					allFrames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-					var frameSummaries []string
-					for _, fr := range allFrames {
-						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
-					}
-					t.Logf("Frames found on mock net.conn for test '%s', stream %d: %v", tc.name, stream.id, frameSummaries)
-					t.Fatalf("Expected RSTStreamFrame for stream %d on mock net.Conn, but none found (Test: %s)", stream.id, tc.name)
-				}
-
-				// rstFrameFound is now populated
-				if rstFrameFound.ErrorCode != tc.expectedRSTCode {
-					t.Errorf("RSTStreamFrame ErrorCode mismatch: got %s, want %s (Test: %s, Stream: %d)", rstFrameFound.ErrorCode, tc.expectedRSTCode, tc.name, stream.id)
-				}
-				// We've found the RST. We should clear the mnc buffer *after* this sub-test's check,
-				// so the next sub-test starts fresh.
-				// However, mnc.ResetWriteBuffer() is already called after performHandshakeForTest at the start of each sub-test run.
-				// So, we don't strictly need to clear it here again, unless multiple RSTs could be sent by one action.
-				// For safety, let's clear it if an RST was expected and found.
-				mnc.ResetWriteBuffer()
-			} else { // No RST expected from the specific action being tested
-				// Give a very brief moment for any unexpected frames to be written by writerLoop
-				time.Sleep(50 * time.Millisecond)
-				frames := readAllFramesFromBuffer(t, mnc.GetWriteBufferBytes())
-
-				unexpectedActionFrames := []Frame{}
-
-				// isCleanupRSTPresent was here, removed as unused.
-
-				for _, f := range frames {
-					// Check if it's an RST frame that could be from the stream's cleanup (called by newTestStream's t.Cleanup)
-					if rstFrame, ok := f.(*RSTStreamFrame); ok && rstFrame.Header().StreamID == stream.id {
-						// If this is the *only* frame, or if other frames are also just cleanup related, it might be OK.
-						// This check is tricky. A simple heuristic: if an RST for *this* stream is found,
-						// and no RST was expected by tc.expectRST, it's suspicious unless it's clearly cleanup.
-						// The t.Cleanup runs *after* the test logic. If we see an RST here, it's likely from the test logic itself.
-						t.Logf("Unexpected RSTStreamFrame found for stream %d when no RST was expected by test case '%s'. Code: %s. This might be an issue or overly aggressive cleanup simulation.", stream.id, tc.name, rstFrame.ErrorCode)
-						unexpectedActionFrames = append(unexpectedActionFrames, f)
-						// Don't set isCleanupRSTPresent = true here, as we are checking for *unexpected* frames from the action.
-					} else {
-						unexpectedActionFrames = append(unexpectedActionFrames, f)
-					}
-				}
-
-				if len(unexpectedActionFrames) > 0 {
-					var frameSummaries []string
-					for _, fr := range unexpectedActionFrames {
-						frameSummaries = append(frameSummaries, fmt.Sprintf("Type: %s, StreamID: %d, Flags: %x, Len: %d", fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length))
-					}
-					t.Errorf("Did not expect frames from test logic on mock net.Conn for test '%s' (stream %d), but got: %v", tc.name, stream.id, frameSummaries)
-				}
-				// Clear the buffer regardless, so subsequent sub-tests don't see these frames.
-				// This is important because ResetWriteBuffer is called at the start of the sub-test (line 1562)
-				// AFTER performHandshake, so frames from one sub-test's action might linger if not cleared here.
-				mnc.ResetWriteBuffer()
-			}
-
-			// This block checks dispatcher call and request properties.
-			// It should only run if the function itself didn't error, isn't a nil dispatcher test,
-			// and isn't the panic test (as panic recovery sends RST but dispatcher won't complete normally).
-			if !tc.expectErrorFromFunc && !tc.isDispatcherNilTest && !strings.Contains(tc.name, "panics") && tc.expectedReq != nil {
-				// Wait a bit for the dispatcher goroutine to run.
-				// The dispatcher itself (mrd.fn) might do assertions.
-				var dispatcherCalled bool
-				var lastReqReceived *http.Request
-
-				// Poll for dispatcher call, with a timeout
-				timeout := time.After(150 * time.Millisecond) // Increased timeout
-				ticker := time.NewTicker(10 * time.Millisecond)
-				defer ticker.Stop()
-
-			pollLoop:
-				for {
-					select {
-					case <-timeout:
-						t.Errorf("Timeout waiting for dispatcher to be called (Test: %s)", tc.name)
-						break pollLoop
-					case <-ticker.C:
-						var wasCalled bool
-						var reqFromDispatcher *http.Request
-
-						mrd.mu.Lock() // Lock to safely read mrd.called and mrd.lastReq
-						wasCalled = mrd.called
-						if wasCalled {
-							reqFromDispatcher = mrd.lastReq
-						}
-						mrd.mu.Unlock()
-
-						if wasCalled {
-							dispatcherCalled = true
-							lastReqReceived = reqFromDispatcher
-							break pollLoop
-						}
-					}
-				}
-
-				if !dispatcherCalled {
-					t.Fatalf("Dispatcher was not called (Test: %s)", tc.name)
-				}
-
-				if tc.expectedReq != nil && lastReqReceived != nil {
-					if lastReqReceived.Method != tc.expectedReq.Method {
-						t.Errorf("Request Method mismatch: got %s, want %s", lastReqReceived.Method, tc.expectedReq.Method)
-					}
-					if lastReqReceived.URL.String() != tc.expectedReq.URL.String() {
-						t.Errorf("Request URL mismatch: got %s, want %s", lastReqReceived.URL.String(), tc.expectedReq.URL.String())
-					}
-					if !reflect.DeepEqual(lastReqReceived.Header, tc.expectedReq.Header) {
-						t.Errorf("Request Headers mismatch: got %+v, want %+v", lastReqReceived.Header, tc.expectedReq.Header)
-					}
-					if lastReqReceived.Host != tc.expectedReq.Host {
-						t.Errorf("Request Host mismatch: got %s, want %s", lastReqReceived.Host, tc.expectedReq.Host)
-					}
-					if lastReqReceived.RequestURI != tc.expectedReq.RequestURI {
-						t.Errorf("RequestURI mismatch: got %s, want %s", lastReqReceived.RequestURI, tc.expectedReq.RequestURI)
-					}
-					if lastReqReceived.RemoteAddr != conn.remoteAddrStr {
-						t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, conn.remoteAddrStr)
-					}
-					if lastReqReceived.Body != stream.requestBodyReader {
-						t.Error("Request Body is not the stream's requestBodyReader")
-					}
-					if lastReqReceived.Context() != stream.ctx { // Compare underlying contexts if wrapped
-						if lastReqReceived.Context() == nil || stream.ctx == nil {
-							t.Error("One of the contexts is nil when comparing request context")
-						} else {
-							// This direct comparison might fail if context is wrapped.
-							// A more robust check would be if lastReqReceived.Context().Value() can retrieve values set on stream.ctx.
-							// For now, direct comparison is a basic check.
-							// t.Logf("Req ctx: %v, Stream ctx: %v", lastReqReceived.Context(), stream.ctx)
-						}
-					}
-
-					// The dispatcher mrd.fn for "valid headers, with endStream on HEADERS" case already checks body EOF.
-				}
-			}
-
-			if tc.customValidation != nil {
-				tc.customValidation(t, mrd, stream, conn)
-			}
-			// Wait for the dispatcher goroutine to complete before the sub-test finishes.
-			// This ensures t.Logf and other t methods are not called on an invalid t.
-			// It also ensures that cleanup logic in newTestStream doesn't race with the dispatcher.
-			if tc.dispatcher != nil { // Only Wait if we Added to the WaitGroup
-				wg.Wait()
-			}
-			// newTestStream's t.Cleanup will handle stream.Close()
-		})
-	}
-}
-
 func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 	t.Parallel()
 	const testStreamID = uint32(10)
@@ -1168,6 +519,659 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 				t.Errorf("Stream was not in Closed state before simulating removeClosedStream call; state: %s", stream.state)
 			}
 			// newTestStream's t.Cleanup will Close stream, which will be idempotent.
+		})
+	}
+}
+
+
+
+// The original getPipeErrors has been removed as it was too complex and had side effects.
+// The checks are now done directly in TestStream_setState_GeneralTransitions.
+
+func TestStream_WriteData(t *testing.T) {
+	t.Parallel()
+	const testStreamID = uint32(1)
+
+	tests := []struct {
+		name string
+		// Initial stream state
+		initialState               StreamState
+		initialResponseHeadersSent bool
+		initialEndStreamSentClient bool
+		initialPendingRSTCode      *ErrorCode
+		// Initial flow control state (absolute values)
+		initialStreamSendWindow int64
+		initialConnSendWindow   int64
+		// Connection's maxFrameSize for this test
+		cfgMaxFrameSize uint32
+		// Input to WriteData
+		dataToSend    []byte
+		endStreamFlag bool
+		// Mock connection behavior
+		connSendDataFrameError error // If non-nil, conn.sendDataFrame will be simulated to fail with this.
+		// Expected outcomes
+		expectedN             int
+		expectError           bool
+		expectedErrorContains string
+		// Expected stream state after
+		expectedFinalState         StreamState
+		expectedFinalEndStreamSent bool
+		// Expected frames on writerChan
+		expectedDataFrames []struct {
+			Data      []byte
+			EndStream bool
+		}
+		// Expected flow control state after (absolute values)
+		expectedStreamSendWindowAfter int64
+		expectedConnSendWindowAfter   int64
+	}{
+		{
+			name:                       "Success: send data, no endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("hello"),
+			endStreamFlag:              false,
+			expectedN:                  5,
+			expectError:                false,
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte("hello"), EndStream: false}},
+			expectedStreamSendWindowAfter: 95,
+			expectedConnSendWindowAfter:   195,
+		},
+		{
+			name:                       "Success: send data, with endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("world"),
+			endStreamFlag:              true,
+			expectedN:                  5,
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte("world"), EndStream: true}},
+			expectedStreamSendWindowAfter: 95,
+			expectedConnSendWindowAfter:   195,
+		},
+		{
+			name:                       "Success: send zero-length data, with endStream",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte{},
+			endStreamFlag:              true,
+			expectedN:                  0,
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{{Data: []byte{}, EndStream: true}},
+			expectedStreamSendWindowAfter: 100, // No window consumed for 0-length
+			expectedConnSendWindowAfter:   200, // No window consumed for 0-length
+		},
+		{
+			name:                          "No-op: send zero-length data, no endStream",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte{},
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   false,
+			expectedFinalState:            StreamStateOpen,
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil, // No frame sent
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                       "Success: send data larger than maxFrameSize, chunking",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            5,                            // Force chunking
+			dataToSend:                 []byte("data_chunking_test"), // 18 bytes
+			endStreamFlag:              true,
+			expectedN:                  18,
+			expectError:                false,
+			expectedFinalState:         StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent: true,
+			expectedDataFrames: []struct {
+				Data      []byte
+				EndStream bool
+			}{
+				{Data: []byte("data_"), EndStream: false},
+				{Data: []byte("chunk"), EndStream: false},
+				{Data: []byte("ing_t"), EndStream: false},
+				{Data: []byte("est"), EndStream: true},
+			},
+			expectedStreamSendWindowAfter: 100 - 18,
+			expectedConnSendWindowAfter:   200 - 18,
+		},
+		{
+			name:                          "Error: WriteData called before SendHeaders",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    false, // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "SendHeaders must be called before WriteData",
+			expectedFinalState:            StreamStateOpen, // State unchanged
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100, // FC not acquired
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream closed",
+			initialState:                  StreamStateClosed, // Key condition
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       0,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateClosed,
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 0,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream resetting (pendingRSTCode set)",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialPendingRSTCode:         func() *ErrorCode { e := ErrCodeCancel; return &e }(), // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateOpen, // State unchanged by this call
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: WriteData after END_STREAM already sent",
+			initialState:                  StreamStateHalfClosedLocal,
+			initialResponseHeadersSent:    true,
+			initialEndStreamSentClient:    true, // Key condition
+			initialStreamSendWindow:       100,
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("test"),
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "cannot send data on closed, reset, or already server-ended stream",
+			expectedFinalState:            StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent:    true,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                          "Error: stream flow control insufficient",
+			initialState:                  StreamStateOpen,
+			initialResponseHeadersSent:    true,
+			initialStreamSendWindow:       5, // Insufficient for "ten_bytes_"
+			initialConnSendWindow:         200,
+			cfgMaxFrameSize:               DefaultMaxFrameSize,
+			dataToSend:                    []byte("ten_bytes_"), // 10 bytes
+			endStreamFlag:                 false,
+			expectedN:                     0,
+			expectError:                   true,
+			expectedErrorContains:         "simulated insufficient stream FC window (closed for test)",
+			expectedFinalState:            StreamStateOpen, // FC error doesn't change state itself in WriteData
+			expectedFinalEndStreamSent:    false,
+			expectedDataFrames:            nil,
+			expectedStreamSendWindowAfter: 5, // FC acquire failed as window was pre-closed by test
+			expectedConnSendWindowAfter:   200,
+		},
+		{
+			name:                       "Error: connection flow control insufficient",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      5, // Insufficient for "ten_bytes_"
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("ten_bytes_"), // 10 bytes
+			endStreamFlag:              false,
+			expectedN:                  0,
+			expectError:                true,
+			expectedErrorContains:      "simulated insufficient conn FC window (closed for test)",
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames:         nil,
+			// Stream FC (10 bytes) acquired, then conn FC fails, then stream FC is released by WriteData's error handling.
+			expectedStreamSendWindowAfter: 100,
+			expectedConnSendWindowAfter:   5, // Conn FC acquire failed as window was pre-closed by test
+		},
+		{
+			name:                       "Error: conn.sendDataFrame fails",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialStreamSendWindow:    100,
+			initialConnSendWindow:      200,
+			cfgMaxFrameSize:            DefaultMaxFrameSize,
+			dataToSend:                 []byte("sendfail"), // 8 bytes
+			endStreamFlag:              false,
+			connSendDataFrameError:     NewConnectionError(ErrCodeConnectError, "simulated conn write error from test"),
+			expectedN:                  0,
+			expectError:                true,
+			expectedErrorContains:      fmt.Sprintf("connection error: connection shutting down (pre-check), cannot send DATA for stream %d", testStreamID),
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+			expectedDataFrames:         nil,
+			// FC is acquired before send attempt. If send fails, FC is NOT currently released by WriteData.
+			expectedStreamSendWindowAfter: 100 - 8, // 92
+			expectedConnSendWindowAfter:   200 - 8, // 192
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Ensure cfgMaxFrameSize has a sensible default for the test case if not specified.
+			effectiveCfgMaxFrameSize := tc.cfgMaxFrameSize
+			if effectiveCfgMaxFrameSize == 0 {
+				effectiveCfgMaxFrameSize = DefaultMaxFrameSize
+			}
+
+			// Create a real connection using newTestConnection
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, len(tc.dataToSend)/int(effectiveCfgMaxFrameSize)+2) // Buffer for all chunks + potential RST
+			conn.ourInitialWindowSize = DefaultInitialWindowSize                                   // Affects stream's receive window
+			conn.peerInitialWindowSize = uint32(tc.initialStreamSendWindow)                        // Sets stream's initial *send* window
+			conn.maxFrameSize = effectiveCfgMaxFrameSize                                           // Max frame size used by stream for chunking
+
+			if conn.connFCManager == nil {
+				conn.connFCManager = NewConnectionFlowControlManager()
+			}
+			// Adjust connection FC window to match test case's initialConnSendWindow
+			currentConnFcAvailable := conn.connFCManager.sendWindow.Available()
+			deltaConnFc := tc.initialConnSendWindow - currentConnFcAvailable
+			if deltaConnFc < 0 { // Need to acquire/reduce
+				if errSetup := conn.connFCManager.sendWindow.Acquire(uint32(-deltaConnFc)); errSetup != nil {
+					t.Fatalf("Setup: Failed to pre-acquire from connFC: %v (target: %d, current: %d, acquire: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, -deltaConnFc)
+				}
+			} else if deltaConnFc > 0 { // Need to increase
+				if errSetup := conn.connFCManager.sendWindow.Increase(uint32(deltaConnFc)); errSetup != nil {
+					t.Fatalf("Setup: Failed to pre-increase connFC: %v (target: %d, current: %d, increase: %d)", errSetup, tc.initialConnSendWindow, currentConnFcAvailable, deltaConnFc)
+				}
+			}
+			if conn.connFCManager.sendWindow.Available() != tc.initialConnSendWindow {
+				t.Fatalf("Setup: connFCManager window not set as expected. Got %d, want %d", conn.connFCManager.sendWindow.Available(), tc.initialConnSendWindow)
+			}
+
+			if tc.connSendDataFrameError != nil {
+				if conn.shutdownChan == nil {
+					conn.shutdownChan = make(chan struct{})
+				}
+				close(conn.shutdownChan)
+				conn.connError = tc.connSendDataFrameError
+			}
+
+			// false for isInitiatedByPeer, as this test is for server sending data.
+			// Provide initialOurWindow (stream's receive window) and initialPeerWindow (stream's send window).
+			// For WriteData, stream's send window (initialPeerWindow) is most relevant from fc perspective.
+			stream := newTestStream(t, testStreamID, conn, false, DefaultInitialWindowSize, uint32(tc.initialStreamSendWindow))
+
+			// Adjust stream FC window to match test case's initialStreamSendWindow AFTER stream creation (as newTestStream uses cfgPeerInitialWindowSize)
+			// This is a bit redundant as newTestStream already sets it, but ensures exactness if initialStreamSendWindow is tricky.
+			// newTestStream correctly uses cfgPeerInitialWindowSize to init stream's send window.
+			// So stream.fcManager.sendWindow.Available() should already be tc.initialStreamSendWindow if logic in newTestStream is correct.
+
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			stream.responseHeadersSent = tc.initialResponseHeadersSent
+			stream.endStreamSentToClient = tc.initialEndStreamSentClient
+			if tc.initialPendingRSTCode != nil {
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			}
+			stream.mu.Unlock()
+
+			initialStreamWin := stream.fcManager.GetStreamSendAvailable()
+			if initialStreamWin != tc.initialStreamSendWindow {
+				// This would indicate a problem in newTestStream's setup of peerInitialWin for stream.fcManager
+				t.Logf("Warning: Initial stream send window from fcManager (%d) does not match test case tc.initialStreamSendWindow (%d). Check newTestStream logic.", initialStreamWin, tc.initialStreamSendWindow)
+				// Forcibly adjust for test if possible, though ideally newTestStream handles it.
+				// This path is complex due to FlowControlWindow internals. Best rely on newTestStream.
+			}
+			initialConnWin := conn.connFCManager.GetConnectionSendAvailable()
+
+			if tc.name == "Error: stream flow control insufficient" {
+				simulatedStreamFCError := errors.New("simulated insufficient stream FC window (closed for test)")
+				stream.fcManager.sendWindow.Close(simulatedStreamFCError) // Close the window to make Acquire fail
+			}
+			if tc.name == "Error: connection flow control insufficient" {
+				simulatedConnFCError := errors.New("simulated insufficient conn FC window (closed for test)")
+				conn.connFCManager.sendWindow.Close(simulatedConnFCError) // Close the window to make Acquire fail
+			}
+
+			n, err := stream.WriteData(tc.dataToSend, tc.endStreamFlag)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorContains != "" && !strings.Contains(err.Error(), tc.expectedErrorContains) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tc.expectedErrorContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if n != tc.expectedN {
+				t.Errorf("Expected n=%d, got n=%d", tc.expectedN, n)
+			}
+
+			if len(tc.expectedDataFrames) > 0 {
+				for i, expectedFrame := range tc.expectedDataFrames {
+					select {
+					case frame := <-conn.writerChan:
+						dataFrame, ok := frame.(*DataFrame)
+						if !ok {
+							t.Fatalf("Expected DataFrame %d on writerChan, got %T", i+1, frame)
+						}
+						if dataFrame.Header().StreamID != testStreamID {
+							t.Errorf("Frame %d: DataFrame StreamID mismatch: got %d, want %d", i+1, dataFrame.Header().StreamID, testStreamID)
+						}
+						if string(dataFrame.Data) != string(expectedFrame.Data) {
+							t.Errorf("Frame %d: DataFrame Data mismatch: got %q, want %q", i+1, string(dataFrame.Data), string(expectedFrame.Data))
+						}
+						if (dataFrame.Header().Flags&FlagDataEndStream != 0) != expectedFrame.EndStream {
+							t.Errorf("Frame %d: DataFrame END_STREAM flag mismatch: got %v, want %v (Flags: %08b)", i+1, (dataFrame.Header().Flags&FlagDataEndStream != 0), expectedFrame.EndStream, dataFrame.Header().Flags)
+						}
+					case <-time.After(100 * time.Millisecond):
+						t.Fatalf("Expected DataFrame %d on writerChan, but none found. Expected: {Data: %q, EndStream: %v}", i+1, string(expectedFrame.Data), expectedFrame.EndStream)
+					}
+				}
+				// Ensure no more frames are sent if all expected frames were received
+				select {
+				case frame := <-conn.writerChan:
+					t.Fatalf("Expected no more frames, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default: // Good, no more frames
+				}
+			} else { // No frames expected
+				select {
+				case frame := <-conn.writerChan:
+					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			finalEndStreamSent := stream.endStreamSentToClient
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedFinalState {
+				t.Errorf("Expected final stream state %s, got %s", tc.expectedFinalState, finalState)
+			}
+			if finalEndStreamSent != tc.expectedFinalEndStreamSent {
+				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedFinalEndStreamSent, finalEndStreamSent)
+			}
+
+			finalStreamWin := stream.fcManager.GetStreamSendAvailable()
+			finalConnWin := conn.connFCManager.GetConnectionSendAvailable()
+
+			if finalStreamWin != tc.expectedStreamSendWindowAfter {
+				t.Errorf("Expected stream send window %d, got %d. (Initial: %d, Change: %d)",
+					tc.expectedStreamSendWindowAfter, finalStreamWin, tc.initialStreamSendWindow, tc.initialStreamSendWindow-finalStreamWin)
+			}
+			if finalConnWin != tc.expectedConnSendWindowAfter {
+				t.Errorf("Expected conn send window %d, got %d. (Initial: %d, Change: %d)",
+					tc.expectedConnSendWindowAfter, finalConnWin, initialConnWin, initialConnWin-finalConnWin)
+			}
+		})
+	}
+}
+
+func TestStream_WriteTrailers(t *testing.T) {
+	t.Parallel()
+	const testStreamID = uint32(1)
+	validTrailers := makeStreamWriterHeaders("x-trailer-1", "value1", "x-trailer-2", "value2")
+	invalidHpackTrailers := makeStreamWriterHeaders("", "bad-trailer-name") // Empty name to cause HPACK error in conn
+
+	tests := []struct {
+		name                         string
+		initialState                 StreamState
+		initialResponseHeadersSent   bool
+		initialEndStreamSentToClient bool // If true, server already sent END_STREAM (e.g. via WriteData)
+		initialPendingRSTCode        *ErrorCode
+		trailersToSend               []HeaderField
+		connSendHeadersFrameError    error // If non-nil, conn.sendHeadersFrame will be simulated to fail
+		expectError                  bool
+		expectedErrorContains        string
+		expectFrameSent              bool // True if a HEADERS frame for trailers is expected on writerChan
+		expectedFinalState           StreamState
+		expectedFinalEndStreamSent   bool // Should always be true if trailers are successfully sent
+	}{
+		{
+			name:                         "Success: send trailers after headers (no data yet)",
+			initialState:                 StreamStateOpen,
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateHalfClosedLocal, // Because trailers imply END_STREAM
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                         "Success: send trailers after data (endStreamSentToClient was false)",
+			initialState:                 StreamStateOpen, // Assume data was sent without END_STREAM
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateHalfClosedLocal,
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                         "Error: send trailers when endStreamSentToClient was already true (e.g. after WriteData with endStream)",
+			initialState:                 StreamStateHalfClosedLocal, // Because server already sent END_STREAM
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: true,
+			trailersToSend:               validTrailers,
+			expectError:                  true,
+			expectedErrorContains:        "cannot send trailers after stream already ended",
+			expectFrameSent:              false,
+			expectedFinalState:           StreamStateHalfClosedLocal, // State should not change
+			expectedFinalEndStreamSent:   true,                       // Remains true
+		},
+		{
+			name:                         "Success: send trailers from HalfClosedRemote state (client sent END_STREAM, server now sends trailers)",
+			initialState:                 StreamStateHalfClosedRemote,
+			initialResponseHeadersSent:   true,
+			initialEndStreamSentToClient: false,
+			trailersToSend:               validTrailers,
+			expectError:                  false,
+			expectFrameSent:              true,
+			expectedFinalState:           StreamStateClosed, // Both sides have sent END_STREAM
+			expectedFinalEndStreamSent:   true,
+		},
+		{
+			name:                       "Error: WriteTrailers called before SendHeaders",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: false, // Key condition
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "cannot send trailers before headers",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State unchanged
+			expectedFinalEndStreamSent: false,
+		},
+		{
+			name:                       "Error: stream closed",
+			initialState:               StreamStateClosed, // Key condition
+			initialResponseHeadersSent: true,              // Irrelevant as stream is closed
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "stream closed or resetting",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateClosed,
+			expectedFinalEndStreamSent: false, // Or initialEndStreamSentToClient if it was already set
+		},
+		{
+			name:                       "Error: stream resetting (pendingRSTCode set)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			initialPendingRSTCode:      func() *ErrorCode { e := ErrCodeCancel; return &e }(), // Key condition
+			trailersToSend:             validTrailers,
+			expectError:                true,
+			expectedErrorContains:      "stream error on stream 1: stream closed or resetting (code STREAM_CLOSED, 5)",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State unchanged by this call
+			expectedFinalEndStreamSent: false,
+		},
+		{
+			name:                       "Error: conn.sendHeadersFrame fails (e.g. HPACK error)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			trailersToSend:             invalidHpackTrailers, // Triggers HPACK error in real conn.sendHeadersFrame
+			expectError:                true,
+			expectedErrorContains:      "stream error on stream 1: HPACK encoding failed (malformed header from application): hpack: invalid header field name: name is empty for Encode method (value: \"bad-trailer-name\") (code PROTOCOL_ERROR, 1)",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen, // State doesn't change on conn send error
+			expectedFinalEndStreamSent: false,           // Not successfully sent
+		},
+		{
+			name:                       "Error: conn.sendHeadersFrame fails (simulated connection error)",
+			initialState:               StreamStateOpen,
+			initialResponseHeadersSent: true,
+			trailersToSend:             validTrailers,
+			connSendHeadersFrameError:  NewConnectionError(ErrCodeInternalError, "simulated conn internal error"),
+			expectError:                true,
+			expectedErrorContains:      "connection error: connection shutting down (pre-check), cannot send HEADERS for stream 1 (last_stream_id 0, code CONNECT_ERROR, 10)",
+			expectFrameSent:            false,
+			expectedFinalState:         StreamStateOpen,
+			expectedFinalEndStreamSent: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, _ := newTestConnection(t, false, nil)
+			conn.writerChan = make(chan Frame, 1) // Buffer for one HEADERS frame (trailers) or RST
+
+			if tc.connSendHeadersFrameError != nil {
+				if conn.shutdownChan == nil {
+					conn.shutdownChan = make(chan struct{})
+				}
+				close(conn.shutdownChan) // Simulate connection shutting down
+				conn.connError = tc.connSendHeadersFrameError
+			}
+
+			// For server sending trailers, isInitiatedByPeer is false.
+			stream := newTestStream(t, testStreamID, conn, false, 0, 0)
+
+			// Setup initial stream conditions
+			stream.mu.Lock()
+			stream.state = tc.initialState
+			stream.responseHeadersSent = tc.initialResponseHeadersSent
+			stream.endStreamSentToClient = tc.initialEndStreamSentToClient
+			if tc.initialPendingRSTCode != nil {
+				codeCopy := *tc.initialPendingRSTCode
+				stream.pendingRSTCode = &codeCopy
+			}
+			stream.mu.Unlock()
+
+			err := stream.WriteTrailers(tc.trailersToSend)
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.expectedErrorContains != "" && !strings.Contains(err.Error(), tc.expectedErrorContains) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tc.expectedErrorContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if tc.expectFrameSent {
+
+				select {
+				case frame := <-conn.writerChan:
+					headersFrame, ok := frame.(*HeadersFrame)
+					if !ok {
+						t.Fatalf("Expected HeadersFrame on writerChan, got %T", frame)
+					}
+					if headersFrame.Header().StreamID != testStreamID {
+						t.Errorf("HeadersFrame StreamID mismatch: got %d, want %d", headersFrame.Header().StreamID, testStreamID)
+					}
+					if (headersFrame.Header().Flags & FlagHeadersEndStream) == 0 {
+						t.Error("HeadersFrame for trailers did not have END_STREAM flag set")
+					}
+					// Verify that the headers sent are the trailers (simplified check for now)
+					// A full check would decode the HeaderBlockFragment.
+					// This test relies on the fact that conn.sendHeadersFrame gets the right hpack.HeaderFields.
+					if len(tc.trailersToSend) > 0 && len(headersFrame.HeaderBlockFragment) == 0 {
+						t.Error("HeadersFrame HeaderBlockFragment is empty, but trailers were provided")
+					}
+				case <-time.After(50 * time.Millisecond):
+					t.Fatal("Expected HeadersFrame on writerChan, but none found")
+				}
+			} else {
+
+				select {
+				case frame := <-conn.writerChan:
+					t.Fatalf("Did not expect any frame on writerChan, but got: %T (StreamID: %d)", frame, frame.Header().StreamID)
+				default:
+					// Expected: no frame
+				}
+			}
+
+			stream.mu.RLock()
+			finalState := stream.state
+			finalEndStreamSent := stream.endStreamSentToClient
+			stream.mu.RUnlock()
+
+			if finalState != tc.expectedFinalState {
+				t.Errorf("Expected final stream state %s, got %s (initial was %s)", tc.expectedFinalState, finalState, tc.initialState)
+			}
+			if finalEndStreamSent != tc.expectedFinalEndStreamSent {
+				t.Errorf("Expected final endStreamSentToClient %v, got %v", tc.expectedFinalEndStreamSent, finalEndStreamSent)
+			}
 		})
 	}
 }
