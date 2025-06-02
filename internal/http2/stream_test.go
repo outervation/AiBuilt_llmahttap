@@ -457,8 +457,8 @@ func TestStream_handleDataFrame(t *testing.T) {
 			expectedErrorContains:       "content-length mismatch on END_STREAM: declared 20, received 12 (current frame 7 bytes, previously 5 bytes)",
 			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
 			expectedEndStreamReceived:   true,
-			expectedDataInPipe:          []byte("partial"), // Data is written before check
-			expectPipeWriterClosed:      true,              // Stream closes on error, closing pipe writer
+			expectedDataInPipe:          nil,  // Data from erroring frame is NOT written
+			expectPipeWriterClosed:      true, // Stream closes on error, closing pipe writer
 			expectedFcRecvWindowReduced: true,
 		},
 		{
