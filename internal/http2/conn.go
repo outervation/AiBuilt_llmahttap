@@ -3327,28 +3327,85 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 		c.log.Debug("Serve loop: About to call c.dispatchFrame().", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
 		dispatchErr := c.dispatchFrame(frame)
 		if dispatchErr != nil {
-			c.log.Error("Serve (reader) loop: error dispatching frame, terminating connection.",
-				logger.LogFields{"error": dispatchErr.Error(), "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
 
-			// Check if this StreamError should be escalated to a ConnectionError for test expectations
-			if se, ok := dispatchErr.(*StreamError); ok && se.Code == ErrCodeProtocolError {
-				// Escalate certain PROTOCOL_ERROR stream errors to ConnectionError
-				// This aligns with tests like TestConnection_HeaderProcessingScenarios expecting GOAWAY
-				connErr := NewConnectionErrorWithCause(se.Code, "escalated stream protocol error: "+se.Msg, se)
+			if se, ok := dispatchErr.(*StreamError); ok {
+				// Handle StreamError: send RST_STREAM for the affected stream,
+				// or escalate to ConnectionError for critical pseudo-header issues.
+				c.log.Warn("Serve (reader) loop: dispatchFrame returned StreamError.",
+					logger.LogFields{
+						"stream_id":           se.StreamID,
+						"code":                se.Code.String(),
+						"msg":                 se.Msg,
+						"original_error_type": fmt.Sprintf("%T", dispatchErr),
+						"remote_addr":         c.remoteAddrStr,
+					})
+
+				// Escalate critical pseudo-header errors to connection errors.
+				// Critical errors include missing :method, :path, :scheme, or fundamentally invalid :path.
+				isCriticalPseudoHeaderError := false
+				if se.Code == ErrCodeProtocolError {
+					if strings.Contains(se.Msg, "missing :method") ||
+						strings.Contains(se.Msg, "missing :path") ||
+						strings.Contains(se.Msg, "missing :scheme") ||
+						(strings.Contains(se.Msg, "invalid :path") && (strings.Contains(se.Msg, "empty") || strings.Contains(se.Msg, "must be '*' or start with '/'"))) {
+						isCriticalPseudoHeaderError = true
+					}
+				}
+
+				if isCriticalPseudoHeaderError {
+					c.log.Error("Serve (reader) loop: Escalating critical pseudo-header StreamError to ConnectionError.",
+						logger.LogFields{"stream_id": se.StreamID, "msg": se.Msg, "remote_addr": c.remoteAddrStr})
+
+					// Store the connection error before returning.
+					// The defer in Serve() will handle the Close() using this error.
+					connErrToSet := NewConnectionError(ErrCodeProtocolError, se.Msg)
+					connErrToSet.LastStreamID = se.StreamID // Associate with the problematic stream
+
+					c.streamsMu.Lock()
+					if c.connError == nil {
+						c.connError = connErrToSet
+					}
+					c.streamsMu.Unlock()
+					return connErrToSet // This will terminate the connection via Serve's defer.
+				}
+
+				// For other StreamErrors, attempt to send RST_STREAM.
+				if rstSendErr := c.sendRSTStreamFrame(se.StreamID, se.Code); rstSendErr != nil {
+					// If sending RST_STREAM fails, this is a fatal connection error.
+					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for a StreamError from dispatch. Terminating connection.",
+						logger.LogFields{
+							"stream_id":      se.StreamID,
+							"rst_send_error": rstSendErr.Error(),
+							"remote_addr":    c.remoteAddrStr,
+						})
+					c.streamsMu.Lock()
+					if c.connError == nil {
+						c.connError = rstSendErr // Store the error from failing to send RST.
+					}
+					c.streamsMu.Unlock()
+					return rstSendErr // Propagate fatal error from RST send failure.
+				}
+				// Successfully sent RST_STREAM for the stream error.
+				// The connection can continue processing other streams.
+				c.log.Debug("Serve (reader) loop: Successfully sent RST_STREAM for StreamError from dispatch. Continuing.",
+					logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "remote_addr": c.remoteAddrStr})
+				continue // Continue the Serve loop.
+			} else {
+				// Not a StreamError, so it's a ConnectionError or other fatal error from dispatchFrame.
+				c.log.Error("Serve (reader) loop: error dispatching frame (fatal, not StreamError). Terminating connection.",
+					logger.LogFields{
+						"error":       dispatchErr.Error(),
+						"error_type":  fmt.Sprintf("%T", dispatchErr),
+						"frame_type":  frame.Header().Type.String(),
+						"remote_addr": c.remoteAddrStr,
+					})
 				c.streamsMu.Lock()
 				if c.connError == nil {
-					c.connError = connErr
+					c.connError = dispatchErr // Store the fatal error.
 				}
 				c.streamsMu.Unlock()
-				return connErr
+				return dispatchErr // Propagate fatal error to terminate the connection.
 			}
-
-			c.streamsMu.Lock()
-			if c.connError == nil {
-				c.connError = dispatchErr
-			}
-			c.streamsMu.Unlock()
-			return dispatchErr // Return the dispatchError
 		}
 	}
 }
