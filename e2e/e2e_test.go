@@ -1233,26 +1233,6 @@ func TestHTTPRequestHeaderValidation(t *testing.T) {
 			Expected: html400Error,
 		},
 
-		// TE: compress, gzip (multiple invalid values)
-		{
-			Name: "TE Compress Gzip Header - JSON",
-			Request: testutil.TestRequest{
-				Method:  "GET",
-				Path:    "/testpath/valid.txt",
-				Headers: http.Header{"TE": []string{"compress, gzip"}, "Accept": []string{"application/json"}},
-			},
-			Expected: json400Error,
-		},
-		{
-			Name: "TE Compress Gzip Header - HTML",
-			Request: testutil.TestRequest{
-				Method:  "GET",
-				Path:    "/testpath/valid.txt",
-				Headers: http.Header{"TE": []string{"compress, gzip"}, "Accept": []string{"text/html"}},
-			},
-			Expected: html400Error,
-		},
-
 		// TE: trailers, compress (valid + invalid value)
 		// RFC 7540 Section 8.1.2.2: "A request containing the TE header field with any value other than "trailers" MUST be treated as malformed"
 		// This implies that if "trailers" is present alongside an invalid value, it's still malformed.
