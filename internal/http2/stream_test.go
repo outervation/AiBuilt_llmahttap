@@ -17,7 +17,6 @@ import (
 	"time"
 )
 
-
 // TestStream_Close_SendsRSTAndCleansUp tests the stream.Close() method.
 // It verifies that an RST_STREAM frame is sent, state transitions to Closed,
 // and associated resources are cleaned up.
@@ -148,8 +147,6 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 		}
 	})
 }
-
-
 
 func TestStream_sendRSTStream_DirectCall(t *testing.T) {
 	t.Parallel()
@@ -453,7 +450,7 @@ func TestStream_handleDataFrame(t *testing.T) {
 			},
 			expectError:                 true,
 			expectedErrorCode:           ErrCodeProtocolError,
-			expectedErrorContains:       "content-length mismatch: declared 20, received 12",
+			expectedErrorContains:       "content-length mismatch on END_STREAM: declared 20, received 12 (current frame 7 bytes, previously 5 bytes)",
 			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
 			expectedEndStreamReceived:   true,
 			expectedDataInPipe:          []byte("partial"), // Data is written before check
@@ -478,7 +475,7 @@ func TestStream_handleDataFrame(t *testing.T) {
 			},
 			expectError:                 true,
 			expectedErrorCode:           ErrCodeProtocolError,
-			expectedErrorContains:       "content-length mismatch: declared 10, received 16",
+			expectedErrorContains:       "content-length mismatch on END_STREAM: declared 10, received 16 (current frame 11 bytes, previously 5 bytes)",
 			expectedStreamStateAfter:    StreamStateClosed, // Stream is closed on error
 			expectedEndStreamReceived:   true,
 			expectedDataInPipe:          []byte("toolongdata"), // Data is written before check
@@ -837,7 +834,6 @@ func TestStream_handleRSTStreamFrame(t *testing.T) {
 		})
 	}
 }
-
 
 // The original getPipeErrors has been removed as it was too complex and had side effects.
 // The checks are now done directly in TestStream_setState_GeneralTransitions.
