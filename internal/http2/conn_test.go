@@ -3448,6 +3448,20 @@ func TestConnection_HandleSettingsFrame(t *testing.T) {
 			},
 		},
 		{
+			name: "SETTINGS ACK with non-zero payload length (h2spec 6.5.1)",
+			settingsFrameToProcess: &SettingsFrame{
+				FrameHeader: FrameHeader{Type: FrameSettings, Flags: FlagSettingsAck, StreamID: 0, Length: 6}, // Non-zero length
+				Settings:    nil,                                                                              // Payload for ACK must be empty. `Settings` items are ignored if Length and ACK flag lead to error.
+			},
+			expectError:                 true,
+			expectedConnectionErrorCode: ErrCodeFrameSizeError,
+			expectedConnectionErrorMsg:  "SETTINGS ACK frame received with non-zero length",
+			expectAckSent:               false,
+			expectedGoAwayOnError:       true,
+			expectedGoAwayErrorCode:     ErrCodeFrameSizeError,
+			checkPeerSettings:           false, // Settings are not applied on error
+		},
+		{
 			name: "SETTINGS frame with non-zero StreamID",
 			settingsFrameToProcess: &SettingsFrame{
 				FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 1, Length: 0}, // StreamID = 1
