@@ -91,7 +91,7 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 			// DIAGNOSTIC CHANGE: Replace fmt.Errorf with specific error types.
 			// This helps confirm if this specific path is the source of the *errors.errorString.
 			var errToReturn error
-			errMsg := fmt.Sprintf("DIAGNOSTIC_PATH_Y: flow control window (conn: %v, stream: %d) is closed", fcw.isConnection, fcw.streamID)
+			errMsg := fmt.Sprintf("flow control window (connection: %t, stream ID: %d) is closed", fcw.isConnection, fcw.streamID)
 			if fcw.isConnection {
 				// For a connection FCW, if closed, it might imply a GOAWAY was sent/received.
 				// Using ErrCodeInternalError for diagnosis, could be refined based on actual close reason if known.
