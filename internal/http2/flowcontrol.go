@@ -123,12 +123,17 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
-	if fcw.err != nil || fcw.closed { // Don't operate on a closed/errored window
-		if fcw.err != nil {
-			return fcw.err
-		}
-		return fmt.Errorf("flow control window (conn: %v, stream: %d) is closed", fcw.isConnection, fcw.streamID)
+	if fcw.err != nil { // If there's a specific terminal error, don't operate.
+		return fcw.err
 	}
+
+	// fcw.closed state is NOT checked here to prevent the increase for WINDOW_UPDATE frames.
+	// RFC 7540, Section 5.1 states that WINDOW_UPDATE frames MUST be processed even on
+	// streams that are half-closed or have entered the "closed" state via normal
+	// END_STREAM exchange.
+	// If fcw.closed is true (e.g., stream gracefully closed) but fcw.err is nil,
+	// the window size will still be updated.
+	// The Acquire method will still prevent new data sending if fcw.closed is true.
 
 	if increment == 0 {
 		if !fcw.isConnection {
@@ -153,7 +158,7 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 		} else {
 			err = NewStreamError(fcw.streamID, ErrCodeFlowControlError, msg)
 		}
-		fcw.setErrorLocked(err) // Mark this FCW as terminally errored.
+		fcw.setErrorLocked(err) // Mark this FCW as terminally errored. This also sets fcw.closed = true.
 		return err
 	}
 
