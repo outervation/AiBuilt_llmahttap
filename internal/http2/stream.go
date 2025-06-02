@@ -832,10 +832,13 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	if currentState == StreamStateClosed {
 		s.conn.log.Warn("Stream.processRequestHeadersAndDispatch: Attempt to process headers on an already closed stream.", logger.LogFields{"stream_id": s.id})
-		// As per h2spec 5.1 Stream States #9 (closed: Sends a HEADERS frame after sending RST_STREAM frame)
-		// "The endpoint MUST treat this as a stream error of type STREAM_CLOSED."
-		// An RST_STREAM should be sent by the connection management logic if this function returns an error.
-		// However, sending one here explicitly aligns with the immediate detection of the error.
+
+		// As per h2spec 5.1/12 (closed: Sends a HEADERS frame):
+		// The endpoint MUST treat this as a connection error of type STREAM_CLOSED.
+		// This implies a GOAWAY(STREAM_CLOSED) from the connection.
+		// By returning NewStreamError here, conn.go (specifically its frame dispatch/error handling)
+		// will be responsible for sending the appropriate GOAWAY frame.
+		// The direct s.sendRSTStream(ErrCodeStreamClosed) call is omitted.
 
 		return NewStreamError(s.id, ErrCodeStreamClosed, "headers received on closed stream")
 	}
