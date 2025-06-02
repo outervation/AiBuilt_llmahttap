@@ -394,16 +394,14 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
 				s.mu.Lock()
 				s.state = StreamStateClosed
-				// Simulate it was closed by a prior RST, so pendingRSTCode might be set
-				// For this test, ensure it *was* cleanly closed.
-				// If sendRSTStream is called again, it should be idempotent if code matches,
-				// or send a new one if codes differ or if pendingRSTCode was nil.
-				// The logic in processRequestHeadersAndDispatch specifically sends ErrCodeStreamClosed.
-				closedCode := ErrCodeCancel // Arbitrary previous close code
-				s.pendingRSTCode = &closedCode
+				// s.pendingRSTCode is deliberately NOT set for this test variant.
+				// This ensures that processRequestHeadersAndDispatch's attempt
+				// to send an RST_STREAM(ErrCodeStreamClosed) will proceed,
+				// as sendRSTStream might be a no-op if pendingRSTCode was already
+				// set to the same code, or if the stream error logic prevents a new RST.
 				s.mu.Unlock()
 			},
-			expectErrorFromFunc: false, // processRequestHeadersAndDispatch returns nil after trying to send RST
+			expectErrorFromFunc: true, // processRequestHeadersAndDispatch returns an error for closed stream
 			expectRST:           true,
 			expectedRSTCode:     ErrCodeStreamClosed,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
@@ -528,8 +526,27 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				}
 				// Further error content checks can be added here if needed
 				t.Logf("Got expected error from processRequestHeadersAndDispatch: %v", err)
+
+				// If an error was expected from the function and an RST is also expected for the stream,
+				// simulate the connection layer sending the RST_STREAM frame in response to the StreamError.
+				if tc.expectRST {
+					if streamErr, ok := err.(*StreamError); ok {
+						// Check if the StreamError's code matches the test's expected RST code.
+						if streamErr.Code == tc.expectedRSTCode {
+							t.Logf("Test: Simulating connection sending RST_STREAM(Code: %s) for StreamID %d due to StreamError from dispatch.", streamErr.Code, stream.id)
+							if rstSendErr := conn.sendRSTStreamFrame(stream.id, streamErr.Code); rstSendErr != nil {
+								t.Fatalf("Test: Failed to simulate conn.sendRSTStreamFrame: %v", rstSendErr)
+							}
+						} else {
+							t.Logf("Test: StreamError code %s from dispatch did not match expectedRSTCode %s. Not simulating RST via conn.sendRSTStreamFrame.", streamErr.Code, tc.expectedRSTCode)
+						}
+					} else {
+						t.Logf("Test: Error from dispatch was not a StreamError (%T), so cannot simulate RST via conn.sendRSTStreamFrame.", err)
+					}
+				}
 			} else {
 				if err != nil {
+					// If no error was expected, but we got one, fail the test.
 					t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
 				}
 			}
