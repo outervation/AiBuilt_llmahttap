@@ -851,10 +851,8 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 	if hasInitialHeadersBeenProcessed && currentState == StreamStateOpen && !endStream {
 		s.conn.log.Warn("Stream: Subsequent HEADERS frame received on Open stream without END_STREAM flag (violates h2spec 8.1/1).",
 			logger.LogFields{"stream_id": s.id, "state": currentState.String()})
-		if rstErr := s.sendRSTStream(ErrCodeProtocolError); rstErr != nil {
-			return rstErr // Propagate error if sending RST fails
-		}
-		return nil // RST_STREAM sent, stream error handled.
+		// s.sendRSTStream(ErrCodeProtocolError) logic removed
+		return NewStreamError(s.id, ErrCodeProtocolError, "Subsequent HEADERS frame received on Open stream without END_STREAM flag (violates h2spec 8.1/1)") // Return StreamError
 	}
 
 	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Entered (after h2spec 8.1/1 check)", logger.LogFields{"stream_id": s.id, "num_headers_arg": len(headers), "end_stream_arg": endStream, "dispatcher_is_nil": dispatcher == nil})
@@ -869,7 +867,6 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 
 	// --- BEGIN Original Header Validations (Task Items 1a, 1b, 1c, 1d) ---
 	// `isPotentiallyTrailers` uses `hasInitialHeadersBeenProcessed` which was captured at the start of this function.
-	isPotentiallyTrailers := hasInitialHeadersBeenProcessed && endStream
 
 	for _, hf := range headers { // 'headers' are the full hpack.HeaderFields for this block
 		// 1.a Uppercase header field names (h2spec 8.1.2 #1)
@@ -878,9 +875,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			if char >= 'A' && char <= 'Z' {
 				errMsg := fmt.Sprintf("invalid header field name '%s' contains uppercase characters", hf.Name)
 				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
-				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
-					return sendErr // Propagate connection error if RST send failed
-				}
+				// s.sendRSTStream(ErrCodeProtocolError) logic removed
 				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 			}
 		}
@@ -896,9 +891,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			// The TE header field is an exception but handled separately.
 			errMsg := fmt.Sprintf("connection-specific header field '%s' is forbidden in HTTP/2", hf.Name)
 			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
-			if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
-				return sendErr
-			}
+			// s.sendRSTStream(ErrCodeProtocolError) logic removed
 			return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 		}
 
@@ -907,27 +900,15 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 			if strings.ToLower(hf.Value) != "trailers" {
 				errMsg := fmt.Sprintf("TE header field contains invalid value '%s', must be 'trailers'", hf.Value)
 				s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_value": hf.Value})
-				if sendErr := s.sendRSTStream(ErrCodeProtocolError); sendErr != nil {
-					return sendErr
-				}
+				// s.sendRSTStream(ErrCodeProtocolError) logic removed
 				return NewStreamError(s.id, ErrCodeProtocolError, errMsg) // Return StreamError
 			}
 		}
 
 		// 1.d Pseudo-headers in trailers (h2spec 8.1.2.1 #3)
+		// VALIDATION MOVED TO conn.go:finalizeHeaderBlockAndDispatch
 		// A HEADERS frame carrying trailers MUST NOT contain pseudo-header fields.
-		if isPotentiallyTrailers && strings.HasPrefix(hf.Name, ":") {
-			errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block", hf.Name)
-			s.conn.log.Error(errMsg, logger.LogFields{"stream_id": s.id, "header_name": hf.Name})
-			if rstSendErr := s.sendRSTStream(ErrCodeProtocolError); rstSendErr != nil {
-				s.conn.log.Error("Failed to send RST_STREAM for pseudo-header in trailers violation (stream.go)", logger.LogFields{"stream_id": s.id, "error": rstSendErr.Error()})
-				return rstSendErr
-			}
-			// The spec (RFC 7540, 8.1.2.1) says "Endpoints MUST treat a request or response that contains a pseudo-header field in a trailer section as malformed (Section 8.1.2.6)."
-			// Section 8.1.2.6 says "A request or response is also malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the body. A response that is defined as malformed is treated as a stream error (Section 5.4.2) of type PROTOCOL_ERROR."
-			// So, this should be a stream error.
-			return NewStreamError(s.id, ErrCodeProtocolError, errMsg)
-		}
+		// This logic is now handled in conn.go's finalizeHeaderBlockAndDispatch.
 	}
 	// --- END Original Header Validations ---
 
@@ -992,12 +973,11 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 	// If extractPseudoHeaders finds an error, it currently returns a ConnectionError.
 	// This needs to be reconciled: pseudo-header errors are usually stream errors.
 	pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority, pseudoErr := s.conn.extractPseudoHeaders(headers)
+
 	if pseudoErr != nil {
 		s.conn.log.Error("Failed to extract/validate pseudo headers", logger.LogFields{"stream_id": s.id, "error": pseudoErr.Error()})
-		// RFC 7540, 8.1.2.6 specifies this as a stream error of type PROTOCOL_ERROR.
-		// The method should return this StreamError. The caller (Connection's dispatchFrame)
-		// is responsible for initiating the RST_STREAM frame based on this error.
-		return NewStreamErrorWithCause(s.id, ErrCodeProtocolError, "pseudo-header validation failed: "+pseudoErr.Error(), pseudoErr)
+		// Return StreamError for pseudo-header issues. conn.go can escalate if needed.
+		return NewStreamError(s.id, ErrCodeProtocolError, "pseudo-header validation failed: "+pseudoErr.Error())
 	}
 
 	reqURL := &url.URL{
