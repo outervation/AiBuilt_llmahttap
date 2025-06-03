@@ -277,12 +277,18 @@ func newStream(
 // SendHeaders sends response headers.
 func (s *Stream) SendHeaders(headers []HeaderField, endStream bool) error {
 	s.conn.log.Debug("Stream.SendHeaders: Entered", logger.LogFields{
-		"stream_id":      s.id,
-		"num_headers":    len(headers),
-		"end_stream_arg": endStream,
+		"stream_id":                      s.id,
+		"num_headers":                    len(headers),
+		"end_stream_arg":                 endStream,
+		"s_responseHeadersSent_PRE_LOCK": s.responseHeadersSent, // Log before lock for initial check
+		"call_stack_trace_PRE_LOCK":      string(debug.Stack()), // Log call stack
 	})
 
-	s.mu.Lock()
+	s.mu.Lock() // Lock for state check and update
+	s.conn.log.Debug("Stream.SendHeaders: MUTEX ACQUIRED", logger.LogFields{
+		"stream_id":                     s.id,
+		"s_responseHeadersSent_IN_LOCK": s.responseHeadersSent,
+	})
 	// defer s.mu.Unlock() // Defer moved to ensure it covers all paths correctly
 
 	if s.responseHeadersSent {
