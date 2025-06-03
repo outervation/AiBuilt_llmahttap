@@ -112,6 +112,28 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 		}
 
 		// Not enough space, wait for WINDOW_UPDATE or settings change.
+		// Diagnostic log before waiting
+		loggerFromStreamOrConn := logger.NewDiscardLogger() // Default to discard
+		if fcw.isConnection && fcw.streamID == 0 {
+			// This is a connection FCW. For now, using discard for conn.
+		} else if !fcw.isConnection && fcw.streamID != 0 {
+			// This is a stream FCW. For now, using discard for stream.
+		}
+		var errStr string
+		if fcw.err != nil {
+			errStr = fcw.err.Error()
+		} else {
+			errStr = "nil"
+		}
+		loggerFromStreamOrConn.Debug("FlowControlWindow.Acquire: blocking", logger.LogFields{
+			"is_connection_fcw": fcw.isConnection,
+			"stream_id":         fcw.streamID,
+			"requested_n":       n,
+			"available":         fcw.available,
+			"closed":            fcw.closed,
+			"err_present":       fcw.err != nil,
+			"err_val_if_any":    errStr,
+		})
 		fcw.cond.Wait()
 	}
 }
