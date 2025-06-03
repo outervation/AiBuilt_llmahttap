@@ -214,16 +214,36 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 	defer fcw.mu.Unlock()
 
 	if fcw.err != nil {
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_E] stream_id: %d, conn: %t, increment: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, increment, fcw.err, fcw.closed, fcw.available)
-		return fcw.err
+		// Log the existing error and the current attempt's increment
+		cErrLogFields := logger.LogFields{
+			"stream_id": fcw.streamID, "is_conn_fcw": fcw.isConnection,
+			"current_increment_arg": increment, // Log the increment for *this* call
+			"existing_fcw_err":      fmt.Sprintf("%v", fcw.err), "fcw_closed": fcw.closed,
+			"fcw_available": fcw.available,
+		}
+		// Use a more general logger if available, or fmt.Fprintf for critical diagnostics
+		// Assuming a logger might be available via a conn reference if this is part of a larger system,
+		// or use a package-level default logger for http2.
+		// For now, using fmt.Fprintf for directness in this isolated test.
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE fcw.err ALREADY SET] Fields: %v\n", cErrLogFields)
+		return fcw.err // Return the pre-existing error
 	}
 
 	if increment == 0 {
+		// Log details specifically when this condition (increment == 0) is met.
+		cErrLogFields := logger.LogFields{
+			"stream_id": fcw.streamID, "is_conn_fcw": fcw.isConnection,
+			"increment_arg_is_zero": true, "fcw_err_before_this_error": fmt.Sprintf("%v", fcw.err), // Should be nil here
+			"fcw_closed_before_this_error": fcw.closed, "fcw_available_before_this_error": fcw.available,
+		}
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE increment IS ZERO] Fields: %v\n", cErrLogFields)
+
 		if !fcw.isConnection {
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_F_PROTO] stream_id: %d, conn: %t, increment: %d\n", fcw.streamID, fcw.isConnection, increment)
+			// This is the specific error message in question.
 			return NewStreamError(fcw.streamID, ErrCodeProtocolError, "WINDOW_UPDATE increment cannot be 0 for a stream")
 		}
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS_G_NOOP_CONN] stream_id: %d, conn: %t, increment: %d\n", fcw.streamID, fcw.isConnection, increment)
+		// For connection-level, increment 0 is a no-op.
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS (increment 0 for conn)] stream_id: %d\n", fcw.streamID)
 		return nil
 	}
 
