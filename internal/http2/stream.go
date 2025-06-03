@@ -1319,25 +1319,28 @@ func (s *Stream) processIncomingDataFrames() {
 		// 3. Else (no pendingRST, no panic), use context error or io.EOF.
 
 		if pendingRST != nil {
+			// If there's a pending RST, that is the definitive error for the pipe.
 			if panicked != nil {
-				closeErr = NewStreamError(s.id, *pendingRST, "stream reset during body processing panic")
+				closeErr = NewStreamError(s.id, *pendingRST, fmt.Sprintf("stream reset (rst_code: %s) during body processing panic: %v", pendingRST.String(), panicked))
 			} else {
-				closeErr = NewStreamError(s.id, *pendingRST, "stream reset")
+				closeErr = NewStreamError(s.id, *pendingRST, fmt.Sprintf("stream reset (rst_code: %s)", pendingRST.String()))
 			}
 		} else if panicked != nil {
+			// No pending RST, but a panic occurred.
 			s.conn.log.Error("Panic in stream.processIncomingDataFrames", logger.LogFields{
 				"stream_id": s.id,
 				"panic_val": fmt.Sprintf("%v", panicked),
 				"stack":     string(debug.Stack()),
 			})
-			// If panic and no pendingRST, try context error first, then panic itself.
+			// Try context error first if panic, then panic itself as error for pipe.
 			select {
 			case <-s.ctx.Done():
-				closeErr = s.ctx.Err() // Context error takes precedence over panic error message for pipe
+				closeErr = s.ctx.Err()
 			default:
 				closeErr = fmt.Errorf("panic in body processing for stream %d: %v", s.id, panicked)
 			}
-		} else { // No pendingRST and no panic
+		} else {
+			// No pending RST and no panic. Error determined by context or EOF.
 			select {
 			case <-s.ctx.Done():
 				closeErr = s.ctx.Err()
@@ -1376,7 +1379,7 @@ func (s *Stream) processIncomingDataFrames() {
 			// This ensures the panic propagates to the connection's Serve loop defer for logging/handling.
 			panic(panicked)
 		}
-	}() // Corrected: moved the final () here
+	}()
 
 	s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine started", logger.LogFields{"stream_id": s.id})
 
