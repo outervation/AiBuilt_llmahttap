@@ -163,7 +163,7 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 	}
 
 	fcw.available = newSize
-	fcw.cond.Broadcast() // Wake up any goroutines waiting in Acquire
+	fcw.cond.Broadcast() // Wakes up all waiters; Signal() might be sufficient if only one type of waiter
 	return nil
 }
 
