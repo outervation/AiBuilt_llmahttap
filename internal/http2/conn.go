@@ -1850,6 +1850,7 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 	// For h2spec 2.3: PRIORITY on half-closed (remote) stream.
 	// Stream is still open for sending. Receiving PRIORITY should be fine and update priority tree.
 	// It should NOT cause the stream to close or transition, nor send RST.
+
 	if preState == StreamStateHalfClosedRemote {
 		c.log.Debug("Dispatching stream-level PRIORITY on HalfClosedRemote stream", logger.LogFields{
 			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
@@ -1862,30 +1863,39 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 					"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
 				})
 			if se, ok := err.(*StreamError); ok {
+				// If ProcessPriorityFrame returns a StreamError (e.g., self-dependency), RST the stream.
 				rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
 				if rstErr != nil {
-					return NewConnectionErrorWithCause(ErrCodeFrameSizeError,
+					// If sending RST fails, it's a connection-level issue.
+					return NewConnectionErrorWithCause(ErrCodeFrameSizeError, // Using FrameSizeError as a placeholder, should be InternalError for send failure
 						fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d (HalfClosedRemote path): %v",
 							se.Code.String(), se.StreamID, rstErr),
-						err,
+						err, // Original error from ProcessPriorityFrame
 					)
 				}
 				return nil // RST sent for stream error from priority tree.
 			}
-			// Non-StreamError from priorityTree.ProcessPriorityFrame is unexpected.
+			// Non-StreamError from priorityTree.ProcessPriorityFrame is unexpected for stream-specific priority.
+			// It might indicate a bug in PriorityTree or a connection-level issue miscategorized.
 			return NewConnectionErrorWithCause(ErrCodeInternalError,
 				fmt.Sprintf("internal error processing PRIORITY frame for stream %d (HalfClosedRemote path): %v", streamID, err),
 				err,
 			)
 		}
 		// Log post-state only if stream was found initially
-		stream.mu.RLock()
-		postStateAfterHCR := stream.state
-		stream.mu.RUnlock()
-		c.log.Debug("Stream-level PRIORITY processed (HalfClosedRemote path)", logger.LogFields{
-			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-			"post_stream_state": postStateAfterHCR.String(), "state_changed": preState != postStateAfterHCR,
-		})
+		if found { // Ensure stream still exists/was found to check its state
+			stream.mu.RLock()
+			postStateAfterHCR := stream.state
+			stream.mu.RUnlock()
+			c.log.Debug("Stream-level PRIORITY processed (HalfClosedRemote path)", logger.LogFields{
+				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+				"post_stream_state": postStateAfterHCR.String(), "state_changed": preState != postStateAfterHCR,
+			})
+		} else {
+			c.log.Debug("Stream-level PRIORITY processed (stream was not in active map, HalfClosedRemote path)", logger.LogFields{
+				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+			})
+		}
 		return nil // Successfully processed on HalfClosedRemote
 	}
 
@@ -2297,15 +2307,25 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 		if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
 			c.log.Error("Error handling stream-level WINDOW_UPDATE from peer (HalfClosedRemote path)",
 				logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
-			var streamErrCode ErrorCode = ErrCodeFlowControlError
-			if frame.WindowSizeIncrement == 0 {
+			// Determine error code for RST_STREAM
+			var streamErrCode ErrorCode = ErrCodeFlowControlError // Default if increment caused FC overflow
+			if frame.WindowSizeIncrement == 0 {                   // WINDOW_UPDATE with 0 increment is PROTOCOL_ERROR for streams
 				streamErrCode = ErrCodeProtocolError
 			}
+			// ADDED LOG:
+			c.log.Error("Detailed error for WU on HCR stream before RST", logger.LogFields{
+				"stream_id":                       streamID,
+				"increment_wu":                    frame.WindowSizeIncrement,
+				"original_error_from_fcManager":   err.Error(),
+				"original_error_type_fcManager":   fmt.Sprintf("%T", err),
+				"determined_rst_code_for_fcError": streamErrCode.String(),
+			})
 			rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
 			if rstErr != nil {
+				// If sending RST fails, it's a connection-level issue.
 				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d (HalfClosedRemote path)", streamID), rstErr)
 			}
-			return nil
+			return nil // RST_STREAM sent, stream error handled.
 		}
 		stream.mu.RLock()
 		postStateAfterHCR := stream.state
@@ -2317,7 +2337,7 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 				"post_stream_state": postStateAfterHCR.String(), "post_send_avail": postSendAvailAfterHCR,
 				"state_changed": preState != postStateAfterHCR, "avail_changed_by": postSendAvailAfterHCR - preSendAvail,
 			})
-		return nil
+		return nil // Successfully processed on HalfClosedRemote
 	}
 
 	// Original logic for other states
