@@ -1400,7 +1400,7 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 
 			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID})
 			// This is a connection error as per RFC 7540, Section 5.1.1.
-			return NewConnectionError(ErrCodeProtocolError, errMsg)
+			return NewConnectionError(ErrCodeProtocolError, errMsg) // Reverted from ErrCodeStreamClosed
 		}
 
 		// If streamID > c.highestPeerInitiatedStreamID, it's a genuinely new stream ID,
