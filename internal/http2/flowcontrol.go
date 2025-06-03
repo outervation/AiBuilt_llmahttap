@@ -2,6 +2,7 @@ package http2
 
 import (
 	"fmt"
+	"os" // ADDED IMPORT
 
 	"example.com/llmahttap/v2/internal/logger"
 	"sync"
@@ -113,27 +114,58 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 
 		// Not enough space, wait for WINDOW_UPDATE or settings change.
 		// Diagnostic log before waiting
-		loggerFromStreamOrConn := logger.NewDiscardLogger() // Default to discard
-		if fcw.isConnection && fcw.streamID == 0 {
-			// This is a connection FCW. For now, using discard for conn.
-		} else if !fcw.isConnection && fcw.streamID != 0 {
-			// This is a stream FCW. For now, using discard for stream.
+
+		// DIAGNOSTIC: Use a global logger temporarily if conn/stream logger is hard to get here.
+		// This is a simplification for debugging; ideally, the correct logger instance is passed down.
+		// var tempLogger *logger.Logger // REMOVED
+		// Attempt to get a real logger if possible.
+		// This is a placeholder as fcw doesn't know its parent directly.
+		// In a real scenario, logger might be passed to Acquire or NewFlowControlWindow.
+		// For now, let's assume a global test logger exists or fall back to discard.
+		// if SomeGlobalTestLogger != nil { tempLogger = SomeGlobalTestLogger } else {
+		// tempLogger = logger.NewDiscardLogger() // Fallback if global isn't easily available for this edit.
+		// }
+		// This logic needs to be improved to get the actual logger from conn or stream.
+		// For the purpose of THIS diagnostic step, if we are inside a stream's FCW,
+		// we need a way to log. This is difficult as FCW is generic.
+		// Let's assume for now the DiscardLogger was intentional if no better logger is found.
+		// The previous plan to use global.Log() is hard to implement without defining global.
+		// Reverting to DiscardLogger for now, as getting the correct logger here is non-trivial.
+		// The core issue of this change is to *attempt* to log if a logger were available.
+		// The actual problem might be elsewhere if logging isn't appearing.
+
+		// For the purpose of this edit, I will hardcode to print to os.Stderr
+		// to ensure *some* output if this path is hit during h2spec.
+		// THIS IS FOR DIAGNOSTICS ONLY AND SHOULD BE REVERTED.
+		if true { // Force this path for diagnostic printing
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE BLOCKING] stream_id: %d, conn: %t, req: %d, avail: %d, closed: %t, err: %v\n",
+				fcw.streamID, fcw.isConnection, n, fcw.available, fcw.closed, fcw.err)
 		}
+
+		// Original attempt:
+		// loggerFromStreamOrConn := logger.NewDiscardLogger() // Default to discard // REMOVED
+		// if fcw.isConnection && fcw.streamID == 0 {
+		// 	// This is a connection FCW. For now, using discard for conn.
+		// } else if !fcw.isConnection && fcw.streamID != 0 {
+		// 	// This is a stream FCW. For now, using discard for stream.
+		// }
 		var errStr string
 		if fcw.err != nil {
 			errStr = fcw.err.Error()
 		} else {
 			errStr = "nil"
 		}
-		loggerFromStreamOrConn.Debug("FlowControlWindow.Acquire: blocking", logger.LogFields{
-			"is_connection_fcw": fcw.isConnection,
-			"stream_id":         fcw.streamID,
-			"requested_n":       n,
-			"available":         fcw.available,
-			"closed":            fcw.closed,
-			"err_present":       fcw.err != nil,
-			"err_val_if_any":    errStr,
-		})
+		_ = errStr // Use errStr to satisfy linters if logger below is commented out.
+		// The actual logger call was:
+		// loggerFromStreamOrConn.Debug("FlowControlWindow.Acquire: blocking", logger.LogFields{
+		//	"is_connection_fcw": fcw.isConnection,
+		//	"stream_id":         fcw.streamID,
+		//	"requested_n":       n,
+		//	"available":         fcw.available,
+		//	"closed":            fcw.closed,
+		//	"err_present":       fcw.err != nil,
+		//	"err_val_if_any":    errStr,
+		// })
 		fcw.cond.Wait()
 	}
 }
