@@ -3256,30 +3256,33 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 		}
 
 		if err != nil {
-			// First, try direct type assertion to *StreamError
-			if se, ok := err.(*StreamError); ok {
-				c.log.Warn("Serve (reader) loop: readFrame returned direct *StreamError. Sending RST_STREAM.",
-					logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "msg": se.Msg, "original_error_type": fmt.Sprintf("%T", err)})
-				if rstSendErr := c.sendRSTStreamFrame(se.StreamID, se.Code); rstSendErr != nil {
-					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for a direct StreamError. Terminating connection.",
-						logger.LogFields{"stream_id": se.StreamID, "rst_send_error": rstSendErr.Error()})
-					c.streamsMu.Lock()
-					if c.connError == nil {
-						c.connError = rstSendErr
-					}
-					c.streamsMu.Unlock()
-					return rstSendErr
+			// Check if the error is a ConnectionError or wraps one.
+			// If so, this is fatal for the connection. Store it and return.
+			var connErrTarget *ConnectionError
+			if errors.As(err, &connErrTarget) {
+				c.log.Error("Serve (reader) loop: readFrame returned ConnectionError. Terminating connection.",
+					logger.LogFields{
+						"error":       err.Error(), // Log the full wrapped error
+						"code":        connErrTarget.Code.String(),
+						"msg":         connErrTarget.Msg,
+						"remote_addr": c.remoteAddrStr,
+					})
+				c.streamsMu.Lock()
+				if c.connError == nil {
+					c.connError = err // Store the original error which might be wrapped
 				}
-				continue // Successfully sent RST_STREAM, continue serving.
+				c.streamsMu.Unlock()
+				return err // This will trigger the defer in Serve to call Close()
 			}
 
-			// If direct assertion failed, try errors.As (for wrapped StreamErrors)
+			// If not a ConnectionError, check if it's a StreamError (direct or wrapped)
+			// This logic remains similar to before, aiming to RST the stream if possible.
 			var streamErrTarget *StreamError
 			if errors.As(err, &streamErrTarget) {
-				c.log.Warn("Serve (reader) loop: readFrame returned wrapped *StreamError. Sending RST_STREAM.",
+				c.log.Warn("Serve (reader) loop: readFrame returned StreamError. Sending RST_STREAM.",
 					logger.LogFields{"stream_id": streamErrTarget.StreamID, "code": streamErrTarget.Code.String(), "msg": streamErrTarget.Msg, "original_error_type": fmt.Sprintf("%T", err)})
 				if rstSendErr := c.sendRSTStreamFrame(streamErrTarget.StreamID, streamErrTarget.Code); rstSendErr != nil {
-					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for an unwrapped StreamError. Terminating connection.",
+					c.log.Error("Serve (reader) loop: failed to send RST_STREAM for a StreamError. Terminating connection.",
 						logger.LogFields{"stream_id": streamErrTarget.StreamID, "rst_send_error": rstSendErr.Error()})
 					c.streamsMu.Lock()
 					if c.connError == nil {
@@ -3291,8 +3294,7 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				continue // Successfully sent RST_STREAM, continue serving.
 			}
 
-			// If neither direct assertion nor errors.As identified a recoverable StreamError,
-			// then it's a fatal connection error, EOF, or closed connection.
+			// If not ConnectionError or StreamError, handle other generic errors (EOF, closed, timeout)
 			logFields := logger.LogFields{"remote_addr": c.remoteAddrStr, "error": err.Error(), "error_type": fmt.Sprintf("%T", err)}
 			if errors.Is(err, io.EOF) {
 				c.log.Info("Serve (reader) loop: peer closed connection (EOF).", logFields)
@@ -3301,17 +3303,7 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 			} else if errors.Is(err, net.ErrClosed) || (err != nil && strings.Contains(err.Error(), "use of closed network connection")) {
 				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logFields)
 			} else {
-				c.log.Error("Serve (reader) loop: fatal error reading/parsing frame (not a recoverable StreamError).", logFields) // Original line
-				if ce, ok := err.(*ConnectionError); ok {                                                                         // New if block
-					c.log.Error("CONN.SERVE DETECTED ConnectionError FROM READFRAME (fatal path)", logger.LogFields{
-						"remote_addr":                   c.remoteAddrStr,
-						"code":                          ce.Code.String(),
-						"msg":                           ce.Msg,
-						"last_stream_id":                ce.LastStreamID,
-						"cause_is_nil":                  ce.Cause == nil,
-						"is_protocol_error_for_padding": ce.Code == ErrCodeProtocolError && strings.Contains(ce.Msg, "invalid padding"),
-					}) // Closes logger.LogFields and the c.log.Error(...) call
-				} // Closes the if block.
+				c.log.Error("Serve (reader) loop: fatal generic error reading/parsing frame. Terminating.", logFields)
 			}
 			c.streamsMu.Lock()
 			if c.connError == nil {
