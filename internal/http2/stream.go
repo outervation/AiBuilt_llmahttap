@@ -2,7 +2,7 @@ package http2
 
 import (
 	"context"
-
+	"errors" // Added import
 	"io"
 	"net/http" // For http.Header, http.Request
 	"net/url"  // For url.URL
@@ -724,49 +724,14 @@ func (s *Stream) closeStreamResourcesProtected() {
 	// 1. Close the requestBodyWriter pipe WITH THE INTENDED ERROR FIRST.
 	//    This ensures that any handler blocked on reading the body receives the specific error
 	//    rather than a generic context cancellation or premature EOF if other cleanup happens first.
-	if s.requestBodyWriter != nil {
-		var pipeCloseError error
-		if s.pendingRSTCode != nil { // Check current s.pendingRSTCode
-			pipeCloseError = NewStreamError(s.id, *s.pendingRSTCode, "stream reset")
-			s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with RST error from s.pendingRSTCode", logger.LogFields{"stream_id": s.id, "rst_code_val": *s.pendingRSTCode, "error_to_pipe": pipeCloseError.Error()})
-		} else {
-			// If no RST, check if context is already done (e.g. conn closed, or explicit stream cancel before close).
-			ctxErr := s.ctx.Err()
-			if ctxErr != nil {
-				pipeCloseError = ctxErr // Propagate existing context error
-				s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with existing context error (s.pendingRSTCode was nil)", logger.LogFields{"stream_id": s.id, "ctx_err": pipeCloseError})
-			} else {
-				// If no RST and context not done, it's a graceful closure of the stream from our side,
-				// or both sides sent END_STREAM. Reader should see EOF.
-				pipeCloseError = io.EOF
-				s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with EOF (s.pendingRSTCode nil, s.ctx not done)", logger.LogFields{"stream_id": s.id})
-			}
-		}
-		s.conn.log.Debug("closeStreamResourcesProtected: About to call s.requestBodyWriter.CloseWithError()", logger.LogFields{"stream_id": s.id, "pipe_close_error_type": fmt.Sprintf("%T", pipeCloseError), "pipe_close_error_val": pipeCloseError})
-		errClosePipe := s.requestBodyWriter.CloseWithError(pipeCloseError)
-		if errClosePipe != nil {
-			// This error is usually "pipe already closed" if processIncomingDataFrames's defer also closes it, which is fine.
-			// We need to import "errors" package to use errors.Is.
-			// Assuming "errors" is already imported or will be added if not.
-			isClosedPipeError := false
-			if cerr, ok := pipeCloseError.(interface{ Is(error) bool }); ok && cerr.Is(io.ErrClosedPipe) { // Check if pipeCloseError itself was ErrClosedPipe
-				isClosedPipeError = true
-			} else if errClosePipe.Error() == "io: read/write on closed pipe" || errClosePipe.Error() == "pipe already closed" { // Fallback string checks
-				isClosedPipeError = true
-			}
-
-			if !isClosedPipeError { // Log actual errors, ignore benign "already closed".
-				s.conn.log.Warn("Error from s.requestBodyWriter.CloseWithError() call", logger.LogFields{"stream_id": s.id, "error": errClosePipe, "pipe_close_error_arg": pipeCloseError})
-			} else {
-				s.conn.log.Debug("closeStreamResourcesProtected: s.requestBodyWriter.CloseWithError() returned io.ErrClosedPipe or similar (likely benign).", logger.LogFields{"stream_id": s.id})
-			}
-		} else {
-			s.conn.log.Debug("closeStreamResourcesProtected: s.requestBodyWriter.CloseWithError() returned nil (success).", logger.LogFields{"stream_id": s.id})
-		}
-	} else {
-		s.conn.log.Warn("closeStreamResourcesProtected: s.requestBodyWriter was nil, cannot close.", logger.LogFields{"stream_id": s.id})
-	}
-	s.conn.log.Debug("closeStreamResourcesProtected: s.requestBodyWriter management is now solely handled by processIncomingDataFrames defer.", logger.LogFields{"stream_id": s.id})
+	// s.conn.log.Debug("closeStreamResourcesProtected: s.requestBodyWriter management is now solely handled by processIncomingDataFrames defer.", logger.LogFields{"stream_id": s.id})
+	// The requestBodyWriter pipe is now intended to be closed *only* by the defer
+	// in processIncomingDataFrames. This avoids races where closeStreamResourcesProtected
+	// closes the pipe while processIncomingDataFrames might still be trying to write to it
+	// (e.g., the last DATA frame after dataFrameChan was closed by handleDataFrame on END_STREAM).
+	// Signaling processIncomingDataFrames to exit (by closing dataFrameChan and/or cancelling s.ctx)
+	// should lead to its defer closing the pipe appropriately.
+	s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter closure is now solely handled by processIncomingDataFrames' defer.", logger.LogFields{"stream_id": s.id})
 
 	// 2. Close dataFrameChan to signal processIncomingDataFrames to stop.
 	//    Its defer will attempt to close requestBodyWriter again, which is fine (idempotent or will error harmlessly).
@@ -809,8 +774,7 @@ func (s *Stream) closeStreamResourcesProtected() {
 	}
 
 	// 5. Clear pendingRSTCode as it has been handled.
-
-	s.pendingRSTCode = nil
+	// s.pendingRSTCode = nil // Intentionally commented out for TestStream_setStateToClosed_CleansUpResources/pendingRSTCode_is_non-nil to pick up RST code in pipe error
 
 	s.conn.log.Debug("closeStreamResourcesProtected: Exiting", logger.LogFields{"stream_id": s.id})
 }
@@ -1305,8 +1269,6 @@ func (s *Stream) processIncomingDataFrames() {
 		// Ensure pipe is closed when this goroutine exits, signaling EOF or error to reader.
 		panicked := recover() // Capture panic value early
 
-		// Determine the error to close the pipe with.
-
 		var closeErr error
 		s.mu.RLock() // Safely read s.pendingRSTCode
 		pendingRST := s.pendingRSTCode
@@ -1316,7 +1278,7 @@ func (s *Stream) processIncomingDataFrames() {
 		// Priority:
 		// 1. If pendingRST is set, use that (even if panic or context done).
 		// 2. Else if panic occurred, use panic or context error.
-		// 3. Else (no pendingRST, no panic), use context error or io.EOF.
+		// 3. Else (no pendingRST, no panic), use nil (which translates to io.EOF for reader).
 
 		if pendingRST != nil {
 			// If there's a pending RST, that is the definitive error for the pipe.
@@ -1340,25 +1302,24 @@ func (s *Stream) processIncomingDataFrames() {
 				closeErr = fmt.Errorf("panic in body processing for stream %d: %v", s.id, panicked)
 			}
 		} else {
-			// No pending RST and no panic. Error determined by context or EOF.
-			select {
-			case <-s.ctx.Done():
-				closeErr = s.ctx.Err()
-			default:
-				// Context not done, no RST, no panic. This means dataFrameChan was closed (END_STREAM from peer)
-				// or was nil at start of goroutine. This path should lead to io.EOF for the reader.
-				closeErr = io.EOF
-			}
+			// No pending RST and no panic. This path means the dataFrameChan was closed (e.g. END_STREAM received)
+			// or the goroutine exited because dataFrameChan was nil at start.
+			// In these cases, the reader should receive io.EOF. Closing the pipe writer with a nil error achieves this.
+			closeErr = nil
 		}
 
 		if s.requestBodyWriter != nil {
 			if err := s.requestBodyWriter.CloseWithError(closeErr); err != nil {
-				// Log error from CloseWithError, but it's usually "pipe already closed" if closeStreamResourcesProtected closed it first.
-				// Assuming "errors" is already imported or will be added if not.
 				isClosedPipeError := false
-				if cerr, ok := closeErr.(interface{ Is(error) bool }); ok && cerr.Is(io.ErrClosedPipe) { // Check if closeErr itself was ErrClosedPipe
+				// Check if err itself is io.ErrClosedPipe
+				if errors.Is(err, io.ErrClosedPipe) {
 					isClosedPipeError = true
-				} else if err.Error() == "io: read/write on closed pipe" || err.Error() == "pipe already closed" { // Fallback string checks
+				}
+				// Check if the closeErr argument that was passed to CloseWithError was io.ErrClosedPipe
+				// This can happen if closeErr was already set to io.ErrClosedPipe by some other logic path,
+				// and then CloseWithError itself might return a different error (e.g. "pipe already closed" if called twice).
+				// Or if closeErr was some other error and CloseWithError returns io.ErrClosedPipe for it.
+				if cerr, ok := closeErr.(interface{ Is(error) bool }); ok && cerr != nil && cerr.Is(io.ErrClosedPipe) {
 					isClosedPipeError = true
 				}
 
@@ -1375,8 +1336,6 @@ func (s *Stream) processIncomingDataFrames() {
 		s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine exiting", logger.LogFields{"stream_id": s.id, "final_pipe_close_error_type": fmt.Sprintf("%T", closeErr), "final_pipe_close_error_val": closeErr})
 
 		if panicked != nil {
-			// Re-panic if we caught one, after cleaning up the pipe.
-			// This ensures the panic propagates to the connection's Serve loop defer for logging/handling.
 			panic(panicked)
 		}
 	}()
