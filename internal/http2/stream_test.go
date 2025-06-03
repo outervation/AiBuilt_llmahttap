@@ -797,22 +797,28 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				t.Logf("Got expected error from processRequestHeadersAndDispatch: %v", err)
 
 				// Verify the error is a StreamError with the expected code and stream ID
-				streamErr, ok := err.(*StreamError)
-				if !ok {
-					t.Fatalf("Expected a StreamError from processRequestHeadersAndDispatch, got %T: %v", err, err)
+				// Default to expecting StreamError. ConnectionError is only for specific cases.
+				if tc.name == "invalid: HEADERS on already closed stream" || tc.name == "invalid: HEADERS on already closed stream#01" {
+					connErr, ok := err.(*ConnectionError)
+					if !ok {
+						t.Fatalf("Expected a ConnectionError from processRequestHeadersAndDispatch for test '%s', got %T: %v", tc.name, err, err)
+					}
+					if connErr.Code != tc.expectedRSTCode { // Using expectedRSTCode to hold the expected ConnectionError.Code
+						t.Errorf("Expected ConnectionError code %s from processRequestHeadersAndDispatch for test '%s', got %s", tc.expectedRSTCode, tc.name, connErr.Code)
+					}
+				} else {
+					streamErr, ok := err.(*StreamError)
+					if !ok {
+						t.Fatalf("Expected a StreamError from processRequestHeadersAndDispatch for test '%s', got %T: %v", tc.name, err, err)
+					}
+					if streamErr.Code != tc.expectedRSTCode {
+						t.Errorf("Expected StreamError code %s from processRequestHeadersAndDispatch for test '%s', got %s", tc.expectedRSTCode, tc.name, streamErr.Code)
+					}
+					if streamErr.StreamID != stream.id {
+						t.Errorf("Expected StreamError StreamID %d for test '%s', got %d", stream.id, tc.name, streamErr.StreamID)
+					}
 				}
-				if streamErr.Code != tc.expectedRSTCode {
-					t.Errorf("Expected StreamError code %s from processRequestHeadersAndDispatch, got %s", tc.expectedRSTCode, streamErr.Code)
-				}
-				if streamErr.StreamID != stream.id {
-					t.Errorf("Expected StreamError StreamID %d from processRequestHeadersAndDispatch, got %d", stream.id, streamErr.StreamID)
-				}
-
-				// The RST_STREAM frame itself is checked later by tc.expectRST block,
-				// which verifies it was written to the mock net.Conn by the SUT (stream.processRequestHeadersAndDispatch
-				// calling s.sendRSTStream).
-				// The previous simulation of conn.sendRSTStreamFrame here was redundant for these cases.
-			} else {
+			} else { // No error was expected from processRequestHeadersAndDispatch
 				if err != nil {
 					// If no error was expected, but we got one, fail the test.
 					t.Fatalf("Expected no error from processRequestHeadersAndDispatch, but got: %v", err)
