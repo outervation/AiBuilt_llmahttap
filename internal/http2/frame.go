@@ -278,8 +278,8 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	if actualDataLength > 0 {
 		f.Data = make([]byte, actualDataLength)
 		if _, err := io.ReadFull(r, f.Data); err != nil {
-			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading actual data (expected %d bytes): %s\\n", header.StreamID, actualDataLength, err.Error()))
-			return fmt.Errorf("reading data for stream %d: %w", header.StreamID, err)
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading actual data (expected %d bytes): %s\n", header.StreamID, actualDataLength, err.Error()))
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("error reading DATA frame payload data for stream %d: %v", header.StreamID, err))
 		}
 	} else {
 		f.Data = []byte{} // Ensure f.Data is empty non-nil slice if actualDataLength is 0
