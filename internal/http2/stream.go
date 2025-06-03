@@ -20,6 +20,64 @@ import (
 	"golang.org/x/net/http2/hpack"             // For hpack.HeaderField
 )
 
+// requestBodyConsumedNotifier wraps an io.ReadCloser (the request body pipe reader)
+// and calls the stream's flow control manager to potentially send WINDOW_UPDATE
+// frames after data is successfully read.
+type requestBodyConsumedNotifier struct {
+	stream *Stream // Points back to the stream to access its fcManager
+	reader io.ReadCloser
+}
+
+// Read reads from the underlying reader and then notifies the flow control manager
+// about the consumed bytes.
+func (rbcn *requestBodyConsumedNotifier) Read(p []byte) (n int, err error) {
+	n, err = rbcn.reader.Read(p)
+	if n > 0 {
+		// Notify the stream's flow control manager that 'n' bytes have been consumed by the application.
+		// This might trigger sending a WINDOW_UPDATE frame for the stream.
+		if notifierErr := rbcn.stream.fcManager.SendWindowUpdateIfNeeded(uint32(n)); notifierErr != nil {
+			// Log the error, but the primary error from Read should be returned to the handler.
+			// This error could be serious (e.g., failed to queue WINDOW_UPDATE).
+			rbcn.stream.conn.log.Error("Error from SendWindowUpdateIfNeeded after request body read", logger.LogFields{
+				"stream_id":      rbcn.stream.id,
+				"bytes_read":     n,
+				"notifier_error": notifierErr.Error(),
+			})
+			// Decide if this error should supersede the Read error.
+			// If Read itself errored (e.g. io.EOF), that's more important for the handler.
+			// If Read was successful but notifier failed, it's a background issue.
+			// For now, just log it. If Read had no error, maybe return this one?
+			// Standard library http.Request.Body readers don't typically surface such errors.
+		}
+	}
+	// Also need to notify connection-level flow control
+	if n > 0 && rbcn.stream != nil && rbcn.stream.conn != nil && rbcn.stream.conn.connFCManager != nil {
+		connIncrement, connErr := rbcn.stream.conn.connFCManager.ApplicationConsumedData(uint32(n))
+		if connErr != nil {
+			rbcn.stream.conn.log.Error("Error from ConnectionFCManager.ApplicationConsumedData", logger.LogFields{
+				"stream_id":     rbcn.stream.id, // Log stream_id for context
+				"bytes_read":    n,
+				"conn_fc_error": connErr.Error(),
+			})
+		} else if connIncrement > 0 {
+			if sendErr := rbcn.stream.conn.sendWindowUpdateFrame(0, connIncrement); sendErr != nil {
+				rbcn.stream.conn.log.Error("Failed to send connection-level WINDOW_UPDATE frame", logger.LogFields{
+					"stream_id": 0, // Connection level
+					"increment": connIncrement,
+					"error":     sendErr.Error(),
+				})
+			}
+		}
+	}
+
+	return n, err
+}
+
+// Close closes the underlying reader.
+func (rbcn *requestBodyConsumedNotifier) Close() error {
+	return rbcn.reader.Close()
+}
+
 // StreamState represents the state of an HTTP/2 stream, as defined in RFC 7540, Section 5.1.
 
 // TODO: Remove this stub once connection.go is implemented
@@ -840,7 +898,7 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		// will be responsible for sending the appropriate GOAWAY frame.
 		// The direct s.sendRSTStream(ErrCodeStreamClosed) call is omitted.
 
-		return NewStreamError(s.id, ErrCodeStreamClosed, "headers received on closed stream")
+		return NewConnectionError(ErrCodeStreamClosed, "headers received on closed stream")
 	}
 
 	// NEW CHECK for h2spec 8.1/1
@@ -1010,7 +1068,10 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 		ProtoMajor: 2,
 		ProtoMinor: 0,
 		Header:     httpHeaders,
-		Body:       s.requestBodyReader, // Reader part of the pipe
+		Body: &requestBodyConsumedNotifier{ // This line is modified
+			stream: s,
+			reader: s.requestBodyReader,
+		}, // This closing brace is part of the Body field
 		Host:       pseudoAuthority,
 		RemoteAddr: s.conn.remoteAddrStr, // From connection
 		RequestURI: pseudoPath,           // Full path + query from :path
@@ -1022,6 +1083,21 @@ func (s *Stream) processRequestHeadersAndDispatch(headers []hpack.HeaderField, e
 	}
 
 	req = req.WithContext(s.ctx) // Associate stream's context with the request
+
+	s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: Comparing pointers", logger.LogFields{
+		"stream_id":           s.id,
+		"s_ptr":               fmt.Sprintf("%p", s),
+		"s.requestBodyReader": fmt.Sprintf("%p", s.requestBodyReader),
+		"req_body_ptr":        fmt.Sprintf("%p", req.Body),
+		"req_body_type":       fmt.Sprintf("%T", req.Body),
+	})
+	if notifier, ok := req.Body.(*requestBodyConsumedNotifier); ok {
+		s.conn.log.Debug("Stream.processRequestHeadersAndDispatch: req.Body is requestBodyConsumedNotifier", logger.LogFields{
+			"stream_id":           s.id,
+			"notifier.stream_ptr": fmt.Sprintf("%p", notifier.stream),
+			"notifier.reader_ptr": fmt.Sprintf("%p", notifier.reader),
+		})
+	}
 
 	s.conn.log.Debug("Stream: Dispatching request to handler", logger.LogFields{"stream_id": s.id, "method": req.Method, "uri": req.RequestURI})
 
