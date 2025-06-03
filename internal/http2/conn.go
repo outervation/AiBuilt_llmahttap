@@ -2220,10 +2220,17 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 func (c *Connection) readFrame() (Frame, error) {
 	frame, err := ReadFrame(c.netConn) // ReadFrame is in the same http2 package (frame.go)
 	if err != nil {
-		// TODO: Differentiate between io.EOF (clean close by peer), timeout, and other errors.
-		// For now, log and return.
-		// c.log.Error("Error reading frame from connection", logger.LogFields{"error": err.Error(), "remote_addr": c.remoteAddrStr})
+		// Log the error type and message directly from here
+		c.log.Error("conn.readFrame: Error returned by http2.ReadFrame", logger.LogFields{
+			"error":       err.Error(),
+			"error_type":  fmt.Sprintf("%T", err),
+			"remote_addr": c.remoteAddrStr,
+		})
 		return nil, err
+	}
+	if frame == nil { // Should not happen if err is nil, but defensive
+		c.log.Error("conn.readFrame: http2.ReadFrame returned nil frame AND nil error. This is unexpected.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+		return nil, NewConnectionError(ErrCodeInternalError, "internal: http2.ReadFrame returned nil frame and nil error")
 	}
 	c.log.Debug("Frame read from connection", logger.LogFields{"type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID, "length": frame.Header().Length, "flags": frame.Header().Flags})
 	return frame, nil
