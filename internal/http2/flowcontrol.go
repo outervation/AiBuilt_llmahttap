@@ -178,33 +178,23 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
-	if fcw.err != nil { // If there's a specific terminal error, don't operate.
+	if fcw.err != nil {
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_E] stream_id: %d, conn: %t, increment: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, increment, fcw.err, fcw.closed, fcw.available)
 		return fcw.err
 	}
 
-	// fcw.closed state is NOT checked here to prevent the increase for WINDOW_UPDATE frames.
-	// RFC 7540, Section 5.1 states that WINDOW_UPDATE frames MUST be processed even on
-	// streams that are half-closed or have entered the "closed" state via normal
-	// END_STREAM exchange.
-	// If fcw.closed is true (e.g., stream gracefully closed) but fcw.err is nil,
-	// the window size will still be updated.
-	// The Acquire method will still prevent new data sending if fcw.closed is true.
-
 	if increment == 0 {
 		if !fcw.isConnection {
-			// Stream-specific WINDOW_UPDATE with 0 increment is a PROTOCOL_ERROR. (RFC 6.9)
-			// This error should cause RST_STREAM by the caller.
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_F_PROTO] stream_id: %d, conn: %t, increment: %d\n", fcw.streamID, fcw.isConnection, increment)
 			return NewStreamError(fcw.streamID, ErrCodeProtocolError, "WINDOW_UPDATE increment cannot be 0 for a stream")
 		}
-		// For connection-level, increment 0 is a no-op. (RFC 6.9)
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS_G_NOOP_CONN] stream_id: %d, conn: %t, increment: %d\n", fcw.streamID, fcw.isConnection, increment)
 		return nil
 	}
 
+	oldAvail := fcw.available
 	newSize := fcw.available + int64(increment)
 	if newSize > MaxWindowSize {
-		// RFC 6.9.1: "A sender MUST NOT allow a flow-control window to exceed 2^31-1 octets.
-		// If a sender receives a WINDOW_UPDATE that causes the flow-control window to exceed this maximum,
-		// it MUST terminate either the stream or the connection, as appropriate."
 		var err error
 		msg := fmt.Sprintf("flow control window (conn: %v, stream: %d) would overflow: current %d + increment %d = %d > max %d",
 			fcw.isConnection, fcw.streamID, fcw.available, increment, newSize, MaxWindowSize)
@@ -213,12 +203,14 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 		} else {
 			err = NewStreamError(fcw.streamID, ErrCodeFlowControlError, msg)
 		}
-		fcw.setErrorLocked(err) // Mark this FCW as terminally errored. This also sets fcw.closed = true.
+		fcw.setErrorLocked(err)
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_H_OVERFLOW] stream_id: %d, conn: %t, increment: %d, old_avail: %d, new_size: %d, error: %v\n", fcw.streamID, fcw.isConnection, increment, oldAvail, newSize, err)
 		return err
 	}
 
 	fcw.available = newSize
-	fcw.cond.Broadcast() // Wakes up all waiters; Signal() might be sufficient if only one type of waiter
+	fcw.cond.Broadcast()
+	fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS_I] stream_id: %d, conn: %t, increment: %d, old_avail: %d, new_avail: %d\n", fcw.streamID, fcw.isConnection, increment, oldAvail, fcw.available)
 	return nil
 }
 
