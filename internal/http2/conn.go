@@ -1373,12 +1373,11 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 				// HEADERS on a closed stream is an error (h2spec 5.1/9 - "closed: Sends a HEADERS frame after sending RST_STREAM frame" -> STREAM_CLOSED).
 				// This case should be caught by the `peerHasRSTDThisStream` check earlier if the client RST'd it.
 				// If it reaches here, it means the stream was closed by server or gracefully.
-				c.log.Warn("Server received HEADERS for a Closed stream (not previously RST'd by client). Sending RST_STREAM(STREAM_CLOSED).",
+				// If it reaches here, it means the stream was closed by server or gracefully.
+				errMsg := fmt.Sprintf("HEADERS frame received on stream %d which was already closed by the server (or gracefully)", streamID)
+				c.log.Warn(errMsg+" - This will result in a connection error (STREAM_CLOSED).",
 					logger.LogFields{"stream_id": streamID, "state": state.String()})
-				if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
-					return errRST
-				}
-				return nil // RST_STREAM sent, stream error handled.
+				return NewConnectionError(ErrCodeStreamClosed, errMsg)
 			}
 
 			// For other states of an existing stream (e.g., HalfClosedRemote, ReservedLocal),
