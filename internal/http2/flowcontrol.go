@@ -72,101 +72,45 @@ func (fcw *FlowControlWindow) Available() int64 {
 // TODO: Add context.Context for cancellation.
 func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	if n == 0 {
-		// Sending 0 bytes in a DATA frame payload does not consume window.
-		// However, acquiring 0 bytes is a usage error for this method.
 		return fmt.Errorf("cannot acquire zero bytes from flow control window")
 	}
-	// n > MaxWindowSize check is not strictly needed here as available can't exceed MaxWindowSize.
-	// If n is very large, the loop condition `fcw.available >= int64(n)` will handle it.
 
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
 	for {
-		if fcw.err != nil { // A terminal error was recorded (e.g., overflow)
+		if fcw.err != nil { // A terminal error was recorded (e.g., overflow or explicit close with error)
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE RETURNING_ERR_A] stream_id: %d, conn: %t, n: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, n, fcw.err, fcw.closed, fcw.available)
 			return fcw.err
 		}
-		if fcw.closed { // Window explicitly closed
-			// Path Y: fcw.err is nil, fcw.closed is true.
-			// This specific log is to check if this path is hit in h2spec 2.2/2.3
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE FCW_CLOSED_PATH_Y] stream_id: %d, conn: %t, initial_fcw_err_was_nil: %t\n",
-				fcw.streamID, fcw.isConnection, fcw.err == nil)
+		if fcw.closed { // Window explicitly closed, possibly without a prior fcw.err
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE FCW_CLOSED_PATH_Y] stream_id: %d, conn: %t, n: %d, initial_fcw_err_was_nil: %t, fcw.available: %d\n",
+				fcw.streamID, fcw.isConnection, n, fcw.err == nil, fcw.available)
 
-			var errToReturn error
-			errMsg := fmt.Sprintf("flow control window (connection: %t, stream ID: %d) is closed", fcw.isConnection, fcw.streamID)
-			if fcw.isConnection {
-				// For a connection FCW, if closed, it might imply a GOAWAY was sent/received.
-				// Using ErrCodeInternalError for diagnosis, could be refined based on actual close reason if known.
-				errToReturn = NewConnectionError(ErrCodeInternalError, errMsg)
-			} else {
-				// For a stream FCW, if closed, ErrCodeStreamClosed is appropriate.
-				errToReturn = NewStreamError(fcw.streamID, ErrCodeStreamClosed, errMsg)
+			if fcw.err == nil { // If no specific error is already set, create one.
+				errMsg := fmt.Sprintf("flow control window (connection: %t, stream ID: %d) is closed", fcw.isConnection, fcw.streamID)
+				if fcw.isConnection {
+					fcw.err = NewConnectionError(ErrCodeInternalError, errMsg)
+				} else {
+					fcw.err = NewStreamError(fcw.streamID, ErrCodeStreamClosed, errMsg)
+				}
 			}
-			// Set fcw.err. Note: setErrorLocked also sets fcw.closed = true and broadcasts.
-			// Since fcw.closed is already true, this is fine.
-			fcw.setErrorLocked(errToReturn)
-			return fcw.err // Return the error that was just set.
+			fcw.cond.Broadcast() // Ensure waiters are woken up as the state is terminal.
+
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE RETURNING_ERR_B] stream_id: %d, conn: %t, n: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, n, fcw.err, fcw.closed, fcw.available)
+			return fcw.err // Return the (potentially newly set) error.
 		}
 
-		if fcw.available >= int64(n) {
+		if fcw.available >= int64(n) { // Sufficient window available
+			currentAvail := fcw.available
 			fcw.available -= int64(n)
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE SUCCESS_C] stream_id: %d, conn: %t, n: %d, old_avail: %d, new_avail: %d\n", fcw.streamID, fcw.isConnection, n, currentAvail, fcw.available)
 			return nil
 		}
 
 		// Not enough space, wait for WINDOW_UPDATE or settings change.
-		// Diagnostic log before waiting
-
-		// DIAGNOSTIC: Use a global logger temporarily if conn/stream logger is hard to get here.
-		// This is a simplification for debugging; ideally, the correct logger instance is passed down.
-		// var tempLogger *logger.Logger // REMOVED
-		// Attempt to get a real logger if possible.
-		// This is a placeholder as fcw doesn't know its parent directly.
-		// In a real scenario, logger might be passed to Acquire or NewFlowControlWindow.
-		// For now, let's assume a global test logger exists or fall back to discard.
-		// if SomeGlobalTestLogger != nil { tempLogger = SomeGlobalTestLogger } else {
-		// tempLogger = logger.NewDiscardLogger() // Fallback if global isn't easily available for this edit.
-		// }
-		// This logic needs to be improved to get the actual logger from conn or stream.
-		// For the purpose of THIS diagnostic step, if we are inside a stream's FCW,
-		// we need a way to log. This is difficult as FCW is generic.
-		// Let's assume for now the DiscardLogger was intentional if no better logger is found.
-		// The previous plan to use global.Log() is hard to implement without defining global.
-		// Reverting to DiscardLogger for now, as getting the correct logger here is non-trivial.
-		// The core issue of this change is to *attempt* to log if a logger were available.
-		// The actual problem might be elsewhere if logging isn't appearing.
-
-		// For the purpose of this edit, I will hardcode to print to os.Stderr
-		// to ensure *some* output if this path is hit during h2spec.
-		// THIS IS FOR DIAGNOSTICS ONLY AND SHOULD BE REVERTED.
-		if true { // Force this path for diagnostic printing
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE BLOCKING] stream_id: %d, conn: %t, req: %d, avail: %d, closed: %t, err: %v\n",
-				fcw.streamID, fcw.isConnection, n, fcw.available, fcw.closed, fcw.err)
-		}
-
-		// Original attempt:
-		// loggerFromStreamOrConn := logger.NewDiscardLogger() // Default to discard // REMOVED
-		// if fcw.isConnection && fcw.streamID == 0 {
-		// 	// This is a connection FCW. For now, using discard for conn.
-		// } else if !fcw.isConnection && fcw.streamID != 0 {
-		// 	// This is a stream FCW. For now, using discard for stream.
-		// }
-		var errStr string
-		if fcw.err != nil {
-			errStr = fcw.err.Error()
-		} else {
-			errStr = "nil"
-		}
-		_ = errStr // Use errStr to satisfy linters if logger below is commented out.
-		// The actual logger call was:
-		// loggerFromStreamOrConn.Debug("FlowControlWindow.Acquire: blocking", logger.LogFields{
-		//	"is_connection_fcw": fcw.isConnection,
-		//	"stream_id":         fcw.streamID,
-		//	"requested_n":       n,
-		//	"available":         fcw.available,
-		//	"closed":            fcw.closed,
-		//	"err_present":       fcw.err != nil,
-		//	"err_val_if_any":    errStr,
-		// })
+		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE BLOCKING_D] stream_id: %d, conn: %t, req: %d, avail: %d, closed: %t, err: %v\n",
+			fcw.streamID, fcw.isConnection, n, fcw.available, fcw.closed, fcw.err)
 		fcw.cond.Wait()
 	}
 }
