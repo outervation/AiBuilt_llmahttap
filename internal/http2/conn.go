@@ -1841,119 +1841,65 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 
 	stream, found := c.getStream(streamID)
 	var preState StreamState = 0xff // Invalid initial state for logging if not found
+
 	if found {
 		stream.mu.RLock()
 		preState = stream.state
 		stream.mu.RUnlock()
+
+		if preState == StreamStateClosed {
+			c.log.Debug("PRIORITY frame received on Closed stream. No effect.",
+				logger.LogFields{"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive})
+			return nil // No effect, as per RFC 7540, Section 6.3.
+		}
 	}
 
-	// For h2spec 2.3: PRIORITY on half-closed (remote) stream.
-	// Stream is still open for sending. Receiving PRIORITY should be fine and update priority tree.
-	// It should NOT cause the stream to close or transition, nor send RST.
-
-	if preState == StreamStateHalfClosedRemote {
-		c.log.Debug("Dispatching stream-level PRIORITY on HalfClosedRemote stream", logger.LogFields{
-			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-			"stream_found": found, "pre_stream_state": preState.String(),
-		})
-		err := c.priorityTree.ProcessPriorityFrame(frame)
-		if err != nil { // ProcessPriorityFrame can return StreamError for self-dependency
-			c.log.Warn("Error processing PRIORITY frame in priority tree (HalfClosedRemote path)",
-				logger.LogFields{
-					"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
-				})
-			// ADDED LOG:
-			determinedRSTCodeForPrio := ErrCodeProtocolError // Default for priority issues unless specific StreamError
-			if se, ok := err.(*StreamError); ok {
-				determinedRSTCodeForPrio = se.Code
-			}
-			c.log.Error("Detailed error for PRIORITY on HCR stream before RST", logger.LogFields{
-				"stream_id":                         streamID,
-				"original_error_from_priorityTree":  err.Error(),
-				"original_error_type_priorityTree":  fmt.Sprintf("%T", err),
-				"determined_rst_code_for_prioError": determinedRSTCodeForPrio.String(),
-			})
-			if se, ok := err.(*StreamError); ok {
-				// If ProcessPriorityFrame returns a StreamError (e.g., self-dependency), RST the stream.
-				rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
-				if rstErr != nil {
-					// If sending RST fails, it's a connection-level issue.
-					return NewConnectionErrorWithCause(ErrCodeFrameSizeError, // Using FrameSizeError as a placeholder, should be InternalError for send failure
-						fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d (HalfClosedRemote path): %v",
-							se.Code.String(), se.StreamID, rstErr),
-						err, // Original error from ProcessPriorityFrame
-					)
-				}
-				return nil // RST sent for stream error from priority tree.
-			}
-			// Non-StreamError from priorityTree.ProcessPriorityFrame is unexpected for stream-specific priority.
-			// It might indicate a bug in PriorityTree or a connection-level issue miscategorized.
-			return NewConnectionErrorWithCause(ErrCodeInternalError,
-				fmt.Sprintf("internal error processing PRIORITY frame for stream %d (HalfClosedRemote path): %v", streamID, err),
-				err,
-			)
-		}
-		// Log post-state only if stream was found initially
-		if found { // Ensure stream still exists/was found to check its state
-			stream.mu.RLock()
-			postStateAfterHCR := stream.state
-			stream.mu.RUnlock()
-			c.log.Debug("Stream-level PRIORITY processed (HalfClosedRemote path)", logger.LogFields{
-				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-				"post_stream_state": postStateAfterHCR.String(), "state_changed": preState != postStateAfterHCR,
-			})
-		} else {
-			c.log.Debug("Stream-level PRIORITY processed (stream was not in active map, HalfClosedRemote path)", logger.LogFields{
-				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-			})
-		}
-		return nil // Successfully processed on HalfClosedRemote
-	}
-
-	// Original logic for other states
-	c.log.Debug("Dispatching stream-level PRIORITY (non-HalfClosedRemote path)", logger.LogFields{
+	// If stream is not found (idle) or not closed, process the PRIORITY frame.
+	// PRIORITY frames can create new nodes in the priority tree if the stream was previously unknown.
+	c.log.Debug("Dispatching stream-level PRIORITY", logger.LogFields{
 		"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-		"stream_found": found, "pre_stream_state": preState.String(),
+		"stream_found": found, "pre_stream_state_if_found": preState.String(),
 	})
 
 	err := c.priorityTree.ProcessPriorityFrame(frame)
 	if err != nil {
-		c.log.Warn("Error processing PRIORITY frame in priority tree (non-HalfClosedRemote path)",
+		c.log.Warn("Error processing PRIORITY frame in priority tree",
 			logger.LogFields{
-				"stream_id":      streamID,
-				"dependency":     frame.StreamDependency,
-				"weight":         frame.Weight,
-				"exclusive":      frame.Exclusive,
-				"original_error": err.Error(),
+				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
 			})
 
+		// If ProcessPriorityFrame returns a StreamError (e.g., self-dependency), RST the stream.
 		if se, ok := err.(*StreamError); ok {
 			rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
 			if rstErr != nil {
-				return NewConnectionErrorWithCause(ErrCodeFrameSizeError,
-					fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d (non-HalfClosedRemote path): %v",
+				// If sending RST fails, it's a connection-level issue.
+				return NewConnectionErrorWithCause(ErrCodeInternalError, // Changed from FrameSizeError
+					fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d: %v",
 						se.Code.String(), se.StreamID, rstErr),
-					err,
+					err, // Original error from ProcessPriorityFrame
 				)
 			}
-			return nil
+			return nil // RST sent for stream error from priority tree.
 		}
+		// Non-StreamError from priorityTree.ProcessPriorityFrame is unexpected for stream-specific priority.
+		// It might indicate a bug in PriorityTree or a connection-level issue miscategorized.
 		return NewConnectionErrorWithCause(ErrCodeInternalError,
-			fmt.Sprintf("internal error processing PRIORITY frame for stream %d (non-HalfClosedRemote path): %v", streamID, err),
+			fmt.Sprintf("internal error processing PRIORITY frame for stream %d: %v", streamID, err),
 			err,
 		)
 	}
 
+	// Log post-state only if stream was found initially
 	if found {
 		stream.mu.RLock()
 		postState := stream.state
 		stream.mu.RUnlock()
-		c.log.Debug("Stream-level PRIORITY processed (non-HalfClosedRemote path)", logger.LogFields{
+		c.log.Debug("Stream-level PRIORITY processed successfully", logger.LogFields{
 			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
-			"post_stream_state": postState.String(), "state_changed": preState != postState,
+			"post_stream_state_if_found": postState.String(), "state_changed": preState != postState,
 		})
 	} else {
-		c.log.Debug("Stream-level PRIORITY processed (stream was not in active map, non-HalfClosedRemote path)", logger.LogFields{
+		c.log.Debug("Stream-level PRIORITY processed (stream was not in active map or was idle)", logger.LogFields{
 			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
 		})
 	}
@@ -2312,7 +2258,7 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	preSendAvail := stream.fcManager.GetStreamSendAvailable() // For logging
 
 	c.log.Debug("Dispatching stream-level WINDOW_UPDATE", logger.LogFields{
-		"stream_id": streamID, "increment": frame.WindowSizeIncrement,
+		"stream_id": streamID, "increment_arg": frame.WindowSizeIncrement, // LOG THE INCREMENT ARGUMENT
 		"current_stream_state": state.String(), "pre_send_avail": preSendAvail,
 	})
 
