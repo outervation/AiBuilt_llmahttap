@@ -3253,7 +3253,17 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 			} else if errors.Is(err, net.ErrClosed) || (err != nil && strings.Contains(err.Error(), "use of closed network connection")) {
 				c.log.Info("Serve (reader) loop: connection closed locally or context cancelled.", logFields)
 			} else {
-				c.log.Error("Serve (reader) loop: fatal error reading/parsing frame (not a recoverable StreamError).", logFields)
+				c.log.Error("Serve (reader) loop: fatal error reading/parsing frame (not a recoverable StreamError).", logFields) // Original line
+				if ce, ok := err.(*ConnectionError); ok {                                                                         // New if block
+					c.log.Error("CONN.SERVE DETECTED ConnectionError FROM READFRAME (fatal path)", logger.LogFields{
+						"remote_addr":                   c.remoteAddrStr,
+						"code":                          ce.Code.String(),
+						"msg":                           ce.Msg,
+						"last_stream_id":                ce.LastStreamID,
+						"cause_is_nil":                  ce.Cause == nil,
+						"is_protocol_error_for_padding": ce.Code == ErrCodeProtocolError && strings.Contains(ce.Msg, "invalid padding"),
+					}) // Closes logger.LogFields and the c.log.Error(...) call
+				} // Closes the if block.
 			}
 			c.streamsMu.Lock()
 			if c.connError == nil {
