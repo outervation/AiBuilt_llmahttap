@@ -770,6 +770,8 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				tc.preFunc(stream, t, struct{ endStream bool }{tc.endStream})
 			} else {
 				stream.mu.Lock()
+
+				t.Logf("TestStream_processRequestHeadersAndDispatch (%s): stream %p, stream.requestBodyReader %p after newTestStream", tc.name, stream, stream.requestBodyReader)
 				if tc.endStream { // If HEADERS has END_STREAM
 					stream.state = StreamStateIdle // Will transition to HalfClosedRemote in processRequestHeadersAndDispatch
 					// stream.endStreamReceivedFromClient will be set by processRequestHeadersAndDispatch
@@ -958,8 +960,11 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 					if lastReqReceived.RemoteAddr != conn.remoteAddrStr {
 						t.Errorf("Request RemoteAddr: got %q, want %q", lastReqReceived.RemoteAddr, conn.remoteAddrStr)
 					}
-					if lastReqReceived.Body != stream.requestBodyReader {
-						t.Error("Request Body is not the stream's requestBodyReader")
+
+					if notifier, ok := lastReqReceived.Body.(*requestBodyConsumedNotifier); !ok {
+						t.Error("Request Body is not of type *requestBodyConsumedNotifier")
+					} else if notifier.reader != stream.requestBodyReader {
+						t.Errorf("Request Body's underlying reader (%p) is not the stream's requestBodyReader (%p)", notifier.reader, stream.requestBodyReader)
 					}
 					if lastReqReceived.Context() != stream.ctx { // Compare underlying contexts if wrapped
 						if lastReqReceived.Context() == nil || stream.ctx == nil {
