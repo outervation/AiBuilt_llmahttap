@@ -2114,6 +2114,16 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	}
 
 	// Stream found, delegate to stream's flow control manager.
+	stream.mu.RLock()
+	preState := stream.state
+	preSendAvail := stream.fcManager.GetStreamSendAvailable()
+	stream.mu.RUnlock()
+
+	c.log.Debug("Dispatching stream-level WINDOW_UPDATE", logger.LogFields{
+		"stream_id": streamID, "increment": frame.WindowSizeIncrement,
+		"pre_stream_state": preState.String(), "pre_send_avail": preSendAvail,
+	})
+
 	if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
 		// fcManager.HandleWindowUpdateFromPeer returns an error for 0 increment or overflow.
 		// This should be treated as a stream error.
@@ -2132,8 +2142,17 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 		return nil // RST sent, stream error handled.
 	}
 
+	stream.mu.RLock()
+	postState := stream.state
+	postSendAvail := stream.fcManager.GetStreamSendAvailable()
+	stream.mu.RUnlock()
+
 	c.log.Debug("Stream-level WINDOW_UPDATE processed",
-		logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "new_stream_send_window": stream.fcManager.GetStreamSendAvailable()})
+		logger.LogFields{
+			"stream_id": streamID, "increment": frame.WindowSizeIncrement,
+			"post_stream_state": postState.String(), "post_send_avail": postSendAvail,
+			"state_changed": preState != postState, "avail_changed_by": postSendAvail - preSendAvail,
+		})
 	return nil
 }
 
