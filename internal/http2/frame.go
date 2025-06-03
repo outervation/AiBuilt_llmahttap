@@ -255,10 +255,10 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		// If f.PadLength > (payloadTotalDeclaredInHeader - 1), it's an error.
 		// This is equivalent to (f.PadLength + 1) > payloadTotalDeclaredInHeader.
 		if uint32(f.PadLength)+1 > payloadTotalDeclaredInHeader {
-			errorMsg := fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value %d (+1 for field itself) exceeds total declared payload length %d", header.StreamID, f.PadLength, payloadTotalDeclaredInHeader)
-
-			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] CRITICAL PADDING ERROR (inserted before return): %s\\n", header.StreamID, errorMsg))
-			// os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] %s\\n", header.StreamID, errorMsg)) // Removed to test h2spec 6.1.3 interference
+			// This means PadLength value itself + 1 byte for the PadLength field > total payload.
+			// Or, equivalently, f.PadLength >= payloadTotalDeclaredInHeader
+			errorMsg := fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength field value %d requires %d octets for padding, but total declared payload is only %d octets (PadLength field + Data + Padding). This implies PadLength field value is too large.", header.StreamID, f.PadLength, uint32(f.PadLength)+1, payloadTotalDeclaredInHeader)
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] CRITICAL PADDING ERROR: %s\\n", header.StreamID, errorMsg))
 			return NewConnectionError(ErrCodeProtocolError, errorMsg)
 		}
 
