@@ -79,10 +79,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
-	// Use a generic logger or fmt.Fprintf for diagnostics if conn.log isn't available here.
-	// Assuming a global or passed-in logger would be better for real use.
-	// For now, using fmt.Fprintf to ensure output during tests.
-
 	// UPFRONT CHECK: If window is already closed, return error immediately.
 	if fcw.closed {
 		if fcw.isConnection {
