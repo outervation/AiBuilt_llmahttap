@@ -775,12 +775,58 @@ func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) er
 // sendWindowUpdateFrame sends a WINDOW_UPDATE frame.
 // This is a stub for stream.go, which expects this method on connection.
 func (c *Connection) sendWindowUpdateFrame(streamID uint32, increment uint32) error {
-	c.log.Debug("sendWindowUpdateFrame called (stub)", logger.LogFields{"streamID": streamID, "increment": increment})
-	// In a real implementation:
-	// 1. Create a WindowUpdateFrame.
-	// 2. Set its StreamID and WindowSizeIncrement.
-	// 3. Send it to c.writerChan.
-	return nil
+	// Log first
+	c.log.Debug("sendWindowUpdateFrame: Preparing to send WINDOW_UPDATE",
+		logger.LogFields{"stream_id": streamID, "increment": increment})
+
+	if increment == 0 {
+		// This should be caught by callers (FC managers), but defensive check.
+		// For streamID 0, it's a PROTOCOL_ERROR. For non-zero, also PROTOCOL_ERROR if stream is not 0.
+		// RFC 6.9: "A WINDOW_UPDATE frame with a flow-control window increment of 0 MUST be treated as a connection error
+		// (Section 5.4.1) of type PROTOCOL_ERROR; errors on stream 0 MUST be treated as a connection error."
+		// "A WINDOW_UPDATE frame with an flow control window increment of 0 sent on a stream MUST be treated as a stream error
+		// (Section 5.4.2) of type PROTOCOL_ERROR."
+		errMsg := fmt.Sprintf("attempted to send WINDOW_UPDATE with zero increment for stream %d", streamID)
+		c.log.Error(errMsg, logger.LogFields{})
+		if streamID == 0 {
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
+		}
+		// For non-zero stream, it's a stream error. However, this function's role is just to send.
+		// The decision to send WU=0 should be prevented by caller.
+		// If it gets here, it's arguably an internal server error in caller logic.
+		// For robustness, let's treat as connection error as per the stream 0 rule if caller bypasses.
+		return NewConnectionError(ErrCodeProtocolError, errMsg) // Defaulting to ConnectionError for safety if streamID !=0 call slips through
+	}
+
+	if increment > MaxWindowSize { // MaxWindowSize = 2^31 - 1
+		errMsg := fmt.Sprintf("attempted to send WINDOW_UPDATE with increment %d for stream %d, which exceeds maximum %d", increment, streamID, MaxWindowSize)
+		c.log.Error(errMsg, logger.LogFields{})
+		// This is a server-side logic error trying to send an invalid frame.
+		// This should be a connection error as we are about to violate protocol.
+		return NewConnectionError(ErrCodeInternalError, errMsg)
+	}
+
+	wuFrame := &WindowUpdateFrame{
+		FrameHeader: FrameHeader{
+			Type:     FrameWindowUpdate,
+			Flags:    0,
+			StreamID: streamID,
+			Length:   4, // WINDOW_UPDATE payload is always 4 octets
+		},
+		WindowSizeIncrement: increment,
+	}
+
+	select {
+	case c.writerChan <- wuFrame:
+		c.log.Debug("WINDOW_UPDATE frame queued",
+			logger.LogFields{"stream_id": streamID, "increment": increment})
+		return nil
+	case <-c.shutdownChan:
+		c.log.Warn("Connection shutting down, cannot send WINDOW_UPDATE frame.",
+			logger.LogFields{"stream_id": streamID, "increment": increment})
+		return NewConnectionError(ErrCodeConnectError, "connection shutting down, cannot send WINDOW_UPDATE")
+		// No default: block if writerChan is full, until space or shutdown.
+	}
 }
 
 // isTLS is a stub to satisfy stream.go
