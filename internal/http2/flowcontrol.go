@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"errors"
 	"example.com/llmahttap/v2/internal/logger"
 	"fmt"
 	"os"
@@ -11,6 +12,11 @@ import (
 )
 
 // MaxWindowSize is the maximum value a flow control window can reach (2^31 - 1).
+
+// Sentinel errors for specific flow control window conditions.
+var errFlowControlWindowOverflow = errors.New("flow control window overflow")
+var errFlowControlWindowClosed = errors.New("flow control window closed")
+
 const MaxWindowSize = (1 << 31) - 1 // As per RFC 7540, 6.9.1
 
 // FlowControlWindow manages the send flow control window for a stream or a connection.
@@ -71,48 +77,133 @@ func (fcw *FlowControlWindow) Available() int64 {
 // Callers must ensure 'n' does not exceed SETTINGS_MAX_FRAME_SIZE for a single frame.
 // TODO: Add context.Context for cancellation.
 func (fcw *FlowControlWindow) Acquire(n uint32) error {
-	if n == 0 {
-		return fmt.Errorf("cannot acquire zero bytes from flow control window")
-	}
-
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
-	for {
-		if fcw.err != nil { // A terminal error was recorded (e.g., overflow or explicit close with error)
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE RETURNING_ERR_A] stream_id: %d, conn: %t, n: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, n, fcw.err, fcw.closed, fcw.available)
+	// UPFRONT CHECK: If window is already closed, return error immediately.
+	if fcw.closed {
+		if fcw.isConnection {
+			if fcw.err != nil {
+				// If fcw.err is already a ConnectionError, return it directly.
+				if _, ok := fcw.err.(*ConnectionError); ok { // Check if it's already ConnectionError
+					return fcw.err // Return the ConnectionError directly
+				}
+				// For other non-nil errors on a closed connection FCW, return fcw.err directly.
+				return fcw.err
+			}
+			// fcw.err is nil, but closed (e.g. Close(nil) was called).
+			return NewConnectionError(ErrCodeInternalError, "connection flow control window closed (no specific error)")
+		}
+		// Stream-specific logic (if not fcw.isConnection)
+		if fcw.err != nil {
+			if _, ok := fcw.err.(*StreamError); ok {
+				return fcw.err
+			}
+			// If fcw.err was a ConnectionError (e.g. connection-level issue propagated to stream FC closure)
+			if _, ok := fcw.err.(*ConnectionError); ok {
+				return fcw.err
+			}
+			// For other generic errors that are not StreamError or ConnectionError, return fcw.err directly.
 			return fcw.err
 		}
-		if fcw.closed { // Window explicitly closed, possibly without a prior fcw.err
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE FCW_CLOSED_PATH_Y] stream_id: %d, conn: %t, n: %d, initial_fcw_err_was_nil: %t, fcw.available: %d\n",
-				fcw.streamID, fcw.isConnection, n, fcw.err == nil, fcw.available)
-
-			if fcw.err == nil { // If no specific error is already set, create one.
-				errMsg := fmt.Sprintf("flow control window (connection: %t, stream ID: %d) is closed", fcw.isConnection, fcw.streamID)
-				if fcw.isConnection {
-					fcw.err = NewConnectionError(ErrCodeInternalError, errMsg)
-				} else {
-					fcw.err = NewStreamError(fcw.streamID, ErrCodeStreamClosed, errMsg)
-				}
-			}
-			fcw.cond.Broadcast() // Ensure waiters are woken up as the state is terminal.
-
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE RETURNING_ERR_B] stream_id: %d, conn: %t, n: %d, fcw.err: %v, fcw.closed: %t, fcw.available: %d\n", fcw.streamID, fcw.isConnection, n, fcw.err, fcw.closed, fcw.available)
-			return fcw.err // Return the (potentially newly set) error.
-		}
-
-		if fcw.available >= int64(n) { // Sufficient window available
-			currentAvail := fcw.available
-			fcw.available -= int64(n)
-			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE SUCCESS_C] stream_id: %d, conn: %t, n: %d, old_avail: %d, new_avail: %d\n", fcw.streamID, fcw.isConnection, n, currentAvail, fcw.available)
-			return nil
-		}
-
-		// Not enough space, wait for WINDOW_UPDATE or settings change.
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE BLOCKING_D] stream_id: %d, conn: %t, req: %d, avail: %d, closed: %t, err: %v\n",
-			fcw.streamID, fcw.isConnection, n, fcw.available, fcw.closed, fcw.err)
-		fcw.cond.Wait()
+		// fcw.err is nil, but closed.
+		return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed", fcw.streamID))
 	}
+
+	// Check for prior non-closing errors (e.g. overflow from a previous operation but window not closed yet).
+	// This is important because an error might have been set (e.g. by Add) without closing the window.
+	if fcw.err != nil {
+		if se, ok := fcw.err.(*StreamError); ok {
+			return se
+		}
+		if ce, ok := fcw.err.(*ConnectionError); ok {
+			return ce
+		}
+		// Check for specific known errors like overflow.
+		if errors.Is(fcw.err, errFlowControlWindowOverflow) {
+			msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v)", fcw.streamID, fcw.isConnection)
+			return NewConnectionError(ErrCodeFlowControlError, msg)
+		}
+		// For other generic errors, if it's a stream, wrap in StreamError.
+		// For connection FCW, return the error as is if not specifically handled.
+		if !fcw.isConnection {
+			return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error: %v", fcw.streamID, fcw.err), fcw.err)
+		}
+		return fcw.err // Return original error for connection FCW
+	}
+
+	// Zero-length DATA frames do not consume flow control window from a protocol perspective.
+	// However, the Acquire method itself might disallow acquiring zero as an operation.
+	// TestFlowControlWindow_Acquire_ZeroError expects an error.
+	if n == 0 {
+		return fmt.Errorf("flow control acquire: cannot acquire zero bytes")
+	}
+
+	// Loop until enough window is available, or an error occurs, or the window is closed.
+	for fcw.available < int64(n) {
+		// Re-check fcw.closed and fcw.err inside the loop after fcw.cond.Wait() unblocks.
+		// fcw.cond.Wait() releases the lock, so state could have changed.
+		// Re-check fcw.closed and fcw.err inside the loop after fcw.cond.Wait() unblocks.
+		// fcw.cond.Wait() releases the lock, so state could have changed.
+		if fcw.closed { // Must check again, window could have closed while waiting.
+			if fcw.isConnection {
+				if fcw.err != nil {
+					// If fcw.err is already a ConnectionError, return it directly.
+					if _, ok := fcw.err.(*ConnectionError); ok { // Check if it's already ConnectionError
+						return fcw.err // Return the ConnectionError directly
+					}
+					// For other non-nil errors on a closed connection FCW, return fcw.err directly.
+					return fcw.err
+				}
+				// fcw.err is nil, but closed (e.g. Close(nil) was called).
+				return NewConnectionError(ErrCodeInternalError, "connection flow control window closed during wait (no specific error)")
+			}
+			// Stream-specific logic (if not fcw.isConnection)
+			if fcw.err != nil { // Check if closed with a specific error.
+				if _, ok := fcw.err.(*StreamError); ok {
+					return fcw.err
+				}
+				if _, ok := fcw.err.(*ConnectionError); ok {
+					return fcw.err
+				}
+				// For other generic errors that are not StreamError or ConnectionError, return fcw.err directly.
+				return fcw.err
+			}
+			return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed during wait", fcw.streamID))
+		}
+		if fcw.err != nil { // Must check again, error could have occurred while waiting.
+			if se, ok := fcw.err.(*StreamError); ok {
+				return se
+			}
+			if ce, ok := fcw.err.(*ConnectionError); ok {
+				return ce
+			}
+			if errors.Is(fcw.err, errFlowControlWindowOverflow) {
+				msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v) during wait", fcw.streamID, fcw.isConnection)
+				return NewConnectionError(ErrCodeFlowControlError, msg)
+			}
+			// For other generic errors, if it's a stream, wrap in StreamError.
+			if !fcw.isConnection {
+				return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error during wait: %v", fcw.streamID, fcw.err), fcw.err)
+			}
+			return fcw.err // Return original error for connection FCW
+		}
+		fcw.cond.Wait() // Wait for window to increase or an error/closure.
+	}
+
+	// At this point: fcw.available >= int64(n), fcw.closed is false, and fcw.err is nil (or was handled and returned).
+	// Sanity check, available should not be negative. Could happen if Add allows it or concurrent non-locked updates.
+	if fcw.available < 0 { // This should not be reachable if Add/Release logic is sound and updates are atomic.
+		errUnexpectedState := fmt.Errorf("internal: flow control window for ID %d (conn: %v) in unexpected negative state %d after wait, trying to acquire %d", fcw.streamID, fcw.isConnection, fcw.available, n)
+		if fcw.isConnection {
+			return NewConnectionError(ErrCodeInternalError, errUnexpectedState.Error())
+		}
+		return NewStreamError(fcw.streamID, ErrCodeInternalError, errUnexpectedState.Error())
+	}
+
+	// Sufficient window is available.
+	fcw.available -= int64(n)
+	return nil
 }
 
 // Increase increases the send window size by 'increment' upon receiving a WINDOW_UPDATE from the peer.
@@ -472,20 +563,20 @@ type StreamFlowControlManager struct {
 // - ourInitialWindowSize: This server's SETTINGS_INITIAL_WINDOW_SIZE. Used for our receive window for this stream.
 // - peerInitialWindowSize: The peer's SETTINGS_INITIAL_WINDOW_SIZE. Used for our send window for this stream.
 
-func NewStreamFlowControlManager(conn *Connection, streamID uint32, ourInitialWindowSize, peerInitialWindowSize uint32) *StreamFlowControlManager {
+func NewStreamFlowControlManager(conn *Connection, streamID uint32, ourInitialWindowSize uint32, peerInitialWindowSize uint32) *StreamFlowControlManager {
 	if ourInitialWindowSize > MaxWindowSize {
-		ourInitialWindowSize = MaxWindowSize // Defensive, should be validated by settings handler
+		ourInitialWindowSize = MaxWindowSize // Defensive
 	}
 	if peerInitialWindowSize > MaxWindowSize {
 		peerInitialWindowSize = MaxWindowSize // Defensive
 	}
 
 	sfcm := &StreamFlowControlManager{
-		conn:                              conn, // Store connection
+		conn:                              conn,
 		streamID:                          streamID,
 		sendWindow:                        NewFlowControlWindow(peerInitialWindowSize, false, streamID),
 		currentReceiveWindowSize:          int64(ourInitialWindowSize),
-		effectiveInitialReceiveWindowSize: ourInitialWindowSize, // Initialize with the current setting
+		effectiveInitialReceiveWindowSize: ourInitialWindowSize,
 		windowUpdateThreshold:             ourInitialWindowSize / 2,
 		// bytesConsumedTotal and lastWindowUpdateSentAt start at 0.
 	}
