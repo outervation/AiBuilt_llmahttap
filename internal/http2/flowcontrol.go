@@ -168,14 +168,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 		}
 	}
 
-	if fcw.available < 0 {
-		errUnexpectedState := fmt.Errorf("internal: flow control window for ID %d (conn: %v) in unexpected negative state %d after wait, trying to acquire %d", fcw.streamID, fcw.isConnection, fcw.available, n)
-		if fcw.isConnection {
-			return NewConnectionError(ErrCodeInternalError, errUnexpectedState.Error())
-		}
-		return NewStreamError(fcw.streamID, ErrCodeInternalError, errUnexpectedState.Error())
-	}
-
 	fcw.available -= int64(n)
 	return nil
 }
