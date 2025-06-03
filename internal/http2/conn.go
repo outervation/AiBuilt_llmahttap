@@ -2287,102 +2287,63 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	// Stream-level WINDOW_UPDATE
 	stream, found := c.getStream(streamID)
 	if !found {
-		c.streamsMu.RLock()
-		lastKnownStreamID := c.lastProcessedStreamID
-		c.streamsMu.RUnlock()
-
-		if streamID <= lastKnownStreamID && streamID != 0 {
-			c.log.Warn("WINDOW_UPDATE for closed or non-existent stream (was known)", logger.LogFields{"stream_id": streamID})
-			rstErr := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed)
-			if rstErr != nil {
-				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE on closed stream %d", streamID), rstErr)
-			}
-			return nil
-		}
-		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("WINDOW_UPDATE on unknown or invalid stream ID %d", streamID))
+		// RFC 6.9 "An endpoint that receives a WINDOW_UPDATE frame for a stream that it has not created
+		// or that is not in the "open" or "half-closed (local)" state MUST treat this as a
+		// connection error (Section 5.4.1) of type STREAM_CLOSED."
+		// This covers streams that are idle from our perspective or already fully closed and removed.
+		c.log.Warn("WINDOW_UPDATE for unknown or already removed stream. Connection error STREAM_CLOSED.", logger.LogFields{"stream_id": streamID})
+		return NewConnectionError(ErrCodeStreamClosed, fmt.Sprintf("WINDOW_UPDATE for unknown/closed stream %d", streamID))
 	}
 
 	stream.mu.RLock()
-	preState := stream.state
-	preSendAvail := stream.fcManager.GetStreamSendAvailable()
+	state := stream.state
 	stream.mu.RUnlock()
 
-	// For h2spec 2.2: WINDOW_UPDATE on half-closed (remote) stream.
-	// The stream is still open for sending from our side. Receiving a WINDOW_UPDATE should
-	// be fine and just update our send window. It should NOT cause the stream to close or transition.
-	if preState == StreamStateHalfClosedRemote {
-		c.log.Debug("Dispatching stream-level WINDOW_UPDATE on HalfClosedRemote stream", logger.LogFields{
-			"stream_id": streamID, "increment": frame.WindowSizeIncrement,
-			"pre_stream_state": preState.String(), "pre_send_avail": preSendAvail,
-		})
-		if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
-			c.log.Error("Error handling stream-level WINDOW_UPDATE from peer (HalfClosedRemote path)",
-				logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
-			// Determine error code for RST_STREAM
-			var streamErrCode ErrorCode = ErrCodeFlowControlError // Default if increment caused FC overflow
-			if frame.WindowSizeIncrement == 0 {                   // WINDOW_UPDATE with 0 increment is PROTOCOL_ERROR for streams
-				streamErrCode = ErrCodeProtocolError
-			}
-			// ADDED LOG:
-			c.log.Error("Detailed error for WU on HCR stream before RST", logger.LogFields{
-				"stream_id":                       streamID,
-				"increment_wu":                    frame.WindowSizeIncrement,
-				"original_error_from_fcManager":   err.Error(),
-				"original_error_type_fcManager":   fmt.Sprintf("%T", err),
-				"determined_rst_code_for_fcError": streamErrCode.String(),
-			})
-			rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
-			if rstErr != nil {
-				// If sending RST fails, it's a connection-level issue.
-				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d (HalfClosedRemote path)", streamID), rstErr)
-			}
-			return nil // RST_STREAM sent, stream error handled.
-		}
-		stream.mu.RLock()
-		postStateAfterHCR := stream.state
-		postSendAvailAfterHCR := stream.fcManager.GetStreamSendAvailable()
-		stream.mu.RUnlock()
-		c.log.Debug("Stream-level WINDOW_UPDATE processed (HalfClosedRemote path)",
-			logger.LogFields{
-				"stream_id": streamID, "increment": frame.WindowSizeIncrement,
-				"post_stream_state": postStateAfterHCR.String(), "post_send_avail": postSendAvailAfterHCR,
-				"state_changed": preState != postStateAfterHCR, "avail_changed_by": postSendAvailAfterHCR - preSendAvail,
-			})
-		return nil // Successfully processed on HalfClosedRemote
+	if state == StreamStateClosed {
+		c.log.Warn("WINDOW_UPDATE for stream that is currently in Closed state. Connection error STREAM_CLOSED.", logger.LogFields{"stream_id": streamID})
+		return NewConnectionError(ErrCodeStreamClosed, fmt.Sprintf("WINDOW_UPDATE on closed stream %d", streamID))
 	}
 
-	// Original logic for other states
-	c.log.Debug("Dispatching stream-level WINDOW_UPDATE (non-HalfClosedRemote path)", logger.LogFields{
+	// If stream is Open or HalfClosed (either local or remote), proceed.
+	// HalfClosedRemote means client sent END_STREAM, server can still send. Peer can send WU to allow server to send more.
+	// HalfClosedLocal means server sent END_STREAM, client can still send. Peer (client) can send WU if it was a response to data we sent before we closed our side.
+	// In essence, as long as the stream is not fully 'Closed', its flow control windows might still be relevant.
+
+	preSendAvail := stream.fcManager.GetStreamSendAvailable() // For logging
+
+	c.log.Debug("Dispatching stream-level WINDOW_UPDATE", logger.LogFields{
 		"stream_id": streamID, "increment": frame.WindowSizeIncrement,
-		"pre_stream_state": preState.String(), "pre_send_avail": preSendAvail,
+		"current_stream_state": state.String(), "pre_send_avail": preSendAvail,
 	})
 
 	if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
-		c.log.Error("Error handling stream-level WINDOW_UPDATE from peer (non-HalfClosedRemote path)",
-			logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
+		c.log.Error("Error handling stream-level WINDOW_UPDATE from peer",
+			logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error(), "state_at_error": state.String()})
 
-		var streamErrCode ErrorCode = ErrCodeFlowControlError
-		if frame.WindowSizeIncrement == 0 {
+		// If HandleWindowUpdateFromPeer returns a ConnectionError (e.g., window overflow due to settings change), propagate it.
+		if _, ok := err.(*ConnectionError); ok {
+			return err
+		}
+
+		// Otherwise, it's a stream-specific error (e.g., bad increment like 0). RST the stream.
+		var streamErrCode ErrorCode = ErrCodeFlowControlError // Default for FC issues
+		if frame.WindowSizeIncrement == 0 {                   // WINDOW_UPDATE with 0 increment is PROTOCOL_ERROR for streams
 			streamErrCode = ErrCodeProtocolError
 		}
 
 		rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
 		if rstErr != nil {
-			return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d (non-HalfClosedRemote path)", streamID), rstErr)
+			// If sending RST fails, it's a connection-level issue.
+			return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d", streamID), rstErr)
 		}
-		return nil
+		return nil // RST_STREAM sent, stream error handled.
 	}
 
-	stream.mu.RLock()
-	postState := stream.state
-	postSendAvail := stream.fcManager.GetStreamSendAvailable()
-	stream.mu.RUnlock()
-
-	c.log.Debug("Stream-level WINDOW_UPDATE processed (non-HalfClosedRemote path)",
+	postSendAvail := stream.fcManager.GetStreamSendAvailable() // For logging
+	c.log.Debug("Stream-level WINDOW_UPDATE processed successfully",
 		logger.LogFields{
 			"stream_id": streamID, "increment": frame.WindowSizeIncrement,
-			"post_stream_state": postState.String(), "post_send_avail": postSendAvail,
-			"state_changed": preState != postState, "avail_changed_by": postSendAvail - preSendAvail,
+			"post_send_avail": postSendAvail, "avail_changed_by": postSendAvail - preSendAvail,
 		})
 	return nil
 }
