@@ -2125,58 +2125,80 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	// Stream-level WINDOW_UPDATE
 	stream, found := c.getStream(streamID)
 	if !found {
-		// RFC 7540, Section 6.9: "WINDOW_UPDATE can be specific to a stream or to the entire connection.
-		// In the former case, the frame's stream identifier indicates the affected stream; in the latter,
-		// the value "0" indicates that the entire connection is the subject of the frame."
-		// "An endpoint MUST treat a WINDOW_UPDATE frame on a closed stream as a connection error (Section 5.4.1) of type PROTOCOL_ERROR." (This seems to be for stream 0)
-		// For non-zero streams: "Receiving a WINDOW_UPDATE on a stream in the "half-closed (remote)" or "closed" state MUST be treated as a stream error (Section 5.4.2) of type STREAM_CLOSED."
-		// And "A receiver that receives a WINDOW_UPDATE frame on a stream that is not open or half-closed (local) MUST treat this as a stream error (Section 5.4.2) of type STREAM_CLOSED."
-
 		c.streamsMu.RLock()
 		lastKnownStreamID := c.lastProcessedStreamID
 		c.streamsMu.RUnlock()
 
 		if streamID <= lastKnownStreamID && streamID != 0 {
-			// Stream was known but is now closed. This implies a stream error.
 			c.log.Warn("WINDOW_UPDATE for closed or non-existent stream (was known)", logger.LogFields{"stream_id": streamID})
 			rstErr := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed)
 			if rstErr != nil {
 				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE on closed stream %d", streamID), rstErr)
 			}
-			return nil // RST sent, error handled.
+			return nil
 		}
-		// Stream ID is higher than any we've processed or otherwise invalid (e.g. client uses even ID for stream specific WU).
-		// This is a connection error.
 		return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("WINDOW_UPDATE on unknown or invalid stream ID %d", streamID))
 	}
 
-	// Stream found, delegate to stream's flow control manager.
 	stream.mu.RLock()
 	preState := stream.state
 	preSendAvail := stream.fcManager.GetStreamSendAvailable()
 	stream.mu.RUnlock()
 
-	c.log.Debug("Dispatching stream-level WINDOW_UPDATE", logger.LogFields{
+	// For h2spec 2.2: WINDOW_UPDATE on half-closed (remote) stream.
+	// The stream is still open for sending from our side. Receiving a WINDOW_UPDATE should
+	// be fine and just update our send window. It should NOT cause the stream to close or transition.
+	if preState == StreamStateHalfClosedRemote {
+		c.log.Debug("Dispatching stream-level WINDOW_UPDATE on HalfClosedRemote stream", logger.LogFields{
+			"stream_id": streamID, "increment": frame.WindowSizeIncrement,
+			"pre_stream_state": preState.String(), "pre_send_avail": preSendAvail,
+		})
+		if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
+			c.log.Error("Error handling stream-level WINDOW_UPDATE from peer (HalfClosedRemote path)",
+				logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
+			var streamErrCode ErrorCode = ErrCodeFlowControlError
+			if frame.WindowSizeIncrement == 0 {
+				streamErrCode = ErrCodeProtocolError
+			}
+			rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
+			if rstErr != nil {
+				return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d (HalfClosedRemote path)", streamID), rstErr)
+			}
+			return nil
+		}
+		stream.mu.RLock()
+		postStateAfterHCR := stream.state
+		postSendAvailAfterHCR := stream.fcManager.GetStreamSendAvailable()
+		stream.mu.RUnlock()
+		c.log.Debug("Stream-level WINDOW_UPDATE processed (HalfClosedRemote path)",
+			logger.LogFields{
+				"stream_id": streamID, "increment": frame.WindowSizeIncrement,
+				"post_stream_state": postStateAfterHCR.String(), "post_send_avail": postSendAvailAfterHCR,
+				"state_changed": preState != postStateAfterHCR, "avail_changed_by": postSendAvailAfterHCR - preSendAvail,
+			})
+		return nil
+	}
+
+	// Original logic for other states
+	c.log.Debug("Dispatching stream-level WINDOW_UPDATE (non-HalfClosedRemote path)", logger.LogFields{
 		"stream_id": streamID, "increment": frame.WindowSizeIncrement,
 		"pre_stream_state": preState.String(), "pre_send_avail": preSendAvail,
 	})
 
 	if err := stream.fcManager.HandleWindowUpdateFromPeer(frame.WindowSizeIncrement); err != nil {
-		// fcManager.HandleWindowUpdateFromPeer returns an error for 0 increment or overflow.
-		// This should be treated as a stream error.
-		c.log.Error("Error handling stream-level WINDOW_UPDATE from peer",
+		c.log.Error("Error handling stream-level WINDOW_UPDATE from peer (non-HalfClosedRemote path)",
 			logger.LogFields{"stream_id": streamID, "increment": frame.WindowSizeIncrement, "error": err.Error()})
 
 		var streamErrCode ErrorCode = ErrCodeFlowControlError
-		if frame.WindowSizeIncrement == 0 { // Zero increment specifically leads to PROTOCOL_ERROR for the stream
+		if frame.WindowSizeIncrement == 0 {
 			streamErrCode = ErrCodeProtocolError
 		}
 
 		rstErr := c.sendRSTStreamFrame(streamID, streamErrCode)
 		if rstErr != nil {
-			return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d", streamID), rstErr)
+			return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM for WINDOW_UPDATE error on stream %d (non-HalfClosedRemote path)", streamID), rstErr)
 		}
-		return nil // RST sent, stream error handled.
+		return nil
 	}
 
 	stream.mu.RLock()
@@ -2184,7 +2206,7 @@ func (c *Connection) dispatchWindowUpdateFrame(frame *WindowUpdateFrame) error {
 	postSendAvail := stream.fcManager.GetStreamSendAvailable()
 	stream.mu.RUnlock()
 
-	c.log.Debug("Stream-level WINDOW_UPDATE processed",
+	c.log.Debug("Stream-level WINDOW_UPDATE processed (non-HalfClosedRemote path)",
 		logger.LogFields{
 			"stream_id": streamID, "increment": frame.WindowSizeIncrement,
 			"post_stream_state": postState.String(), "post_send_avail": postSendAvail,
