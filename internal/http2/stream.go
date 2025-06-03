@@ -1307,32 +1307,51 @@ func (s *Stream) processIncomingDataFrames() {
 
 	defer func() {
 		// Ensure pipe is closed when this goroutine exits, signaling EOF or error to reader.
-		if r := recover(); r != nil {
+		panicked := recover() // Capture panic value early
+
+		// Determine the error to close the pipe with.
+		var closeErr error
+		if panicked != nil {
 			s.conn.log.Error("Panic in stream.processIncomingDataFrames", logger.LogFields{
 				"stream_id": s.id,
-				"panic_val": fmt.Sprintf("%v", r),
+				"panic_val": fmt.Sprintf("%v", panicked),
 				"stack":     string(debug.Stack()),
 			})
-			// Ensure requestBodyWriter is closed with an error to unblock any handler.
-			if s.requestBodyWriter != nil { // Check if nil before closing
-				_ = s.requestBodyWriter.CloseWithError(fmt.Errorf("panic in body processing for stream %d: %v", s.id, r))
+			// If panic, try to use context error if available, otherwise panic error.
+			select {
+			case <-s.ctx.Done():
+				closeErr = s.ctx.Err()
+			default:
+				closeErr = fmt.Errorf("panic in body processing for stream %d: %v", s.id, panicked)
 			}
 		} else {
-			// Normal exit from loop (channel closed or context done).
-			// Determine the correct close reason for the pipe.
-			if s.requestBodyWriter != nil { // Check if nil before closing
-				select {
-				case <-s.ctx.Done():
-					// If context was cancelled, use that error.
-					_ = s.requestBodyWriter.CloseWithError(s.ctx.Err())
-				default:
-					// Otherwise, it was a graceful close of dataFrameChan (END_STREAM). Signal EOF.
-					_ = s.requestBodyWriter.Close()
-				}
+			// No panic. If context is done, use that error. Otherwise, it's a normal EOF.
+			select {
+			case <-s.ctx.Done():
+				closeErr = s.ctx.Err()
+			default:
+				// This case covers normal exit due to dataFrameChan being closed (END_STREAM from peer)
+				// or if dataFrameChan was nil at start. We want to signal EOF to the reader.
+				closeErr = io.EOF
 			}
 		}
-		s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine exiting", logger.LogFields{"stream_id": s.id})
-	}()
+
+		if s.requestBodyWriter != nil {
+			if err := s.requestBodyWriter.CloseWithError(closeErr); err != nil {
+				// Log error from CloseWithError, but it's usually "pipe already closed".
+				s.conn.log.Debug("Error from requestBodyWriter.CloseWithError in processIncomingDataFrames defer (may be benign)",
+					logger.LogFields{"stream_id": s.id, "close_err_arg_type": fmt.Sprintf("%T", closeErr), "close_err_arg_val": closeErr, "pipe_close_error": err.Error()})
+			}
+		}
+
+		s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine exiting", logger.LogFields{"stream_id": s.id, "final_pipe_close_error_type": fmt.Sprintf("%T", closeErr), "final_pipe_close_error_val": closeErr})
+
+		if panicked != nil {
+			// Re-panic if we caught one, after cleaning up the pipe.
+			// This ensures the panic propagates to the connection's Serve loop defer for logging/handling.
+			panic(panicked)
+		}
+	}() // Corrected: moved the final () here
 
 	s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine started", logger.LogFields{"stream_id": s.id})
 
