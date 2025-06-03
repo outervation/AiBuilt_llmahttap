@@ -80,98 +80,101 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
+	logFields := logger.LogFields{
+		"stream_id":     fcw.streamID,
+		"is_conn_fcw":   fcw.isConnection,
+		"acquire_bytes": n,
+		"current_avail": fcw.available,
+		"fcw_closed":    fcw.closed,
+		"fcw_err":       fmt.Sprintf("%v", fcw.err),
+	}
+	// Use a generic logger or fmt.Fprintf for diagnostics if conn.log isn't available here.
+	// Assuming a global or passed-in logger would be better for real use.
+	// For now, using fmt.Fprintf to ensure output during tests.
+	fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ENTRY] Fields: %v\n", logFields)
+
 	// UPFRONT CHECK: If window is already closed, return error immediately.
 	if fcw.closed {
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_CLOSED_UPFRONT] Fields: %v\n", logFields)
 		if fcw.isConnection {
 			if fcw.err != nil {
-				// If fcw.err is already a ConnectionError, return it directly.
-				if _, ok := fcw.err.(*ConnectionError); ok { // Check if it's already ConnectionError
-					return fcw.err // Return the ConnectionError directly
+				if _, ok := fcw.err.(*ConnectionError); ok {
+					return fcw.err
 				}
-				// For other non-nil errors on a closed connection FCW, return fcw.err directly.
 				return fcw.err
 			}
-			// fcw.err is nil, but closed (e.g. Close(nil) was called).
 			return NewConnectionError(ErrCodeInternalError, "connection flow control window closed (no specific error)")
 		}
-		// Stream-specific logic (if not fcw.isConnection)
 		if fcw.err != nil {
 			if _, ok := fcw.err.(*StreamError); ok {
 				return fcw.err
 			}
-			// If fcw.err was a ConnectionError (e.g. connection-level issue propagated to stream FC closure)
 			if _, ok := fcw.err.(*ConnectionError); ok {
 				return fcw.err
 			}
-			// For other generic errors that are not StreamError or ConnectionError, return fcw.err directly.
 			return fcw.err
 		}
-		// fcw.err is nil, but closed.
 		return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed", fcw.streamID))
 	}
 
-	// Check for prior non-closing errors (e.g. overflow from a previous operation but window not closed yet).
-	// This is important because an error might have been set (e.g. by Add) without closing the window.
 	if fcw.err != nil {
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_PRIOR_ERR_UPFRONT] Fields: %v\n", logFields)
 		if se, ok := fcw.err.(*StreamError); ok {
 			return se
 		}
 		if ce, ok := fcw.err.(*ConnectionError); ok {
 			return ce
 		}
-		// Check for specific known errors like overflow.
 		if errors.Is(fcw.err, errFlowControlWindowOverflow) {
 			msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v)", fcw.streamID, fcw.isConnection)
 			return NewConnectionError(ErrCodeFlowControlError, msg)
 		}
-		// For other generic errors, if it's a stream, wrap in StreamError.
-		// For connection FCW, return the error as is if not specifically handled.
 		if !fcw.isConnection {
 			return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error: %v", fcw.streamID, fcw.err), fcw.err)
 		}
-		return fcw.err // Return original error for connection FCW
+		return fcw.err
 	}
 
-	// Zero-length DATA frames do not consume flow control window from a protocol perspective.
-	// However, the Acquire method itself might disallow acquiring zero as an operation.
-	// TestFlowControlWindow_Acquire_ZeroError expects an error.
 	if n == 0 {
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ZERO_N] Fields: %v, Returning error.\n", logFields)
 		return fmt.Errorf("flow control acquire: cannot acquire zero bytes")
 	}
 
-	// Loop until enough window is available, or an error occurs, or the window is closed.
+	waitCount := 0
 	for fcw.available < int64(n) {
-		// Re-check fcw.closed and fcw.err inside the loop after fcw.cond.Wait() unblocks.
-		// fcw.cond.Wait() releases the lock, so state could have changed.
-		// Re-check fcw.closed and fcw.err inside the loop after fcw.cond.Wait() unblocks.
-		// fcw.cond.Wait() releases the lock, so state could have changed.
-		if fcw.closed { // Must check again, window could have closed while waiting.
+		waitCount++
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_WAITING] Fields: %v, WaitCount: %d\n", logFields, waitCount)
+		fcw.cond.Wait()
+		// Update logFields with potentially changed state after wait
+		logFields["current_avail_after_wait"] = fcw.available
+		logFields["fcw_closed_after_wait"] = fcw.closed
+		logFields["fcw_err_after_wait"] = fmt.Sprintf("%v", fcw.err)
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_AWOKE] Fields: %v, WaitCount: %d\n", logFields, waitCount)
+
+		if fcw.closed {
+			fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_CLOSED_IN_LOOP] Fields: %v\n", logFields)
 			if fcw.isConnection {
 				if fcw.err != nil {
-					// If fcw.err is already a ConnectionError, return it directly.
-					if _, ok := fcw.err.(*ConnectionError); ok { // Check if it's already ConnectionError
-						return fcw.err // Return the ConnectionError directly
+					if _, ok := fcw.err.(*ConnectionError); ok {
+						return fcw.err
 					}
-					// For other non-nil errors on a closed connection FCW, return fcw.err directly.
 					return fcw.err
 				}
-				// fcw.err is nil, but closed (e.g. Close(nil) was called).
 				return NewConnectionError(ErrCodeInternalError, "connection flow control window closed during wait (no specific error)")
 			}
-			// Stream-specific logic (if not fcw.isConnection)
-			if fcw.err != nil { // Check if closed with a specific error.
+			if fcw.err != nil {
 				if _, ok := fcw.err.(*StreamError); ok {
 					return fcw.err
 				}
 				if _, ok := fcw.err.(*ConnectionError); ok {
 					return fcw.err
 				}
-				// For other generic errors that are not StreamError or ConnectionError, return fcw.err directly.
 				return fcw.err
 			}
 			return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed during wait", fcw.streamID))
 		}
-		if fcw.err != nil { // Must check again, error could have occurred while waiting.
+		if fcw.err != nil {
+			fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ERR_IN_LOOP] Fields: %v\n", logFields)
 			if se, ok := fcw.err.(*StreamError); ok {
 				return se
 			}
@@ -182,27 +185,25 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 				msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v) during wait", fcw.streamID, fcw.isConnection)
 				return NewConnectionError(ErrCodeFlowControlError, msg)
 			}
-			// For other generic errors, if it's a stream, wrap in StreamError.
 			if !fcw.isConnection {
 				return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error during wait: %v", fcw.streamID, fcw.err), fcw.err)
 			}
-			return fcw.err // Return original error for connection FCW
+			return fcw.err
 		}
-		fcw.cond.Wait() // Wait for window to increase or an error/closure.
 	}
 
-	// At this point: fcw.available >= int64(n), fcw.closed is false, and fcw.err is nil (or was handled and returned).
-	// Sanity check, available should not be negative. Could happen if Add allows it or concurrent non-locked updates.
-	if fcw.available < 0 { // This should not be reachable if Add/Release logic is sound and updates are atomic.
+	if fcw.available < 0 {
 		errUnexpectedState := fmt.Errorf("internal: flow control window for ID %d (conn: %v) in unexpected negative state %d after wait, trying to acquire %d", fcw.streamID, fcw.isConnection, fcw.available, n)
+		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_NEGATIVE_AVAIL_UNEXPECTED] Fields: %v, Error: %v\n", logFields, errUnexpectedState)
 		if fcw.isConnection {
 			return NewConnectionError(ErrCodeInternalError, errUnexpectedState.Error())
 		}
 		return NewStreamError(fcw.streamID, ErrCodeInternalError, errUnexpectedState.Error())
 	}
 
-	// Sufficient window is available.
 	fcw.available -= int64(n)
+	logFields["final_avail"] = fcw.available
+	fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_SUCCESS] Fields: %v\n", logFields)
 	return nil
 }
 
