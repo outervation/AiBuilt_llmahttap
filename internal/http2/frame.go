@@ -2,8 +2,10 @@ package http2
 
 import (
 	"encoding/binary"
+
 	"fmt"
 	"io"
+	"os"
 	"strings" // Added import
 )
 
@@ -220,50 +222,67 @@ func (f *DataFrame) Header() *FrameHeader { return &f.FrameHeader }
 func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 	f.FrameHeader = header
 	if header.StreamID == 0 {
+		// This check should really be done by the dispatcher before calling this for a DATA frame.
+		// However, if it gets here, it's a protocol error.
+		os.Stderr.WriteString("[DEBUG-DATA-PAYLOAD Stream 0] DATA frame on stream 0 is invalid\\n")
 		return NewConnectionError(ErrCodeProtocolError, "received DATA on stream 0")
 	}
 
+	payloadTotalDeclaredInHeader := header.Length
 	var actualDataLength uint32
 	var paddingOctetsToRead uint32 // How many padding octets to read from the stream
 
 	if f.Flags&FlagDataPadded != 0 {
+		if payloadTotalDeclaredInHeader == 0 {
+			// If PADDED flag is set, the frame MUST contain at least one byte for PadLength.
+			// So, a total payload length of 0 is invalid.
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Padded DATA frame with total declared payload 0 is invalid\\n", header.StreamID))
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("padded DATA frame for stream %d has invalid declared payload length 0", header.StreamID))
+		}
+
 		var padLenFieldAsByte [1]byte
 		if _, err := io.ReadFull(r, padLenFieldAsByte[:]); err != nil {
-			// RFC 7540, Section 6.1: "If the length of the padding is the length of the
-			// frame payload or greater, the recipient MUST treat this as a connection
-			// error [HTTP/2] of type PROTOCOL_ERROR."
-			// This specific case is where the PadLength field itself cannot be read.
-			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame too short to contain PadLength field for stream %d: %v", header.StreamID, err))
+			// This means we couldn't even read the PadLength byte itself.
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading PadLength field: %s\\n", header.StreamID, err.Error()))
+			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame (stream %d) too short to contain PadLength field: %v", header.StreamID, err))
 		}
 		f.PadLength = padLenFieldAsByte[0] // Store the PadLength *value* from the 1-byte field
 
-		// Validation: PadLength value must not be such that it implies negative data or consumes the whole frame.
-		// FrameHeader.Length = 1 (PadLength_field) + Data_Length + Padding_Octets_Length (which is f.PadLength value)
-		// So, Data_Length = FrameHeader.Length - 1 - f.PadLength_value.
-		// If f.PadLength_value >= FrameHeader.Length, then Data_Length <= -1, which is invalid.
-		if uint32(f.PadLength) >= f.FrameHeader.Length {
-			// As per RFC 7540, Section 6.1: "If the length of the padding is the length of the
-			// frame payload or greater, the recipient MUST treat this as a connection
-			// error [HTTP/2] of type PROTOCOL_ERROR."
-			// FrameHeader.Length is the total payload length.
-			// If PadLength itself takes up this much or more, it's invalid.
-			return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("DATA frame invalid: PadLength %d is invalid relative to FrameHeader.Length %d for stream %d", f.PadLength, f.FrameHeader.Length, header.StreamID))
+		// At this point, 1 byte (PadLength field) has been consumed from payloadTotalDeclaredInHeader.
+		// The remaining length is payloadTotalDeclaredInHeader - 1.
+		// This remaining length must accommodate f.PadLength (the padding itself) and the actual data.
+		// So, (payloadTotalDeclaredInHeader - 1) must be >= f.PadLength.
+		// If f.PadLength > (payloadTotalDeclaredInHeader - 1), it's an error.
+		// This is equivalent to (f.PadLength + 1) > payloadTotalDeclaredInHeader.
+		if uint32(f.PadLength)+1 > payloadTotalDeclaredInHeader {
+			errorMsg := fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value %d (+1 for field itself) exceeds total declared payload length %d", header.StreamID, f.PadLength, payloadTotalDeclaredInHeader)
+
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] CRITICAL PADDING ERROR (inserted before return): %s\\n", header.StreamID, errorMsg))
+			// os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] %s\\n", header.StreamID, errorMsg)) // Removed to test h2spec 6.1.3 interference
+			return NewConnectionError(ErrCodeProtocolError, errorMsg)
 		}
 
-		// Now that f.PadLength value is validated, calculate lengths
-		actualDataLength = f.FrameHeader.Length - 1 - uint32(f.PadLength)
+		// Now that f.PadLength value is validated against the total payload, calculate lengths
+		actualDataLength = payloadTotalDeclaredInHeader - 1 - uint32(f.PadLength)
 		paddingOctetsToRead = uint32(f.PadLength)
-	} else {
-		actualDataLength = f.FrameHeader.Length
+		os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Padded. Header.Length: %d, PadLengthField: %d. Calculated DataLen: %d, PaddingToRead: %d\\n", header.StreamID, payloadTotalDeclaredInHeader, f.PadLength, actualDataLength, paddingOctetsToRead))
+
+	} else { // Not Padded
+		actualDataLength = payloadTotalDeclaredInHeader
 		paddingOctetsToRead = 0
 		f.PadLength = 0 // Ensure f.PadLength struct field is 0 if not padded.
+		os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Not Padded. Header.Length: %d. Calculated DataLen: %d\\n", header.StreamID, payloadTotalDeclaredInHeader, actualDataLength))
 	}
 
-	f.Data = make([]byte, actualDataLength)
-	if actualDataLength > 0 { // Only read if there's data to read
+	// Read the actual data payload
+	if actualDataLength > 0 {
+		f.Data = make([]byte, actualDataLength)
 		if _, err := io.ReadFull(r, f.Data); err != nil {
-			return fmt.Errorf("reading data: %w", err)
+			os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading actual data (expected %d bytes): %s\\n", header.StreamID, actualDataLength, err.Error()))
+			return fmt.Errorf("reading data for stream %d: %w", header.StreamID, err)
 		}
+	} else {
+		f.Data = []byte{} // Ensure f.Data is empty non-nil slice if actualDataLength is 0
 	}
 
 	// Read padding if PADDED flag was set and there are padding octets specified by f.PadLength
@@ -271,16 +290,19 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		if paddingOctetsToRead > 0 {
 			f.Padding = make([]byte, paddingOctetsToRead)
 			if _, err := io.ReadFull(r, f.Padding); err != nil {
-				// This is where "unexpected EOF" occurs in tests
-				return fmt.Errorf("reading padding: %w", err)
+				os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading padding (expected %d bytes): %s\\n", header.StreamID, paddingOctetsToRead, err.Error()))
+				return fmt.Errorf("reading padding for stream %d: %w", header.StreamID, err)
 			}
 		} else {
-			f.Padding = []byte{} // PadLength field was 0, so an empty non-nil slice for padding.
+			// PadLength field was 0 (but PADDED flag was set).
+			// This means there's a PadLength field of 1 byte (value 0), and 0 padding octets.
+			f.Padding = []byte{}
 		}
 	} else {
 		f.Padding = nil // Not padded, so no padding bytes
 	}
 
+	os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] ParsePayload successful. Data len: %d, Padding len: %d\\n", header.StreamID, len(f.Data), len(f.Padding)))
 	return nil
 }
 
