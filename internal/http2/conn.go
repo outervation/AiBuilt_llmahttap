@@ -1355,12 +1355,9 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 				// `endStream` refers to the END_STREAM flag on *this* incoming HEADERS frame.
 				// If !endStream, it's definitely not trailers and thus an error.
 				if !endStream { // This condition specifically matches h2spec 8.1/1
-					c.log.Warn("Server received subsequent HEADERS (without END_STREAM) for an Open/HalfClosedLocal stream. Sending RST_STREAM(PROTOCOL_ERROR).",
-						logger.LogFields{"stream_id": streamID, "state": state.String()})
-					if errRST := c.sendRSTStreamFrame(streamID, ErrCodeProtocolError); errRST != nil {
-						return errRST // If sending RST fails, propagate connection error
-					}
-					return nil // RST_STREAM sent, stream error handled.
+					errMsg := fmt.Sprintf("subsequent HEADERS frame without END_STREAM received on stream %d in state %s (violates h2spec 8.1.1)", streamID, state.String())
+					c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "state": state.String(), "h2spec_ref": "8.1.1"})
+					return NewConnectionError(ErrCodeProtocolError, errMsg)
 				}
 				// If endStream is true, it *could* be trailers.
 				// Let stream.processRequestHeadersAndDispatch handle it.
