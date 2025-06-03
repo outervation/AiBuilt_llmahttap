@@ -1865,7 +1865,9 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 	if err != nil {
 		c.log.Warn("Error processing PRIORITY frame in priority tree",
 			logger.LogFields{
-				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
+				"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+				"error_from_priority_tree": err.Error(), "error_type_from_priority_tree": fmt.Sprintf("%T", err), // LOG ERROR AND TYPE
+				"original_error": err.Error(),
 			})
 
 		// If ProcessPriorityFrame returns a StreamError (e.g., self-dependency), RST the stream.
