@@ -2648,10 +2648,22 @@ func (c *Connection) handleSettingsFrame(frame *SettingsFrame) error {
 	c.settingsMu.Lock()
 	oldPeerInitialWindowSize = c.peerInitialWindowSize // Capture current effective peer initial window size
 
+	// Map to track setting IDs seen in this specific SETTINGS frame
+	seenSettingsInThisFrame := make(map[SettingID]bool)
+
 	for _, setting := range frame.Settings {
 		// Validate setting ID and value
 		switch setting.ID {
 		case SettingHeaderTableSize:
+
+			// Check for duplicate setting ID within this frame
+			if seenSettingsInThisFrame[setting.ID] {
+				c.settingsMu.Unlock() // Important to unlock before returning
+				errMsg := fmt.Sprintf("duplicate setting ID %s (0x%x) received in a single SETTINGS frame", setting.ID.String(), setting.ID)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": header.StreamID /* StreamID is 0 for SETTINGS */})
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
+			}
+			seenSettingsInThisFrame[setting.ID] = true
 			// Max value is effectively bounded by uint32.
 			c.peerSettings[SettingHeaderTableSize] = setting.Value
 			c.log.Debug("Peer SETTINGS_HEADER_TABLE_SIZE received", logger.LogFields{"value": setting.Value})
