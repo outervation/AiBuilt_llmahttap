@@ -3517,18 +3517,86 @@ func (c *Connection) writerLoop() {
 		c.log.Debug("Writer loop: Top of main for-loop.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 		select {
 		case <-c.shutdownChan: // Primary shutdown signal
-			c.log.Info("Writer loop: shutdownChan selected. Draining writerChan.", logger.LogFields{"remote_addr": c.remoteAddrStr})
-			// Drain any remaining frames in writerChan.
-			// This loop continues until writerChan is closed (by initiateShutdown) and empty.
-			for frame := range c.writerChan { // Loop until writerChan is closed
-				c.log.Debug("Writer loop (draining): Writing frame from writerChan", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
-				if err := c.writeFrame(frame); err != nil {
-					c.log.Error("Writer loop: error writing frame during shutdown drain.",
-						logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
-					// Continue draining if possible, but log errors.
+			c.log.Info("Writer loop: shutdownChan selected. Draining writerChan with error-aware logic.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+			c.streamsMu.RLock()
+			connErr := c.connError // Get the error that caused shutdown
+			c.streamsMu.RUnlock()
+
+			isFatalShutdown := false
+			if connErr != nil {
+				// EOF from peer or explicit graceful close (errCode == NoError in GOAWAY) are not "fatal" for this purpose.
+				if ce, ok := connErr.(*ConnectionError); ok {
+					if ce.Code != ErrCodeNoError {
+						isFatalShutdown = true
+					}
+				} else if !errors.Is(connErr, io.EOF) { // Any other error type is considered fatal for this selective write logic
+					isFatalShutdown = true
 				}
 			}
-			c.log.Info("Writer loop: writerChan drained and closed. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+
+			if isFatalShutdown {
+				c.log.Debug("Writer loop: Fatal shutdown detected. Will prioritize GOAWAY and discard other stream frames.", logger.LogFields{"conn_error_type": fmt.Sprintf("%T", connErr), "conn_error_val": connErr, "remote_addr": c.remoteAddrStr})
+			} else {
+				c.log.Debug("Writer loop: Graceful shutdown or no error recorded for special handling. Will write all queued frames.", logger.LogFields{"conn_error_type": fmt.Sprintf("%T", connErr), "conn_error_val": connErr, "remote_addr": c.remoteAddrStr})
+			}
+
+			// Drain writerChan. It will eventually be closed by initiateShutdown.
+			// The goal is to ensure GOAWAY is sent, and other data is discarded if it's a fatal shutdown.
+			var goAwaySentThisDrain bool
+		DrainLoop:
+			for {
+				var frame Frame
+				var ok bool
+				// Non-blocking check first to see if there's anything, then blocking if there is.
+				// This is to allow quick exit if channel is empty and will be closed.
+				// However, simpler is just to range or blocking read until closed.
+				// Let's stick to blocking read as `initiateShutdown` closes `writerChan`.
+				frame, ok = <-c.writerChan
+				if !ok { // writerChan is closed and empty
+					c.log.Info("Writer loop: writerChan drained and closed during shutdown processing. Exiting drain loop.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+					break DrainLoop
+				}
+
+				gf, isGoAway := frame.(*GoAwayFrame)
+
+				if isFatalShutdown {
+					if isGoAway {
+						c.log.Debug("Writer loop (fatal shutdown): Writing GOAWAY frame from queue.", logger.LogFields{"remote_addr": c.remoteAddrStr, "stream_id": gf.Header().StreamID, "error_code": gf.ErrorCode.String()})
+						if err := c.writeFrame(frame); err != nil {
+							c.log.Error("Writer loop (fatal shutdown): error writing GOAWAY frame during drain.",
+								logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
+						}
+						goAwaySentThisDrain = true // Mark that a GOAWAY has been sent
+						// After sending GOAWAY in a fatal shutdown, we might want to stop sending anything else.
+						// However, other critical control frames might be queued by initiateShutdown itself if logic changes.
+						// For now, this ensures GOAWAY gets out.
+					} else if !goAwaySentThisDrain {
+						// If it's a fatal shutdown, and we haven't sent our GOAWAY yet,
+						// we must continue to search for it in the queue and send other frames if they are before it.
+						// This path means: fatal shutdown, frame is NOT GOAWAY, and we haven't sent a GOAWAY yet in this drain.
+						// We should still write this frame, as our GOAWAY might be after it.
+						c.log.Debug("Writer loop (fatal shutdown, pre-GOAWAY): Writing non-GOAWAY frame from queue.",
+							logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
+						if err := c.writeFrame(frame); err != nil {
+							c.log.Error("Writer loop (fatal shutdown, pre-GOAWAY): error writing non-GOAWAY frame.",
+								logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+						}
+					} else {
+						// Fatal shutdown, AND we've already sent a GOAWAY. Discard subsequent non-GOAWAY frames.
+						c.log.Debug("Writer loop (fatal shutdown, post-GOAWAY): Discarding non-GOAWAY frame from queue.",
+							logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
+					}
+				} else {
+					// Graceful shutdown or no error: write all frames.
+					c.log.Debug("Writer loop (graceful/no error): Writing frame from queue.", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
+					if err := c.writeFrame(frame); err != nil {
+						c.log.Error("Writer loop (graceful/no error): error writing frame during drain.",
+							logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
+					}
+				}
+			}
+			c.log.Info("Writer loop: Finished processing writerChan during shutdown. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 			return
 
 		case frame, ok := <-c.writerChan:
