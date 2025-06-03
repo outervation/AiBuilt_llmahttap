@@ -792,7 +792,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{}, // No data to provide the PadLength octet
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: "DATA frame too short to contain PadLength field",
+			expectedMsgSubstring: fmt.Sprintf("padded DATA frame for stream %d has invalid declared payload length 0", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength too large for payload (PadLength only)", // PadLength value >= FrameHeader.Length (5 >= 1)
@@ -805,7 +805,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{5}, // PadLength 5, but only 1 byte total in payload means data/padding missing
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 1 for stream %d", baseHeader.StreamID),
+			expectedMsgSubstring: fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value 5 (+1 for field itself) exceeds total declared payload length 1", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength too large for payload (PadLength + some data)", // PadLength value >= FrameHeader.Length (10 >= 3)
@@ -818,7 +818,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{10, 'd', 'a'}, // PadLength 10, dataLen becomes (1+2)-10 = -7 (invalid)
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length %d for stream %d", (1 + 2), baseHeader.StreamID),
+			expectedMsgSubstring: fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value %d (+1 for field itself) exceeds total declared payload length %d", baseHeader.StreamID, 10, (1 + 2)),
 		},
 		{
 			name: "error reading data (PADDED)",
@@ -830,7 +830,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:              []byte{2, 'd', 'a', 't'}, // PadLength=2, Data should be 5, but only 3 'dat' provided
 			expectConnError:      false,
-			expectedMsgSubstring: "reading data: unexpected EOF",
+			expectedMsgSubstring: "reading data for stream 1: unexpected EOF",
 		},
 		{
 			name: "error reading data (not PADDED)",
@@ -842,7 +842,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:              []byte{'d', 'a', 't'}, // Data should be 5, but only 3 'dat' provided
 			expectConnError:      false,
-			expectedMsgSubstring: "reading data: unexpected EOF",
+			expectedMsgSubstring: "reading data for stream 1: unexpected EOF",
 		},
 		{
 			name: "error reading padding",
@@ -854,7 +854,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			}(),
 			payload:              []byte{5, 'd', 'a', 'p', 'a', 'd'}, // PadLength=5, Data='da', Padding should be 5, but only 3 'pad' provided
 			expectConnError:      false,
-			expectedMsgSubstring: "reading padding: unexpected EOF",
+			expectedMsgSubstring: "reading padding for stream 1: unexpected EOF",
 		},
 		{
 			name: "PadLength equals FrameHeader.Length (invalid)", // PadLength value >= FrameHeader.Length (5 >= 5)
@@ -867,7 +867,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{5}, // PadLength field says 5.
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 5 is invalid relative to FrameHeader.Length 5 for stream %d", baseHeader.StreamID),
+			expectedMsgSubstring: fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value 5 (+1 for field itself) exceeds total declared payload length 5", baseHeader.StreamID),
 		},
 		{
 			name: "PadLength greater than FrameHeader.Length (invalid)", // PadLength value >= FrameHeader.Length (10 >= 3)
@@ -880,7 +880,7 @@ func TestDataFrame_ParsePayload_Errors(t *testing.T) {
 			payload:              []byte{10}, // PadLength field says 10.
 			expectConnError:      true,
 			expectedCode:         http2.ErrCodeProtocolError,
-			expectedMsgSubstring: fmt.Sprintf("DATA frame invalid: PadLength 10 is invalid relative to FrameHeader.Length 3 for stream %d", baseHeader.StreamID),
+			expectedMsgSubstring: fmt.Sprintf("DATA frame (stream %d) invalid padding: PadLength value 10 (+1 for field itself) exceeds total declared payload length 3", baseHeader.StreamID),
 		},
 	}
 
@@ -3239,7 +3239,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				return buf.Bytes()
 			}(),
 			maxReadSize: 100,
-			wantErr:     fmt.Errorf("parsing DATA payload: reading data: %w", io.EOF),
+			wantErr:     fmt.Errorf("parsing DATA payload: %w", fmt.Errorf("reading data for stream 1: %w", io.EOF)),
 		},
 		{
 			name: "frame too large (length > fr.maxFrameSize)",
@@ -3255,7 +3255,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 				return frameBytes
 			}(),
 			maxReadSize: http2.DefaultMaxFrameSize + 10, // Prefixed
-			wantErr:     fmt.Errorf("parsing DATA payload: reading data: %w", io.EOF),
+			wantErr:     fmt.Errorf("parsing DATA payload: %w", fmt.Errorf("reading data for stream 1: %w", io.EOF)),
 		},
 		{
 			name: "unknown frame type",
@@ -3404,7 +3404,7 @@ func TestReadFrame_ErrorConditions(t *testing.T) {
 			// This error comes from ReadFrame -> frame.ParsePayload -> io.ReadFull.
 			// The wrapping text would be "parsing DATA payload: reading data: unexpected EOF"
 			// So, we check for io.ErrUnexpectedEOF as the underlying cause.
-			wantErr: fmt.Errorf("parsing DATA payload: reading data: %w", io.ErrUnexpectedEOF),
+			wantErr: fmt.Errorf("parsing DATA payload: %w", fmt.Errorf("reading data for stream 1: %w", io.ErrUnexpectedEOF)),
 		},
 	}
 
