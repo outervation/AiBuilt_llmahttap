@@ -1857,7 +1857,7 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 	// If stream is not found (idle) or not closed, process the PRIORITY frame.
 	// PRIORITY frames can create new nodes in the priority tree if the stream was previously unknown.
 	c.log.Debug("Dispatching stream-level PRIORITY", logger.LogFields{
-		"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+		"stream_id": streamID, "dependency_arg": frame.StreamDependency, "weight_arg": frame.Weight, "exclusive_arg": frame.Exclusive, // LOG PRIORITY ARGS
 		"stream_found": found, "pre_stream_state_if_found": preState.String(),
 	})
 
