@@ -17,6 +17,7 @@ import (
 
 	"strings"
 	"sync"
+	"sync/atomic" // Added for atomic.Bool
 	"time"
 	// "example.com/llmahttap/v2/internal/router" // REMOVED to break cycle
 )
@@ -141,6 +142,8 @@ type Connection struct {
 	// Added fields
 	maxFrameSize uint32 // To satisfy stream.go, should eventually alias to peerMaxFrameSize or ourCurrentMaxFrameSize depending on context
 
+	fatalShutdownSignaled atomic.Bool // NEW: Set to true when a fatal shutdown is initiated
+
 	remoteAddrStr string // Cached remote address string
 
 	dispatcher RequestDispatcherFunc // For dispatching requests to application layer
@@ -191,6 +194,7 @@ func NewConnection(
 		peerReportedErrorCode:        ErrCodeNoError,             // Initialize to NoError
 		highestPeerInitiatedStreamID: 0,                          // Initialize new field
 		peerRstStreamTimes:           make(map[uint32]time.Time), // Initialize the new map
+		// fatalShutdownSignaled is initialized to false (zero value for atomic.Bool)
 	}
 
 	lg.Debug("NewConnection: Post-initialization. Dumping conn.ourSettings before applyOurSettings", logger.LogFields{"conn_ourSettingsDump_before_apply": fmt.Sprintf("%#v", conn.ourSettings)})
@@ -387,13 +391,11 @@ func (c *Connection) canCreateStream(isInitiatedByPeer bool) bool {
 func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isInitiatedByPeer bool) (*Stream, error) {
 	c.log.Debug("Conn: Entered createStream", logger.LogFields{"stream_id": id, "isPeerInitiated": isInitiatedByPeer, "prioInfo_present": prioInfo != nil})
 
-	// Acquire locks in consistent order: settingsMu THEN streamsMu
-	c.settingsMu.Lock()
-	c.streamsMu.Lock() // RLock for canCreateStream checks, then Lock for modification
+	c.settingsMu.Lock() // Lock to read connection-level window settings
+	c.streamsMu.Lock()  // Lock for canCreateStream checks and stream map modification
 
 	c.log.Debug("Conn.createStream: Acquired settingsMu and streamsMu (Lock)", logger.LogFields{"stream_id": id})
 
-	// First check for canCreateStream
 	if !c.canCreateStream(isInitiatedByPeer) {
 		c.streamsMu.Unlock()
 		c.settingsMu.Unlock()
@@ -426,29 +428,29 @@ func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isI
 		c.log.Debug("Conn.createStream: Using default priority", logger.LogFields{"stream_id": id, "weight": weight, "parentID": parentID, "exclusive": exclusive})
 	}
 
-	// Window sizes are already protected by settingsMu which is held.
-	currentOurInitialWindowSize := c.ourInitialWindowSize
-	currentPeerInitialWindowSize := c.peerInitialWindowSize
-	c.log.Debug("Conn.createStream: Window sizes retrieved.", logger.LogFields{"stream_id": id, "ourInitial": currentOurInitialWindowSize, "peerInitial": currentPeerInitialWindowSize})
+	// Determine initial window sizes for the new stream's FC manager
+	// Stream's receive window is based on OUR settings.
+	// Stream's send window is based on PEER's settings.
+	streamOurInitialWindow := c.ourInitialWindowSize
+	streamPeerInitialWindow := c.peerInitialWindowSize
+	c.log.Debug("Conn.createStream: Window sizes for new stream.", logger.LogFields{"stream_id": id, "ourInitialWin (for stream recv)": streamOurInitialWindow, "peerInitialWin (for stream send)": streamPeerInitialWindow})
 
-	// Release settingsMu as it's no longer needed for newStream or priorityTree.AddStream.
-	// Keep streamsMu locked for map modification and counter increment.
-	c.settingsMu.Unlock()
+	c.settingsMu.Unlock() // settingsMu no longer needed for newStream call
 	c.log.Debug("Conn.createStream: Released settingsMu.", logger.LogFields{"stream_id": id})
 
 	c.log.Debug("Conn.createStream: About to call newStream", logger.LogFields{"stream_id": id})
 	stream, err := newStream(
 		c,
 		id,
-		currentOurInitialWindowSize, // These values are now from variables, settingsMu already released
-		currentPeerInitialWindowSize,
+		streamOurInitialWindow,  // our initial window size for the stream's receive side
+		streamPeerInitialWindow, // peer's initial window size for the stream's send side
 		weight,
 		parentID,
 		exclusive,
 		isInitiatedByPeer,
 	)
 	if err != nil {
-		c.streamsMu.Unlock() // Ensure streamsMu is unlocked before returning on error
+		c.streamsMu.Unlock()
 		c.log.Error("Conn.createStream: newStream call failed", logger.LogFields{"stream_id": id, "error": err.Error()})
 		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to create new stream object for ID %d: %v", id, err))
 	}
@@ -465,8 +467,7 @@ func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isI
 	c.log.Debug("Conn.createStream: About to add stream to priorityTree", logger.LogFields{"stream_id": id})
 	if errPrio := c.priorityTree.AddStream(id, actualPrioInfoForTree); errPrio != nil {
 		delete(c.streams, id)
-		// Don't decrement concurrentStreams counters here yet as they haven't been incremented
-		c.streamsMu.Unlock() // Unlock before returning
+		c.streamsMu.Unlock()
 		c.log.Error("Failed to add stream to priority tree", logger.LogFields{"streamID": id, "error": errPrio.Error()})
 		return nil, NewConnectionError(ErrCodeInternalError, fmt.Sprintf("failed to add stream %d to priority tree: %v", id, errPrio))
 	}
@@ -485,7 +486,7 @@ func (c *Connection) createStream(id uint32, prioInfo *streamDependencyInfo, isI
 		c.log.Debug("Conn.createStream: Updated lastProcessedStreamID for peer-initiated stream", logger.LogFields{"stream_id": id, "new_last_id": c.lastProcessedStreamID})
 	}
 
-	c.streamsMu.Unlock() // Release streamsMu
+	c.streamsMu.Unlock()
 	c.log.Debug("Conn.createStream: Released streamsMu.", logger.LogFields{"stream_id": id})
 
 	c.log.Debug("Stream created (generically)", logger.LogFields{"streamID": id, "isPeerInitiated": isInitiatedByPeer})
@@ -824,9 +825,9 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 // This is a stub implementation.
 
 func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
+
 	// Add call stack logging here
-	stack := string(debug.Stack())
-	c.log.Debug("Queuing RST_STREAM frame for sending", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "caller_stack": stack})
+	stack := string(debug.Stack()) // Keep stack for potential future use if brief log isn't enough
 
 	if streamID == 0 {
 		errMsg := "internal error: attempted to send RST_STREAM on stream 0"
@@ -860,17 +861,11 @@ func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) er
 			return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("fatal connection error (%v), cannot send RST_STREAM for stream %d", connErr, streamID))
 		}
 	}
-	// This combined check: if shutdownChan is closed.
-	// If connErr was fatal, it would have returned above. So if shutdownSignaled is true here,
-	// it implies either connErr was nil, or it was a non-fatal ConnectionError (like GOAWAY NoError).
-	// In either of those cases, if shutdownChan is closed, we should not send new frames like RST_STREAM
-	// unless it's part of the shutdown itself (e.g. a GOAWAY frame).
-	if shutdownSignaled { // connErr == nil or connErr is non-fatal but shutdown initiated
+	if shutdownSignaled {
 		c.log.Warn("sendRSTStreamFrame: Connection already shutting down (pre-check, shutdownChan closed), cannot send RST_STREAM frame.",
-			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "existing_conn_err_if_any": connErr}) // Log existing_conn_err for context
+			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "existing_conn_err_if_any": connErr})
 		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send RST_STREAM for stream %d", streamID))
 	}
-	// If neither of the above returned, it's safe to proceed to construct and send rstFrame.
 
 	rstFrame := &RSTStreamFrame{
 		FrameHeader: FrameHeader{
@@ -882,14 +877,39 @@ func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) er
 		ErrorCode: errorCode,
 	}
 
-	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
+	callerInfo := "unknown_caller"
+	stackLines := strings.Split(stack, "\n")
+	if len(stackLines) > 2 {
+		for i := 2; i < len(stackLines); i++ {
+			if !strings.HasPrefix(stackLines[i], "\truntime/") &&
+				!strings.HasPrefix(stackLines[i], "\ttesting/") &&
+				!strings.Contains(stackLines[i], "sendRSTStreamFrame") {
+				callerInfo = strings.TrimSpace(strings.Split(stackLines[i], "(")[0])
+				break
+			}
+		}
+	}
+
+	c.log.Debug("sendRSTStreamFrame: PRE-SELECT trying to send to writerChan",
+		logger.LogFields{
+			"stream_id": streamID, "error_code": errorCode.String(),
+			"from_caller": callerInfo,
+		})
+
 	select {
 	case c.writerChan <- rstFrame:
-		c.log.Debug("RST_STREAM frame queued", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		c.log.Debug("sendRSTStreamFrame: POST-SELECT send to writerChan SUCCEEDED",
+			logger.LogFields{
+				"stream_id": streamID, "error_code": errorCode.String(),
+				"from_caller": callerInfo,
+			})
 		return nil
 	case <-c.shutdownChan:
-		c.log.Warn("sendRSTStreamFrame: Connection shutting down (during send attempt), cannot send RST_STREAM frame.",
-			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+		c.log.Warn("sendRSTStreamFrame: Connection shutting down (detected in select), cannot send RST_STREAM frame.",
+			logger.LogFields{
+				"stream_id": streamID, "error_code": errorCode.String(),
+				"from_caller": callerInfo,
+			})
 		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send RST_STREAM for stream %d", streamID))
 	}
 }
@@ -1034,10 +1054,19 @@ func (c *Connection) dispatchDataFrame(frame *DataFrame) error {
 		// stream.handleDataFrame might return a StreamError (e.g., stream FC violation, content-length mismatch)
 		// or a ConnectionError if something catastrophic happened at stream level.
 		if se, ok := err.(*StreamError); ok {
-			c.log.Warn("Stream error handling DATA frame, sending RST_STREAM",
+			c.log.Warn("Stream error handling DATA frame",
 				logger.LogFields{"stream_id": se.StreamID, "code": se.Code.String(), "msg": se.Msg})
-			// Send RST_STREAM for the stream error.
-			// If sending RST_STREAM fails, it's a connection-level problem.
+
+			// h2spec 3.1.2: DATA on RST'd stream -> PROTOCOL_ERROR (connection error)
+			// If the stream error was specifically ErrCodeStreamClosed (meaning DATA on already closed/RST'd stream)
+			if se.Code == ErrCodeStreamClosed {
+				errMsg := fmt.Sprintf("DATA frame received on already closed/RST'd stream %d. Escalating to ConnectionError(PROTOCOL_ERROR).", se.StreamID)
+				c.log.Error(errMsg, logger.LogFields{"stream_id": se.StreamID, "original_stream_error": se.Error()})
+				return NewConnectionError(ErrCodeProtocolError, errMsg)
+			}
+
+			// For other stream errors from handleDataFrame (e.g. content-length mismatch, stream FC violation),
+			// we RST the stream and continue the connection.
 			if rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code); rstErr != nil {
 				c.log.Error("Failed to send RST_STREAM for stream error during DATA frame handling",
 					logger.LogFields{"stream_id": se.StreamID, "original_stream_error_code": se.Code.String(), "rst_send_error": rstErr.Error()})
@@ -1236,23 +1265,12 @@ func (c *Connection) finalizeHeaderBlockAndDispatch(initialFramePrioInfo *stream
 		c.log.Debug("Current header block identified as potential trailers, validating for pseudo-headers.",
 			logger.LogFields{"stream_id": streamIDForTrailerCheck})
 		for _, hf := range decodedHeaders {
+
 			if strings.HasPrefix(hf.Name, ":") {
 				errMsg := fmt.Sprintf("pseudo-header field '%s' found in trailer block for stream %d", hf.Name, streamIDForTrailerCheck)
 				c.log.Error(errMsg, logger.LogFields{"stream_id": streamIDForTrailerCheck, "header_name": hf.Name})
 				c.resetHeaderAssemblyState()
-				// Per h2spec 8.1.2.1, item 3: "Trailers MUST NOT include pseudo-header fields...
-				// An endpoint that detects a malformed request or response MUST treat it as a stream error
-				// (Section 5.4.2) of type PROTOCOL_ERROR."
-				// However, the specific test case "Malformed_Headers:_Pseudo-header_in_trailers" in conn_test.go
-				// expects a *connection error* leading to GOAWAY, which aligns with RFC 7540 Section 8.1.2.6:
-				// "An HTTP/2 request or response is malformed if...mandatory pseudo-header fields are omitted...
-				// pseudo-header fields are malformed or have invalid values...or trailers contain pseudo-header fields.
-				// A server that receives a malformed request...MUST respond with a stream error (Section 5.4.2) of type
-				// PROTOCOL_ERROR. For malformed requests, a server MAY send an HTTP response prior to closing or
-				// resetting the stream."
-				// The h2spec interpretation often favors connection errors for malformed messages that are severe.
-				// The test expects a connection error. Let's align with that.
-				c.log.Debug("finalizeHeaderBlockAndDispatch: returning ProtocolError for pseudo-header in trailers", logger.LogFields{"stream_id": streamIDForTrailerCheck, "error_code": ErrCodeProtocolError, "msg_val": errMsg})
+				// Per h2spec 8.1.2.1/3, this should be a connection error of type PROTOCOL_ERROR.
 				return NewConnectionError(ErrCodeProtocolError, errMsg)
 			}
 		}
@@ -1480,12 +1498,11 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		if peerHasRSTDThisStream { // This check now comes BEFORE streamFound and other logic for existing streams.
 			// h2spec 5.1.9: Client sends HEADERS after it has RST the stream.
 			// Server MUST send RST_STREAM with STREAM_CLOSED.
-			c.log.Warn("Server received HEADERS for a stream previously RST'd by the client. Sending RST_STREAM(STREAM_CLOSED).",
+			c.log.Warn("Server received HEADERS for a stream previously RST'd by the client. Responding with RST_STREAM(STREAM_CLOSED).",
 				logger.LogFields{"stream_id": streamID})
-			if errRST := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); errRST != nil {
-				return errRST // If sending RST fails, propagate connection error
-			}
-			return nil // RST_STREAM sent, stream error handled.
+			// The test TestHEADERSOnClientRSTStream_ServeLoop expects RST_STREAM(STREAM_CLOSED).
+			// Returning a StreamError will cause conn.Serve to send RST_STREAM.
+			return NewStreamError(streamID, ErrCodeStreamClosed, fmt.Sprintf("HEADERS received on stream %d previously RST'd by client", streamID))
 		}
 
 		if streamFound {
@@ -1561,16 +1578,18 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 		if streamID <= c.highestPeerInitiatedStreamID {
 			// This case covers when a client sends HEADERS for a stream ID that is
 			// not strictly greater than the highest one it has already initiated.
-			// If `streamFound` (checked earlier) was false, it means this stream ID
-			// refers to a stream that was closed or never fully opened by the client.
-			// Here, `peerHasRSTDThisStream` was false, so client didn't RST it.
-			// Thus, this is a PROTOCOL_ERROR for reusing an ID or using one out of order.
-			c.streamsMu.Unlock() // Unlock before sending RST or returning
+			// This logic applies if the stream was not found (`streamFound` is false) and
+			// was not previously RST'd by the peer (`peerHasRSTDThisStream` is false).
+			// RFC 7540, 5.1.1: "Stream identifiers cannot be reused. An endpoint that
+			// receives a HEADERS frame that causes their stream identifier to become invalid
+			// MUST treat this as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
+			// "Invalid" includes numerically smaller than a previous one from the same peer for a new stream.
+			c.streamsMu.Unlock() // Unlock before returning. This pairs with c.streamsMu.Lock() just before this if block.
 			errMsg := fmt.Sprintf("client attempted to initiate new stream %d, which is not numerically greater than highest previously client-initiated stream ID %d (and not a known client-RST'd stream)", streamID, c.highestPeerInitiatedStreamID)
 
 			c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "highest_peer_initiated_stream_id": c.highestPeerInitiatedStreamID})
-			// This is a connection error as per RFC 7540, Section 5.1.1.
-			return NewConnectionError(ErrCodeProtocolError, errMsg) // Reverted from ErrCodeStreamClosed
+			// Per RFC 7540, 5.1.1, this should be a PROTOCOL_ERROR.
+			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		}
 
 		// If streamID > c.highestPeerInitiatedStreamID, it's a genuinely new stream ID,
@@ -2395,7 +2414,33 @@ func (c *Connection) writeFrame(frame Frame) error {
 	}
 
 	// Actual write to the network connection
+	// Set a write deadline
+	writeDeadline := time.Now().Add(5 * time.Second) // Configurable timeout
+	if errDeadline := c.netConn.SetWriteDeadline(writeDeadline); errDeadline != nil {
+		c.log.Error("Error setting write deadline before netConn.Write", logger.LogFields{
+			"error":       errDeadline.Error(),
+			"remote_addr": c.remoteAddrStr,
+			"frame_type":  frame.Header().Type.String(),
+		})
+		// If setting deadline fails, it's a significant issue. Propagate as an error.
+		return fmt.Errorf("failed to set write deadline: %w", errDeadline)
+	}
+
 	n, writeErr := c.netConn.Write(frameBytes)
+
+	// Clear the write deadline immediately after the write attempt
+	if errClearDeadline := c.netConn.SetWriteDeadline(time.Time{}); errClearDeadline != nil {
+		c.log.Warn("Error clearing write deadline after netConn.Write", logger.LogFields{
+			"error":       errClearDeadline.Error(),
+			"remote_addr": c.remoteAddrStr,
+			"frame_type":  frame.Header().Type.String(),
+		})
+		// If the write itself succeeded (writeErr == nil), but clearing deadline failed,
+		// this is a warning. The primary outcome is based on writeErr.
+		// If writeErr was also nil, we might proceed, but the connection state for future writes is dubious.
+		// For now, prioritize writeErr.
+	}
+
 	if writeErr != nil {
 		c.log.Error("Error writing frame to network connection", logger.LogFields{
 			"error":                      writeErr.Error(),
@@ -3466,17 +3511,26 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 			// If so, this is fatal for the connection. Store it and return.
 			var connErrTarget *ConnectionError
 			if errors.As(err, &connErrTarget) {
-				c.log.Error("Serve (reader) loop: readFrame returned ConnectionError. Terminating connection.",
+				c.log.Error("Serve (reader) loop: readFrame returned ConnectionError. THIS IS THE TARGET LOG FOR H2SPEC 6.1.3.",
 					logger.LogFields{
-						"error":       err.Error(), // Log the full wrapped error
-						"code":        connErrTarget.Code.String(),
-						"msg":         connErrTarget.Msg,
-						"remote_addr": c.remoteAddrStr,
+						"error":                      err.Error(), // Log the full wrapped error
+						"code":                       connErrTarget.Code.String(),
+						"msg":                        connErrTarget.Msg,
+						"last_stream_id_in_conn_err": connErrTarget.LastStreamID,
+						"debug_data_in_conn_err_len": len(connErrTarget.DebugData),
+						"remote_addr":                c.remoteAddrStr,
 					})
 				c.streamsMu.Lock()
 				if c.connError == nil {
 					c.connError = err // Store the original error which might be wrapped
 				}
+				// ---- NEW ----
+				if connErrTarget.Code != ErrCodeNoError && connErrTarget.Code != ErrCodeCancel {
+					c.fatalShutdownSignaled.Store(true)
+					c.log.Debug("Serve loop: readFrame ConnectionError set fatalShutdownSignaled.",
+						logger.LogFields{"code": connErrTarget.Code.String()})
+				}
+				// -------------
 				c.streamsMu.Unlock()
 				return err // This will trigger the defer in Serve to call Close()
 			}
@@ -3668,6 +3722,20 @@ func (c *Connection) Serve(ctx context.Context) (err error) {
 				if c.connError == nil {
 					c.connError = dispatchErr // Store the fatal error.
 				}
+				// ---- NEW ----
+				// Check if dispatchErr is ConnectionError and if its code implies fatal
+				if ce, ok := dispatchErr.(*ConnectionError); ok {
+					if ce.Code != ErrCodeNoError && ce.Code != ErrCodeCancel {
+						c.fatalShutdownSignaled.Store(true)
+						c.log.Debug("Serve loop: dispatchFrame ConnectionError set fatalShutdownSignaled.",
+							logger.LogFields{"code": ce.Code.String()})
+					}
+				} else if dispatchErr != nil { // Other non-nil, non-StreamError from dispatchFrame is also fatal
+					c.fatalShutdownSignaled.Store(true)
+					c.log.Debug("Serve loop: dispatchFrame generic fatal error set fatalShutdownSignaled.",
+						logger.LogFields{"error_type": fmt.Sprintf("%T", dispatchErr)})
+				}
+				// -------------
 				c.streamsMu.Unlock()
 				return dispatchErr // Propagate fatal error to terminate the connection.
 			}
@@ -3725,12 +3793,16 @@ func (c *Connection) writerLoop() {
 			if connErr != nil {
 				// EOF from peer or explicit graceful close (errCode == NoError in GOAWAY) are not "fatal" for this purpose.
 				if ce, ok := connErr.(*ConnectionError); ok {
-					if ce.Code != ErrCodeNoError {
+					if ce.Code != ErrCodeNoError && ce.Code != ErrCodeCancel { // CANCEL is usually part of stream closing, not fatal conn error for drain logic
 						isFatalShutdown = true
 					}
 				} else if !errors.Is(connErr, io.EOF) { // Any other error type is considered fatal for this selective write logic
 					isFatalShutdown = true
 				}
+			}
+			// Also consider c.fatalShutdownSignaled, which might be set slightly before c.connError is fully propagated or if c.connError is nil but it's still fatal.
+			if c.fatalShutdownSignaled.Load() {
+				isFatalShutdown = true
 			}
 
 			if isFatalShutdown {
@@ -3741,49 +3813,42 @@ func (c *Connection) writerLoop() {
 
 			// Drain writerChan. It will eventually be closed by initiateShutdown.
 			// The goal is to ensure GOAWAY is sent, and other data is discarded if it's a fatal shutdown.
-			var goAwaySentThisDrain bool
 		DrainLoop:
 			for {
 				var frame Frame
 				var ok bool
-				// Non-blocking check first to see if there's anything, then blocking if there is.
-				// This is to allow quick exit if channel is empty and will be closed.
-				// However, simpler is just to range or blocking read until closed.
-				// Let's stick to blocking read as `initiateShutdown` closes `writerChan`.
 				frame, ok = <-c.writerChan
 				if !ok { // writerChan is closed and empty
 					c.log.Info("Writer loop: writerChan drained and closed during shutdown processing. Exiting drain loop.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 					break DrainLoop
 				}
 
-				gf, isGoAway := frame.(*GoAwayFrame)
-
+				// If in fatal shutdown mode, only write GOAWAY frames. Discard others.
 				if isFatalShutdown {
-					if isGoAway {
+					if gf, isGoAway := frame.(*GoAwayFrame); isGoAway {
 						c.log.Debug("Writer loop (fatal shutdown): Writing GOAWAY frame from queue.", logger.LogFields{"remote_addr": c.remoteAddrStr, "stream_id": gf.Header().StreamID, "error_code": gf.ErrorCode.String()})
 						if err := c.writeFrame(frame); err != nil {
 							c.log.Error("Writer loop (fatal shutdown): error writing GOAWAY frame during drain.",
 								logger.LogFields{"error": err, "remote_addr": c.remoteAddrStr})
 						}
-						goAwaySentThisDrain = true // Mark that a GOAWAY has been sent
-						// After sending GOAWAY in a fatal shutdown, we might want to stop sending anything else.
-						// However, other critical control frames might be queued by initiateShutdown itself if logic changes.
-						// For now, this ensures GOAWAY gets out.
-					} else if !goAwaySentThisDrain {
-						// If it's a fatal shutdown, and we haven't sent our GOAWAY yet,
-						// we must continue to search for it in the queue and send other frames if they are before it.
-						// This path means: fatal shutdown, frame is NOT GOAWAY, and we haven't sent a GOAWAY yet in this drain.
-						// We should still write this frame, as our GOAWAY might be after it.
-						c.log.Debug("Writer loop (fatal shutdown, pre-GOAWAY): Writing non-GOAWAY frame from queue.",
-							logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
-						if err := c.writeFrame(frame); err != nil {
-							c.log.Error("Writer loop (fatal shutdown, pre-GOAWAY): error writing non-GOAWAY frame.",
-								logger.LogFields{"error": err, "frame_type": frame.Header().Type.String(), "remote_addr": c.remoteAddrStr})
-						}
 					} else {
-						// Fatal shutdown, AND we've already sent a GOAWAY. Discard subsequent non-GOAWAY frames.
-						c.log.Debug("Writer loop (fatal shutdown, post-GOAWAY): Discarding non-GOAWAY frame from queue.",
+						// Discard non-GOAWAY frames during fatal shutdown.
+						c.log.Debug("Writer loop (fatal shutdown): Discarding non-GOAWAY frame from queue.",
 							logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
+						// Special handling for initial SETTINGS if discarded during fatal shutdown
+						if !c.isClient {
+							if sfCheck, okCheck := frame.(*SettingsFrame); okCheck && (sfCheck.Header().Flags&FlagSettingsAck == 0) {
+								c.initialSettingsMu.Lock()
+								if !c.initialSettingsSignaled {
+									if c.initialSettingsWritten != nil {
+										close(c.initialSettingsWritten)
+									}
+									c.initialSettingsSignaled = true
+									c.log.Warn("Writer loop (fatal shutdown drain): Discarded initial SETTINGS frame; signaled initialSettingsWritten.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+								}
+								c.initialSettingsMu.Unlock()
+							}
+						}
 					}
 				} else {
 					// Graceful shutdown or no error: write all frames.
@@ -3798,14 +3863,36 @@ func (c *Connection) writerLoop() {
 			return
 
 		case frame, ok := <-c.writerChan:
-			c.log.Debug("Connection.writerLoop: Received frame from writerChan", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": nil, "ok": ok}) // Frame type later
 			if !ok {
 				c.log.Info("Writer loop: writerChan closed. Exiting.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 				return
 			}
 			c.log.Debug("Writer loop: Received frame from writerChan", logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
 
-			// The redundant `if !ok` check that was here previously has been removed.
+			// NEW: Check fatalShutdownSignaled before writing any frame in the main path.
+			if c.fatalShutdownSignaled.Load() {
+				if _, isGoAway := frame.(*GoAwayFrame); !isGoAway {
+					c.log.Debug("Writer loop (main path): fatalShutdownSignaled is true, discarding non-GOAWAY frame.",
+						logger.LogFields{"remote_addr": c.remoteAddrStr, "frame_type": frame.Header().Type.String(), "stream_id": frame.Header().StreamID})
+
+					// Handle initial SETTINGS being discarded.
+					if !c.isClient {
+						if sfCheck, okCheck := frame.(*SettingsFrame); okCheck && (sfCheck.Header().Flags&FlagSettingsAck == 0) {
+							c.initialSettingsMu.Lock()
+							if !c.initialSettingsSignaled {
+								if c.initialSettingsWritten != nil {
+									close(c.initialSettingsWritten)
+								}
+								c.initialSettingsSignaled = true
+								c.log.Warn("Writer loop (main path discard): Discarded initial SETTINGS frame due to fatalShutdownSignaled; signaled initialSettingsWritten.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+							}
+							c.initialSettingsMu.Unlock()
+						}
+					}
+					continue // Discard frame and go back to select
+				}
+				c.log.Debug("Writer loop (main path): fatalShutdownSignaled is true, but frame is GOAWAY. Proceeding to write.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+			}
 
 			c.log.Debug("Writer loop: Attempting to write frame", logger.LogFields{"frame_type": frame.Header().Type.String(), "frame_flags": frame.Header().Flags, "stream_id": frame.Header().StreamID, "remote_addr": c.remoteAddrStr})
 			if err := c.writeFrame(frame); err != nil {
@@ -3819,12 +3906,24 @@ func (c *Connection) writerLoop() {
 					c.connError = err
 				}
 				// Ensure shutdownChan is closed to signal other parts of the system.
-				// c.isShuttingDownLocked() is safe as streamsMu is held.
-				if !c.isShuttingDownLocked() {
+				if !c.isShuttingDownLocked() { // c.isShuttingDownLocked() is safe as streamsMu is held.
+					// NEW: If this write error is fatal, also set fatalShutdownSignaled.
+					// Consider ConnectionError codes and generic errors like io.EOF or net.Error
+					isWriteErrorFatal := true // Assume fatal unless specific non-fatal conditions met
+					if ce, ok := err.(*ConnectionError); ok {
+						if ce.Code == ErrCodeNoError || ce.Code == ErrCodeCancel {
+							isWriteErrorFatal = false
+						}
+					} else if errors.Is(err, io.EOF) { // EOF might not always be fatal for signaling, but often is for writes
+						// isWriteErrorFatal remains true for EOF during write
+					}
+					// Other net.Error types are generally fatal for writes
+
+					if isWriteErrorFatal {
+						c.fatalShutdownSignaled.Store(true)
+						c.log.Debug("Writer loop: writeFrame error set fatalShutdownSignaled.", logger.LogFields{"error": err})
+					}
 					close(c.shutdownChan)
-					// Since shutdownChan is now closed, the Serve() loop's defer c.Close()
-					// or an external Close() call will handle the full shutdown.
-					// We don't call c.Close() from writerLoop directly to avoid deadlocks.
 				}
 				c.streamsMu.Unlock()
 				return // Exit writer loop. Its defer will close c.writerDone.
