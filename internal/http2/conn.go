@@ -568,6 +568,65 @@ func (c *Connection) removeStream(id uint32, initiatedByPeer bool, errCode Error
 func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, endStream bool) error {
 	c.log.Debug("Connection.sendHeadersFrame: Entered", logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "end_stream": endStream})
 
+	// Pre-check for existing fatal connection error
+	c.streamsMu.RLock()
+	connErr := c.connError
+	shutdownSignaled := false
+	select {
+	case <-c.shutdownChan:
+		shutdownSignaled = true
+	default:
+	}
+	c.streamsMu.RUnlock()
+
+	if connErr != nil {
+		isFatalError := false
+		if ce, ok := connErr.(*ConnectionError); ok {
+			if ce.Code != ErrCodeNoError && ce.Code != ErrCodeCancel {
+				isFatalError = true
+			}
+		} else {
+			isFatalError = true
+		}
+		if isFatalError {
+			c.log.Warn("sendHeadersFrame: Fatal connection error already present, cannot send HEADERS frame.",
+				logger.LogFields{"stream_id": s.id, "num_headers": len(headers), "conn_error": connErr.Error()})
+			return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("fatal connection error (%v), cannot send HEADERS for stream %d", connErr, s.id))
+		}
+	}
+	if shutdownSignaled && connErr == nil { // Similar check as in sendDataFrame
+		c.log.Warn("sendHeadersFrame: Connection already shutting down (pre-check, shutdownChan closed but no c.connError), cannot send HEADERS frame.",
+			logger.LogFields{"stream_id": s.id, "num_headers": len(headers)})
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
+	}
+
+	// Check if peer has sent GOAWAY indicating it won't process this stream
+	c.streamsMu.RLock()
+	goAwayRecvd := c.goAwayReceived
+	peerLastID := c.peerReportedLastStreamID
+	peerErrCode := c.peerReportedErrorCode
+	c.streamsMu.RUnlock()
+
+	shouldAbortSendDueToPeerGoAway := false
+	if goAwayRecvd {
+		if peerErrCode != ErrCodeNoError {
+			shouldAbortSendDueToPeerGoAway = true
+		} else {
+			if s.id > peerLastID {
+				shouldAbortSendDueToPeerGoAway = true
+			}
+		}
+	}
+	if shouldAbortSendDueToPeerGoAway {
+		c.log.Warn("sendHeadersFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
+			logger.LogFields{
+				"stream_id":                     s.id,
+				"peer_last_processed_stream_id": peerLastID,
+				"peer_error_code":               peerErrCode.String(),
+			})
+		return NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, HEADERS send aborted")
+	}
+
 	headerBlock, err := c.hpackAdapter.Encode(headers)
 	if err != nil {
 		c.log.Error("Connection.sendHeadersFrame: HPACK encoding failed", logger.LogFields{"stream_id": s.id, "error": err.Error()})
@@ -615,24 +674,22 @@ func (c *Connection) sendHeadersFrame(s *Stream, headers []hpack.HeaderField, en
 
 	c.log.Debug("Connection.sendHeadersFrame: Queuing HEADERS frame", logger.LogFields{"stream_id": s.id, "frame_flags": flags, "header_block_len": len(hf.HeaderBlockFragment)})
 	// Check for shutdown or context cancellation FIRST (non-blocking)
-	select {
-	case <-c.shutdownChan:
-		c.log.Warn("Connection.sendHeadersFrame: Shutdown already signaled (pre-check), cannot queue HEADERS frame", logger.LogFields{"stream_id": s.id})
-		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send HEADERS for stream %d", s.id))
-	case <-c.ctx.Done():
-		c.log.Warn("Connection.sendHeadersFrame: Context done (pre-check), cannot queue HEADERS frame", logger.LogFields{"stream_id": s.id, "error": c.ctx.Err()})
-		return c.ctx.Err()
-	default:
-		// Not shutting down or context cancelled yet, proceed to try queuing.
-	}
+	// This initial non-blocking check was removed in previous edits; restoring a similar pattern
+	// as in sendDataFrame, but ensuring it's before the blocking select.
 
-	// Now attempt to queue, with shutdown/context check in select as fallback
+	// Attempt to queue, with shutdown/context check in select as fallback
 	select {
 	case c.writerChan <- hf:
 		c.log.Debug("Connection.sendHeadersFrame: HEADERS frame queued successfully", logger.LogFields{"stream_id": s.id})
 		return nil
 	case <-c.shutdownChan: // Fallback check if shutdown happened while trying to queue
 		c.log.Warn("Connection.sendHeadersFrame: Shutdown signaled while attempting to queue HEADERS frame", logger.LogFields{"stream_id": s.id})
+		c.streamsMu.RLock()
+		finalConnErr := c.connError
+		c.streamsMu.RUnlock()
+		if finalConnErr != nil {
+			return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down due to error (%v), cannot send HEADERS for stream %d", finalConnErr, s.id))
+		}
 		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during queue attempt), cannot send HEADERS for stream %d", s.id))
 	case <-c.ctx.Done(): // Fallback check for context cancellation
 		c.log.Warn("Connection.sendHeadersFrame: Context done while attempting to queue HEADERS frame", logger.LogFields{"stream_id": s.id, "error": c.ctx.Err()})
@@ -655,42 +712,76 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 		return 0, NewConnectionError(ErrCodeInternalError, errMsg)
 	}
 
-	// Check 1: Is connection already known to be shutting down? (Non-blocking)
+	c.streamsMu.RLock()
+	connErr := c.connError
+	shutdownSignaled := false
 	select {
 	case <-c.shutdownChan:
-		c.log.Warn("sendDataFrame: Connection already shutting down (pre-check), cannot send DATA frame.",
+		shutdownSignaled = true
+	default:
+	}
+	c.streamsMu.RUnlock()
+
+	if connErr != nil {
+		// If a fatal connection error has already occurred, don't send new stream data.
+		// Check if the error is one that implies the connection is unusable for new frames.
+		isFatalError := false
+		if ce, ok := connErr.(*ConnectionError); ok {
+			if ce.Code != ErrCodeNoError && ce.Code != ErrCodeCancel { // NoError/Cancel might be part of graceful shutdown
+				isFatalError = true
+			}
+		} else {
+			isFatalError = true // Any other error type is generally fatal for new operations
+		}
+
+		if isFatalError {
+			c.log.Warn("sendDataFrame: Fatal connection error already present, cannot send DATA frame.",
+				logger.LogFields{"stream_id": s.id, "data_len": len(data), "conn_error": connErr.Error()})
+			return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("fatal connection error (%v), cannot send DATA for stream %d", connErr, s.id))
+		}
+	}
+	// This combined check ensures that if shutdownChan is closed (signaling shutdown),
+	// we only proceed if c.connError is nil (e.g. graceful shutdown where DATA might still be allowed for a moment).
+	// If shutdownChan is closed AND c.connError is non-nil and fatal (handled above), we'd have already returned.
+	// If shutdownChan is closed AND c.connError is non-nil but NOT fatal (e.g. ErrCodeNoError from GOAWAY),
+	// the peer GOAWAY check below should handle it if the stream ID is too high.
+	// This specific 'if' targets scenarios where shutdown is initiated (shutdownChan closed)
+	// but a specific fatal c.connError hasn't been set yet (e.g. a race, or a very quick graceful shutdown).
+	// If connErr *was* set above, the isFatalError check would have caught it.
+	// So, if shutdown is signaled AND connErr is currently nil (meaning it wasn't a fatal error caught above),
+	// then we treat it as a generic "connection shutting down" and block new DATA.
+	if shutdownSignaled && connErr == nil {
+		c.log.Warn("sendDataFrame: Connection already shutting down (pre-check, shutdownChan closed but no c.connError), cannot send DATA frame.",
 			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
 		return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send DATA for stream %d", s.id))
-	default:
-		// Not shutting down yet, proceed.
+	}
 
-		// Check if peer has sent GOAWAY indicating it won't process this stream
-		c.streamsMu.RLock()
-		goAwayRecvd := c.goAwayReceived
-		peerLastID := c.peerReportedLastStreamID
-		peerErrCode := c.peerReportedErrorCode
-		c.streamsMu.RUnlock()
+	// Check if peer has sent GOAWAY indicating it won't process this stream
+	c.streamsMu.RLock()
+	goAwayRecvd := c.goAwayReceived
+	peerLastID := c.peerReportedLastStreamID
+	peerErrCode := c.peerReportedErrorCode
+	c.streamsMu.RUnlock()
 
-		shouldAbortSendDueToPeerGoAway := false
-		if goAwayRecvd {
-			if peerErrCode != ErrCodeNoError {
+	shouldAbortSendDueToPeerGoAway := false
+	if goAwayRecvd {
+		if peerErrCode != ErrCodeNoError { // If peer sent GOAWAY with an error, stop all new data.
+			shouldAbortSendDueToPeerGoAway = true
+		} else { // Peer sent GOAWAY with NoError (graceful shutdown)
+			if s.id > peerLastID { // If stream ID is greater than what peer will process, abort.
 				shouldAbortSendDueToPeerGoAway = true
-			} else {
-				if s.id > peerLastID { // If peerLastID is 0, this still correctly aborts for s.id > 0
-					shouldAbortSendDueToPeerGoAway = true
-				}
 			}
 		}
+	}
 
-		if shouldAbortSendDueToPeerGoAway {
-			c.log.Warn("sendDataFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
-				logger.LogFields{
-					"stream_id":                     s.id,
-					"peer_last_processed_stream_id": peerLastID,
-					"peer_error_code":               peerErrCode.String(),
-				})
-			return 0, NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, data send aborted")
-		}
+	if shouldAbortSendDueToPeerGoAway {
+		c.log.Warn("sendDataFrame: Peer sent GOAWAY, indicating this stream may not be processed by peer.",
+			logger.LogFields{
+				"stream_id":                     s.id,
+				"peer_last_processed_stream_id": peerLastID,
+				"peer_error_code":               peerErrCode.String(),
+			})
+		return 0, NewStreamError(s.id, ErrCodeRefusedStream, "peer sent GOAWAY, data send aborted")
 	}
 
 	// Construct DATA frame
@@ -709,20 +800,23 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 		Data: data,
 	}
 
-	// Check 2: Attempt to send, also checking for shutdown if writerChan blocks.
+	// Attempt to send, also checking for shutdown if writerChan blocks.
 	select {
 	case c.writerChan <- dataFrame:
 		c.log.Debug("sendDataFrame: DATA frame queued",
 			logger.LogFields{"stream_id": s.id, "flags": frameFlags, "payload_len": len(data)})
 		return len(data), nil
-	case <-c.shutdownChan:
+	case <-c.shutdownChan: // This check is important if queuing blocks.
 		c.log.Warn("sendDataFrame: Connection shutting down (during send attempt), cannot send DATA frame.",
 			logger.LogFields{"stream_id": s.id, "data_len": len(data)})
+		// Check c.connError again, as it might have been set between the top check and now.
+		c.streamsMu.RLock()
+		finalConnErr := c.connError
+		c.streamsMu.RUnlock()
+		if finalConnErr != nil {
+			return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down due to error (%v), cannot send DATA for stream %d", finalConnErr, s.id))
+		}
 		return 0, NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (during send attempt), cannot send DATA for stream %d", s.id))
-		// No default case here. If writerChan is full, we want this to block until
-		// either the frame is sent or shutdownChan is closed.
-		// The previous 'default' case that errored on full writerChan is removed.
-		// If writerChan is indefinitely full and no shutdown, it's a different kind of problem (writerLoop stuck).
 	}
 }
 
@@ -740,15 +834,43 @@ func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) er
 		return NewConnectionError(ErrCodeInternalError, errMsg)
 	}
 
-	// Check 1: Is connection already known to be shutting down? (Non-blocking)
+	// Pre-check for existing fatal connection error or shutdown
+	c.streamsMu.RLock()
+	connErr := c.connError
+	shutdownSignaled := false
 	select {
 	case <-c.shutdownChan:
-		c.log.Warn("sendRSTStreamFrame: Connection already shutting down (pre-check), cannot send RST_STREAM frame.",
-			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
-		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send RST_STREAM for stream %d", streamID))
+		shutdownSignaled = true
 	default:
-		// Not shutting down yet, proceed.
 	}
+	c.streamsMu.RUnlock()
+
+	if connErr != nil {
+		isFatalError := false
+		if ce, ok := connErr.(*ConnectionError); ok {
+			if ce.Code != ErrCodeNoError && ce.Code != ErrCodeCancel { // NoError/Cancel might be part of graceful shutdown
+				isFatalError = true
+			}
+		} else { // Any other error type is generally fatal for new operations
+			isFatalError = true
+		}
+		if isFatalError {
+			c.log.Warn("sendRSTStreamFrame: Fatal connection error already present, cannot send RST_STREAM frame.",
+				logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "conn_error": connErr.Error()})
+			return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("fatal connection error (%v), cannot send RST_STREAM for stream %d", connErr, streamID))
+		}
+	}
+	// This combined check: if shutdownChan is closed.
+	// If connErr was fatal, it would have returned above. So if shutdownSignaled is true here,
+	// it implies either connErr was nil, or it was a non-fatal ConnectionError (like GOAWAY NoError).
+	// In either of those cases, if shutdownChan is closed, we should not send new frames like RST_STREAM
+	// unless it's part of the shutdown itself (e.g. a GOAWAY frame).
+	if shutdownSignaled { // connErr == nil or connErr is non-fatal but shutdown initiated
+		c.log.Warn("sendRSTStreamFrame: Connection already shutting down (pre-check, shutdownChan closed), cannot send RST_STREAM frame.",
+			logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "existing_conn_err_if_any": connErr}) // Log existing_conn_err for context
+		return NewConnectionError(ErrCodeConnectError, fmt.Sprintf("connection shutting down (pre-check), cannot send RST_STREAM for stream %d", streamID))
+	}
+	// If neither of the above returned, it's safe to proceed to construct and send rstFrame.
 
 	rstFrame := &RSTStreamFrame{
 		FrameHeader: FrameHeader{
