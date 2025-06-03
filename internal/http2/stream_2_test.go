@@ -783,7 +783,7 @@ func TestStream_WriteData(t *testing.T) {
 			connSendDataFrameError:     NewConnectionError(ErrCodeConnectError, "simulated conn write error from test"),
 			expectedN:                  0,
 			expectError:                true,
-			expectedErrorContains:      fmt.Sprintf("connection error: connection shutting down (pre-check), cannot send DATA for stream %d", testStreamID),
+			expectedErrorContains:      fmt.Sprintf("connection error: fatal connection error (connection error: simulated conn write error from test (last_stream_id 0, code CONNECT_ERROR, 10)), cannot send DATA for stream %d", testStreamID),
 			expectedFinalState:         StreamStateOpen,
 			expectedFinalEndStreamSent: false,
 			expectedDataFrames:         nil,
