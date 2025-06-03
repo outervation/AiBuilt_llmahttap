@@ -2785,8 +2785,6 @@ func (c *Connection) handleSettingsFrame(frame *SettingsFrame) error {
 	seenSettingsInThisFrame := make(map[SettingID]bool)
 
 	for _, setting := range frame.Settings {
-		// Validate setting ID and value
-
 		// Check for duplicate setting ID within this frame
 		if _, ok := seenSettingsInThisFrame[setting.ID]; ok {
 			c.settingsMu.Unlock() // Unlock before returning
@@ -2795,6 +2793,7 @@ func (c *Connection) handleSettingsFrame(frame *SettingsFrame) error {
 			return NewConnectionError(ErrCodeProtocolError, errMsg)
 		}
 		seenSettingsInThisFrame[setting.ID] = true
+		// Validate setting ID and value
 		switch setting.ID {
 		case SettingHeaderTableSize:
 
