@@ -730,7 +730,9 @@ func (c *Connection) sendDataFrame(s *Stream, data []byte, endStream bool) (int,
 // This is a stub implementation.
 
 func (c *Connection) sendRSTStreamFrame(streamID uint32, errorCode ErrorCode) error {
-	c.log.Debug("Queuing RST_STREAM frame for sending", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String()})
+	// Add call stack logging here
+	stack := string(debug.Stack())
+	c.log.Debug("Queuing RST_STREAM frame for sending", logger.LogFields{"stream_id": streamID, "error_code": errorCode.String(), "caller_stack": stack})
 
 	if streamID == 0 {
 		errMsg := "internal error: attempted to send RST_STREAM on stream 0"
