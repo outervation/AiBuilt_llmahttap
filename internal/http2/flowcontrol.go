@@ -86,10 +86,12 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 		if fcw.err != nil { // A terminal error was recorded (e.g., overflow)
 			return fcw.err
 		}
-		if fcw.closed { // Window explicitly closed (e.g., stream reset, connection GOAWAY)
-			// Path Y: fcw.err is nil, fcw.closed is true. Original was fmt.Errorf.
-			// DIAGNOSTIC CHANGE: Replace fmt.Errorf with specific error types.
-			// This helps confirm if this specific path is the source of the *errors.errorString.
+		if fcw.closed { // Window explicitly closed
+			// Path Y: fcw.err is nil, fcw.closed is true.
+			// This specific log is to check if this path is hit in h2spec 2.2/2.3
+			fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.ACQUIRE FCW_CLOSED_PATH_Y] stream_id: %d, conn: %t, initial_fcw_err_was_nil: %t\n",
+				fcw.streamID, fcw.isConnection, fcw.err == nil)
+
 			var errToReturn error
 			errMsg := fmt.Sprintf("flow control window (connection: %t, stream ID: %d) is closed", fcw.isConnection, fcw.streamID)
 			if fcw.isConnection {
