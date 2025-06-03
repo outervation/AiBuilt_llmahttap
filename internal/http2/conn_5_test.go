@@ -841,18 +841,33 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				mockDispatcher.fn = func(sw StreamWriter, req *http.Request) {
 					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Consuming request body (ContentLength: %d, TE: %s)", tc.name, sw.ID(), req.ContentLength, req.Header.Get("Transfer-Encoding"))
 					if req.Body != nil {
-						_, err := io.Copy(io.Discard, req.Body)
-						if err != nil {
-							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error consuming request body: %v", tc.name, sw.ID(), err)
+						bodyBytes, errReadAll := io.ReadAll(req.Body) // Renamed err to errReadAll for clarity
+						var seReadAll *StreamError
+						if !(errors.As(errReadAll, &seReadAll) && seReadAll.Code == ErrCodeCancel) { // If NOT the expected error
+							// This is where the t.Errorf should be
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Unexpected error consuming request body: %v (type %T), body read: %q. Expected StreamError with ErrCodeCancel.", tc.name, sw.ID(), errReadAll, errReadAll, string(bodyBytes))
+						} else {
+							// Expected error was received
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Correctly received StreamError (CANCEL) consuming request body after stream reset: %v", tc.name, sw.ID(), errReadAll)
 						}
-						req.Body.Close()
+						// Regardless of error, try to close. This might also error.
+						if errClose := req.Body.Close(); errClose != nil {
+							// Don't fail the test for this, just log. Pipe may already be closed with error.
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Error closing request body (might be expected if already closed): %v", tc.name, sw.ID(), errClose)
+						}
 					}
-					// Send a minimal response to unblock the handler and allow the stream to proceed/close.
-					// Use http2.HeaderField here
-					if err := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); err != nil {
-						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error sending 204 response: %v", tc.name, sw.ID(), err)
+					// Attempt to send headers, expecting an error because stream should be reset.
+					if sendHdrErr := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); sendHdrErr == nil {
+						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Expected error sending 204 response on reset stream, but got nil", tc.name, sw.ID())
+					} else {
+						var seSendHdr *StreamError
+						if errors.As(sendHdrErr, &seSendHdr) && (seSendHdr.Code == ErrCodeStreamClosed || seSendHdr.Code == ErrCodeCancel || seSendHdr.Code == ErrCodeProtocolError) {
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Correctly received expected error sending 204 response on already closed/reset stream: %v", tc.name, sw.ID(), sendHdrErr)
+						} else {
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Unexpected error sending 204 response: %v (type %T). Expected StreamError with Closed/Cancel/Protocol.", tc.name, sw.ID(), sendHdrErr, sendHdrErr)
+						}
 					}
-					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, sent 204.", tc.name, sw.ID())
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, attempted to send 204.", tc.name, sw.ID())
 				}
 			}
 			if tc.name == "Malformed Headers: Pseudo-header in trailers" {
@@ -860,19 +875,35 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				mockDispatcher.fn = func(sw StreamWriter, req *http.Request) {
 					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Consuming request body (ContentLength: %d, TE: %s)", tc.name, sw.ID(), req.ContentLength, req.Header.Get("Transfer-Encoding"))
 					if req.Body != nil {
-						_, err := io.Copy(io.Discard, req.Body)
-						if err != nil {
-							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error consuming request body: %v", tc.name, sw.ID(), err)
+						_, errBodyRead := io.Copy(io.Discard, req.Body)
+						var seBodyRead *StreamError
+						if errBodyRead == nil {
+							// This is an error because we expect io.Copy to fail as the stream should be reset.
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Expected error consuming request body due to stream reset, but got nil", tc.name, sw.ID())
+						} else if !errors.As(errBodyRead, &seBodyRead) || !(seBodyRead.Code == ErrCodeCancel || seBodyRead.Code == ErrCodeStreamClosed || seBodyRead.Code == ErrCodeProtocolError) {
+							// The error was not nil, but it wasn't the expected type/code.
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Unexpected error type/code consuming request body: %v (type %T). Expected StreamError with Cancel/Closed/Protocol.", tc.name, sw.ID(), errBodyRead, errBodyRead)
+						} else {
+							// Correctly received an expected StreamError.
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Correctly received expected StreamError (code %s) consuming request body.", tc.name, sw.ID(), seBodyRead.Code)
 						}
-						req.Body.Close()
+						// Attempt to close body, may also error if pipe already broken
+						if errClose := req.Body.Close(); errClose != nil {
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Error closing request body (might be expected if already reset/closed): %v", tc.name, sw.ID(), errClose)
+						}
 					}
-					// Send a minimal response to unblock the handler and allow the stream to proceed/close.
-					// This helps ensure the server doesn't hang waiting for the handler if that's part of the issue.
-					// A 204 No Content is simple and often appropriate after consuming a POST body.
-					if err := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); err != nil {
-						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Error sending 204 response: %v", tc.name, sw.ID(), err)
+					// Attempt to send headers, expecting an error because stream should be reset.
+					if sendHdrErr := sw.SendHeaders([]HeaderField{{Name: ":status", Value: "204"}}, true); sendHdrErr == nil {
+						t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Expected error sending 204 response on reset stream, but got nil", tc.name, sw.ID())
+					} else {
+						var seSendHdr *StreamError
+						if !errors.As(sendHdrErr, &seSendHdr) || !(seSendHdr.Code == ErrCodeStreamClosed || seSendHdr.Code == ErrCodeCancel || seSendHdr.Code == ErrCodeProtocolError) {
+							t.Errorf("mockDispatcher.fn (for trailers test %s, stream %d): Unexpected error type/code sending 204 response: %v (type %T). Expected StreamError with Closed/Cancel/Protocol.", tc.name, sw.ID(), sendHdrErr, sendHdrErr)
+						} else {
+							t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Correctly received expected StreamError (code %s) sending 204 response on reset stream.", tc.name, sw.ID(), seSendHdr.Code)
+						}
 					}
-					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, sent 204.", tc.name, sw.ID())
+					t.Logf("mockDispatcher.fn (for trailers test %s, stream %d): Finished processing request, attempted to send 204.", tc.name, sw.ID())
 				}
 			}
 			go func() {

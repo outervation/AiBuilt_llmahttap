@@ -371,7 +371,8 @@ func TestNewStreamFlowControlManager(t *testing.T) {
 	assert.Equal(t, uint64(0), sfcm.totalBytesReceived)
 
 	// Test threshold adjustment for small initial size
-	sfcmSmall := NewStreamFlowControlManager(nil, testStreamID, 1, 1)
+	// Test with ourInitialWindowSize = 1, peerInitialWindowSize can be anything, e.g. 1
+	sfcmSmall := NewStreamFlowControlManager(nil, testStreamID, 1 /* ourInitialWindowSize */, 1 /* peerInitialWindowSize */)
 	assert.Equal(t, uint32(1), sfcmSmall.windowUpdateThreshold, "Threshold should be 1 if initial size is 1")
 }
 
@@ -653,9 +654,10 @@ func TestStreamFlowControlManager_HandlePeerSettingsInitialWindowSizeChange(t *t
 	// Test scenario: available becomes negative due to settings change and GetStreamSendAvailable reports it
 	t.Run("send window becomes negative and GetStreamSendAvailable reports it", func(t *testing.T) {
 		const subStreamID = testStreamID + 1
+		const subInitialOurSize uint32 = 65535 // Example value for our side, not directly tested here
 		const subInitialPeerSize uint32 = 100
 
-		sfcmNegative := NewStreamFlowControlManager(nil, subStreamID, testOurInitialWindowSize, subInitialPeerSize)
+		sfcmNegative := NewStreamFlowControlManager(nil, subStreamID, subInitialOurSize, subInitialPeerSize)
 		require.Equal(t, int64(subInitialPeerSize), sfcmNegative.GetStreamSendAvailable(), "Initial send window should match peer's initial setting")
 		require.Equal(t, subInitialPeerSize, sfcmNegative.sendWindow.initialWindowSize)
 
@@ -759,7 +761,9 @@ func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange(t *te
 }
 
 func TestStreamFlowControlManager_HandleOurSettingsInitialWindowSizeChange_OverflowError(t *testing.T) {
-	sfcm := NewStreamFlowControlManager(nil, testStreamID, 100, testPeerInitialWindowSize)
+	// Choose initial sizes that make sense. Here, ourInitialWindowSize is what's being changed.
+	// Peer's initial window size doesn't affect this specific test on our receive window.
+	sfcm := NewStreamFlowControlManager(nil, testStreamID, 100 /* ourInitialWindowSize */, testPeerInitialWindowSize /* peerInitialWindowSize */)
 	sfcm.currentReceiveWindowSize = MaxWindowSize - 50 // Current available is high
 
 	// New our setting that, when delta is applied, overflows available
@@ -1477,6 +1481,7 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ThresholdOne(t *testin
 	// This test specifically checks ApplicationConsumedData when windowUpdateThreshold is 1.
 	// This occurs when ourInitialWindowSize is 1.
 	const localStreamID uint32 = 99
+	// Create sfcm with ourInitialWindowSize = 1
 	sfcm := NewStreamFlowControlManager(nil, localStreamID, 1 /* ourInitialWindowSize */, 1000 /* peerInitialWindowSize */)
 	require.NotNil(t, sfcm)
 	assert.Equal(t, uint32(1), sfcm.windowUpdateThreshold, "Window update threshold should be 1 when ourInitialWindowSize is 1")
@@ -1504,10 +1509,10 @@ func TestStreamFlowControlManager_ApplicationConsumedData_ThresholdOne(t *testin
 
 func TestStreamFlowControlManager_SendWindow_NegativeBySettings_PositiveBySettings_Acquire(t *testing.T) {
 	const streamIDForTest uint32 = 123
+	const initialOurSize uint32 = 200 // Not directly relevant for send window part
 	const initialPeerSize uint32 = 100
-	const ourInitialSize uint32 = 200 // Not directly relevant for send window part
 
-	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, ourInitialSize, initialPeerSize)
+	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, initialOurSize, initialPeerSize)
 	require.Equal(t, int64(initialPeerSize), sfcm.GetStreamSendAvailable(), "Initial send window should match peer's initial setting")
 	require.Equal(t, initialPeerSize, sfcm.sendWindow.initialWindowSize)
 
@@ -1575,10 +1580,10 @@ func TestStreamFlowControlManager_SendWindow_NegativeBySettings_PositiveBySettin
 
 func TestStreamFlowControlManager_SendWindow_NegativeBySettings_PositiveByWindowUpdate_Acquire(t *testing.T) {
 	const streamIDForTest uint32 = 456
+	const initialOurSize uint32 = 200 // Not relevant for send window
 	const initialPeerSize uint32 = 100
-	const ourInitialSize uint32 = 200 // Not relevant for send window
 
-	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, ourInitialSize, initialPeerSize)
+	sfcm := NewStreamFlowControlManager(nil, streamIDForTest, initialOurSize, initialPeerSize)
 	require.Equal(t, int64(initialPeerSize), sfcm.GetStreamSendAvailable())
 
 	// Step 1: Acquire some data

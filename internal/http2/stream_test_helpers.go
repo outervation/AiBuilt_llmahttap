@@ -1,12 +1,9 @@
 package http2
 
 import (
-	"fmt"
-
-	"strings"
 	"testing"
-	"time"
 
+	"github.com/stretchr/testify/require" // Added
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -29,104 +26,17 @@ import (
 // newTestStream is a helper function to initialize a http2.Stream for testing.
 
 func newTestStream(t *testing.T, id uint32, conn *Connection, isInitiatedByPeer bool, initialOurWindow, initialPeerWindow uint32) *Stream {
-	t.Helper()
+	// initialOurWindow: desired receive window for this stream (how much peer can send us).
+	// initialPeerWindow: desired send window for this stream (how much we can send peer).
 
-	// Use default priority for most stream tests, can be overridden if specific priority tests are needed.
-	defaultWeight := uint8(15) // Default priority weight (normalized from spec 16)
-	defaultParentID := uint32(0)
-	defaultExclusive := false
+	// Create stream with dummy priority info for now.
+	// newStream will now correctly initialize StreamFlowControlManager using these two distinct window sizes.
+	s, err := newStream(conn, id, initialOurWindow, initialPeerWindow, 15, 0, false, isInitiatedByPeer) // Default prioWeight = 15 (effective 16)
+	require.NoError(t, err)
 
-	// Ensure the connection passed is not nil, as it's crucial.
-	if conn == nil {
-		t.Fatal("newTestStream: provided conn is nil")
-	}
-	if conn.log == nil {
-		t.Fatal("newTestStream: conn.log is nil, connection not properly initialized for test")
-	}
-	if conn.ctx == nil {
-		// If conn.ctx is nil, it means the connection itself wasn't fully initialized.
-		// newTestConnection should set this up.
-		t.Fatal("newTestStream: conn.ctx is nil. Connection likely not from newTestConnection.")
-	}
+	// The t.Logf in the test file stream_4_test.go will verify the resulting fcManager windows.
+	// No need for direct manipulation of s.fcManager here anymore.
 
-	// Create the stream using the real newStream function and the provided real Connection.
-	ourWin := initialOurWindow
-	if ourWin == 0 { // If 0, use the connection's configured initial window size
-		ourWin = conn.ourInitialWindowSize
-	}
-	if ourWin == 0 { // If still 0 (e.g. conn's default was also 0, or conn not fully setup), use http2 default
-		ourWin = DefaultInitialWindowSize
-	}
-
-	peerWin := initialPeerWindow
-
-	t.Logf("newTestStream: Creating stream %d with ourInitialWin=%d, peerInitialWin=%d. (conn.ourInitialWindowSize=%d, conn.peerInitialWindowSize=%d)",
-		id, ourWin, peerWin, conn.ourInitialWindowSize, conn.peerInitialWindowSize)
-
-	s, err := newStream(
-		conn, // Use the real *http2.Connection
-		id,
-		ourWin,
-		peerWin,
-		defaultWeight,
-		defaultParentID,
-		defaultExclusive,
-		isInitiatedByPeer,
-	)
-	if err != nil {
-		// Log connection state for debugging
-		conn.settingsMu.RLock()
-		ourSettingsDump := make(map[SettingID]uint32)
-		for k, v := range conn.ourSettings {
-			ourSettingsDump[k] = v
-		}
-		peerSettingsDump := make(map[SettingID]uint32)
-		for k, v := range conn.peerSettings {
-			peerSettingsDump[k] = v
-		}
-		conn.settingsMu.RUnlock()
-
-		t.Fatalf("newTestStream: newStream() failed for stream %d: %v. \n"+
-			"Connection details: ourInitialWindowSize=%d, peerInitialWindowSize=%d, maxFrameSize=%d. \n"+
-			"Our Settings: %v. Peer Settings: %v",
-			id, err, conn.ourInitialWindowSize, conn.peerInitialWindowSize, conn.maxFrameSize,
-			ourSettingsDump, peerSettingsDump)
-	}
-
-	t.Logf("newTestStream created stream %d: fcManager receiveWindow=%d, sendWindow=%d. State=%s",
-		s.id, s.fcManager.GetStreamReceiveAvailable(), s.fcManager.GetStreamSendAvailable(), s.state)
-
-	t.Cleanup(func() {
-		closeErr := fmt.Errorf("test stream %d cleanup", s.id)
-		if s.state != StreamStateClosed { // Avoid error if already closed
-			if err := s.Close(closeErr); err != nil {
-				// Log error but don't fail test if it's about already closed stream
-				if !strings.Contains(err.Error(), "stream closed or being reset") && !strings.Contains(err.Error(), "already closed") {
-					t.Logf("Error during stream.Close in newTestStream cleanup for stream %d: %v", s.id, err)
-				}
-			}
-		}
-		// Drain any RST frame sent by s.Close() during cleanup from the connection's writerChan.
-		// This uses s.conn which is a real *Connection.
-
-		// Drain conn.writerChan if writerLoop isn't running.
-		// Loop to drain multiple frames, as stream.Close() might be preceded by other frames in some tests.
-	drainLoop:
-		for i := 0; i < 5; i++ { // Limit iterations to prevent infinite loop in weird cases
-			select {
-			case frame, ok := <-s.conn.writerChan:
-				if ok {
-					t.Logf("Drained frame from conn.writerChan during stream %d cleanup (iter %d): Type %s, StreamID %d", s.id, i, frame.Header().Type, frame.Header().StreamID)
-				} else {
-					t.Logf("conn.writerChan closed during stream %d cleanup.", s.id)
-					break drainLoop
-				}
-			case <-time.After(10 * time.Millisecond): // Short timeout per frame
-				// Assume channel is empty if we time out
-				break drainLoop
-			}
-		}
-	}) // End of t.Cleanup
 	return s
 }
 
