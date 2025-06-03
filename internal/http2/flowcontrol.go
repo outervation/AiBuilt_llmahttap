@@ -266,7 +266,6 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 
 	fcw.available = newSize
 	fcw.cond.Broadcast()
-	fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS_I] stream_id: %d, conn: %t, increment: %d, old_avail: %d, new_avail: %d\n", fcw.streamID, fcw.isConnection, increment, oldAvail, fcw.available)
 	return nil
 }
 
