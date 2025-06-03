@@ -1681,17 +1681,15 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 	if header.Length != 5 {
 		errMsg := fmt.Sprintf("PRIORITY frame (stream %d) received with invalid length %d, expected 5", streamID, header.Length)
 		c.log.Error(errMsg, logger.LogFields{"stream_id": streamID, "length": header.Length})
-		// Send RST_STREAM for this specific stream error.
 		rstErr := c.sendRSTStreamFrame(streamID, ErrCodeFrameSizeError)
 		if rstErr != nil {
-			// If sending RST_STREAM fails, it's a more severe connection issue.
 			return NewConnectionErrorWithCause(ErrCodeInternalError,
 				fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY frame size error on stream %d: %v",
 					ErrCodeFrameSizeError.String(), streamID, rstErr),
 				rstErr,
 			)
 		}
-		return nil // Stream error handled by sending RST_STREAM, connection continues.
+		return nil
 	}
 
 	if streamID == 0 {
@@ -1708,14 +1706,57 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 		stream.mu.RUnlock()
 	}
 
-	c.log.Debug("Dispatching stream-level PRIORITY", logger.LogFields{
+	// For h2spec 2.3: PRIORITY on half-closed (remote) stream.
+	// Stream is still open for sending. Receiving PRIORITY should be fine and update priority tree.
+	// It should NOT cause the stream to close or transition, nor send RST.
+	if preState == StreamStateHalfClosedRemote {
+		c.log.Debug("Dispatching stream-level PRIORITY on HalfClosedRemote stream", logger.LogFields{
+			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+			"stream_found": found, "pre_stream_state": preState.String(),
+		})
+		err := c.priorityTree.ProcessPriorityFrame(frame)
+		if err != nil { // ProcessPriorityFrame can return StreamError for self-dependency
+			c.log.Warn("Error processing PRIORITY frame in priority tree (HalfClosedRemote path)",
+				logger.LogFields{
+					"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
+				})
+			if se, ok := err.(*StreamError); ok {
+				rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
+				if rstErr != nil {
+					return NewConnectionErrorWithCause(ErrCodeFrameSizeError,
+						fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d (HalfClosedRemote path): %v",
+							se.Code.String(), se.StreamID, rstErr),
+						err,
+					)
+				}
+				return nil // RST sent for stream error from priority tree.
+			}
+			// Non-StreamError from priorityTree.ProcessPriorityFrame is unexpected.
+			return NewConnectionErrorWithCause(ErrCodeInternalError,
+				fmt.Sprintf("internal error processing PRIORITY frame for stream %d (HalfClosedRemote path): %v", streamID, err),
+				err,
+			)
+		}
+		// Log post-state only if stream was found initially
+		stream.mu.RLock()
+		postStateAfterHCR := stream.state
+		stream.mu.RUnlock()
+		c.log.Debug("Stream-level PRIORITY processed (HalfClosedRemote path)", logger.LogFields{
+			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+			"post_stream_state": postStateAfterHCR.String(), "state_changed": preState != postStateAfterHCR,
+		})
+		return nil // Successfully processed on HalfClosedRemote
+	}
+
+	// Original logic for other states
+	c.log.Debug("Dispatching stream-level PRIORITY (non-HalfClosedRemote path)", logger.LogFields{
 		"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
 		"stream_found": found, "pre_stream_state": preState.String(),
 	})
 
 	err := c.priorityTree.ProcessPriorityFrame(frame)
 	if err != nil {
-		c.log.Warn("Error processing PRIORITY frame in priority tree",
+		c.log.Warn("Error processing PRIORITY frame in priority tree (non-HalfClosedRemote path)",
 			logger.LogFields{
 				"stream_id":      streamID,
 				"dependency":     frame.StreamDependency,
@@ -1727,8 +1768,8 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 		if se, ok := err.(*StreamError); ok {
 			rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
 			if rstErr != nil {
-				return NewConnectionErrorWithCause(ErrCodeFrameSizeError, // Use original error type
-					fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d: %v",
+				return NewConnectionErrorWithCause(ErrCodeFrameSizeError,
+					fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d (non-HalfClosedRemote path): %v",
 						se.Code.String(), se.StreamID, rstErr),
 					err,
 				)
@@ -1736,21 +1777,21 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 			return nil
 		}
 		return NewConnectionErrorWithCause(ErrCodeInternalError,
-			fmt.Sprintf("internal error processing PRIORITY frame for stream %d: %v", streamID, err),
+			fmt.Sprintf("internal error processing PRIORITY frame for stream %d (non-HalfClosedRemote path): %v", streamID, err),
 			err,
 		)
 	}
 
-	if found { // Log post-state only if stream was found initially
+	if found {
 		stream.mu.RLock()
 		postState := stream.state
 		stream.mu.RUnlock()
-		c.log.Debug("Stream-level PRIORITY processed", logger.LogFields{
+		c.log.Debug("Stream-level PRIORITY processed (non-HalfClosedRemote path)", logger.LogFields{
 			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
 			"post_stream_state": postState.String(), "state_changed": preState != postState,
 		})
 	} else {
-		c.log.Debug("Stream-level PRIORITY processed (stream was not in active map)", logger.LogFields{
+		c.log.Debug("Stream-level PRIORITY processed (stream was not in active map, non-HalfClosedRemote path)", logger.LogFields{
 			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
 		})
 	}
