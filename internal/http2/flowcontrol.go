@@ -1,10 +1,9 @@
 package http2
 
 import (
-	"fmt"
-	"os" // ADDED IMPORT
-
 	"example.com/llmahttap/v2/internal/logger"
+	"fmt"
+	"os"
 	"sync"
 	// ErrorCode constants like ErrorCodeFlowControlError are defined in errors.go
 	// and are accessible as they are in the same package.
