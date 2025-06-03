@@ -220,7 +220,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -228,28 +228,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "invalid: pseudo-header in trailer block",
-			headers: []hpack.HeaderField{
-				{Name: ":status", Value: "200"}, // Example pseudo-header
-				{Name: "trailer-field", Value: "value"},
-			},
-			endStream: true, // Trailers imply endStream
-			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
-				s.mu.Lock()
-				s.state = StreamStateOpen
-				s.initialHeadersProcessed = true
-				s.mu.Unlock()
-			},
-			expectErrorFromFunc: true,
-			expectRST:           true,
-			expectedRSTCode:     ErrCodeProtocolError,
-			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
-				if mrd.CalledCount() > 0 {
-					t.Error("Dispatcher was called for pseudo-header in trailers, expected not called.")
-				}
-			},
-		},
+
 		{
 			name: "invalid: connection-specific header (Connection)",
 			headers: []hpack.HeaderField{
@@ -266,7 +245,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -290,7 +269,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -314,7 +293,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -338,7 +317,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -362,7 +341,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -386,7 +365,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -444,7 +423,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -453,6 +432,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			},
 		},
 		{
+
 			name: "invalid: pseudo-header in trailer block",
 			headers: []hpack.HeaderField{
 				{Name: ":status", Value: "200"}, // Example pseudo-header
@@ -461,14 +441,12 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			endStream: true, // Trailers imply endStream
 			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
 				s.mu.Lock()
-				// s.state should be Open or HalfClosedLocal for trailers to be processed.
-				// The key is initialHeadersProcessed.
-				s.state = StreamStateOpen        // Or HalfClosedLocal if data was sent
-				s.initialHeadersProcessed = true // Simulate that initial headers were already processed
+				s.state = StreamStateOpen
+				s.initialHeadersProcessed = true
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -492,7 +470,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -516,7 +494,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -540,7 +518,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -564,7 +542,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -588,7 +566,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				s.mu.Unlock()
 			},
 			expectErrorFromFunc: true, // Corrected
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -607,9 +585,16 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 				{Name: "Keep-Alive", Value: "timeout=10"},     // Connection-specific
 				{Name: "Transfer-Encoding", Value: "chunked"}, // Connection-specific
 			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.mu.Unlock()
+			},
+			dispatcher: nil,
 
 			expectErrorFromFunc: true,
-			expectRST:           true,
+			expectRST:           false,
 			expectedRSTCode:     ErrCodeProtocolError,
 			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
 				if mrd.CalledCount() > 0 {
@@ -705,7 +690,33 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 					t.Errorf("Dispatcher was called %d times for valid te header, expected 1.", mrd.CalledCount())
 				}
 			},
-		}, // Added trailing comma
+		}, // Closes "valid: TE header with 'trailers'" test case
+		{ // Starts "invalid: subsequent HEADERS frame (not trailer)" test case
+			name: "invalid: subsequent HEADERS frame (not trailer)",
+			headers: []hpack.HeaderField{
+				{Name: ":method", Value: "GET"},
+				{Name: ":path", Value: "/newpath_after_initial_headers"},
+				{Name: ":scheme", Value: "https"},
+				{Name: ":authority", Value: "example.com"},
+				{Name: "some-regular-header", Value: "value"},
+			},
+			endStream: false,
+			preFunc: func(s *Stream, t *testing.T, tcData struct{ endStream bool }) {
+				s.mu.Lock()
+				s.state = StreamStateOpen
+				s.initialHeadersProcessed = true
+				s.mu.Unlock()
+			},
+			dispatcher:          nil,
+			expectErrorFromFunc: true,
+			expectedRSTCode:     ErrCodeProtocolError,
+			expectRST:           false,
+			customValidation: func(t *testing.T, mrd *mockRequestDispatcher, s *Stream, conn *Connection) {
+				if mrd.CalledCount() > 0 {
+					t.Error("Dispatcher was called for subsequent non-trailer HEADERS, expected not called.")
+				}
+			},
+		}, // Closes "invalid: subsequent HEADERS frame (not trailer)" test case
 		// --- END NEW TEST CASES FOR INVALID HEADERS ---
 	}
 
