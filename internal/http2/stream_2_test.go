@@ -1072,7 +1072,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 			trailersToSend:             validTrailers,
 			connSendHeadersFrameError:  NewConnectionError(ErrCodeInternalError, "simulated conn internal error"),
 			expectError:                true,
-			expectedErrorContains:      "connection error: connection shutting down (pre-check), cannot send HEADERS for stream 1 (last_stream_id 0, code CONNECT_ERROR, 10)",
+			expectedErrorContains:      fmt.Sprintf("connection error: fatal connection error (connection error: simulated conn internal error (last_stream_id 0, code INTERNAL_ERROR, 2)), cannot send HEADERS for stream %d (last_stream_id 0, code CONNECT_ERROR, 10)", testStreamID),
 			expectFrameSent:            false,
 			expectedFinalState:         StreamStateOpen,
 			expectedFinalEndStreamSent: false,
