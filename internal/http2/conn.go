@@ -2536,11 +2536,12 @@ func (c *Connection) sendGoAway(lastStreamID uint32, errorCode ErrorCode, debugD
 	c.goAwaySent = true
 	c.streamsMu.Unlock()
 
-	c.log.Info("Sending GOAWAY frame",
+	c.log.Info("Sending GOAWAY frame (from sendGoAway via initiateShutdown or direct call)",
 		logger.LogFields{
 			"last_stream_id": lastStreamID,
 			"error_code":     errorCode.String(),
 			"debug_data_len": len(debugData),
+			"remote_addr":    c.remoteAddrStr, // Added remote_addr
 		})
 
 	goAwayFrame := &GoAwayFrame{
