@@ -290,8 +290,8 @@ func (f *DataFrame) ParsePayload(r io.Reader, header FrameHeader) error {
 		if paddingOctetsToRead > 0 {
 			f.Padding = make([]byte, paddingOctetsToRead)
 			if _, err := io.ReadFull(r, f.Padding); err != nil {
-				os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading padding (expected %d bytes): %s\\n", header.StreamID, paddingOctetsToRead, err.Error()))
-				return fmt.Errorf("reading padding for stream %d: %w", header.StreamID, err)
+				os.Stderr.WriteString(fmt.Sprintf("[DEBUG-DATA-PAYLOAD Stream %d] Error reading padding (expected %d bytes): %s\n", header.StreamID, paddingOctetsToRead, err.Error()))
+				return NewConnectionError(ErrCodeProtocolError, fmt.Sprintf("error reading DATA frame payload padding for stream %d: %v", header.StreamID, err))
 			}
 		} else {
 			// PadLength field was 0 (but PADDED flag was set).
