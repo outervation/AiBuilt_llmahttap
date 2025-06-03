@@ -79,14 +79,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	fcw.mu.Lock()
 	defer fcw.mu.Unlock()
 
-	logFields := logger.LogFields{
-		"stream_id":     fcw.streamID,
-		"is_conn_fcw":   fcw.isConnection,
-		"acquire_bytes": n,
-		"current_avail": fcw.available,
-		"fcw_closed":    fcw.closed,
-		"fcw_err":       fmt.Sprintf("%v", fcw.err),
-	}
 	// Use a generic logger or fmt.Fprintf for diagnostics if conn.log isn't available here.
 	// Assuming a global or passed-in logger would be better for real use.
 	// For now, using fmt.Fprintf to ensure output during tests.
@@ -140,9 +132,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 		waitCount++
 		fcw.cond.Wait()
 		// Update logFields with potentially changed state after wait
-		logFields["current_avail_after_wait"] = fcw.available
-		logFields["fcw_closed_after_wait"] = fcw.closed
-		logFields["fcw_err_after_wait"] = fmt.Sprintf("%v", fcw.err)
 
 		if fcw.closed {
 			if fcw.isConnection {
@@ -192,7 +181,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	}
 
 	fcw.available -= int64(n)
-	logFields["final_avail"] = fcw.available
 	return nil
 }
 
