@@ -1862,6 +1862,17 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 				logger.LogFields{
 					"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive, "original_error": err.Error(),
 				})
+			// ADDED LOG:
+			determinedRSTCodeForPrio := ErrCodeProtocolError // Default for priority issues unless specific StreamError
+			if se, ok := err.(*StreamError); ok {
+				determinedRSTCodeForPrio = se.Code
+			}
+			c.log.Error("Detailed error for PRIORITY on HCR stream before RST", logger.LogFields{
+				"stream_id":                         streamID,
+				"original_error_from_priorityTree":  err.Error(),
+				"original_error_type_priorityTree":  fmt.Sprintf("%T", err),
+				"determined_rst_code_for_prioError": determinedRSTCodeForPrio.String(),
+			})
 			if se, ok := err.(*StreamError); ok {
 				// If ProcessPriorityFrame returns a StreamError (e.g., self-dependency), RST the stream.
 				rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
