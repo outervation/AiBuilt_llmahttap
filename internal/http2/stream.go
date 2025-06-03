@@ -186,8 +186,9 @@ type Stream struct {
 
 	// Request handling
 	requestHeaders    []hpack.HeaderField
-	requestBodyReader *io.PipeReader // For handler to read incoming DATA frames
-	requestBodyWriter *io.PipeWriter // For stream to write incoming DATA frames into
+	requestBodyReader *io.PipeReader  // For handler to read incoming DATA frames
+	requestBodyWriter *io.PipeWriter  // For stream to write incoming DATA frames into
+	dataFrameChan     chan *DataFrame // Channel for queueing incoming DATA frames for async processing
 
 	// Response handling (Stream implements ResponseWriter or provides one)
 	responseHeadersSent bool                // True if response HEADERS frame has been sent
@@ -204,17 +205,7 @@ type Stream struct {
 	initialHeadersProcessed bool                // True once the first HEADERS frame (request/response) has been processed
 	requestTrailers         []hpack.HeaderField // Stores received trailer headers, if any
 	parsedContentLength     *int64              // Parsed Content-Length from request headers
-	receivedDataBytes       uint64              // Accumulates received DATA frame payload sizes
-	// Channels for internal coordination (examples, might evolve)
-	// headersComplete chan struct{} // Signals that all request headers (and CONTINUATIONs) have been received
-	// dataAvailable   *sync.Cond  // Signals new data in requestBodyWriter or error
-	// streamErr       error       // Records a terminal error for the stream
-
-	// Buffer for request body if not directly piped.
-	// For now, using io.Pipe which handles buffering.
-	// _requestDataBuffer *bytes.Buffer
-
-	// TODO: Add fields for server push if implementing PUSH_PROMISE
+	receivedDataBytes       uint64              // Accumulates received DATA frame payload sizes (on the bodyWriter goroutine)
 }
 
 // NewStream creates a new stream.
@@ -251,6 +242,7 @@ func newStream(
 		priorityExclusive:           prioExclusive,
 		requestBodyReader:           pr,
 		requestBodyWriter:           pw,
+		dataFrameChan:               make(chan *DataFrame, 32), // Buffered channel for DATA frames
 		ctx:                         ctx,
 		cancelCtx:                   cancel,
 		endStreamReceivedFromClient: false,
@@ -272,9 +264,13 @@ func newStream(
 			cancel()
 			_ = pr.CloseWithError(err) // Best effort close
 			_ = pw.CloseWithError(err) // Best effort close
+			// Don't try to close dataFrameChan here as bodyWriterLoop hasn't started.
 			return nil, err
 		}
 	}
+
+	go s.processIncomingDataFrames() // Start the goroutine to handle data frames for this stream
+
 	return s, nil
 }
 
@@ -582,38 +578,43 @@ func (s *Stream) WriteData(p []byte, endStream bool) (n int, err error) {
 
 // sendRSTStream initiates sending an RST_STREAM frame from this endpoint.
 func (s *Stream) sendRSTStream(errorCode ErrorCode) error {
-	s.mu.Lock()
+	s.mu.Lock() // Lock to check state and prevent races on pendingRSTCode
+	// If already definitively closed and RST_STREAM processing initiated for this code, no-op.
 	if s.state == StreamStateClosed && s.pendingRSTCode != nil && *s.pendingRSTCode == errorCode {
-		// Already actioned or being actioned for this specific error.
 		s.mu.Unlock()
 		return nil
 	}
-	if s.state == StreamStateClosed { // Generic closed state, might be from peer RST or graceful.
-		s.mu.Unlock()
-		return nil // Don't send RST on an already closed stream by us.
+	// If it's closed but not due to our RST action, and we now want to RST, proceed.
+	// If it's merely half-closed, we can still RST it.
+
+	// If already closed for a *different* reason, or trying to RST an already generally closed stream,
+	// it might be okay to just return nil or log, rather than re-sending RST,
+	// but for now, if it's not specifically closed *for this error code*, we proceed.
+	if s.state == StreamStateClosed {
+		s.conn.log.Debug("sendRSTStream: Stream already closed, but not for this specific error code or pendingRSTCode was nil. Proceeding to mark.", logger.LogFields{"stream_id": s.id, "current_pending_rst": s.pendingRSTCode, "new_rst_code": errorCode})
+		// Even if generally closed, if pendingRSTCode wasn't set for *this* code,
+		// we update it and ensure resources are cleaned with this error context.
 	}
 
+	// Update state *before* sending the frame to make the stream locally aware of reset.
 	s.pendingRSTCode = &errorCode
-	s.mu.Unlock()
+	s._setState(StreamStateClosed) // This calls closeStreamResourcesProtected
+	s.mu.Unlock()                  // Unlock before calling conn.sendRSTStreamFrame which is potentially blocking
 
 	err := s.conn.sendRSTStreamFrame(s.id, errorCode)
 
-	s.mu.Lock()         // Lock to update state
-	defer s.mu.Unlock() // Ensure unlock even if early return from error
-
-	if err == nil {
-		// Successfully sent RST_STREAM frame
-		s.pendingRSTCode = &errorCode  // Ensure this is set before calling _setState
-		s._setState(StreamStateClosed) // This will call closeStreamResourcesProtected for cleanup
-
-		// Cleanup (pipes, context, conn.removeStream) is handled by closeStreamResourcesProtected.
-		return nil
+	if err != nil {
+		// Failed to send RST_STREAM. The state is already 'Closed' locally.
+		// Log the failure. The stream remains logically closed on our side.
+		s.conn.log.Error("stream: failed to send RST_STREAM frame to peer (state already updated to Closed locally)",
+			logger.LogFields{"stream_id": s.id, "error_code": errorCode.String(), "send_error": err.Error()})
+		return err // Return the send error, but local state is already 'Closed'
 	}
 
-	// Failed to send RST_STREAM.
-	s.pendingRSTCode = nil // Revert, as we didn't successfully RST.
-	s.conn.log.Error("stream: failed to send RST_STREAM", logger.LogFields{"stream_id": s.id, "error_code": errorCode.String(), "send_error": err.Error()})
-	return err // Return the send error
+	// Successfully sent RST_STREAM frame (or queued it).
+	// Stream is already marked as Closed and resources cleaned up by the _setState call above.
+	s.conn.log.Debug("stream: RST_STREAM frame sent/queued successfully.", logger.LogFields{"stream_id": s.id, "error_code": errorCode.String()})
+	return nil
 }
 
 // WriteTrailers sends trailing headers after the response body.
@@ -704,54 +705,84 @@ func (s *Stream) Context() context.Context {
 }
 
 // closeStreamResourcesProtected cleans up stream resources. Assumes s.mu is held.
+
 func (s *Stream) closeStreamResourcesProtected() {
-	// This function is called when stream transitions to Closed state,
-	// either by explicit Close(), RST_STREAM, or graceful (both END_STREAMs).
+	s.conn.log.Debug("closeStreamResourcesProtected: Entered", logger.LogFields{"stream_id": s.id, "current_state_in_func": s.state.String(), "pending_rst_code_at_entry": fmt.Sprintf("%v", s.pendingRSTCode)})
 
-	// Close the request body pipe. This unblocks handlers trying to read.
+	// Order of operations is critical here:
+	// 1. Close the requestBodyWriter pipe WITH THE INTENDED ERROR FIRST.
+	//    This ensures that any handler blocked on reading the body receives the specific error
+	//    rather than a generic context cancellation or premature EOF if other cleanup happens first.
 	if s.requestBodyWriter != nil {
-		// Close with an error that reflects the closure reason if possible.
-		// If pendingRSTCode is set, that's a good error. Otherwise, generic EOF or stream closed.
-		var closeReason error
+		var pipeCloseError error
 		if s.pendingRSTCode != nil {
-			closeReason = NewStreamError(s.id, *s.pendingRSTCode, "stream reset")
+			pipeCloseError = NewStreamError(s.id, *s.pendingRSTCode, "stream reset")
+			s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with RST error from s.pendingRSTCode", logger.LogFields{"stream_id": s.id, "rst_code_val": *s.pendingRSTCode, "error_to_pipe": pipeCloseError.Error()})
 		} else {
-			// If closed gracefully or for other reasons not an RST, io.EOF is typical for PipeReader.
-			// However, if state is Closed, it implies termination.
-			closeReason = io.EOF // Or a more specific error like "stream closed"
+			ctxErr := s.ctx.Err()
+			if ctxErr != nil {
+				pipeCloseError = ctxErr
+				s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with context error (s.pendingRSTCode was nil)", logger.LogFields{"stream_id": s.id, "ctx_err": pipeCloseError})
+			} else {
+				pipeCloseError = io.EOF // Graceful close if no RST and context not done.
+				s.conn.log.Debug("closeStreamResourcesProtected: requestBodyWriter will be closed with EOF (s.pendingRSTCode nil, s.ctx not done)", logger.LogFields{"stream_id": s.id})
+			}
 		}
-		_ = s.requestBodyWriter.CloseWithError(closeReason) // Best effort
+		s.conn.log.Debug("closeStreamResourcesProtected: About to call s.requestBodyWriter.CloseWithError()", logger.LogFields{"stream_id": s.id, "pipe_close_error_type": fmt.Sprintf("%T", pipeCloseError), "pipe_close_error_val": pipeCloseError})
+		errClosePipe := s.requestBodyWriter.CloseWithError(pipeCloseError)
+		if errClosePipe != nil {
+			s.conn.log.Warn("Error from s.requestBodyWriter.CloseWithError() call (possibly already closed or other issue)", logger.LogFields{"stream_id": s.id, "error": errClosePipe})
+		} else {
+			s.conn.log.Debug("closeStreamResourcesProtected: s.requestBodyWriter.CloseWithError() returned nil (success).", logger.LogFields{"stream_id": s.id})
+		}
+	} else {
+		s.conn.log.Warn("closeStreamResourcesProtected: s.requestBodyWriter was nil, cannot close.", logger.LogFields{"stream_id": s.id})
 	}
-	// if s.requestBodyReader != nil {
-	// 	_ = s.requestBodyReader.Close() // Reader side often just needs Close()
-	// }
 
-	// Cancel the stream's context.
+	// 2. Close dataFrameChan to signal processIncomingDataFrames to stop.
+	//    Its defer will attempt to close requestBodyWriter again, which is fine (idempotent or will error harmlessly).
+	if s.dataFrameChan != nil {
+		s.conn.log.Debug("closeStreamResourcesProtected: Attempting to close dataFrameChan (after closing requestBodyWriter)", logger.LogFields{"stream_id": s.id})
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.conn.log.Debug("Recovered from panic closing dataFrameChan (likely already closed)", logger.LogFields{"stream_id": s.id, "panic_val": r})
+				}
+			}()
+			close(s.dataFrameChan)
+			s.conn.log.Debug("closeStreamResourcesProtected: dataFrameChan closed.", logger.LogFields{"stream_id": s.id})
+		}()
+	} else {
+		s.conn.log.Debug("closeStreamResourcesProtected: s.dataFrameChan was nil or already processed.", logger.LogFields{"stream_id": s.id})
+	}
 
-	// Close flow control manager
+	// 3. Cancel the stream's specific context.
+	//    This signals any other operations using this stream's context to stop.
+	if s.cancelCtx != nil {
+		s.conn.log.Debug("closeStreamResourcesProtected: Calling s.cancelCtx() (after closing pipe & data chan).", logger.LogFields{"stream_id": s.id})
+		s.cancelCtx()
+	} else {
+		s.conn.log.Warn("closeStreamResourcesProtected: s.cancelCtx was nil.", logger.LogFields{"stream_id": s.id})
+	}
+
+	// 4. Close flow control manager windows.
 	if s.fcManager != nil {
-		// The error passed to fcManager.Close() can be used to signal waiters.
-		// If pendingRSTCode is set, use that, otherwise a generic stream closed error.
 		var fcCloseReason error
 		if s.pendingRSTCode != nil {
 			fcCloseReason = NewStreamError(s.id, *s.pendingRSTCode, "stream reset affecting flow control")
 		} else {
-			// Consider if it was a graceful closure (ErrCodeNoError) vs other non-RST.
-			// For now, using StreamClosed for non-RST.
 			fcCloseReason = NewStreamError(s.id, ErrCodeStreamClosed, "stream closed affecting flow control")
 		}
 		s.fcManager.Close(fcCloseReason)
-	}
-	if s.cancelCtx != nil {
-		s.cancelCtx()
+		s.conn.log.Debug("closeStreamResourcesProtected: fcManager closed", logger.LogFields{"stream_id": s.id})
+	} else {
+		s.conn.log.Warn("closeStreamResourcesProtected: s.fcManager was nil.", logger.LogFields{"stream_id": s.id})
 	}
 
-	// The actual removal from conn.streams and priority tree
-	// is now handled by conn.removeStream.
-	// This function focuses on *local* resource cleanup for the stream object itself.
+	// 5. Clear pendingRSTCode as it has been handled.
+	s.pendingRSTCode = nil
 
-	// Mark as definitively cleaned up.
-	s.pendingRSTCode = nil // Clear any pending RST intention if we reached Closed state through it.
+	s.conn.log.Debug("closeStreamResourcesProtected: Exiting", logger.LogFields{"stream_id": s.id})
 }
 
 // handleDataFrame processes an incoming DATA frame for this stream.
@@ -763,101 +794,145 @@ func (s *Stream) closeStreamResourcesProtected() {
 // issues occur. Returns a ConnectionError if a problem warrants closing the connection.
 
 func (s *Stream) handleDataFrame(frame *DataFrame) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	currentState := s.state
+	isPendingRST := s.pendingRSTCode != nil
+	ctxErr := s.ctx.Err()
+	s.conn.log.Debug("handleDataFrame: Entry state check", logger.LogFields{"stream_id": s.id, "state": currentState.String(), "pending_rst": isPendingRST, "end_stream_recv_client": s.endStreamReceivedFromClient, "ctx_err": ctxErr})
+	s.mu.RUnlock()
 
-	if s.state == StreamStateHalfClosedRemote || s.state == StreamStateClosed {
-		msg := fmt.Sprintf("DATA frame on closed/half-closed-remote stream %d", s.id)
-		s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+	if currentState == StreamStateClosed || isPendingRST {
+		msg := fmt.Sprintf("DATA frame on closed/resetting stream %d (state: %s, pendingRST: %v)", s.id, currentState, isPendingRST)
+		s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id})
 		return NewStreamError(s.id, ErrCodeStreamClosed, msg)
+	}
+	if ctxErr != nil {
+		msg := fmt.Sprintf("DATA frame on stream %d with cancelled context: %v", s.id, ctxErr)
+		s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id})
+		return NewStreamError(s.id, ErrCodeCancel, msg) // Or StreamClosed if context implies that
 	}
 
 	dataLen := uint32(len(frame.Data))
 	hasEndStreamFlag := frame.Header().Flags&FlagDataEndStream != 0
 
-	// Stream-level flow control
-	if err := s.fcManager.DataReceived(dataLen); err != nil {
+	s.mu.Lock() // Lock for state and fcManager access
+	// Re-check state under full lock after initial RLock checks, as it might have changed.
+	if s.state == StreamStateHalfClosedRemote || s.state == StreamStateClosed {
+		s.mu.Unlock()
+		msg := fmt.Sprintf("DATA frame on closed/half-closed-remote stream %d (re-check under lock)", s.id)
+		s.conn.log.Warn(msg, logger.LogFields{"stream_id": s.id, "state": s.state.String()})
+		return NewStreamError(s.id, ErrCodeStreamClosed, msg)
+	}
+
+	// Stream-level flow control (for received data)
+	if errFc := s.fcManager.DataReceived(dataLen); errFc != nil {
+		s.mu.Unlock()
 		s.conn.log.Error("Stream flow control error on receive", logger.LogFields{
 			"stream_id": s.id,
 			"data_len":  dataLen,
 			"window":    s.fcManager.GetStreamReceiveAvailable(),
-			"error":     err.Error(),
+			"error":     errFc.Error(),
 		})
-		// If END_STREAM was on this frame, still mark it as received and close pipe.
-		if hasEndStreamFlag {
-			s.endStreamReceivedFromClient = true
-			_ = s.requestBodyWriter.Close() // Close with EOF as data wasn't processed.
-		}
-		return err
+		return errFc // This is a StreamError, conn layer will RST
 	}
 
-	// Content-Length validation logic:
+	// Content-Length validation.
 	if s.parsedContentLength != nil {
-		potentialTotalReceived := s.receivedDataBytes + uint64(dataLen)
-		s.conn.log.Debug("Content-Length check (every DATA frame)", logger.LogFields{
-			"stream_id":                s.id,
-			"parsedContentLength":      *s.parsedContentLength,
-			"currentReceivedDataBytes": s.receivedDataBytes,
-			"currentFrameDataLen":      dataLen,
-			"potentialTotalReceived":   potentialTotalReceived,
-			"hasEndStreamFlag":         hasEndStreamFlag,
-		})
+		clValue := *s.parsedContentLength
+		potentialTotalReceivedThisFrameContext := s.receivedDataBytes + uint64(dataLen)
 
-		protocolErrorMsg := ""
-
-		// Prioritize END_STREAM specific check if the flag is present
-		if hasEndStreamFlag && (*s.parsedContentLength != int64(potentialTotalReceived)) {
-			protocolErrorMsg = fmt.Sprintf("content-length mismatch on END_STREAM: declared %d, received %d (current frame %d bytes, previously %d bytes)",
-				*s.parsedContentLength, potentialTotalReceived, dataLen, s.receivedDataBytes)
-		} else if int64(potentialTotalReceived) > *s.parsedContentLength { // Check for exceeding CL if not an END_STREAM mismatch
-			protocolErrorMsg = fmt.Sprintf("data received (%d with current frame) exceeds declared content-length (%d)",
-				potentialTotalReceived, *s.parsedContentLength)
-		}
-
-		if protocolErrorMsg != "" {
-			// Even with error, if END_STREAM was present, mark it and close pipe.
-			if hasEndStreamFlag {
-				s.endStreamReceivedFromClient = true
-				// Close with an error reflecting the problem for the reader.
-				_ = s.requestBodyWriter.CloseWithError(NewStreamError(s.id, ErrCodeProtocolError, protocolErrorMsg))
+		if hasEndStreamFlag {
+			if int64(potentialTotalReceivedThisFrameContext) != clValue {
+				s.endStreamReceivedFromClient = true // Mark this even if it's an error
+				s.mu.Unlock()
+				msg := fmt.Sprintf("content-length mismatch on END_STREAM: declared %d, received %d",
+					clValue, potentialTotalReceivedThisFrameContext)
+				s.conn.log.Error(msg, logger.LogFields{"stream_id": s.id, "final_total": potentialTotalReceivedThisFrameContext, "content_length": clValue})
+				return NewStreamError(s.id, ErrCodeProtocolError, msg)
 			}
-			return NewStreamError(s.id, ErrCodeProtocolError, protocolErrorMsg)
+		} else { // Not END_STREAM on this frame
+			if int64(potentialTotalReceivedThisFrameContext) > clValue {
+				s.mu.Unlock()
+				msg := fmt.Sprintf("data received (%d with current frame) exceeds declared content-length (%d)",
+					potentialTotalReceivedThisFrameContext, clValue)
+				s.conn.log.Error(msg, logger.LogFields{"stream_id": s.id, "potential_total": potentialTotalReceivedThisFrameContext, "content_length": clValue})
+				return NewStreamError(s.id, ErrCodeProtocolError, msg)
+			}
+		}
+		if dataLen > 0 {
+			s.receivedDataBytes += uint64(dataLen)
+		}
+	} else { // s.parsedContentLength == nil (no Content-Length header was present)
+		if dataLen > 0 {
+			s.receivedDataBytes += uint64(dataLen)
 		}
 	}
 
-	// If Content-Length validation passed (or no CL was set), write data to pipe.
-	if dataLen > 0 {
-		if _, err := s.requestBodyWriter.Write(frame.Data); err != nil {
-			s.conn.log.Error("Error writing to stream requestBodyWriter", logger.LogFields{
-				"stream_id": s.id,
-				"error":     err.Error(),
-			})
-			// If pipe write fails, and END_STREAM was on this frame, mark it.
-			if hasEndStreamFlag {
-				s.endStreamReceivedFromClient = true
-				// Close with the pipe error.
-				_ = s.requestBodyWriter.CloseWithError(err)
-			}
-			return NewStreamError(s.id, ErrCodeCancel, fmt.Sprintf("pipe write failed for stream %d: %v", s.id, err))
+	currentDataFrameChan := s.dataFrameChan
+	streamCtx := s.ctx // Use the stream's context for the select below
+	s.mu.Unlock()      // UNLOCK BEFORE CHANNEL OPERATIONS
+
+	// Re-check stream context (s.ctx not currentCtx from outer scope) before attempting to queue.
+	s.conn.log.Debug("handleDataFrame: Checking streamCtx (s.ctx) before select.", logger.LogFields{"stream_id": s.id, "ctx_err_before_select": fmt.Sprintf("%v", streamCtx.Err())})
+	select {
+	case <-streamCtx.Done():
+		s.conn.log.Warn("handleDataFrame: Stream context done before queuing DATA frame (re-check). Returning error.", logger.LogFields{"stream_id": s.id, "ctx_err": streamCtx.Err()})
+		return NewStreamError(s.id, ErrCodeCancel, "stream context done, cannot queue data") // Or StreamClosed
+	default:
+		// Context not done, proceed to queue.
+	}
+
+	if currentDataFrameChan == nil {
+		s.conn.log.Warn("handleDataFrame: dataFrameChan already closed/nil, cannot queue DATA frame.", logger.LogFields{"stream_id": s.id, "data_len": dataLen, "has_end_stream": hasEndStreamFlag})
+		if dataLen > 0 && !hasEndStreamFlag {
+			return NewStreamError(s.id, ErrCodeStreamClosed, "attempt to send DATA on stream where END_STREAM already processed via channel closure")
 		}
-		s.receivedDataBytes += uint64(dataLen)
-		s.conn.log.Debug("Wrote DATA to pipe", logger.LogFields{"stream_id": s.id, "bytes": dataLen, "total_received_on_stream": s.receivedDataBytes})
+		// If dataLen is 0 or hasEndStreamFlag is true, and channel is nil, it's likely fine (already handled).
+		// However, the top-level checks for closed/reset state should catch this earlier.
+		// If it reaches here, it implies a more subtle state issue. For now, return nil if not an error condition.
+		return nil
+	}
+
+	select {
+	case currentDataFrameChan <- frame:
+		s.conn.log.Debug("handleDataFrame: Queued DATA frame to dataFrameChan", logger.LogFields{"stream_id": s.id, "data_len": dataLen, "has_end_stream": hasEndStreamFlag})
+	case <-streamCtx.Done():
+		s.conn.log.Warn("handleDataFrame: Stream context done, cannot queue DATA frame (during send).", logger.LogFields{"stream_id": s.id, "ctx_err": streamCtx.Err()})
+		return NewStreamError(s.id, ErrCodeCancel, "stream context done, cannot queue data")
+	default: // Non-blocking check for full channel
+		s.conn.log.Error("handleDataFrame: dataFrameChan full, cannot queue DATA frame. Stream may be stuck.", logger.LogFields{"stream_id": s.id})
+		s.mu.Lock()
+		if s.dataFrameChan != nil { // Check again under lock
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.conn.log.Debug("Recovered from panic closing dataFrameChan in handleDataFrame (chan full path)",
+							logger.LogFields{"stream_id": s.id, "panic": r})
+					}
+				}()
+				close(s.dataFrameChan) // Close the channel to unblock processIncomingDataFrames
+			}()
+			// s.dataFrameChan = nil // Do not nil it out here
+		}
+		s.mu.Unlock()
+		return NewStreamError(s.id, ErrCodeFlowControlError, "stream data channel full, possible deadlock or slow handler")
 	}
 
 	if hasEndStreamFlag {
+		s.mu.Lock() // Lock for state and s.dataFrameChan modification
 		s.endStreamReceivedFromClient = true
-		s.conn.log.Debug("Processing END_STREAM flag actions for DATA frame.", logger.LogFields{"stream_id": s.id})
-
-		// Close the writer. If dataLen was 0, this effectively sends EOF.
-		// If data was written, this signals no more data will follow.
-		if err := s.requestBodyWriter.Close(); err != nil { // Use Close() for normal EOF scenario
-			s.conn.log.Error("Error closing requestBodyWriter after END_STREAM", logger.LogFields{
-				"stream_id": s.id,
-				"error":     err.Error(),
-			})
-			// This is an internal error, but stream processing might continue to state transition.
-			// However, if pipe close fails, it's safer to return an error.
-			return NewStreamError(s.id, ErrCodeInternalError, fmt.Sprintf("pipe close failed for stream %d: %v", s.id, err))
+		s.conn.log.Debug("handleDataFrame: END_STREAM flag on DATA frame. Closing dataFrameChan.", logger.LogFields{"stream_id": s.id})
+		if s.dataFrameChan != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.conn.log.Debug("Recovered from panic closing dataFrameChan in handleDataFrame (END_STREAM path)",
+							logger.LogFields{"stream_id": s.id, "panic": r})
+					}
+				}()
+				close(s.dataFrameChan)
+			}()
+			// s.dataFrameChan = nil // REMOVED: Mark as closed for this context
 		}
 
 		switch s.state {
@@ -866,14 +941,15 @@ func (s *Stream) handleDataFrame(frame *DataFrame) error {
 		case StreamStateHalfClosedLocal:
 			s._setState(StreamStateClosed)
 		default:
+			s.mu.Unlock() // Unlock before returning error
 			s.conn.log.Error("Received END_STREAM on DATA frame in unexpected stream state", logger.LogFields{
 				"stream_id": s.id,
 				"state":     s.state.String(),
 			})
 			return NewStreamError(s.id, ErrCodeProtocolError, fmt.Sprintf("END_STREAM on DATA in unexpected state %s for stream %d", s.state, s.id))
 		}
+		s.mu.Unlock() // Unlock after state changes
 	}
-
 	return nil
 }
 
@@ -1209,4 +1285,112 @@ func (s *Stream) handleRSTStreamFrame(errorCode ErrorCode) {
 	// The stream is now considered terminated.
 	// Cleanup of pipes, context, fcManager, and removal from conn.streams/priorityTree
 	// is handled by _setState(StreamStateClosed) -> closeStreamResourcesProtected -> conn.removeClosedStream.
+}
+
+// processIncomingDataFrames is a goroutine that reads DATA frames from dataFrameChan
+// and writes their payload to the requestBodyWriter pipe. It handles END_STREAM.
+func (s *Stream) processIncomingDataFrames() {
+	// Capture dataFrameChan locally to prevent issues if s.dataFrameChan is nilled out concurrently.
+	// This localChan will be used in the select.
+	s.mu.RLock() // RLock to safely read s.dataFrameChan
+	localChan := s.dataFrameChan
+	s.mu.RUnlock()
+
+	if localChan == nil {
+		s.conn.log.Warn("Stream.processIncomingDataFrames: s.dataFrameChan was nil at goroutine start. Exiting.", logger.LogFields{"stream_id": s.id})
+		// Ensure pipe is closed if we exit early.
+		if s.requestBodyWriter != nil {
+			_ = s.requestBodyWriter.CloseWithError(fmt.Errorf("stream %d data channel was nil at start of processing", s.id))
+		}
+		return
+	}
+
+	defer func() {
+		// Ensure pipe is closed when this goroutine exits, signaling EOF or error to reader.
+		if r := recover(); r != nil {
+			s.conn.log.Error("Panic in stream.processIncomingDataFrames", logger.LogFields{
+				"stream_id": s.id,
+				"panic_val": fmt.Sprintf("%v", r),
+				"stack":     string(debug.Stack()),
+			})
+			// Ensure requestBodyWriter is closed with an error to unblock any handler.
+			if s.requestBodyWriter != nil { // Check if nil before closing
+				_ = s.requestBodyWriter.CloseWithError(fmt.Errorf("panic in body processing for stream %d: %v", s.id, r))
+			}
+		} else {
+			// Normal exit from loop (channel closed or context done).
+			// Determine the correct close reason for the pipe.
+			if s.requestBodyWriter != nil { // Check if nil before closing
+				select {
+				case <-s.ctx.Done():
+					// If context was cancelled, use that error.
+					_ = s.requestBodyWriter.CloseWithError(s.ctx.Err())
+				default:
+					// Otherwise, it was a graceful close of dataFrameChan (END_STREAM). Signal EOF.
+					_ = s.requestBodyWriter.Close()
+				}
+			}
+		}
+		s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine exiting", logger.LogFields{"stream_id": s.id})
+	}()
+
+	s.conn.log.Debug("Stream.processIncomingDataFrames: Goroutine started", logger.LogFields{"stream_id": s.id})
+
+	for {
+		s.conn.log.Debug("Stream.processIncomingDataFrames: Top of loop, before select.", logger.LogFields{"stream_id": s.id})
+		select {
+		case <-s.ctx.Done(): // Stream context cancelled (e.g., RST_STREAM received/sent, or conn closed)
+			s.conn.log.Debug("Stream.processIncomingDataFrames: Stream context done, exiting.", logger.LogFields{"stream_id": s.id, "ctx_err": s.ctx.Err()})
+			// The defer will handle closing the requestBodyWriter with s.ctx.Err().
+			return
+		case frame, ok := <-localChan: // Use localChan here
+			s.conn.log.Debug("Stream.processIncomingDataFrames: Post-select, read from dataFrameChan.", logger.LogFields{"stream_id": s.id, "frame_is_nil_after_read": frame == nil, "ok_after_read": ok})
+			// s.conn.log.Debug("Stream.processIncomingDataFrames: Read from dataFrameChan.", logger.LogFields{"stream_id": s.id, "frame_is_nil": frame == nil, "ok": ok}) // Temporarily commented out
+			if !ok { // dataFrameChan was closed, means END_STREAM was processed or stream is closing forcefully.
+				s.conn.log.Debug("Stream.processIncomingDataFrames: dataFrameChan closed, exiting.", logger.LogFields{"stream_id": s.id})
+				// The defer will handle closing the requestBodyWriter (likely with EOF if context not done).
+				return
+			}
+
+			if frame == nil { // Should not happen if chan is typed *DataFrame, but defensive
+				s.conn.log.Warn("Stream.processIncomingDataFrames: Received nil frame from dataFrameChan", logger.LogFields{"stream_id": s.id})
+				continue
+			}
+
+			s.conn.log.Debug("Stream.processIncomingDataFrames: Got DATA frame from channel", logger.LogFields{"stream_id": s.id, "data_len": len(frame.Data)})
+
+			// Content-Length validation is now handled synchronously in handleDataFrame.
+			// processIncomingDataFrames just writes data from the channel to the pipe.
+
+			if len(frame.Data) > 0 {
+				// Write to pipe. This can block if handler isn't reading.
+				// If s.ctx is cancelled, this Write should eventually unblock due to pipe breaking.
+				nWritten, err := s.requestBodyWriter.Write(frame.Data)
+				if err != nil {
+					s.conn.log.Error("Stream.processIncomingDataFrames: Error writing to requestBodyWriter, attempting to RST stream.", logger.LogFields{
+						"stream_id": s.id,
+						"error":     err.Error(),
+					})
+					// Error writing to pipe, probably means reader side closed or stream context cancelled.
+					// Attempt to RST the stream.
+					// Use ErrCodeCancel as the handler essentially cancelled its reception of the body.
+					// Or ErrCodeInternalError if it's seen as an internal server problem.
+					// Let's use ErrCodeCancel for now.
+					if rstErr := s.sendRSTStream(ErrCodeCancel); rstErr != nil {
+						s.conn.log.Error("Stream.processIncomingDataFrames: Failed to send RST_STREAM after pipe write error.", logger.LogFields{
+							"stream_id":      s.id,
+							"pipe_err":       err.Error(),
+							"rst_stream_err": rstErr.Error(),
+						})
+					}
+					// Exit goroutine.
+					return
+				}
+				// s.receivedDataBytes += uint64(nWritten) // Removed: data race and CL validation is synchronous in handleDataFrame
+				s.conn.log.Debug("Stream.processIncomingDataFrames: Wrote DATA to pipe", logger.LogFields{"stream_id": s.id, "bytes": nWritten})
+			}
+			// END_STREAM on the frame itself is handled by handleDataFrame by closing dataFrameChan.
+			// This loop just processes data until chan is closed.
+		}
+	}
 }
