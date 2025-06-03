@@ -4,7 +4,6 @@ import (
 	"errors"
 	"example.com/llmahttap/v2/internal/logger"
 	"fmt"
-	"os"
 	"sync"
 	// ErrorCode constants like ErrorCodeFlowControlError are defined in errors.go
 	// and are accessible as they are in the same package.
@@ -91,11 +90,9 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	// Use a generic logger or fmt.Fprintf for diagnostics if conn.log isn't available here.
 	// Assuming a global or passed-in logger would be better for real use.
 	// For now, using fmt.Fprintf to ensure output during tests.
-	fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ENTRY] Fields: %v\n", logFields)
 
 	// UPFRONT CHECK: If window is already closed, return error immediately.
 	if fcw.closed {
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_CLOSED_UPFRONT] Fields: %v\n", logFields)
 		if fcw.isConnection {
 			if fcw.err != nil {
 				if _, ok := fcw.err.(*ConnectionError); ok {
@@ -118,7 +115,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	}
 
 	if fcw.err != nil {
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_PRIOR_ERR_UPFRONT] Fields: %v\n", logFields)
 		if se, ok := fcw.err.(*StreamError); ok {
 			return se
 		}
@@ -136,23 +132,19 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	}
 
 	if n == 0 {
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ZERO_N] Fields: %v, Returning error.\n", logFields)
 		return fmt.Errorf("flow control acquire: cannot acquire zero bytes")
 	}
 
 	waitCount := 0
 	for fcw.available < int64(n) {
 		waitCount++
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_WAITING] Fields: %v, WaitCount: %d\n", logFields, waitCount)
 		fcw.cond.Wait()
 		// Update logFields with potentially changed state after wait
 		logFields["current_avail_after_wait"] = fcw.available
 		logFields["fcw_closed_after_wait"] = fcw.closed
 		logFields["fcw_err_after_wait"] = fmt.Sprintf("%v", fcw.err)
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_AWOKE] Fields: %v, WaitCount: %d\n", logFields, waitCount)
 
 		if fcw.closed {
-			fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_CLOSED_IN_LOOP] Fields: %v\n", logFields)
 			if fcw.isConnection {
 				if fcw.err != nil {
 					if _, ok := fcw.err.(*ConnectionError); ok {
@@ -174,7 +166,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 			return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed during wait", fcw.streamID))
 		}
 		if fcw.err != nil {
-			fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_ERR_IN_LOOP] Fields: %v\n", logFields)
 			if se, ok := fcw.err.(*StreamError); ok {
 				return se
 			}
@@ -194,7 +185,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 
 	if fcw.available < 0 {
 		errUnexpectedState := fmt.Errorf("internal: flow control window for ID %d (conn: %v) in unexpected negative state %d after wait, trying to acquire %d", fcw.streamID, fcw.isConnection, fcw.available, n)
-		fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_NEGATIVE_AVAIL_UNEXPECTED] Fields: %v, Error: %v\n", logFields, errUnexpectedState)
 		if fcw.isConnection {
 			return NewConnectionError(ErrCodeInternalError, errUnexpectedState.Error())
 		}
@@ -203,7 +193,6 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 
 	fcw.available -= int64(n)
 	logFields["final_avail"] = fcw.available
-	fmt.Fprintf(os.Stderr, "[FCW.ACQUIRE_SUCCESS] Fields: %v\n", logFields)
 	return nil
 }
 
@@ -216,39 +205,24 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 
 	if fcw.err != nil {
 		// Log the existing error and the current attempt's increment
-		cErrLogFields := logger.LogFields{
-			"stream_id": fcw.streamID, "is_conn_fcw": fcw.isConnection,
-			"current_increment_arg": increment, // Log the increment for *this* call
-			"existing_fcw_err":      fmt.Sprintf("%v", fcw.err), "fcw_closed": fcw.closed,
-			"fcw_available": fcw.available,
-		}
 		// Use a more general logger if available, or fmt.Fprintf for critical diagnostics
 		// Assuming a logger might be available via a conn reference if this is part of a larger system,
 		// or use a package-level default logger for http2.
 		// For now, using fmt.Fprintf for directness in this isolated test.
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE fcw.err ALREADY SET] Fields: %v\n", cErrLogFields)
 		return fcw.err // Return the pre-existing error
 	}
 
 	if increment == 0 {
 		// Log details specifically when this condition (increment == 0) is met.
-		cErrLogFields := logger.LogFields{
-			"stream_id": fcw.streamID, "is_conn_fcw": fcw.isConnection,
-			"increment_arg_is_zero": true, "fcw_err_before_this_error": fmt.Sprintf("%v", fcw.err), // Should be nil here
-			"fcw_closed_before_this_error": fcw.closed, "fcw_available_before_this_error": fcw.available,
-		}
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE increment IS ZERO] Fields: %v\n", cErrLogFields)
 
 		if !fcw.isConnection {
 			// This is the specific error message in question.
 			return NewStreamError(fcw.streamID, ErrCodeProtocolError, "WINDOW_UPDATE increment cannot be 0 for a stream")
 		}
 		// For connection-level, increment 0 is a no-op.
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE SUCCESS (increment 0 for conn)] stream_id: %d\n", fcw.streamID)
 		return nil
 	}
 
-	oldAvail := fcw.available
 	newSize := fcw.available + int64(increment)
 	if newSize > MaxWindowSize {
 		var err error
@@ -260,7 +234,6 @@ func (fcw *FlowControlWindow) Increase(increment uint32) error {
 			err = NewStreamError(fcw.streamID, ErrCodeFlowControlError, msg)
 		}
 		fcw.setErrorLocked(err)
-		fmt.Fprintf(os.Stderr, "[DIAGNOSTIC FCW.INCREASE RETURNING_ERR_H_OVERFLOW] stream_id: %d, conn: %t, increment: %d, old_avail: %d, new_size: %d, error: %v\n", fcw.streamID, fcw.isConnection, increment, oldAvail, newSize, err)
 		return err
 	}
 
