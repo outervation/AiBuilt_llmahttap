@@ -374,7 +374,7 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 		{
 			name:                   "pendingRSTCode is nil",
 			initialPendingRSTCode:  nil,
-			expectedPipeReadError:  io.EOF,              // As per closeStreamResourcesProtected logic for nil pendingRSTCode
+			expectedPipeReadError:  io.EOF,              // Corrected: pipe closed with EOF if ctx not already cancelled
 			expectedFcAcquireError: ErrCodeStreamClosed, // As per closeStreamResourcesProtected logic
 		},
 		{
@@ -433,8 +433,10 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 				t.Error("Expected stream context to be canceled")
 			}
 
+			t.Logf("TestStream_setStateToClosed_CleansUpResources (%s): Before stream.requestBodyWriter.Write for stream_id=%d. Stream state: %s, stream.ctx.Err: %v", tc.name, stream.id, stream.state, stream.ctx.Err())
 			// 3. Pipe Closures
 			_, errWrite := stream.requestBodyWriter.Write([]byte("test"))
+			t.Logf("TestStream_setStateToClosed_CleansUpResources (%s): stream.requestBodyWriter.Write returned for stream_id=%d. errWrite: %v", tc.name, stream.id, errWrite)
 			if errWrite == nil {
 				t.Error("Expected error writing to requestBodyWriter after _setState(Closed), got nil")
 			} else if errWrite != io.ErrClosedPipe {
@@ -448,9 +450,11 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 			} else {
 				if tc.expectedPipeReadError == io.EOF {
 					if errRead != io.EOF {
-						// Sometimes pipe might wrap EOF, e.g. *os.PathError{Err:io.EOF}. For io.Pipe, it's typically direct io.EOF.
-						// Or if the error from CloseWithError was io.EOF.
 						t.Errorf("requestBodyReader.Read error: got %v (type %T), want io.EOF", errRead, errRead)
+					}
+				} else if tc.expectedPipeReadError == context.Canceled { // New condition
+					if !errors.Is(errRead, context.Canceled) { // Use errors.Is for context errors
+						t.Errorf("requestBodyReader.Read error: got %v (type %T), want context.Canceled", errRead, errRead)
 					}
 				} else if expectedStreamErr, ok := tc.expectedPipeReadError.(*StreamError); ok {
 					actualStreamErr, okActual := errRead.(*StreamError)
