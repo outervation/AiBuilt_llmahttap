@@ -1694,22 +1694,25 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 		return nil // Stream error handled by sending RST_STREAM, connection continues.
 	}
 
-	// PRIORITY frames MUST be associated with an existing stream or a stream that could be
-	// created (i.e., not stream 0).
-	// RFC 7540, Section 6.3: "A PRIORITY frame with a stream identifier of 0x0 MUST be
-	// treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
-	// This check should ideally be performed by the general frame dispatcher before
-	// routing to this specific handler. If it reaches here, it indicates an issue
-	// in the upstream dispatch logic or an unexpected scenario.
 	if streamID == 0 {
 		c.log.Error("dispatchPriorityFrame called with PRIORITY frame on stream 0",
 			logger.LogFields{"frame_type": frame.Header().Type.String()})
 		return NewConnectionError(ErrCodeProtocolError, "PRIORITY frame received on stream 0")
 	}
 
-	// Process the priority update using the PriorityTree.
-	// The PriorityTree.ProcessPriorityFrame method handles internal locking and specific
-	// validations like self-dependency (a stream cannot depend on itself).
+	stream, found := c.getStream(streamID)
+	var preState StreamState = 0xff // Invalid initial state for logging if not found
+	if found {
+		stream.mu.RLock()
+		preState = stream.state
+		stream.mu.RUnlock()
+	}
+
+	c.log.Debug("Dispatching stream-level PRIORITY", logger.LogFields{
+		"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+		"stream_found": found, "pre_stream_state": preState.String(),
+	})
+
 	err := c.priorityTree.ProcessPriorityFrame(frame)
 	if err != nil {
 		c.log.Warn("Error processing PRIORITY frame in priority tree",
@@ -1721,43 +1724,36 @@ func (c *Connection) dispatchPriorityFrame(frame *PriorityFrame) error {
 				"original_error": err.Error(),
 			})
 
-		// Check if the error from ProcessPriorityFrame is a StreamError.
-		// This typically occurs if the frame specified a self-dependency.
 		if se, ok := err.(*StreamError); ok {
-			// The stream ID in the StreamError (se.StreamID) should match frame.StreamID.
-			// Send RST_STREAM for the problematic stream.
 			rstErr := c.sendRSTStreamFrame(se.StreamID, se.Code)
 			if rstErr != nil {
-				// Failed to send RST_STREAM. This is a more serious issue, potentially
-				// indicating a problem with the connection writer.
 				return NewConnectionErrorWithCause(ErrCodeFrameSizeError, // Use original error type
 					fmt.Sprintf("failed to send RST_STREAM (code %s) for PRIORITY processing error on stream %d: %v",
 						se.Code.String(), se.StreamID, rstErr),
-					err, // Include the original error from ProcessPriorityFrame as context
+					err,
 				)
 			}
-			// Successfully sent RST_STREAM. The stream error is considered handled.
-			// No further error propagation to tear down the connection for this specific issue.
 			return nil
 		}
-
-		// If the error is not a StreamError, it might be an internal issue within
-		// the PriorityTree logic or a condition that ProcessPriorityFrame deemed
-		// severe but didn't fit into a StreamError.
-		// Treat such errors as internal connection errors for now.
 		return NewConnectionErrorWithCause(ErrCodeInternalError,
 			fmt.Sprintf("internal error processing PRIORITY frame for stream %d: %v", streamID, err),
 			err,
 		)
 	}
 
-	c.log.Debug("PRIORITY frame processed successfully",
-		logger.LogFields{
-			"stream_id":  streamID,
-			"dependency": frame.StreamDependency,
-			"weight":     frame.Weight,
-			"exclusive":  frame.Exclusive,
+	if found { // Log post-state only if stream was found initially
+		stream.mu.RLock()
+		postState := stream.state
+		stream.mu.RUnlock()
+		c.log.Debug("Stream-level PRIORITY processed", logger.LogFields{
+			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+			"post_stream_state": postState.String(), "state_changed": preState != postState,
 		})
+	} else {
+		c.log.Debug("Stream-level PRIORITY processed (stream was not in active map)", logger.LogFields{
+			"stream_id": streamID, "dependency": frame.StreamDependency, "weight": frame.Weight, "exclusive": frame.Exclusive,
+		})
+	}
 	return nil
 }
 
