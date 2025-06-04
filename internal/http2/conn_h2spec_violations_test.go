@@ -172,5 +172,9 @@ func TestInvalidClientPreface(t *testing.T) {
 	defer conn.Close(nil)
 	defer mnc.Close()
 
-	// Steps 2-6 will be implemented subsequently.
+	// Step 2: Simulate a client sending an invalid connection preface.
+	invalidPreface := "PRI * HTTP/2.0\r\n\r\nSM\r\nBAD" // Truncated and incorrect
+	mnc.FeedReadBuffer([]byte(invalidPreface))
+
+	// Steps 3-6 will be implemented subsequently.
 }
