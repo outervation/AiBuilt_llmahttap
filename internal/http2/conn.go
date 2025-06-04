@@ -1544,6 +1544,22 @@ func (c *Connection) handleIncomingCompleteHeaders(streamID uint32, headers []hp
 			isEndStreamAlreadyReceived := existingStream.endStreamReceivedFromClient
 			existingStream.mu.RUnlock()
 
+			// Check for HEADERS on a stream in half-closed (remote) state
+			// RFC 7540, Section 5.1: "half-closed (remote)":
+			// "An endpoint that receives any frame other than WINDOW_UPDATE, PRIORITY, or RST_STREAM
+			// on a stream in this state MUST respond with a stream error (Section 5.4.2) of type STREAM_CLOSED."
+			// Since HEADERS is not one of the allowed frames, this is an error.
+			if state == StreamStateHalfClosedRemote {
+				errMsg := fmt.Sprintf("HEADERS frame received on stream %d in half-closed (remote) state", streamID)
+				c.log.Warn(errMsg, logger.LogFields{"stream_id": streamID, "state": state.String()})
+				if rstErr := c.sendRSTStreamFrame(streamID, ErrCodeStreamClosed); rstErr != nil {
+					c.log.Error("Failed to send RST_STREAM for HEADERS on half-closed (remote) stream", logger.LogFields{"stream_id": streamID, "error": rstErr.Error()})
+					// If sending RST fails, it's a connection-level issue.
+					return NewConnectionErrorWithCause(ErrCodeInternalError, fmt.Sprintf("failed to send RST_STREAM(STREAM_CLOSED) for stream %d: %v", streamID, rstErr), rstErr)
+				}
+				return nil // Stream error handled by RST_STREAM. Connection continues.
+			}
+
 			// If initial headers were processed and the client's side of the stream isn't closed yet,
 			// this subsequent HEADERS block is considered trailers.
 			isTrailerBlock := initialHeadersAlreadyProcessed && !isEndStreamAlreadyReceived
