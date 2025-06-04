@@ -164,3 +164,13 @@ func hexDump(data []byte) string {
 }
 
 // TestMain is explicitly disallowed.
+
+func TestInvalidClientPreface(t *testing.T) {
+	t.Parallel()
+	// Step 1: Set up a server-side http2.Connection using newTestConnection and a mockNetConn.
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side, no specific dispatcher or peer settings needed for this test initially
+	defer conn.Close(nil)
+	defer mnc.Close()
+
+	// Steps 2-6 will be implemented subsequently.
+}
