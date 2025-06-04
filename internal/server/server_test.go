@@ -2721,6 +2721,62 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 			t.Errorf("Expected activeConns to be empty after handling connection with invalid preface, found %d", activeCount)
 		}
 	})
+
+	t.Run("newHTTP2Connection_ReturnsNil", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		mockNetC := newMockConn("127.0.0.1:1234", "127.0.0.1:54321")
+
+		// Mock newHTTP2Connection to return nil
+		originalNewH2ConnFunc_subtest := newHTTP2Connection // Use a subtest-specific var to avoid conflict if other t.Runs mock it
+		newHTTP2ConnectionCalled := false
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			newHTTP2ConnectionCalled = true
+			return nil // Simulate newHTTP2Connection failing and returning nil
+		}
+		defer func() { newHTTP2Connection = originalNewH2ConnFunc_subtest }()
+
+		handleDone := make(chan struct{})
+		go func() {
+			s.handleTCPConnection(mockNetC)
+			close(handleDone)
+		}()
+
+		select {
+		case <-handleDone:
+			// Expected: handleTCPConnection completed
+		case <-time.After(1 * time.Second):
+			t.Fatal("handleTCPConnection did not complete in time when newHTTP2Connection returns nil")
+		}
+
+		if !newHTTP2ConnectionCalled {
+			t.Error("Expected newHTTP2Connection to be called, but it wasn't")
+		}
+
+		// Verify mockNetC.Close() was called
+		if err := mockNetC.WaitCloseCalled(100 * time.Millisecond); err != nil {
+			t.Errorf("mockNetC.Close() was not called or WaitCloseCalled timed out: %v", err)
+		}
+
+		// Verify log message
+		serverLogs := logBuf.String()
+		expectedLogMsg := "newHTTP2Connection returned nil, cannot handle TCP connection"
+		if !strings.Contains(serverLogs, expectedLogMsg) {
+			t.Errorf("Expected log message '%s', not found. Logs: %s", expectedLogMsg, serverLogs)
+		}
+
+		// Verify activeConns remains empty
+		s.mu.RLock()
+		if len(s.activeConns) != 0 {
+			t.Errorf("Expected activeConns to be empty, found %d", len(s.activeConns))
+		}
+		s.mu.RUnlock()
+	})
 }
 
 func teardownHandleTCPConnectionMocks_Test() {
