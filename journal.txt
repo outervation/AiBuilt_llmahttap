@@ -19,3 +19,28 @@ h2spec failures showing "Actual: HEADERS Frame" where "DATA frame" was expected,
 2. `FlowControlWindow.Acquire` does not block correctly (e.g., when the window is negative or insufficient), or returns an error that is mishandled, leading the server to send an erroneous HEADERS frame instead of waiting or sending DATA.
 3. The server does not send WINDOW_UPDATE frames in a timely manner, causing the peer to stall (leading to DATA frame timeouts from the test client).
 4. The server fails to process incoming DATA/HEADERS correctly due to internal errors (possibly related to flow control state), leading to no response or an incorrect response.
+Objective: Fix h2spec failure "Sends invalid connection preface" where "connection reset by peer" is observed instead of "Connection closed".
+Hypothesis: The `conn.Close()` method calls `c.initiateShutdown()` in a goroutine. If `conn.Close()` returns to its caller (e.g., `server.handleTCPConnection`) too quickly, the goroutine handling the TCP connection might exit. This could lead to the OS closing the underlying socket abruptly (TCP RST) before `initiateShutdown` has a chance to send the GOAWAY frame and perform a graceful FIN-based TCP close.
+
+Proposed Change:
+In `internal/http2/conn.go`, within the `Close` method, modify the call to `initiateShutdown`:
+From: `go c.initiateShutdown(lastStreamID, goAwayErrorCode, debugData, gracefulTimeout)`
+To:   `c.initiateShutdown(lastStreamID, goAwayErrorCode, debugData, gracefulTimeout)`
+
+Rationale for Synchronous Call:
+1.  **Guaranteed Completion:** `conn.Close()` will now block until `initiateShutdown` fully completes.
+2.  **`initiateShutdown`'s Responsibilities:**
+    *   Sends GOAWAY (queues to `writerChan`).
+    *   Closes `shutdownChan` (signals reader/writer loops to stop).
+    *   Closes `writerChan` (signals `writerLoop` to drain and exit).
+    *   Waits for `writerLoop` to finish (`<-c.writerDone`). This ensures GOAWAY is written.
+    *   Performs stream cleanup.
+    *   **Crucially, closes `c.netConn` (the underlying TCP socket).**
+    *   Cleans up other resources.
+3.  **Preventing Premature Exit:** By making `initiateShutdown` synchronous, `c.netConn.Close()` (which performs the TCP FIN sequence) is guaranteed to be called before `conn.Close()` returns. This should give the OS time to handle the graceful TCP closure correctly.
+
+Consideration of Existing Logic:
+-   The `Close` method already has logic to wait for `readerDone` and `writerDone` *after* the (previously goroutined) `initiateShutdown` call. If `initiateShutdown` is now synchronous and itself ensures these are done (or signals them appropriately, e.g., `writerDone` is waited for, and `netConn.Close()` causes reader to exit and signal `readerDone`), these subsequent waits in `Close` will simply find the channels already closed, which is harmless.
+-   Recursive or deferred calls to `Close()` (e.g., from timers or `writerLoop`'s defer) should still function correctly. If `initiateShutdown` is already running due to a primary `Close` call, subsequent `Close` calls will find `shutdownChan` closed and their `initiateShutdown` path will return early or simply wait, preventing problematic re-entrancy into the core shutdown logic.
+
+This change directly targets the requirement of ensuring `initiateShutdown` completes before `Close` returns, which is believed to be the root cause of the TCP RST.
