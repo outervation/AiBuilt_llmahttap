@@ -2316,8 +2316,9 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		s.mu.RUnlock()
 
 		serverLogs := logBuf.String()
-		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
-			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+
+		if !strings.Contains(serverLogs, "Finished handleTCPConnection (defer completed, h2conn.Close called)") {
+			t.Errorf("Expected log for handleTCPConnection completion, not found. Logs: %s", serverLogs)
 		}
 	})
 
@@ -2370,8 +2371,8 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		}
 		s.mu.RUnlock()
 
-		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
-			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+		if !strings.Contains(serverLogs, "Finished handleTCPConnection (defer completed, h2conn.Close called)") {
+			t.Errorf("Expected log for handleTCPConnection completion, not found. Logs: %s", serverLogs)
 		}
 	})
 
@@ -2435,8 +2436,8 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		}
 		s.mu.RUnlock()
 
-		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
-			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
+		if !strings.Contains(serverLogs, "Finished handleTCPConnection (defer completed, h2conn.Close called)") {
+			t.Errorf("Expected log for handleTCPConnection completion, not found. Logs: %s", serverLogs)
 		}
 	})
 	t.Run("HandshakeFailure_InvalidPreface_SendsGoAwayAndCloses", func(t *testing.T) {
@@ -2558,8 +2559,9 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 			t.Errorf("Expected log message '%s' from http2.Connection, not found in server logs. Logs: %s", expectedConnGoAwayLog, serverLogs)
 		}
 		// 3. Assert logs indicate subsequent connection closure.
-		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
-			t.Errorf("Expected log for connection closure (from server.go defer), not found. Logs: %s", serverLogs)
+
+		if !strings.Contains(serverLogs, "Finished handleTCPConnection (defer completed, h2conn.Close called)") {
+			t.Errorf("Expected log for handleTCPConnection completion, not found. Logs: %s", serverLogs)
 		}
 
 		s.mu.RLock()
@@ -2710,8 +2712,9 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		if !strings.Contains(serverLogs, expectedConnGoAwayLog) { // Check log from http2.Connection via test logger
 			t.Errorf("Expected log message '%s' from http2.Connection, not found in server logs (which capture http2 conn logs). Logs: %s", expectedConnGoAwayLog, serverLogs)
 		}
-		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
-			t.Errorf("Expected log for connection closure (from server.go defer), not found. Logs: %s", serverLogs)
+
+		if !strings.Contains(serverLogs, "Finished handleTCPConnection (defer completed, h2conn.Close called)") {
+			t.Errorf("Expected log for handleTCPConnection completion, not found. Logs: %s", serverLogs)
 		}
 
 		s.mu.RLock()
