@@ -268,6 +268,7 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 		mc.closeOnce.Do(func() {
 			mc.mu.Lock()
 			defer mc.mu.Unlock()
+
 			mc.closeCalled = true
 			select {
 			case <-mc.closed:
@@ -275,6 +276,17 @@ func newMockConn(localStr, remoteStr string) *mockConn {
 			default:
 				close(mc.closed)
 				mc.readCond.Broadcast()
+			}
+
+			// Signal that CloseFunc logic has completed by closing closeCalledChan
+			// Ensure closeCalledChan is not nil and not already closed to prevent panic.
+			if mc.closeCalledChan != nil {
+				select {
+				case <-mc.closeCalledChan:
+					// Already closed, do nothing
+				default:
+					close(mc.closeCalledChan)
+				}
 			}
 		})
 		return nil
