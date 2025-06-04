@@ -6,6 +6,7 @@ package http2
 */
 
 import (
+	"bytes" // Added for bytes.Contains
 	"encoding/hex"
 	"errors"
 	"fmt" // Added import
@@ -1324,4 +1325,109 @@ func TestConnection_DispatchWindowUpdateFrame_ConnLevel_Overflow(t *testing.T) {
 		t.Errorf("Connection send window has invalid size after overflow: %d", conn.connFCManager.GetConnectionSendAvailable())
 	}
 	closeErr = nil
+}
+
+func TestServerHandshake_InvalidClientPreface_TriggersGoAwayOnClose(t *testing.T) {
+	t.Parallel()
+
+	lg := logger.NewDiscardLogger() // Use discard logger for this test
+	_ = lg                          // Explicitly use lg to avoid "declared and not used" if truly not needed.
+	// For ServerHandshake focusing on preface, dispatcher logic is not critical.
+	// A nil dispatcher might be problematic if conn.NewConnection requires it for other setup,
+	// so provide a simple one.
+	mockDispatcher := &mockRequestDispatcher{}
+	conn, mnc := newTestConnection(t, false /* isClient */, mockDispatcher, nil /* initialPeerSettingsForTest */)
+
+	// Feed invalid preface
+	// The exact content of invalidity doesn't matter as much as it being different from ClientPreface.
+	invalidPreface := []byte("THIS IS NOT THE CORRECT PREFACE AT ALL")
+	mnc.FeedReadBuffer(invalidPreface)
+
+	// Call ServerHandshake
+	err := conn.ServerHandshake()
+
+	// Assert error type and code
+	if err == nil {
+		t.Fatalf("ServerHandshake did not return an error for invalid preface")
+	}
+	connErr, ok := err.(*ConnectionError)
+	if !ok {
+		t.Fatalf("ServerHandshake error is not of type *ConnectionError, got %T for error: %v", err, err)
+	}
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("Expected ConnectionError code %s (%d), got %s (%d)", ErrCodeProtocolError, ErrCodeProtocolError, connErr.Code, connErr.Code)
+	}
+	// The message in conn.go is now just "invalid client connection preface"
+	expectedMsg := "invalid client connection preface"
+	if connErr.Msg != expectedMsg {
+		t.Errorf("Expected ConnectionError message '%s', got '%s'", expectedMsg, connErr.Msg)
+	}
+
+	// Simulate Serve() loop's defer calling conn.Close() with the error from ServerHandshake.
+	// This should trigger initiateShutdown which sends the GOAWAY frame.
+	closeErr := conn.Close(err)
+	if closeErr != nil && !errors.Is(closeErr, err) {
+		// conn.Close might return the same error or a related one if further issues occur during close.
+		// If it's a new, unrelated error, that's a problem.
+		// We expect it to either be the same 'err' or an error that wraps 'err' or nil if very graceful.
+		var ce1 *ConnectionError
+		var ce2 *ConnectionError
+		isSameUnderlyingConnError := false
+		if errors.As(err, &ce1) && errors.As(closeErr, &ce2) {
+			if ce1.Code == ce2.Code && ce1.Msg == ce2.Msg { // Basic check
+				isSameUnderlyingConnError = true
+			}
+		}
+		if !isSameUnderlyingConnError {
+			t.Logf("conn.Close returned error '%v' (type %T), which is different from ServerHandshake error '%v' (type %T). This might be okay or indicate an issue during shutdown.", closeErr, closeErr, err, err)
+		}
+	}
+
+	// Check for GOAWAY frame in mockNetConn's write buffer
+	// Ensure that there's enough time for the writerLoop to process the GOAWAY if conn.Close involves async operations.
+	// waitForCondition can be used if needed, but conn.Close() should be blocking enough.
+	// For this test, we'll assume conn.Close() completes all synchronous parts of shutdown relevant to GOAWAY.
+
+	writtenBytes := mnc.GetWriteBufferBytes()
+	frames := readAllFramesFromBuffer(t, writtenBytes)
+	foundGoAway := false
+	for _, f := range frames {
+		if gf, ok := f.(*GoAwayFrame); ok {
+			if gf.ErrorCode == ErrCodeProtocolError {
+				foundGoAway = true
+				if gf.LastStreamID != 0 { // Last processed stream ID should be 0 for preface error
+					t.Errorf("GOAWAY LastStreamID: got %d, want 0 for preface error", gf.LastStreamID)
+				}
+				// The debug data should be related to "invalid client connection preface"
+				// The ConnectionError created has this as its Msg, which GenerateGoAwayFrame uses.
+				expectedDebugData := []byte("invalid client connection preface")
+				if !bytes.Contains(gf.AdditionalDebugData, expectedDebugData) {
+					// Looser check: an exact match might be too brittle if formatting changes slightly.
+					// Check if the core message is there.
+					t.Errorf("GOAWAY AdditionalDebugData: got %q, expected to contain %q", string(gf.AdditionalDebugData), string(expectedDebugData))
+				}
+				break
+			} else {
+				t.Logf("Found GOAWAY frame, but ErrorCode was %s, expected %s", gf.ErrorCode, ErrCodeProtocolError)
+			}
+		}
+	}
+
+	if !foundGoAway {
+		t.Errorf("Expected GOAWAY frame with PROTOCOL_ERROR, but not found. %d frames found.", len(frames))
+		for i, fr := range frames {
+			t.Logf("Frame %d: Type %s, StreamID %d, Flags %x, Length %d", i, fr.Header().Type, fr.Header().StreamID, fr.Header().Flags, fr.Header().Length)
+			if gfDump, okDump := fr.(*GoAwayFrame); okDump {
+				t.Logf("  GOAWAY details: LastStreamID %d, ErrorCode %s, DebugData %q", gfDump.LastStreamID, gfDump.ErrorCode, string(gfDump.AdditionalDebugData))
+			}
+		}
+		t.Logf("Raw written bytes (hex): %x", writtenBytes)
+	}
+
+	// Check that the mock connection is closed
+	// Give a very brief moment for Close() operations to fully settle netConn closure.
+	waitForCondition(t, 100*time.Millisecond, 10*time.Millisecond, mnc.IsClosed, "mockNetConn to be closed")
+	if !mnc.IsClosed() {
+		t.Errorf("Expected mockNetConn to be closed after invalid preface and conn.Close()")
+	}
 }
