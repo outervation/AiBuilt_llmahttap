@@ -3222,10 +3222,22 @@ func (c *Connection) ServerHandshake() error {
 			"expected_preface_str": ClientPreface,
 		})
 
-		// The GOAWAY frame will be sent as part of the standard connection shutdown
-		// sequence triggered by the ConnectionError returned below.
+		connErr := NewConnectionError(ErrCodeProtocolError, "invalid client connection preface")
+		// Attempt to send GOAWAY as per RFC 7540 Section 3.5
+		// Use LastStreamID 0 as no streams have been processed.
+		var debugMsgBytes []byte
+		if connErr.Msg != "" {
+			debugMsgBytes = []byte(connErr.Msg)
+		}
 
-		return NewConnectionError(ErrCodeProtocolError, "invalid client connection preface")
+		// The GOAWAY frame will be queued here. The writerLoop should pick it up.
+		// The connection will then be closed by the caller of ServerHandshake
+		// (e.g., server.handleTCPConnection) by calling conn.Close(connErr).
+		if sendError := c.sendGoAway(0, connErr.Code, debugMsgBytes); sendError != nil {
+			c.log.Warn("ServerHandshake: Failed to send GOAWAY for invalid preface. Proceeding to return original error.", logger.LogFields{"send_error": sendError.Error(), "original_error": connErr.Error(), "remote_addr": c.remoteAddrStr})
+			// Even if sendGoAway fails, the primary error is the invalid preface.
+		}
+		return connErr // Return the original ConnectionError for invalid preface
 	}
 	c.log.Debug("Client connection preface received and validated.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
