@@ -311,6 +311,12 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 
 	h2conn := newHTTP2Connection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, nil /*initialPeerSettingsForTest*/, dispatcherFunc)
 
+	if h2conn == nil {
+		s.log.Error("newHTTP2Connection returned nil, cannot handle TCP connection", logger.LogFields{"remote_addr": remoteAddr})
+		tcpConn.Close()
+		return
+	}
+
 	s.mu.Lock()
 	s.activeConns[h2conn] = struct{}{}
 	s.mu.Unlock()
