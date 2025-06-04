@@ -15,8 +15,8 @@ import (
 // This corresponds to h2spec test: 5. Streams and Multiplexing / 5.1. Stream States / 6: half closed (remote): Sends a HEADERS frame
 func TestHEADERSOnHalfClosedRemoteStream(t *testing.T) {
 	t.Parallel()
-        // TODO: uncomment and fix this
-        t.Skip()
+	// TODO: uncomment and fix this
+	t.Skip()
 	mockDispatcher := &mockRequestDispatcher{
 		fn: func(sw StreamWriter, req *http.Request) {
 			tLogf(t, "Mock dispatcher called for stream %d, method %s, path %s", sw.ID(), req.Method, req.URL.Path)

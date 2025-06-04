@@ -828,7 +828,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 			}
 
 			performHandshakeForTest(t, conn, mnc, nil) // Includes ServerHandshake
-			mnc.ResetWriteBuffer()                // Clear handshake frames
+			mnc.ResetWriteBuffer()                     // Clear handshake frames
 
 			serveErrChan := make(chan error, 1)
 
