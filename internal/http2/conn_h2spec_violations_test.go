@@ -176,5 +176,22 @@ func TestInvalidClientPreface(t *testing.T) {
 	invalidPreface := "PRI * HTTP/2.0\r\n\r\nSM\r\nBAD" // Truncated and incorrect
 	mnc.FeedReadBuffer([]byte(invalidPreface))
 
-	// Steps 3-6 will be implemented subsequently.
+	// Step 3: Call conn.ServerHandshake() to trigger preface processing.
+	// Step 4: Assert that conn.ServerHandshake() returns a ConnectionError with ErrorCodeProtocolError.
+	err := conn.ServerHandshake()
+	if err == nil {
+		t.Fatalf("ServerHandshake did not return an error for invalid preface")
+	}
+
+	connErr, ok := err.(*ConnectionError)
+	if !ok {
+		t.Fatalf("ServerHandshake error is not of type *ConnectionError, got %T: %v", err, err)
+	}
+
+	if connErr.Code != ErrCodeProtocolError {
+		t.Errorf("Expected ConnectionError with code %s, got %s", ErrCodeProtocolError, connErr.Code)
+	}
+	t.Logf("ServerHandshake returned expected ConnectionError: %v", connErr)
+
+	// Steps 5-6 will be implemented subsequently.
 }
