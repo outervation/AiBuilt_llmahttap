@@ -2641,7 +2641,7 @@ func (c *Connection) Close(err error) error {
 		// initiateShutdown is responsible for closing shutdownChan.
 		// The first call to Close() that finds shutdownChan open will set c.connError
 		// and then call initiateShutdown.
-		go c.initiateShutdown(lastStreamID, goAwayErrorCode, debugData, gracefulTimeout)
+		c.initiateShutdown(lastStreamID, goAwayErrorCode, debugData, gracefulTimeout)
 	}
 
 	// Wait for reader and writer goroutines to finish, regardless of who initiated shutdown.
