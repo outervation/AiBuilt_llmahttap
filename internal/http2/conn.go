@@ -2414,6 +2414,7 @@ func (c *Connection) writeFrame(frame Frame) error {
 	}
 
 	n, writeErr := c.netConn.Write(frameBytes)
+	c.log.Debug("Finished writing frame to connection.", logFields)
 
 	// Clear the write deadline immediately after the write attempt
 	if errClearDeadline := c.netConn.SetWriteDeadline(time.Time{}); errClearDeadline != nil {
@@ -2594,6 +2595,7 @@ func (c *Connection) Close(err error) error {
 		c.streamsMu.RLock()
 		lastStreamID = c.lastProcessedStreamID
 		c.streamsMu.RUnlock()
+		c.log.Debug("Connection.Close: Initiating shutdown got lastStreamID.", logger.LogFields{"lastStreamId": lastStreamID})
 
 		// Use initialShutdownError to determine GOAWAY parameters
 		currentErrForGoAway := initialShutdownError
@@ -2713,6 +2715,7 @@ func (c *Connection) isShuttingDownLocked() bool {
 // It sends GOAWAY, closes streams, closes the net.Conn, and cleans up resources.
 // This method should be called at most once, typically by Close().
 func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, debugData []byte, gracefulStreamTimeout time.Duration) {
+	c.log.Debug("initiateShutdown: checking shutdownChan.", logger.LogFields{})
 	// Check if already shutting down (using shutdownChan directly is better here for first check)
 	select {
 	case <-c.shutdownChan:
@@ -2730,6 +2733,7 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 			"remote_addr":               c.remoteAddrStr,
 		})
 
+	c.log.Debug("initiateShutdown: Sending GOAWAY.", logger.LogFields{"errCode": errCode, "debugData": debugData})
 	// 1. Send GOAWAY frame. This must happen BEFORE closing shutdownChan,
 	//    as sendGoAway itself checks shutdownChan.
 	//    sendGoAway handles its own goAwaySent idempotency.
@@ -2835,7 +2839,7 @@ func (c *Connection) initiateShutdown(lastStreamID uint32, errCode ErrorCode, de
 	}
 
 	// 7. Close the underlying network connection. This happens AFTER writer is done.
-	c.log.Debug("Closing network connection.", logger.LogFields{"remote_addr": c.remoteAddrStr})
+	c.log.Debug("Closing network connection..", logger.LogFields{"remote_addr": c.remoteAddrStr})
 	if errNetClose := c.netConn.Close(); errNetClose != nil {
 		c.log.Warn("Error closing network connection.", logger.LogFields{"error": errNetClose.Error(), "remote_addr": c.remoteAddrStr})
 		c.streamsMu.Lock()

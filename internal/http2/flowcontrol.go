@@ -306,7 +306,6 @@ func (fcw *FlowControlWindow) UpdateInitialWindowSize(newInitialSize uint32) err
 		}
 		return fmt.Errorf("flow control window (conn: %v, stream: %d) is closed", fcw.isConnection, fcw.streamID)
 	}
-
 	// newInitialSize itself should be validated against MaxWindowSize by SETTINGS processing.
 	// Assuming newInitialSize <= MaxWindowSize.
 	if newInitialSize > MaxWindowSize { // Values from SETTINGS_INITIAL_WINDOW_SIZE

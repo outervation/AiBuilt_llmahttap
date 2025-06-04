@@ -12,6 +12,8 @@ import (
 	"os/signal"     // Added for signal handling
 	"path/filepath" // Added for filepath.Abs
 	"strings"       // Added for strings.Join
+
+	"runtime/debug" // For stack trace in panic recovery
 	"sync"
 	"syscall" // Added for signal types
 	"time"
@@ -287,12 +289,9 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 	remoteAddr := tcpConn.RemoteAddr().String()
 	s.log.Debug("Accepted new TCP connection", logger.LogFields{"remote_addr": remoteAddr})
 
-	// Set TCP_NODELAY to disable Nagle's algorithm for this connection.
-	// This helps ensure small frames (like SETTINGS) are sent promptly.
 	if tcpCon, ok := tcpConn.(*net.TCPConn); ok {
 		if err := tcpCon.SetNoDelay(true); err != nil {
 			s.log.Warn("Failed to set TCP_NODELAY on connection", logger.LogFields{"remote_addr": remoteAddr, "error": err.Error()})
-			// Continue anyway, but this might impact handshake timing.
 		} else {
 			s.log.Debug("Successfully set TCP_NODELAY on connection", logger.LogFields{"remote_addr": remoteAddr})
 		}
@@ -301,12 +300,8 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 	}
 
 	var srvSettingsOverride map[http2.SettingID]uint32
-	if s.cfg != nil && s.cfg.Server != nil {
-		// Example: srvSettingsOverride = s.cfg.Server.Http2Settings (if defined)
-		// For now, this remains nil, relying on defaults in http2.NewConnection.
-	}
+	// srvSettingsOverride = s.cfg.Server.Http2Settings // Example
 
-	// The dispatcherFunc uses s.dispatchRequest which correctly handles type assertions.
 	dispatcherFunc := s.dispatchRequest
 
 	h2conn := newHTTP2Connection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, nil /*initialPeerSettingsForTest*/, dispatcherFunc)
@@ -317,65 +312,63 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 		return
 	}
 
+	// Add to active connections map
 	s.mu.Lock()
 	s.activeConns[h2conn] = struct{}{}
 	s.mu.Unlock()
 
+	var connErr error // To capture error from handshake or serve, or panic
+
 	defer func() {
+		// This defer runs regardless of panic or normal return.
+		// It's crucial for cleaning up s.activeConns and ensuring h2conn.Close is called.
 		s.mu.Lock()
 		delete(s.activeConns, h2conn)
 		s.mu.Unlock()
-		// tcpConn.Close() // http2.Connection.Close() should handle closing the underlying net.Conn
-		s.log.Debug("Closed HTTP/2 connection and underlying TCP connection", logger.LogFields{"remote_addr": remoteAddr})
+
+		if r := recover(); r != nil {
+			s.log.Error("Panic in HTTP/2 connection handling (handleTCPConnection)", logger.LogFields{"remote_addr": remoteAddr, "panic": r, "stack": string(debug.Stack())})
+			// If panic occurred, ensure 'connErr' reflects this for h2conn.Close()
+			if connErr == nil { // If no specific error was set before panic (e.g. panic in Handshake/Serve itself)
+				connErr = fmt.Errorf("panic recovered in handleTCPConnection: %v", r)
+			}
+		}
+
+		// Now, connErr contains the error from Handshake, Serve, or a panic.
+		// Close the h2conn with this definitive error.
+		h2conn.Close(connErr) // This call is now guaranteed.
+		s.log.Debug("Finished handleTCPConnection (defer completed, h2conn.Close called)", logger.LogFields{"remote_addr": remoteAddr, "final_error_for_close": connErr})
 	}()
 
-	// Perform the server-side HTTP/2 handshake.
-	if err := h2conn.ServerHandshake(); err != nil {
-		s.log.Error("HTTP/2 server handshake failed", logger.LogFields{"remote_addr": remoteAddr, "error": err.Error()})
-		// Close will also remove from activeConns in its defer, but good to ensure it's called
-		// with the error from handshake.
-		h2conn.Close(err) // This will trigger the defer in this function to remove from activeConns
+	connErr = h2conn.ServerHandshake()
+	if connErr != nil {
+		s.log.Error("HTTP/2 server handshake failed", logger.LogFields{"remote_addr": remoteAddr, "error": connErr.Error()})
+		// connErr is already set. Defer will call h2conn.Close(connErr).
 		return
 	}
 
-	// The h2conn.Serve() method is blocking and handles the frame loop.
-	// It will return when the connection is closed or an unrecoverable error occurs.
-	// The h2conn.Close() method is idempotent and handles cleanup.
-	// The context passed to Serve can be used for cancellation signals if needed by Serve's internals.
-	err := h2conn.Serve(context.Background()) // Or pass a more specific context like s.ctx
-	if err != nil {
-		// Check for common "expected" errors that don't need to be logged as "Error" level.
-		isExpectedError := errors.Is(err, net.ErrClosed) || // Connection closed by our side
-			errors.Is(err, io.EOF) || // Peer closed connection cleanly
-			(err == nil) // Graceful GOAWAY scenario
+	// Handshake successful
+	s.log.Info("HTTP/2 server handshake successful. Starting Serve loop.", logger.LogFields{"remote_addr": remoteAddr})
+	connErr = h2conn.Serve(context.Background()) // Or pass a more specific context like s.ctx
 
-		if connErr, ok := err.(*http2.ConnectionError); ok {
-			if connErr.Code == http2.ErrCodeNoError || connErr.Code == http2.ErrCodeCancel {
+	// Log error from Serve if any
+	if connErr != nil {
+		isExpectedError := errors.Is(connErr, net.ErrClosed) || // Connection closed by our side
+			errors.Is(connErr, io.EOF) // Peer closed connection cleanly
+
+		if http2ConnErr, ok := connErr.(*http2.ConnectionError); ok {
+			if http2ConnErr.Code == http2.ErrCodeNoError || http2ConnErr.Code == http2.ErrCodeCancel {
 				isExpectedError = true
 			}
 		}
 
 		if !isExpectedError {
-			s.log.Error("HTTP/2 connection Serve() returned an error", logger.LogFields{"remote_addr": remoteAddr, "error": err.Error()})
+			s.log.Error("HTTP/2 connection Serve() returned an error", logger.LogFields{"remote_addr": remoteAddr, "error": connErr.Error()})
 		} else {
-			s.log.Debug("HTTP/2 connection Serve() exited", logger.LogFields{"remote_addr": remoteAddr, "reason": err})
+			s.log.Debug("HTTP/2 connection Serve() exited", logger.LogFields{"remote_addr": remoteAddr, "reason": connErr})
 		}
 	}
-
-	// If conn.Serve() returned io.EOF, it means the client closed the connection.
-	// This can happen immediately after sending a request that might result in an error response from our server (e.g., 405).
-	// If we proceed to close the h2conn immediately, our error response might not get a chance to be written
-	// if the handler was still processing or queueing it.
-	// Adding a small delay here is a pragmatic attempt to give in-flight handler responses a window to be queued
-	// before the connection's writer goroutine is fully shut down by h2conn.Close().
-	if errors.Is(err, io.EOF) {
-		s.log.Debug("handleTCPConnection: conn.Serve() returned io.EOF. Delaying before final h2conn.Close() to allow in-flight responses.",
-			logger.LogFields{"remote_addr": remoteAddr, "delay_ms": 50})
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	// Ensure connection is fully closed; Serve might return before Close is fully effective or if it wasn't called from within.
-	h2conn.Close(err) // Pass the error from Serve to Close.
+	// connErr (from Serve, or nil if successful) is set. Defer will call h2conn.Close(connErr).
 }
 
 // dispatchRequest is a helper method for the dispatcherFunc.
