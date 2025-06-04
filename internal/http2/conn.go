@@ -3222,23 +3222,10 @@ func (c *Connection) ServerHandshake() error {
 			"expected_preface_str": ClientPreface,
 		})
 
-		// Task Item 1: Send GOAWAY(PROTOCOL_ERROR) for invalid client preface
-		// Queue GOAWAY directly from ServerHandshake.
-		// lastProcessedStreamID will be 0 at this stage of handshake, which is correct for GOAWAY.
-		var currentLastProcessedStreamID uint32
-		c.streamsMu.RLock() // RLock for reading lastProcessedStreamID
-		currentLastProcessedStreamID = c.lastProcessedStreamID
-		c.streamsMu.RUnlock()
+		// The GOAWAY frame will be sent as part of the standard connection shutdown
+		// sequence triggered by the ConnectionError returned below.
 
-		// debugData for GOAWAY
-		debugMsg := "invalid client connection preface"
-
-		// c.sendGoAway is idempotent. It will queue the frame if not already sent.
-		// Errors from sendGoAway are logged by it; the primary error returned by ServerHandshake
-		// will drive the connection closure.
-		_ = c.sendGoAway(currentLastProcessedStreamID, ErrCodeProtocolError, []byte(debugMsg))
-
-		return NewConnectionError(ErrCodeProtocolError, debugMsg)
+		return NewConnectionError(ErrCodeProtocolError, "invalid client connection preface")
 	}
 	c.log.Debug("Client connection preface received and validated.", logger.LogFields{"remote_addr": c.remoteAddrStr})
 
