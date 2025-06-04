@@ -2438,7 +2438,132 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
 			t.Errorf("Expected log for connection closure in handleTCPConnection, not found. Logs: %s", serverLogs)
 		}
-	})
+	}) // This is the original line 2440 content, correctly indented
+	t.Run("HandshakeFailure_InvalidPreface_SendsGoAwayAndCloses", func(t *testing.T) {
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+
+		mockNetC := newMockConn("127.0.0.1:1234", "127.0.0.1:54321")
+
+		// a. Set up a mockNetConn to provide an invalid client connection preface.
+		invalidPrefaceBytes := []byte("THIS IS NOT THE CORRECT PREFACE*") // Must be != http2.ClientPreface
+		if bytes.Equal(invalidPrefaceBytes, []byte(http2.ClientPreface)) {
+			t.Fatal("Test setup error: invalidPrefaceBytes is the same as http2.ClientPreface")
+		}
+		mockNetC.SetReadBuffer(invalidPrefaceBytes)
+
+		// b. Ensure mockNetConn.autoEOF = true so the preface read fails predictably.
+		mockNetC.autoEOF = true
+
+		// c. Mock newHTTP2Connection to return a real http2.Connection instance that uses the mockNetConn.
+		originalServNewH2ConnFunc := newHTTP2Connection
+		defer func() { newHTTP2Connection = originalServNewH2ConnFunc }()
+
+		var createdH2Conn *http2.Connection
+		newHTTP2ConnectionCalled := false
+
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			newHTTP2ConnectionCalled = true
+			if nc != mockNetC {
+				t.Errorf("newHTTP2Connection called with wrong net.Conn. Expected mockNetC (%p), got %T (%p)", mockNetC, nc, nc)
+			}
+			noopDispatcher := func(sw http2.StreamWriter, r *http.Request) { /* No-op */ }
+			// originalNewHTTP2Connection_TestHandleTCP is the reference to the real http2.NewConnection factory function
+			// saved by setupHandleTCPConnectionMocks_Test()
+			realConn := originalNewHTTP2Connection_TestHandleTCP(mockNetC, lgLogger, isClientSide, srvSettingsOverride, initialPeerSettingsForTest, noopDispatcher)
+			createdH2Conn = realConn
+			return realConn
+		}
+
+		// d. Call s.handleTCPConnection(mockNetC).
+		handleDone := make(chan struct{})
+		go func() {
+			s.handleTCPConnection(mockNetC)
+			close(handleDone)
+		}()
+
+		select {
+		case <-handleDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("handleTCPConnection did not complete in time for invalid preface handshake failure. Logs:\n%s", logBuf.String())
+		}
+
+		if !newHTTP2ConnectionCalled {
+			t.Error("server.newHTTP2Connection (mocked) was not called as expected.")
+		}
+		if createdH2Conn == nil && newHTTP2ConnectionCalled {
+			t.Errorf("newHTTP2Connection was called, but the resulting http2.Connection (createdH2Conn) was nil. Check mock setup for originalNewHTTP2Connection_TestHandleTCP.")
+		}
+
+		if err := mockNetC.WaitCloseCalled(1 * time.Second); err != nil {
+			mockNetC.mu.Lock()
+			closeCalledFlag := mockNetC.closeCalled
+			isClosedChanClosed := false
+			select {
+			case <-mockNetC.closeCalledChan:
+				isClosedChanClosed = true
+			default:
+			}
+			mockNetC.mu.Unlock()
+			t.Fatalf("mockNetC.Close() was not called (or WaitCloseCalled timed out): %v. closeCalled flag: %v, closeCalledChan closed: %v. WriteBuffer (len %d):\n%x\nLogs:\n%s",
+				err, closeCalledFlag, isClosedChanClosed, len(mockNetC.GetWriteBuffer()), mockNetC.GetWriteBuffer(), logBuf.String())
+		}
+
+		writtenBytes := mockNetC.GetWriteBuffer()
+		if len(writtenBytes) == 0 {
+			t.Fatalf("No data written to mockNetC. Expected GOAWAY frame. Server Logs:\n%s", logBuf.String())
+		}
+
+		frameReader := bytes.NewReader(writtenBytes)
+		parsedFrame, errParse := http2.ReadFrame(frameReader)
+		if errParse != nil {
+			t.Fatalf("Failed to parse frame from mockNetC write buffer: %v. Buffer content (len %d):\n%x\nServer Logs:\n%s", errParse, len(writtenBytes), writtenBytes, logBuf.String())
+		}
+
+		goAwayFrame, ok := parsedFrame.(*http2.GoAwayFrame)
+		if !ok {
+			t.Fatalf("Expected a GOAWAY frame, but got type %T. Buffer content:\n%x\nServer Logs:\n%s", parsedFrame, writtenBytes, logBuf.String())
+		}
+
+		if goAwayFrame.LastStreamID != 0 {
+			t.Errorf("Expected GOAWAY LastStreamID to be 0, got %d", goAwayFrame.LastStreamID)
+		}
+		if goAwayFrame.ErrorCode != http2.ErrCodeProtocolError {
+			t.Errorf("Expected GOAWAY ErrorCode to be PROTOCOL_ERROR (%d), got %s (%d)", http2.ErrCodeProtocolError, goAwayFrame.ErrorCode.String(), goAwayFrame.ErrorCode)
+		}
+
+		expectedDebugMsgPart := "invalid client connection preface"
+		if !strings.Contains(string(goAwayFrame.AdditionalDebugData), expectedDebugMsgPart) {
+			t.Logf("Warning: GOAWAY AdditionalDebugData (%q) did not strictly contain '%s'. ErrorCode (%s) and LastStreamID (%d) are primary checks.",
+				string(goAwayFrame.AdditionalDebugData), expectedDebugMsgPart, goAwayFrame.ErrorCode, goAwayFrame.LastStreamID)
+		}
+
+		serverLogs := logBuf.String()
+		if !strings.Contains(serverLogs, "HTTP/2 server handshake failed") {
+			t.Errorf("Expected log for handshake failure (from server.go), not found. Logs: %s", serverLogs)
+		}
+		if !strings.Contains(serverLogs, expectedDebugMsgPart) {
+			t.Errorf("Expected log detail '%s' (from http2.Connection error), not found. Logs: %s", expectedDebugMsgPart, serverLogs)
+		}
+		expectedGoAwaySentLog := "Sending GOAWAY frame (from sendGoAway via initiateShutdown or direct call)"
+		if !strings.Contains(serverLogs, expectedGoAwaySentLog) {
+			t.Errorf("Expected log message from http2.Connection about sending GOAWAY ('%s'), not found. Logs: %s", expectedGoAwaySentLog, serverLogs)
+		}
+		if !strings.Contains(serverLogs, "Closed HTTP/2 connection and underlying TCP connection") {
+			t.Errorf("Expected log for connection closure (from server.go defer), not found. Logs: %s", serverLogs)
+		}
+
+		s.mu.RLock()
+		activeCount := len(s.activeConns)
+		s.mu.RUnlock()
+		if activeCount != 0 {
+			t.Errorf("Expected server.activeConns to be empty after handling connection with invalid preface, found %d", activeCount)
+		}
+	}) // This is the closing of the new t.Run, correctly indented.
 	t.Run("HandshakeFailure_InvalidPreface_SendsGoAwayAndCloses", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
