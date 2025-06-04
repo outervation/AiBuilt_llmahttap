@@ -760,7 +760,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 
 			// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
 			performHandshakeForTest(t, conn, mnc, nil) // from conn_test.go
-			mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
+			mnc.ResetWriteBuffer()                     // Clear handshake frames written by server to mnc
 
 			// Create stream using the real connection.
 			// Pass 0 for window sizes so newTestStream uses the connection's default/negotiated ones.

@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -261,12 +263,46 @@ func (mrd *mockRequestDispatcher) CalledCount() int {
 	return mrd.calledCount
 }
 
+func StartingPollingAndPrintingBuffer(buffer *bytes.Buffer) {
+	if buffer == nil {
+		fmt.Fprintln(os.Stderr, "Error: pollAndPrintBuffer received a nil buffer")
+		return
+	}
+
+	go func() {
+		const pollingRate = 50 * time.Millisecond // Hard-coded polling rate
+
+		for {
+			// Check if there's anything to read in the buffer.
+			// buffer.Len() gives the number of unread bytes.
+			if buffer.Len() > 0 {
+				// buffer.WriteTo reads all unread bytes from the buffer
+				// and writes them to the provided writer (os.Stdout).
+				// This also advances the buffer's internal read pointer,
+				// effectively "consuming" the data from the buffer's perspective.
+				_, err := buffer.WriteTo(os.Stdout)
+				if err != nil {
+					// Handle potential errors writing to stdout (e.g., pipe closed).
+					// For this example, we'll print to stderr and continue polling.
+					// In a real application, you might want more robust error handling
+					// or a way to stop the goroutine if stdout is permanently broken.
+					fmt.Fprintf(os.Stderr, "Error writing to stdout: %v\n", err)
+				}
+			}
+
+			// Wait for the next poll interval.
+			time.Sleep(pollingRate)
+		}
+	}()
+}
+
 func newTestConnection(t *testing.T, isClient bool, mockDispatcher *mockRequestDispatcher, initialPeerSettingsForTest map[SettingID]uint32) (*Connection, *mockNetConn) {
 	t.Helper()
 	mnc := newMockNetConn()
 	var writer bytes.Buffer // Capture log output
 	lg := logger.NewTestLogger(&writer)
-	// lg.SetLevel(logger.LevelDebug) // Uncomment for verbose debug output in writer
+	// Start writing connection logs to stdout
+	StartingPollingAndPrintingBuffer(&writer)
 
 	var dispatcherFunc RequestDispatcherFunc
 	if mockDispatcher != nil {
