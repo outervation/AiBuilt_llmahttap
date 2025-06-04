@@ -41,7 +41,7 @@ func TestStream_transitionStateOnSendEndStream(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1) // For teardown
 			stream := newTestStream(t, 1, conn, true, 0, 0)
 
@@ -169,7 +169,7 @@ func TestNewStream_SuccessfulInitialization(t *testing.T) {
 	const peerInitialWindowSize = uint32(54321)
 	const isInitiatedByPeer = true
 
-	conn, _ := newTestConnection(t, false, nil)
+	conn, _ := newTestConnection(t, false, nil, nil)
 	// Default priority values used by newTestStream
 	const expectedPrioWeight = uint8(16 - 1) // Normalized value for spec 16
 	const expectedPrioParentID = uint32(0)   // Corresponds to defaultParentID in newTestStream
@@ -308,7 +308,7 @@ func TestNewStream_PriorityAddFailure(t *testing.T) {
 	const peerInitialWindowSize = DefaultInitialWindowSize
 
 	// This setup will cause PriorityTree.AddStream to fail because streamID == prioParentID
-	conn, _ := newTestConnection(t, false, nil) // isClient = false
+	conn, _ := newTestConnection(t, false, nil, nil)
 	// conn.ourInitialWindowSize and conn.peerInitialWindowSize are set to defaults by newTestConnection
 	// if not specified, which is fine for this test.
 	// Logger, context, and priority tree are also initialized by newTestConnection.
@@ -387,7 +387,7 @@ func TestStream_setStateToClosed_CleansUpResources(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1) // For teardown stream.Close()
 
 			stream := newTestStream(t, testStreamID, conn, true, 0, 0)
@@ -807,8 +807,8 @@ func TestStream_WriteData(t *testing.T) {
 			expectedFinalEndStreamSent: false,
 			expectedDataFrames:         nil,
 			// FC is acquired before send attempt. If send fails, FC is NOT currently released by WriteData.
-			expectedStreamSendWindowAfter: 100 - 8, // 92
-			expectedConnSendWindowAfter:   200 - 8, // 192
+			expectedStreamSendWindowAfter: 100, // FC is rolled back on send error
+			expectedConnSendWindowAfter:   200, // FC is rolled back on send error
 		},
 	}
 
@@ -821,11 +821,30 @@ func TestStream_WriteData(t *testing.T) {
 			}
 
 			// Create a real connection using newTestConnection
-			conn, _ := newTestConnection(t, false, nil)
+			// Create a real connection using newTestConnection
+			var peerSettingsForTest map[SettingID]uint32
+			if effectiveCfgMaxFrameSize != DefaultMaxFrameSize || tc.initialStreamSendWindow != int64(DefaultInitialWindowSize) {
+				peerSettingsForTest = make(map[SettingID]uint32)
+				if effectiveCfgMaxFrameSize != DefaultMaxFrameSize {
+					peerSettingsForTest[SettingMaxFrameSize] = effectiveCfgMaxFrameSize
+				}
+				// The stream's send window is initialized from peer's SETTINGS_INITIAL_WINDOW_SIZE.
+				// tc.initialStreamSendWindow represents this desired initial send window for the stream.
+				// So, we set it as the peer's global initial window size for this test connection.
+				// Note: newTestStream also takes initialPeerWindow directly for the specific stream,
+				// but setting it on the connection ensures consistency if other streams were involved.
+				if tc.initialStreamSendWindow != int64(DefaultInitialWindowSize) {
+					peerSettingsForTest[SettingInitialWindowSize] = uint32(tc.initialStreamSendWindow)
+				}
+			}
+
+			conn, _ := newTestConnection(t, false, nil, peerSettingsForTest)
 			conn.writerChan = make(chan Frame, len(tc.dataToSend)/int(effectiveCfgMaxFrameSize)+2) // Buffer for all chunks + potential RST
-			conn.ourInitialWindowSize = DefaultInitialWindowSize                                   // Affects stream's receive window
-			conn.peerInitialWindowSize = uint32(tc.initialStreamSendWindow)                        // Sets stream's initial *send* window
-			conn.maxFrameSize = effectiveCfgMaxFrameSize                                           // Max frame size used by stream for chunking
+			// conn.ourInitialWindowSize = DefaultInitialWindowSize // Already set by newTestConnection's defaults
+			// conn.peerInitialWindowSize = uint32(tc.initialStreamSendWindow) // Now handled by peerSettingsForTest
+			// conn.maxFrameSize = effectiveCfgMaxFrameSize // This was incorrect; peerMaxFrameSize is what matters for sending.
+			// ourCurrentMaxFrameSize is for receiving.
+			// peerMaxFrameSize is set via peerSettingsForTest.
 
 			if conn.connFCManager == nil {
 				conn.connFCManager = NewConnectionFlowControlManager()
@@ -908,6 +927,11 @@ func TestStream_WriteData(t *testing.T) {
 			}
 
 			if n != tc.expectedN {
+
+				// Reset modified connection state to avoid interference between subtests
+				conn.peerMaxFrameSize = DefaultMaxFrameSize
+				conn.ourCurrentMaxFrameSize = DefaultMaxFrameSize // If any test modifies this too
+				// Reset other potentially modified fields on conn if necessary for other tests
 				t.Errorf("Expected n=%d, got n=%d", tc.expectedN, n)
 			}
 
@@ -1100,7 +1124,7 @@ func TestStream_WriteTrailers(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1) // Buffer for one HEADERS frame (trailers) or RST
 
 			if tc.connSendHeadersFrameError != nil {

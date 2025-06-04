@@ -17,7 +17,7 @@ import (
 
 func TestStream_IDAndContext(t *testing.T) {
 	t.Parallel()
-	conn, _ := newTestConnection(t, false, nil)
+	conn, _ := newTestConnection(t, false, nil, nil)
 	conn.writerChan = make(chan Frame, 1) // For RST_STREAM from Close()
 
 	streamID := uint32(5)
@@ -201,7 +201,7 @@ func TestStream_SendHeaders(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1) // Buffer for one HEADERS frame or RST
 
 			// Configure mockConnection for specific error simulation if needed for conn.sendHeadersFrame
@@ -306,7 +306,7 @@ func TestStream_setState_GeneralTransitions(t *testing.T) {
 		for _, targetState := range allStates {
 
 			t.Run(fmt.Sprintf("From%s_To%s", initialState, targetState), func(t *testing.T) {
-				conn, mnc := newTestConnection(t, false, nil) // mnc can be used if needed for debugging writes
+				conn, mnc := newTestConnection(t, false, nil, nil) // mnc can be used if needed for debugging writes
 				t.Cleanup(func() {
 					// Define a unique error for cleanup-initiated close for clarity in logs if needed
 					cleanupErr := fmt.Errorf("connection cleanup for sub-test From%s_To%s", initialState, targetState)

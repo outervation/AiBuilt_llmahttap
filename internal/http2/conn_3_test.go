@@ -21,7 +21,7 @@ import (
 )
 
 func TestServerHandshake_Failure_TimeoutWritingServerSettings(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_TimeoutWritingServerSettings")
 	// This defer needs to be careful if ServerHandshake itself calls conn.Close on timeout.
 	// Let test logic explicitly call conn.Close with the error from ServerHandshake if it returns one.
@@ -106,7 +106,7 @@ func TestServerHandshake_Failure_TimeoutWritingServerSettings(t *testing.T) {
 
 // Test for conn.Close being called during ServerHandshake, e.g. by external signal.
 func TestServerHandshake_ConnectionClosedExternally(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_ConnectionClosedExternally")
 	defer func() {
 		if conn != nil {
@@ -234,11 +234,11 @@ func TestFrameSizeExceeded_DATA(t *testing.T) {
 	t.Run("OnValidStream_Expect_RST_STREAM", func(t *testing.T) {
 		t.Parallel()
 		mockDispatcher := &mockRequestDispatcher{}
-		conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+		conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher, nil)
 		var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_DATA/OnValidStream")
 		defer func() { conn.Close(closeErr) }()
 
-		performHandshakeForTest(t, conn, mnc) // Server sends its SETTINGS_MAX_FRAME_SIZE
+		performHandshakeForTest(t, conn, mnc, nil)
 		mnc.ResetWriteBuffer()
 
 		serveErrChan := make(chan error, 1)
@@ -320,7 +320,7 @@ func TestFrameSizeExceeded_DATA(t *testing.T) {
 	// --- Subtest 2: Oversized DATA frame on stream 0 ---
 	t.Run("OnStream0_Expect_GOAWAY", func(t *testing.T) {
 		t.Parallel()
-		conn, mnc := newTestConnection(t, false, nil)
+		conn, mnc := newTestConnection(t, false, nil, nil)
 		var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_DATA/OnStream0")
 		// Defer conn.Close with a specific error variable that can be set to nil if test logic passes.
 		// This ensures GOAWAY from this Close uses the error from Serve if it occurs.
@@ -342,7 +342,7 @@ func TestFrameSizeExceeded_DATA(t *testing.T) {
 		// Initialize closeErr for the subtest body. It will be set to nil if logic passes.
 		closeErr = errors.New("test logic failure in: " + t.Name())
 
-		performHandshakeForTest(t, conn, mnc)
+		performHandshakeForTest(t, conn, mnc, nil)
 		mnc.ResetWriteBuffer()
 
 		serveErrChan := make(chan error, 1)
@@ -485,7 +485,7 @@ func TestFrameSizeExceeded_HEADERS(t *testing.T) {
 		hpackPayload = hpackPayload[:oversizedFrameLength]
 	}
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestFrameSizeExceeded_HEADERS")
 	// Defer a final conn.Close. The error used here will be updated if the test passes.
 	defer func() {
@@ -494,7 +494,7 @@ func TestFrameSizeExceeded_HEADERS(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc) // Server sends its SETTINGS_MAX_FRAME_SIZE
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -622,7 +622,7 @@ func TestInterleavedFramesDuringHeaderBlock(t *testing.T) {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+			conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name)
 			defer func() {
 				if conn != nil {
@@ -630,7 +630,7 @@ func TestInterleavedFramesDuringHeaderBlock(t *testing.T) {
 				}
 			}()
 
-			performHandshakeForTest(t, conn, mnc)
+			performHandshakeForTest(t, conn, mnc, nil)
 			mnc.ResetWriteBuffer()
 
 			serveErrChan := make(chan error, 1)
@@ -708,7 +708,7 @@ func TestInterleavedFramesDuringHeaderBlock(t *testing.T) {
 func TestRSTStreamOnIdleStream_ServeLoop(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestRSTStreamOnIdleStream_ServeLoop")
 	// Defer a final conn.Close. The error used here will be updated by test logic.
 	defer func() {
@@ -717,7 +717,7 @@ func TestRSTStreamOnIdleStream_ServeLoop(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -804,7 +804,7 @@ func TestHEADERSOnClientRSTStream_ServeLoop(t *testing.T) {
 	t.Parallel()
 
 	mockDispatcher := &mockRequestDispatcher{}
-	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher, nil)
 	var closeErr error = errors.New("test cleanup: TestHEADERSOnClientRSTStream_ServeLoop")
 	defer func() {
 		if conn != nil {
@@ -812,7 +812,7 @@ func TestHEADERSOnClientRSTStream_ServeLoop(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -949,7 +949,7 @@ func TestInterleavedPriorityFrameDuringHeaderBlock(t *testing.T) {
 		Weight:           10,
 	}
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInterleavedPriorityFrameDuringHeaderBlock")
 	defer func() {
 		if conn != nil {
@@ -957,7 +957,7 @@ func TestInterleavedPriorityFrameDuringHeaderBlock(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -1050,7 +1050,7 @@ func TestInterleavedUnknownFrameDuringHeaderBlock(t *testing.T) {
 		Payload:     []byte{0xDE, 0xAD, 0xBE, 0xEF},
 	}
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInterleavedUnknownFrameDuringHeaderBlock")
 	defer func() {
 		if conn != nil {
@@ -1058,7 +1058,7 @@ func TestInterleavedUnknownFrameDuringHeaderBlock(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)

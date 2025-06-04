@@ -240,8 +240,8 @@ func TestConnection_DispatchDataFrame(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()                                  // Subtests can run in parallel if they don't interfere
-			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			t.Parallel() // Subtests can run in parallel if they don't interfere
+			conn, mnc := newTestConnection(t, false, nil, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name)
 			defer func() {
 				if conn != nil {
@@ -812,7 +812,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			mockDispatcher := &mockRequestDispatcher{}
-			conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+			conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name) // Default close error
 			defer func() {
 				if conn != nil {
@@ -827,7 +827,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 				conn.settingsMu.Unlock()
 			}
 
-			performHandshakeForTest(t, conn, mnc) // Includes ServerHandshake
+			performHandshakeForTest(t, conn, mnc, nil) // Includes ServerHandshake
 			mnc.ResetWriteBuffer()                // Clear handshake frames
 
 			serveErrChan := make(chan error, 1)
@@ -1029,7 +1029,7 @@ func TestConnection_HeaderProcessingScenarios(t *testing.T) {
 }
 
 func TestConnection_HandlePingFrame_RequestSendsAck(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_HandlePingFrame_RequestSendsAck")
 	defer func() { conn.Close(closeErr) }()
 
@@ -1105,7 +1105,7 @@ func (mt *mockTimer) Stop() bool {
 }
 
 func TestConnection_HandlePingFrame_AckClearsOutstandingPing(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_HandlePingFrame_AckClearsOutstandingPing")
 	defer func() { conn.Close(closeErr) }()
 
@@ -1147,7 +1147,7 @@ func TestConnection_HandlePingFrame_AckClearsOutstandingPing(t *testing.T) {
 }
 
 func TestConnection_HandlePingFrame_Error_NonZeroStreamID(t *testing.T) {
-	conn, _ := newTestConnection(t, false, nil) // Server-side
+	conn, _ := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_HandlePingFrame_Error_NonZeroStreamID")
 	defer func() { conn.Close(closeErr) }()
 
@@ -1172,7 +1172,7 @@ func TestConnection_HandlePingFrame_Error_NonZeroStreamID(t *testing.T) {
 }
 
 func TestConnection_HandlePingFrame_Error_IncorrectLength(t *testing.T) {
-	conn, _ := newTestConnection(t, false, nil) // Server-side
+	conn, _ := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_HandlePingFrame_Error_IncorrectLength")
 	defer func() { conn.Close(closeErr) }()
 
@@ -1202,8 +1202,8 @@ func TestConnection_HandlePingFrame_UnsolicitedAck(t *testing.T) {
 	logBuf := new(bytes.Buffer)
 	lg := logger.NewTestLogger(logBuf)
 
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
-	conn.log = lg                                 // Use custom logger
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
+	conn.log = lg                                      // Use custom logger
 	var closeErr error = errors.New("test cleanup: TestConnection_HandlePingFrame_UnsolicitedAck")
 	defer func() { conn.Close(closeErr) }()
 

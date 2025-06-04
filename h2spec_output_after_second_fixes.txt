@@ -1,3 +1,4 @@
+*** NOTE: This is a snapshot and not live; live results are not available! Only after the entire refactoring process is complete will h2spec be run again.***
 Generic tests for HTTP/2 server
   1. Starting HTTP/2
       1: Sends a client connection preface    ✔ 1: Sends a client connection preface

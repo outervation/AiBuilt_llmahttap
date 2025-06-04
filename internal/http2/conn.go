@@ -162,7 +162,8 @@ func NewConnection(
 	lg *logger.Logger,
 	isClientSide bool,
 	srvSettingsOverride map[SettingID]uint32,
-	dispatcher RequestDispatcherFunc, // CHANGED to RequestDispatcherFunc
+	initialPeerSettingsForTest map[SettingID]uint32, // New parameter for testing
+	dispatcher RequestDispatcherFunc,
 ) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -186,8 +187,9 @@ func NewConnection(
 		activePings:   make(map[[8]byte]*time.Timer),
 		ourSettings:   make(map[SettingID]uint32),
 		// initialSettingsOnce is zero-valued correctly by default
-		initialSettingsWritten:       make(chan struct{}), // Initialize the new channel
-		peerSettings:                 make(map[SettingID]uint32),
+		initialSettingsWritten: make(chan struct{}), // Initialize the new channel
+
+		peerSettings:                 make(map[SettingID]uint32), // Initialize, then overwrite if needed
 		remoteAddrStr:                nc.RemoteAddr().String(),
 		dispatcher:                   dispatcher,                 // Store dispatcher func
 		peerReportedLastStreamID:     0xffffffff,                 // Initialize to max uint32, indicating no GOAWAY received yet or peer processes all streams
@@ -209,12 +211,41 @@ func NewConnection(
 	}
 
 	// Initialize default settings values for peer (will be updated upon receiving peer's SETTINGS frame)
-	conn.peerSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
-	conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush
-	conn.peerSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
-	conn.peerSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
-	conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff
-	conn.peerSettings[SettingMaxHeaderListSize] = 0xffffffff
+	if initialPeerSettingsForTest != nil {
+		// If specific peer settings are provided for testing, use them.
+		for id, val := range initialPeerSettingsForTest {
+			conn.peerSettings[id] = val
+		}
+		// Ensure all required peer settings have a value, falling back to defaults if not in initialPeerSettingsForTest
+		if _, ok := conn.peerSettings[SettingHeaderTableSize]; !ok {
+			conn.peerSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
+		}
+		if _, ok := conn.peerSettings[SettingEnablePush]; !ok {
+			// Client typically enables push from server if server supports it. Server peer (client) usually has push disabled.
+			// Default to server's expectation of client if not specified.
+			conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush // Peer (client) usually has push enabled from server by default
+		}
+		if _, ok := conn.peerSettings[SettingInitialWindowSize]; !ok {
+			conn.peerSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
+		}
+		if _, ok := conn.peerSettings[SettingMaxFrameSize]; !ok {
+			conn.peerSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
+		}
+		if _, ok := conn.peerSettings[SettingMaxConcurrentStreams]; !ok {
+			conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff // Default to effectively unlimited
+		}
+		if _, ok := conn.peerSettings[SettingMaxHeaderListSize]; !ok {
+			conn.peerSettings[SettingMaxHeaderListSize] = 0xffffffff // Default to effectively unlimited
+		}
+	} else {
+		// Standard default initialization if no test overrides are provided.
+		conn.peerSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize
+		conn.peerSettings[SettingEnablePush] = DefaultServerEnablePush // Peer (client) usually has push enabled from server by default
+		conn.peerSettings[SettingInitialWindowSize] = DefaultSettingsInitialWindowSize
+		conn.peerSettings[SettingMaxFrameSize] = DefaultSettingsMaxFrameSize
+		conn.peerSettings[SettingMaxConcurrentStreams] = 0xffffffff // Effectively unlimited
+		conn.peerSettings[SettingMaxHeaderListSize] = 0xffffffff    // Effectively unlimited
+	}
 
 	// Initialize our settings
 	conn.ourSettings[SettingHeaderTableSize] = DefaultSettingsHeaderTableSize

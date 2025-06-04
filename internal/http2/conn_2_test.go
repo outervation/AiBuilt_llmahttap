@@ -24,7 +24,7 @@ import (
 func TestInvalidFrameLength_PING(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_PING")
 	// Defer a final conn.Close. The error used here will be updated if the test passes.
 	defer func() {
@@ -33,7 +33,7 @@ func TestInvalidFrameLength_PING(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -111,7 +111,7 @@ func TestInvalidFrameLength_PING(t *testing.T) {
 func TestInvalidFrameLength_PRIORITY(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_PRIORITY")
 	// Defer a final conn.Close. The error used here will be updated if the test passes.
 	defer func() {
@@ -120,7 +120,7 @@ func TestInvalidFrameLength_PRIORITY(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -215,7 +215,7 @@ func TestInvalidFrameLength_PRIORITY(t *testing.T) {
 func TestInvalidFrameLength_RST_STREAM(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_RST_STREAM")
 	// Defer a final conn.Close. The error used here will be updated if the test passes.
 	defer func() {
@@ -224,7 +224,7 @@ func TestInvalidFrameLength_RST_STREAM(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -307,7 +307,7 @@ func TestInvalidFrameLength_RST_STREAM(t *testing.T) {
 func TestInvalidFrameLength_WINDOW_UPDATE(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestInvalidFrameLength_WINDOW_UPDATE")
 	// Defer a final conn.Close. The error used here will be updated if the test passes.
 	defer func() {
@@ -316,7 +316,7 @@ func TestInvalidFrameLength_WINDOW_UPDATE(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -401,7 +401,7 @@ func TestInvalidFrameLength_WINDOW_UPDATE(t *testing.T) {
 func TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength")
 	defer func() {
 		if conn != nil {
@@ -409,7 +409,7 @@ func TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength(t *testin
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -485,7 +485,7 @@ func TestMalformedContentLength_HEADERS_EndStream_NonZeroContentLength(t *testin
 func TestMalformedContentLength_DATA_DoesNotMatch_EndStream(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestMalformedContentLength_DATA_DoesNotMatch_EndStream")
 	defer func() {
 		if conn != nil {
@@ -493,7 +493,7 @@ func TestMalformedContentLength_DATA_DoesNotMatch_EndStream(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -591,7 +591,7 @@ func TestMalformedContentLength_DATA_DoesNotMatch_EndStream(t *testing.T) {
 func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
 	t.Parallel()
 
-	conn, mnc := newTestConnection(t, false /*isClient*/, nil)
+	conn, mnc := newTestConnection(t, false /*isClient*/, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestStreamIDNumericallySmaller_ServeLoop")
 	// Defer a final conn.Close. The error used here will be updated by test logic.
 	defer func() {
@@ -600,7 +600,7 @@ func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -639,9 +639,9 @@ func TestStreamIDNumericallySmaller_ServeLoop(t *testing.T) {
 	// This is a bit heavy, but ensures reliable synchronization.
 	_ = conn.Close(errors.New("re-initializing conn for dispatcher")) // Close previous conn
 	mockDisp := &mockRequestDispatcher{}
-	conn, mnc = newTestConnection(t, false, mockDisp) // Re-assign conn and mnc
+	conn, mnc = newTestConnection(t, false, mockDisp, nil) // Re-assign conn and mnc
 	// Re-perform handshake and start Serve for the new connection instance
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 	serveErrChan = make(chan error, 1) // Re-make channel
 	go func() {
@@ -736,7 +736,7 @@ func TestPriorityOnHalfClosedRemoteStream(t *testing.T) {
 	t.Parallel()
 
 	mockDispatcher := &mockRequestDispatcher{}
-	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher, nil)
 	var closeErr error = errors.New("test cleanup: TestPriorityOnHalfClosedRemoteStream")
 	defer func() {
 		if conn != nil {
@@ -744,7 +744,7 @@ func TestPriorityOnHalfClosedRemoteStream(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -854,7 +854,7 @@ func TestWindowUpdateOnHalfClosedRemoteStream(t *testing.T) {
 	t.Parallel()
 
 	mockDispatcher := &mockRequestDispatcher{}
-	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher)
+	conn, mnc := newTestConnection(t, false /*isClient*/, mockDispatcher, nil)
 	var closeErr error = errors.New("test cleanup: TestWindowUpdateOnHalfClosedRemoteStream")
 	defer func() {
 		if conn != nil {
@@ -862,7 +862,7 @@ func TestWindowUpdateOnHalfClosedRemoteStream(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc) // This sets conn.peerInitialWindowSize from client's default SETTINGS
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)

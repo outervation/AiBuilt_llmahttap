@@ -19,11 +19,11 @@ import (
 )
 
 func TestServerHandshake_Success(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Success")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc) // This calls ServerHandshake() and does basic verification
+	performHandshakeForTest(t, conn, mnc, nil) // This calls ServerHandshake() and does basic verification
 
 	// Additional assertions for successful handshake:
 	// 1. ServerHandshake() returned nil (implicit in performHandshakeForTest not failing)
@@ -41,7 +41,7 @@ func TestServerHandshake_Success(t *testing.T) {
 }
 
 func TestServerHandshake_Failure_InvalidPrefaceContent(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_InvalidPrefaceContent")
 	// The defer will be a safety net. Test logic will explicitly call conn.Close().
 	// closeErr will be updated by the test logic to reflect the outcome.
@@ -129,11 +129,11 @@ func TestServerHandshake_Failure_InvalidPrefaceContent(t *testing.T) {
 }
 
 func TestHandleSettingsFrame_ClientAckToServerSettings(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestHandleSettingsFrame_ClientAckToServerSettings")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc) // This handles initial SETTINGS from both sides, including server sending its initial SETTINGS.
+	performHandshakeForTest(t, conn, mnc, nil) // This handles initial SETTINGS from both sides, including server sending its initial SETTINGS.
 
 	// Simulate client sending ACK to server's initial SETTINGS.
 	// The server's initial SETTINGS frame was sent during performHandshakeForTest.
@@ -169,7 +169,7 @@ func TestConnection_Settings_AckTimeout(t *testing.T) {
 	SettingsAckTimeoutDuration = 50 * time.Millisecond // Short for test
 	defer func() { SettingsAckTimeoutDuration = originalTimeout }()
 
-	conn, _ := newTestConnection(t, false, nil) // Server-side
+	conn, _ := newTestConnection(t, false, nil, nil)
 	// No explicit closeErr = nil here because the test expects conn.Close to be called by timeout.
 	// The defer conn.Close is a safety net.
 	var closeErr error = errors.New("test cleanup: TestConnection_Settings_AckTimeout")
@@ -211,11 +211,11 @@ func TestConnection_Settings_AckTimeout(t *testing.T) {
 }
 
 func TestConnection_GoAway_ServerInitiated_NoError(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_GoAway_ServerInitiated_NoError")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer() // Clear handshake frames
 
 	lastStreamID := uint32(5)
@@ -259,11 +259,11 @@ func TestConnection_GoAway_ServerInitiated_NoError(t *testing.T) {
 }
 
 func TestConnection_GoAway_ReceivedFromPeer_NoError(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_GoAway_ReceivedFromPeer_NoError")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer() // Clear handshake frames
 
 	// Start server's main read loop in a goroutine so it can process the GOAWAY
@@ -349,11 +349,11 @@ func TestConnection_GoAway_ReceivedFromPeer_NoError(t *testing.T) {
 }
 
 func TestConnection_Serve_DispatchPing(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_Serve_DispatchPing")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer() // Clear handshake frames
 
 	serveErrChan := make(chan error, 1)
@@ -407,11 +407,11 @@ func TestConnection_Serve_DispatchPing(t *testing.T) {
 }
 
 func TestConnection_SendGoAway_Idempotency(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_SendGoAway_Idempotency")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer() // Clear handshake frames
 
 	lastStreamID1 := uint32(5)
@@ -483,11 +483,11 @@ func TestConnection_SendGoAway_Idempotency(t *testing.T) {
 }
 
 func TestConnection_HandleGoAwayFrame_MultipleValid(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_HandleGoAwayFrame_MultipleValid")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	// Dispatch first GOAWAY from peer
@@ -556,7 +556,7 @@ func TestConnection_HandleGoAwayFrame_MultipleValid(t *testing.T) {
 }
 
 func TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID")
 	// Defer Close needs to be careful here. We call it explicitly at the end.
 	// Let defer only close if test panics or fails early.
@@ -572,7 +572,7 @@ func TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID(t *test
 		// If test passed but closeErr is not nil (from an explicit conn.Close call), it means conn.Close was already called successfully.
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	// Dispatch first GOAWAY from peer
@@ -710,14 +710,14 @@ func TestConnection_HandleGoAwayFrame_MultipleInvalid_HigherLastStreamID(t *test
 }
 
 func TestConnection_Serve_DispatchRSTStream(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	mockDispatcher := &mockRequestDispatcher{}
 	conn.dispatcher = mockDispatcher.Dispatch // Re-assign dispatcher after NewConnection
 
 	var closeErr error = errors.New("test cleanup: TestConnection_Serve_DispatchRSTStream")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 
 	// Create a stream
 	streamID := uint32(1) // Client-initiated streams are odd
@@ -765,7 +765,7 @@ func TestConnection_Serve_ConnectionErrorOnDispatch(t *testing.T) {
 	mnc := newMockNetConn()
 	lg := logger.NewDiscardLogger() // Use discard logger
 	mockDispatcher := &mockRequestDispatcher{}
-	conn := NewConnection(mnc, lg, false /*isClient*/, nil, mockDispatcher.Dispatch)
+	conn := NewConnection(mnc, lg, false /*isClient*/, nil, nil, mockDispatcher.Dispatch)
 	if conn == nil {
 		t.Fatal("NewConnection returned nil")
 	}
@@ -781,7 +781,7 @@ func TestConnection_Serve_ConnectionErrorOnDispatch(t *testing.T) {
 		}
 	}()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -851,12 +851,12 @@ func TestConnection_Serve_ConnectionErrorOnDispatch(t *testing.T) {
 }
 
 func TestConnection_Close_Graceful(t *testing.T) {
-	var gracefulTestCloseErr error                // Declare gracefulTestCloseErr
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	var gracefulTestCloseErr error                     // Declare gracefulTestCloseErr
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	// No defer conn.Close here as we are testing it.
 	// It should eventually close the mock connection.
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	// Start Serve and Writer loops
@@ -934,9 +934,9 @@ func TestConnection_Close_Graceful(t *testing.T) {
 }
 
 func TestConnection_Close_WithError(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -1012,10 +1012,10 @@ func TestConnection_Close_WithError(t *testing.T) {
 }
 
 func TestConnection_Serve_PanicRecovery(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	// Do not defer conn.Close() as we want to check the error it returns/state after panic.
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	// Setup readHook to panic
@@ -1120,11 +1120,11 @@ func TestConnection_Serve_PanicRecovery(t *testing.T) {
 }
 
 func TestConnection_DispatchWindowUpdateFrame_ConnLevel_ValidIncrement(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_DispatchWindowUpdateFrame_ConnLevel_ValidIncrement")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer() // Clear handshake frames
 
 	serveErrChan := make(chan error, 1)
@@ -1168,11 +1168,11 @@ func TestConnection_DispatchWindowUpdateFrame_ConnLevel_ValidIncrement(t *testin
 }
 
 func TestConnection_DispatchWindowUpdateFrame_ConnLevel_ZeroIncrement(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_DispatchWindowUpdateFrame_ConnLevel_ZeroIncrement")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)
@@ -1243,11 +1243,11 @@ func TestConnection_DispatchWindowUpdateFrame_ConnLevel_ZeroIncrement(t *testing
 }
 
 func TestConnection_DispatchWindowUpdateFrame_ConnLevel_Overflow(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil) // Server-side
+	conn, mnc := newTestConnection(t, false, nil, nil) // Server-side
 	var closeErr error = errors.New("test cleanup: TestConnection_DispatchWindowUpdateFrame_ConnLevel_Overflow")
 	defer func() { conn.Close(closeErr) }()
 
-	performHandshakeForTest(t, conn, mnc)
+	performHandshakeForTest(t, conn, mnc, nil)
 	mnc.ResetWriteBuffer()
 
 	serveErrChan := make(chan error, 1)

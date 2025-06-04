@@ -746,7 +746,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			// The dispatcher set on the connection (conn.dispatcher) will be used by newStream
 			// if no specific dispatcher is given to a stream later.
 			// However, processRequestHeadersAndDispatch takes a dispatcher func directly.
-			conn, mnc := newTestConnection(t, false /*isClient*/, mrd)
+			conn, mnc := newTestConnection(t, false /*isClient*/, mrd, nil)
 
 			// Crucial: Ensure conn.cfgRemoteAddrStr is set for http.Request.RemoteAddr
 			// newTestConnection does not explicitly set this. We set it on the mockNetConn's remoteAddr.
@@ -759,7 +759,7 @@ func TestStream_processRequestHeadersAndDispatch(t *testing.T) {
 			conn.maxFrameSize = DefaultMaxFrameSize        // Ensure this is set for tests.
 
 			// Perform handshake. This is vital for settings exchange (e.g., initial window sizes).
-			performHandshakeForTest(t, conn, mnc) // from conn_test.go
+			performHandshakeForTest(t, conn, mnc, nil) // from conn_test.go
 			mnc.ResetWriteBuffer()                // Clear handshake frames written by server to mnc
 
 			// Create stream using the real connection.

@@ -73,7 +73,7 @@ func TestConnection_DispatchPriorityFrame(t *testing.T) {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			conn, mnc := newTestConnection(t, false, nil, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name)
 			defer func() { conn.Close(closeErr) }() // Ensure writerLoop and other resources are cleaned up
 
@@ -243,7 +243,7 @@ func TestConnection_DispatchRSTStreamFrame(t *testing.T) {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, mnc := newTestConnection(t, false, nil)
+			conn, mnc := newTestConnection(t, false, nil, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name)
 			// Defer Close needs to be conditional or handled carefully if the test itself calls conn.Close.
 			// Let's assume for these direct dispatch tests, the test is responsible for final conn.Close if checking GOAWAY.
@@ -635,7 +635,7 @@ func TestConnection_HandleSettingsFrame(t *testing.T) {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn, mnc := newTestConnection(t, false, nil) // Server-side
+			conn, mnc := newTestConnection(t, false, nil, nil)
 			var closeErr error = errors.New("test cleanup: " + tc.name)
 			defer func() {
 				if conn != nil {
@@ -760,7 +760,7 @@ func TestConnection_HandleSettingsFrame(t *testing.T) {
 }
 
 func TestServerHandshake_Failure_ClientDisconnectsBeforePreface(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_ClientDisconnectsBeforePreface")
 	defer func() { conn.Close(closeErr) }()
 
@@ -791,7 +791,7 @@ func TestServerHandshake_Failure_ClientDisconnectsBeforePreface(t *testing.T) {
 }
 
 func TestServerHandshake_Failure_ClientSendsIncompletePreface(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_ClientSendsIncompletePreface")
 	defer func() { conn.Close(closeErr) }()
 
@@ -819,7 +819,7 @@ func TestServerHandshake_Failure_ClientSendsIncompletePreface(t *testing.T) {
 }
 
 func TestServerHandshake_Failure_ClientSendsWrongFrameAfterPreface(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_ClientSendsWrongFrameAfterPreface")
 	defer func() { conn.Close(closeErr) }()
 
@@ -851,7 +851,7 @@ func TestServerHandshake_Failure_ClientSendsWrongFrameAfterPreface(t *testing.T)
 }
 
 func TestServerHandshake_Failure_ClientInitialSettingsHasAck(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_ClientInitialSettingsHasAck")
 	defer func() { conn.Close(closeErr) }()
 
@@ -882,7 +882,7 @@ func TestServerHandshake_Failure_ClientInitialSettingsHasAck(t *testing.T) {
 }
 
 func TestServerHandshake_Failure_TimeoutReadingClientSettings(t *testing.T) {
-	conn, mnc := newTestConnection(t, false, nil)
+	conn, mnc := newTestConnection(t, false, nil, nil)
 	var closeErr error = errors.New("test cleanup: TestServerHandshake_Failure_TimeoutReadingClientSettings")
 	// Defer a final conn.Close. The error used here will be updated by test logic.
 	defer func() {

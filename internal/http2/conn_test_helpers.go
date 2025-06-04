@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -42,7 +41,7 @@ func newMockNetConn() *mockNetConn {
 		localAddr:         &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
 		remoteAddr:        &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321},
 		closeErr:          errors.New("use of closed network connection"),
-		readDataAvailable: make(chan struct{}, 1), // Buffered to allow Feed before first Read
+		readDataAvailable: make(chan struct{}, 1), // Buffered by 1
 		readClosed:        make(chan struct{}),
 	}
 }
@@ -262,25 +261,34 @@ func (mrd *mockRequestDispatcher) CalledCount() int {
 	return mrd.calledCount
 }
 
-func newTestConnection(t *testing.T, isClient bool, mockDispatcher *mockRequestDispatcher) (*Connection, *mockNetConn) {
+func newTestConnection(t *testing.T, isClient bool, mockDispatcher *mockRequestDispatcher, initialPeerSettingsForTest map[SettingID]uint32) (*Connection, *mockNetConn) {
 	t.Helper()
 	mnc := newMockNetConn()
-	lg := logger.NewTestLogger(os.Stdout)
-	// lg.SetLevel(logger.LevelDebug) // Uncomment for verbose debug output
+	var writer bytes.Buffer // Capture log output
+	lg := logger.NewTestLogger(&writer)
+	// lg.SetLevel(logger.LevelDebug) // Uncomment for verbose debug output in writer
 
 	var dispatcherFunc RequestDispatcherFunc
 	if mockDispatcher != nil {
 		dispatcherFunc = mockDispatcher.Dispatch
 	} else {
-		dispatcherFunc = func(sw StreamWriter, req *http.Request) { /* No-op */ }
+		// Provide a default no-op dispatcher if nil is passed
+		dispatcherFunc = func(sw StreamWriter, req *http.Request) {
+			// Default no-op dispatcher
+			// t.Logf("newTestConnection: Default no-op dispatcher called for stream %d, req %s %s", sw.ID(), req.Method, req.URL.Path)
+			// Using logger instead of t.Logf for safety if called from non-test goroutine context
+			lg.Debug("newTestConnection: Default no-op dispatcher called", logger.LogFields{"stream_id": sw.ID(), "method": req.Method, "path": req.URL.Path})
+		}
 	}
 
-	conn := NewConnection(mnc, lg, isClient, nil, dispatcherFunc)
+	// Pass initialPeerSettingsForTest to NewConnection
+	conn := NewConnection(mnc, lg, isClient, nil, initialPeerSettingsForTest, dispatcherFunc)
 	if conn == nil {
 		t.Fatal("NewConnection returned nil")
 	}
-	// Give writerLoop a chance to start, especially important for handshake.
-	time.Sleep(100 * time.Millisecond)
+	// Give writerLoop a chance to start and process initial settings.
+	time.Sleep(100 * time.Millisecond) // Increased slightly to ensure settings are processed
+	// t.Logf("newTestConnection log output:\n%s", writer.String()) // Log captured output if debugging tests
 	return conn, mnc
 }
 
@@ -422,13 +430,40 @@ func getErrorCode(f Frame) interface{} {
 }
 
 // performHandshakeForTest performs the client-side actions and server-side handshake for tests.
-func performHandshakeForTest(t *testing.T, conn *Connection, mnc *mockNetConn) {
+func performHandshakeForTest(t *testing.T, conn *Connection, mnc *mockNetConn, clientInitialSettingsForHandshake map[SettingID]uint32) {
 	t.Helper()
 	// Client sends preface
 	mnc.FeedReadBuffer([]byte(ClientPreface))
 
 	// Client sends its initial SETTINGS
-	clientSettings := []Setting{{ID: SettingInitialWindowSize, Value: DefaultSettingsInitialWindowSize}}
+	// Use settings provided by the test for the handshake, otherwise default.
+	var clientSettings []Setting
+	if clientInitialSettingsForHandshake != nil {
+		if val, ok := clientInitialSettingsForHandshake[SettingInitialWindowSize]; ok {
+			clientSettings = append(clientSettings, Setting{ID: SettingInitialWindowSize, Value: val})
+		}
+		// TODO: Add other settings from clientInitialSettingsForHandshake if needed for other tests.
+		// For now, if IWS is not in the map, we won't add a default IWS from here,
+		// assuming the test setup or default peer settings in Connection handle the baseline.
+		// For this specific test, clientInitialSettingsForHandshake will contain IWS.
+	}
+
+	if len(clientSettings) == 0 { // Fallback if no specific settings were provided for handshake via map, or if IWS was not in the map explicitly
+		// Check if SettingInitialWindowSize needs a default if not in map
+		// The original code unconditionally sent DefaultSettingsInitialWindowSize.
+		// If clientInitialSettingsForHandshake is nil OR if it's non-nil but doesn't contain IWS, this ensures IWS is still sent.
+		foundIWS := false
+		for _, s := range clientSettings {
+			if s.ID == SettingInitialWindowSize {
+				foundIWS = true
+				break
+			}
+		}
+		if !foundIWS {
+			clientSettings = append(clientSettings, Setting{ID: SettingInitialWindowSize, Value: DefaultSettingsInitialWindowSize})
+		}
+	}
+
 	clientSettingsFrame := &SettingsFrame{
 		FrameHeader: FrameHeader{Type: FrameSettings, StreamID: 0, Length: uint32(len(clientSettings) * 6)},
 		Settings:    clientSettings,

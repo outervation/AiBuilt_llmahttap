@@ -29,13 +29,21 @@ func newTestStream(t *testing.T, id uint32, conn *Connection, isInitiatedByPeer 
 	// initialOurWindow: desired receive window for this stream (how much peer can send us).
 	// initialPeerWindow: desired send window for this stream (how much we can send peer).
 
-	// Create stream with dummy priority info for now.
-	// newStream will now correctly initialize StreamFlowControlManager using these two distinct window sizes.
-	s, err := newStream(conn, id, initialOurWindow, initialPeerWindow, 15, 0, false, isInitiatedByPeer) // Default prioWeight = 15 (effective 16)
+	// Default priority values for newStream
+	const defaultPrioWeight = uint8(16 - 1) // Normalized for spec default 16
+	const defaultPrioParentID = uint32(0)
+	const defaultPrioExclusive = false
+
+	s, err := newStream(conn, id, initialOurWindow, initialPeerWindow, defaultPrioWeight, defaultPrioParentID, defaultPrioExclusive, isInitiatedByPeer)
 	require.NoError(t, err)
 
-	// The t.Logf in the test file stream_4_test.go will verify the resulting fcManager windows.
-	// No need for direct manipulation of s.fcManager here anymore.
+	// The stream's fcManager is initialized by newStream using initialOurWindow and initialPeerWindow.
+	// initialOurWindow -> s.fcManager.receiveWindow.effectiveInitialReceiveWindowSize and s.fcManager.currentReceiveWindowSize
+	// initialPeerWindow -> s.fcManager.sendWindow.initialWindowSize and s.fcManager.sendWindow.available
+
+	// Verify initialization if needed (example, can be removed if tests cover this elsewhere)
+	// require.Equal(t, int64(initialOurWindow), s.fcManager.GetStreamReceiveAvailable(), "Stream receive window mismatch after newStream")
+	// require.Equal(t, int64(initialPeerWindow), s.fcManager.GetStreamSendAvailable(), "Stream send window mismatch after newStream")
 
 	return s
 }

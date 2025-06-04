@@ -24,7 +24,7 @@ import (
 func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 	t.Parallel()
 	// Use newTestConnection from conn_test.go to get a real *Connection
-	conn, _ := newTestConnection(t, false /*isClient*/, nil /*mockDispatcher*/)
+	conn, _ := newTestConnection(t, false /*isClient*/, nil /*mockDispatcher*/, nil)
 	conn.writerChan = make(chan Frame, 1) // Buffer 1 for the RST_STREAM
 
 	stream := newTestStream(t, 1, conn, true /*isInitiatedByPeer*/, 0, 0)
@@ -118,7 +118,7 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 	// This specific test needs a new stream instance as the previous one is closed.
 
 	t.Run("WithNilError", func(t *testing.T) {
-		conn2, _ := newTestConnection(t, false, nil)
+		conn2, _ := newTestConnection(t, false, nil, nil)
 		conn2.writerChan = make(chan Frame, 1)
 		stream2 := newTestStream(t, 2, conn2, true, 0, 0)
 		stream2.mu.Lock()
@@ -150,7 +150,7 @@ func TestStream_Close_SendsRSTAndCleansUp(t *testing.T) {
 
 func TestStream_sendRSTStream_DirectCall(t *testing.T) {
 	t.Parallel()
-	conn, _ := newTestConnection(t, false, nil)
+	conn, _ := newTestConnection(t, false, nil, nil)
 	conn.ourInitialWindowSize = DefaultInitialWindowSize // Ensure FC manager is happy
 	conn.peerInitialWindowSize = DefaultInitialWindowSize
 	conn.writerChan = make(chan Frame, 1)
@@ -557,7 +557,7 @@ func TestStream_handleDataFrame(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1)               // Buffer for potential RST by stream.Close in teardown
 			conn.ourInitialWindowSize = tc.initialOurWindowSize // Set for the connection
 
@@ -809,7 +809,7 @@ func TestStream_handleRSTStreamFrame(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, _ := newTestConnection(t, false, nil)
+			conn, _ := newTestConnection(t, false, nil, nil)
 			conn.writerChan = make(chan Frame, 1) // Not used by handleRSTStreamFrame directly, but by teardown
 
 			stream := newTestStream(t, testStreamID, conn, true, 0, 0)

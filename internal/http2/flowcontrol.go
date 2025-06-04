@@ -172,6 +172,76 @@ func (fcw *FlowControlWindow) Acquire(n uint32) error {
 	return nil
 }
 
+// AcquireAdditionalSendSpace attempts to acquire 'n' more bytes from the send window.
+// It's similar to Acquire but assumes an initial byte might have already been acquired
+// and thus doesn't check for n == 0.
+// TODO: Add context.Context for cancellation.
+func (fcw *FlowControlWindow) AcquireAdditionalSendSpace(n uint32) error {
+	fcw.mu.Lock()
+	defer fcw.mu.Unlock()
+
+	// UPFRONT CHECK: If window is already closed, return error immediately.
+	if fcw.closed {
+		if fcw.isConnection {
+			if fcw.err != nil {
+				return fcw.err
+			}
+			return NewConnectionError(ErrCodeInternalError, "connection flow control window closed (no specific error)")
+		}
+		if fcw.err != nil {
+			return fcw.err
+		}
+		return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed", fcw.streamID))
+	}
+
+	if fcw.err != nil {
+		if errors.Is(fcw.err, errFlowControlWindowOverflow) {
+			msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v)", fcw.streamID, fcw.isConnection)
+			return NewConnectionError(ErrCodeFlowControlError, msg)
+		}
+		if !fcw.isConnection {
+			return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error: %v", fcw.streamID, fcw.err), fcw.err)
+		}
+		return fcw.err
+	}
+
+	// If n is 0 here, it's a no-op for additional acquisition.
+	if n == 0 {
+		return nil
+	}
+
+	waitCount := 0
+	for fcw.available < int64(n) {
+		waitCount++
+		fcw.cond.Wait()
+		if fcw.closed {
+			if fcw.isConnection {
+				if fcw.err != nil {
+					return fcw.err
+				}
+				return NewConnectionError(ErrCodeInternalError, "connection flow control window closed during wait (no specific error)")
+			}
+			if fcw.err != nil {
+				return fcw.err
+			}
+			return NewStreamError(fcw.streamID, ErrCodeStreamClosed, fmt.Sprintf("stream %d flow control window closed during wait", fcw.streamID))
+		}
+		if fcw.err != nil {
+			if errors.Is(fcw.err, errFlowControlWindowOverflow) {
+				msg := fmt.Sprintf("flow control window overflow for ID %d (conn: %v) during wait", fcw.streamID, fcw.isConnection)
+				return NewConnectionError(ErrCodeFlowControlError, msg)
+			}
+			if !fcw.isConnection {
+				return NewStreamErrorWithCause(fcw.streamID, ErrCodeInternalError, fmt.Sprintf("stream %d flow control encountered prior error during wait: %v", fcw.streamID, fcw.err), fcw.err)
+			}
+			return fcw.err
+		}
+	}
+
+	fcw.available -= int64(n)
+	return nil
+}
+
 // Increase increases the send window size by 'increment' upon receiving a WINDOW_UPDATE from the peer.
 // Returns an error if the increment is 0 (for streams) or causes the window to exceed MaxWindowSize.
 // If an error occurs, the window is not changed, and fcw.err is set.
@@ -285,6 +355,24 @@ func (fcw *FlowControlWindow) setErrorLocked(err error) {
 		fcw.closed = true    // For safety, if an error is set, consider it closed for new ops.
 		fcw.cond.Broadcast() // Wake up waiters so they can see the error
 	}
+}
+
+// Release returns 'n' bytes to the send window.
+// This is typically used to roll back an acquisition if a subsequent operation fails.
+func (fcw *FlowControlWindow) Release(n uint32) {
+	if n == 0 {
+		return
+	}
+	fcw.mu.Lock()
+	defer fcw.mu.Unlock()
+
+	// It's possible the window was driven negative by an update and then an acquire failed.
+	// Releasing should be safe even then.
+	// No check against MaxWindowSize here as we are undoing a previous valid reduction.
+	fcw.available += int64(n)
+	// TODO: Consider logging like:
+	// fcw.logLocked("Released %d, new available %d (isConn: %v, streamID: %d)", n, fcw.available, fcw.isConnection, fcw.streamID)
+	fcw.cond.Broadcast() // Signal in case someone was waiting for this specific amount or any space.
 }
 
 // Close marks the flow control window as closed, optionally with an error.
@@ -484,6 +572,16 @@ func (cfcm *ConnectionFlowControlManager) ApplicationConsumedData(n uint32) (uin
 
 // Close signals that the connection is closing. It closes the underlying send flow control window,
 // which will unblock any goroutines waiting to acquire send space.
+
+// ReleaseSendSpace returns 'n' bytes to the connection-level send window.
+// Used for rolling back an acquisition.
+func (cfcm *ConnectionFlowControlManager) ReleaseSendSpace(n uint32) {
+	if n == 0 {
+		return
+	}
+	cfcm.sendWindow.Release(n)
+}
+
 func (cfcm *ConnectionFlowControlManager) Close(err error) {
 	cfcm.sendWindow.Close(err)
 	// The receive side counters don't need explicit closing beyond their mutex.
@@ -593,6 +691,15 @@ func (sfcm *StreamFlowControlManager) HandleWindowUpdateFromPeer(increment uint3
 	// sendWindow.Increase() is aware via its `isConnection` flag (which is false for stream windows)
 	// that an increment of 0 is a protocol error for streams.
 	return sfcm.sendWindow.Increase(increment)
+}
+
+// AcquireAdditionalSendSpace is similar to AcquireSendSpace but for subsequent chunks
+// after an initial successful acquisition.
+func (sfcm *StreamFlowControlManager) AcquireAdditionalSendSpace(n uint32) error {
+	if n == 0 {
+		return nil
+	}
+	return sfcm.sendWindow.AcquireAdditionalSendSpace(n)
 }
 
 // DataReceived is called when 'n' bytes of a DATA frame payload are received on this stream.
@@ -740,6 +847,16 @@ func (sfcm *StreamFlowControlManager) HandleOurSettingsInitialWindowSizeChange(n
 
 // Close signals that the stream is closing. It closes the underlying send flow control window,
 // which will unblock any goroutines waiting to acquire send space for this stream.
+
+// ReleaseSendSpace returns 'n' bytes to the stream-level send window.
+// Used for rolling back an acquisition.
+func (sfcm *StreamFlowControlManager) ReleaseSendSpace(n uint32) {
+	if n == 0 {
+		return
+	}
+	sfcm.sendWindow.Release(n)
+}
+
 func (sfcm *StreamFlowControlManager) Close(err error) {
 	sfcm.sendWindow.Close(err)
 	// Receive side counters don't need explicit closing beyond their mutex.

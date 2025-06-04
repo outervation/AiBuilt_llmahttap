@@ -309,7 +309,7 @@ func (s *Server) handleTCPConnection(tcpConn net.Conn) {
 	// The dispatcherFunc uses s.dispatchRequest which correctly handles type assertions.
 	dispatcherFunc := s.dispatchRequest
 
-	h2conn := newHTTP2Connection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, dispatcherFunc)
+	h2conn := newHTTP2Connection(tcpConn, s.log, false /*isClientSide*/, srvSettingsOverride, nil /*initialPeerSettingsForTest*/, dispatcherFunc)
 
 	s.mu.Lock()
 	s.activeConns[h2conn] = struct{}{}

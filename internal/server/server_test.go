@@ -1105,7 +1105,7 @@ func TestServer_Shutdown(t *testing.T) {
 		var dispatcherFunc http2.RequestDispatcherFunc = func(sw http2.StreamWriter, r *http.Request) {
 			// No-op dispatcher for this test
 		}
-		h2ActiveConn := http2.NewConnection(underlyingNetConn, h2ConnLogger, false, nil, dispatcherFunc)
+		h2ActiveConn := http2.NewConnection(underlyingNetConn, h2ConnLogger, false, nil, nil, dispatcherFunc)
 
 		s.mu.Lock()
 		s.activeConns[h2ActiveConn] = struct{}{}
@@ -1228,7 +1228,7 @@ func TestServer_Shutdown(t *testing.T) {
 		underlyingNetConn.SetReadBuffer(readData)
 
 		var dispatcherFunc http2.RequestDispatcherFunc = func(sw http2.StreamWriter, r *http.Request) {}
-		h2StuckConn := http2.NewConnection(underlyingNetConn, h2ConnLogger, false, nil, dispatcherFunc)
+		h2StuckConn := http2.NewConnection(underlyingNetConn, h2ConnLogger, false, nil, nil, dispatcherFunc)
 
 		s.mu.Lock()
 		s.activeConns[h2StuckConn] = struct{}{}
@@ -2176,7 +2176,7 @@ func TestServer_HandleSignals(t *testing.T) {
 }
 
 var (
-	originalNewHTTP2Connection_TestHandleTCP func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection
+	originalNewHTTP2Connection_TestHandleTCP func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection
 )
 
 func setupHandleTCPConnectionMocks_Test() {
@@ -2225,14 +2225,14 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 
 		// Modify the newHTTP2Connection mock to capture the created http2.Connection
 		var capturedH2Conn *http2.Connection
-		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
 			if nc != mockNetC {
 				t.Errorf("newHTTP2Connection called with wrong net.Conn. Expected %p, got %p", mockNetC, nc)
 			}
 			if lgLogger != lg {
 				t.Errorf("newHTTP2Connection called with wrong logger. Expected %p, got %p", lg, lgLogger)
 			}
-			capturedH2Conn = originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+			capturedH2Conn = originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, nil, dispatcher)
 			return capturedH2Conn
 		}
 
@@ -2322,9 +2322,9 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		mockNetC.autoEOF = true          // Ensure EOF immediately
 
 		var newHTTP2ConnectionCalledOnFailure bool
-		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
 			newHTTP2ConnectionCalledOnFailure = true
-			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, nil, dispatcher)
 		}
 
 		handleDone := make(chan struct{})
@@ -2382,10 +2382,10 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		originalNewH2ConnFunc := newHTTP2Connection
 		defer func() { newHTTP2Connection = originalNewH2ConnFunc }()
 
-		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
 			newHTTP2ConnectionCalledOnFailure = true
 			// Call the original (real) http2.NewConnection
-			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, nil, dispatcher)
 		}
 
 		handleDone := make(chan struct{})
@@ -3128,7 +3128,7 @@ func TestServer_acceptLoop(t *testing.T) {
 		originalNewH2ConnFunc_subtest := newHTTP2Connection
 		defer func() { newHTTP2Connection = originalNewH2ConnFunc_subtest }()
 
-		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+		newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
 			if nc == mockNetC {
 				newH2ConnCalled = true
 				acceptedNetConn = nc
@@ -3157,7 +3157,7 @@ func TestServer_acceptLoop(t *testing.T) {
 				t.Logf("Warning: newHTTP2Connection called with nc of type %T, expected *mockConn", nc)
 			}
 
-			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, dispatcher)
+			return originalNewHTTP2Connection_TestHandleTCP(nc, lgLogger, isClientSide, srvSettingsOverride, nil, dispatcher)
 		}
 
 		acceptCallCount := 0
