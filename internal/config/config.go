@@ -116,10 +116,11 @@ type Config struct {
 
 // ServerConfig holds general server settings.
 type ServerConfig struct {
-	Address                 *string `json:"address,omitempty" toml:"address,omitempty"` // e.g., ":443", "localhost:8080"
-	ExecutablePath          *string `json:"executable_path,omitempty" toml:"executable_path,omitempty"`
-	ChildReadinessTimeout   *string `json:"child_readiness_timeout,omitempty" toml:"child_readiness_timeout,omitempty"`     // e.g., "10s"
-	GracefulShutdownTimeout *string `json:"graceful_shutdown_timeout,omitempty" toml:"graceful_shutdown_timeout,omitempty"` // e.g., "30s"
+	Address                 *string    `json:"address,omitempty" toml:"address,omitempty"` // e.g., ":443", "localhost:8080"
+	ExecutablePath          *string    `json:"executable_path,omitempty" toml:"executable_path,omitempty"`
+	ChildReadinessTimeout   *string    `json:"child_readiness_timeout,omitempty" toml:"child_readiness_timeout,omitempty"`     // e.g., "10s"
+	GracefulShutdownTimeout *string    `json:"graceful_shutdown_timeout,omitempty" toml:"graceful_shutdown_timeout,omitempty"` // e.g., "30s"
+	TLS                     *TLSConfig `json:"tls,omitempty" toml:"tls,omitempty"`
 }
 
 // TLSConfig holds TLS-specific configuration options.
