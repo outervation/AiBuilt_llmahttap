@@ -32,20 +32,43 @@ type StaticFileServer struct {
 
 // New creates a new StaticFileServer handler.
 // It conforms to the server.HandlerFactory signature when partially applied or wrapped.
-func New(cfg *config.StaticFileServerConfig, lg *logger.Logger) (server.Handler, error) {
+func New(cfg *config.StaticFileServerConfig, lg *logger.Logger, mainConfigFilePath string) (server.Handler, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("staticfileserver: config cannot be nil")
+		return nil, fmt.Errorf("staticfile: config cannot be nil")
 	}
 	if lg == nil {
-		return nil, fmt.Errorf("staticfileserver: logger cannot be nil")
+		return nil, fmt.Errorf("staticfile: logger cannot be nil")
 	}
-	// Further validation of cfg specific to static file server could happen here
-	// e.g., checking if DocumentRoot is valid, etc.
-	// For now, config.ParseAndValidateStaticFileServerConfig handles most of it.
+	if mainConfigFilePath == "" {
+		// This path is essential for resolving relative MimeTypesPath.
+		// Log a warning/error, as per previous structure.
+		// Depending on strictness, could return an error:
+		// return nil, fmt.Errorf("staticfile: mainConfigFilePath cannot be empty for MimeTypeResolver")
+		lg.Warn("staticfile.New: mainConfigFilePath is empty. MimeTypeResolver might not correctly resolve relative paths for MimeTypesPath in config.",
+			logger.LogFields{"handler_type": "StaticFileServer"})
+	}
+
+	// Initialize MimeTypeResolver using the provided config and main config file path
+	// The staticfileserver.NewMimeTypeResolver handles the logic of loading from cfg.MimeTypesPath and cfg.MimeTypesMap
+	var mimeResolver *staticfileserver.MimeTypeResolver
+	var err error
+
+	// We need to ensure mimeResolver is created even if cfg is minimal,
+	// as getMimeType will rely on it.
+	// NewMimeTypeResolver should handle a nil sfsConfig.MimeTypesPath and sfsConfig.MimeTypesMap gracefully.
+	mimeResolver, err = staticfileserver.NewMimeTypeResolver(cfg, mainConfigFilePath)
+	if err != nil {
+		lg.Error("staticfile: Failed to initialize MimeTypeResolver", logger.LogFields{
+			"error":            err.Error(),
+			"main_config_path": mainConfigFilePath,
+		})
+		return nil, fmt.Errorf("staticfile: failed to create MimeTypeResolver: %w", err)
+	}
 
 	return &StaticFileServer{
-		config: cfg,
-		logger: lg,
+		config:       cfg,
+		logger:       lg,
+		mimeResolver: mimeResolver,
 	}, nil
 }
 
@@ -291,21 +314,29 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 }
 
 func (s *StaticFileServer) getMimeType(filePath string) string {
-	ext := filepath.Ext(filePath)
-	// Prefer explicitly configured MIME types
-	if s.config.ResolvedMimeTypes != nil {
-		if mimeType, ok := s.config.ResolvedMimeTypes[ext]; ok {
+	// Ensure mimeResolver is available; it should be initialized by New.
+	// If New failed to initialize it, this would panic. Good for catching errors.
+	// Consider adding a nil check here if defensive programming is preferred,
+	// though a properly constructed StaticFileServer should always have it.
+	if s.mimeResolver == nil {
+		// This case should ideally not happen if New constructs the object correctly.
+		// Log an error and fall back to a very basic MIME type resolution.
+		s.logger.Error("StaticFileServer.getMimeType called with nil mimeResolver. This indicates an instantiation error.",
+			logger.LogFields{"filePath": filePath})
+
+		// Fallback logic similar to original if resolver is missing
+		ext := filepath.Ext(filePath)
+		if s.config != nil && s.config.ResolvedMimeTypes != nil { // Check config as well
+			if mimeType, ok := s.config.ResolvedMimeTypes[ext]; ok {
+				return mimeType
+			}
+		}
+		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
 			return mimeType
 		}
+		return "application/octet-stream"
 	}
-	// Fallback to Go's built-in detection
-	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-		// Go's mime.TypeByExtension might return "type/subtype; charset=utf-8"
-		// We want to keep this full string.
-		return mimeType
-	}
-	// Default fallback
-	return "application/octet-stream"
+	return s.mimeResolver.GetMimeType(filePath)
 }
 
 func (s *StaticFileServer) handleFile(stream http2.StreamWriter, req *http.Request, filePath string, fileInfo os.FileInfo) {
