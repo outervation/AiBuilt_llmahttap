@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bufio" // Added for peekConn
 	"context"
+	"crypto/tls" // Added for TLS handling
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,20 @@ import (
 
 // newHTTP2Connection is a variable that holds the function to create a new http2.Connection.
 // It's used to allow mocking in tests.
+
+// peekConn allows peeking at the initial bytes of a connection
+// and then having those bytes available for subsequent reads.
+// It wraps a net.Conn and uses a bufio.Reader for the peeking and subsequent reads.
+type peekConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+// Read implements the io.Reader interface for peekConn, reading from the bufio.Reader.
+func (p *peekConn) Read(b []byte) (int, error) {
+	return p.r.Read(b)
+}
+
 var newHTTP2Connection = http2.NewConnection
 
 // Server manages the HTTP/2 server lifecycle, including listening sockets,
@@ -221,6 +237,7 @@ func (s *Server) StartAccepting() error {
 
 // acceptLoop continuously accepts new connections on a given listener
 // and spawns goroutines to handle them.
+
 func (s *Server) acceptLoop(l net.Listener) {
 	s.log.Info("Starting accept loop", logger.LogFields{"address": l.Addr().String()})
 	defer s.log.Info("Exiting accept loop", logger.LogFields{"address": l.Addr().String()})
@@ -268,10 +285,7 @@ func (s *Server) acceptLoop(l net.Listener) {
 		}
 		tempDelay = 0 // Reset delay on successful accept
 
-		// Check stopAccepting again *after* a successful accept, before spawning handler.
-
 		s.log.Debug("acceptLoop: Accepted new connection", logger.LogFields{"local_addr": l.Addr().String(), "remote_addr": conn.RemoteAddr().String()})
-		// This is a small window, but ensures we don't start new handlers if stop was just signaled.
 		select {
 		case <-s.stopAccepting:
 			s.log.Info("Accept loop received stop signal just after accepting a connection; closing it.", logger.LogFields{"address": l.Addr().String(), "remote": conn.RemoteAddr().String()})
@@ -280,7 +294,91 @@ func (s *Server) acceptLoop(l net.Listener) {
 		default:
 		}
 
-		go s.handleTCPConnection(conn)
+		// --- BEGIN TLS MODIFICATION ---
+		var effectiveConn net.Conn = conn // Default to original conn
+
+		tlsConfiguredAndEnabled := false
+		var certFile, keyFile string
+
+		if s.cfg.Server != nil && s.cfg.Server.TLS != nil &&
+			s.cfg.Server.TLS.Enabled != nil && *s.cfg.Server.TLS.Enabled &&
+			s.cfg.Server.TLS.CertFile != nil && *s.cfg.Server.TLS.CertFile != "" &&
+			s.cfg.Server.TLS.KeyFile != nil && *s.cfg.Server.TLS.KeyFile != "" {
+
+			tlsConfiguredAndEnabled = true
+			certFile = *s.cfg.Server.TLS.CertFile
+			keyFile = *s.cfg.Server.TLS.KeyFile
+			s.log.Debug("TLS is configured and enabled. Peeking for TLS handshake.", logger.LogFields{"remote_addr": conn.RemoteAddr().String(), "cert": certFile, "key": keyFile})
+		} else {
+			s.log.Debug("TLS not configured or not enabled. Proceeding with clear text.", logger.LogFields{"remote_addr": conn.RemoteAddr().String()})
+		}
+
+		if tlsConfiguredAndEnabled {
+			br := bufio.NewReader(conn)
+			hdr, peekErr := br.Peek(3) // Peek 3 bytes for TLS handshake check
+
+			if peekErr != nil {
+				s.log.Error("Failed to peek connection for TLS detection", logger.LogFields{"remote_addr": conn.RemoteAddr().String(), "error": peekErr.Error()})
+				conn.Close()
+				continue
+			}
+
+			pc := &peekConn{Conn: conn, r: br} // Wrap original conn with peekConn
+
+			// TLS record header: first byte 22 (handshake), second byte 3 (TLS major version)
+			if hdr[0] == 22 && hdr[1] == 0x03 {
+				s.log.Info("Potential TLS connection detected based on peeked bytes.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
+
+				certificate, errLoadCert := tls.LoadX509KeyPair(certFile, keyFile)
+				if errLoadCert != nil {
+					s.log.Error("Failed to load TLS certificate/key", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "cert": certFile, "key": keyFile, "error": errLoadCert.Error()})
+					pc.Close()
+					continue
+				}
+
+				tlsCfg := &tls.Config{
+					Certificates: []tls.Certificate{certificate},
+					NextProtos:   []string{"h2", "http/1.1"},
+					MinVersion:   tls.VersionTLS12,
+				}
+
+				tlsConn := tls.Server(pc, tlsCfg)
+				if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+					s.log.Error("TLS handshake failed", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "error": errHandshake.Error()})
+					tlsConn.Close()
+					continue
+				}
+				s.log.Info("TLS handshake successful.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String()})
+
+				state := tlsConn.ConnectionState()
+				s.log.Debug("TLS connection state after handshake", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String(), "alpn_protocol": state.NegotiatedProtocol, "cipher_suite": tls.CipherSuiteName(state.CipherSuite)})
+
+				if state.NegotiatedProtocol != "h2" {
+					s.log.Warn("TLS ALPN did not negotiate \"h2\". Closing connection.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String(), "negotiated_protocol": state.NegotiatedProtocol})
+					// Respond with HTTP/1.1 505 Version Not Supported (inspired by example)
+					errMsg := "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nThis server requires ALPN \"h2\" for TLS connections.\r\n"
+					_, errWrite := io.WriteString(tlsConn, errMsg)
+					if errWrite != nil {
+						s.log.Error("Error writing ALPN failure message to TLS connection", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String(), "error": errWrite.Error()})
+					}
+					tlsConn.Close()
+					continue
+				}
+
+				s.log.Info("TLS ALPN negotiated \"h2\". Proceeding with HTTP/2 over TLS.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String()})
+				effectiveConn = tlsConn // Use the *tls.Conn for handleTCPConnection
+			} else {
+				// Peeked bytes do not indicate TLS, but TLS was configured. Proceed with pc (peekConn) as clear text.
+				s.log.Info("Peeked bytes do not indicate TLS, but TLS was configured. Proceeding with clear text connection using peekConn.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
+				effectiveConn = pc
+			}
+		}
+		// If TLS was not configured, effectiveConn remains the original conn.
+		// If TLS was configured but peek did not indicate TLS, effectiveConn is pc.
+		// If TLS was configured and TLS handshake succeeded with ALPN h2, effectiveConn is tlsConn.
+
+		go s.handleTCPConnection(effectiveConn)
+		// --- END TLS MODIFICATION ---
 	}
 }
 
