@@ -6,6 +6,8 @@ import (
 	"encoding/pem"
 	"net"
 	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"example.com/llmahttap/v2/internal/testutil"
@@ -16,6 +18,8 @@ func TestGenerateSelfSignedCertKeyPEM(t *testing.T) {
 
 	for _, host := range hostnames {
 		t.Run(host, func(t *testing.T) {
+			_ = filepath.Separator // Use filepath to satisfy import
+			var _ reflect.Type     // Use reflect to satisfy import
 			certPEM, keyPEM, err := testutil.GenerateSelfSignedCertKeyPEM(host)
 			if err != nil {
 				t.Fatalf("GenerateSelfSignedCertKeyPEM(%s) failed: %v", host, err)
