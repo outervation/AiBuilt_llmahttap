@@ -446,10 +446,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.TLS == nil {
 		cfg.Server.TLS = &TLSConfig{}
 	}
-	if cfg.Server.TLS.Enabled == nil {
-		val := false
-		cfg.Server.TLS.Enabled = &val
-	}
+
 	if cfg.Server.TLS.Enabled == nil {
 		val := false
 		cfg.Server.TLS.Enabled = &val
