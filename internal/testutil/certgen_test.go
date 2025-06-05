@@ -197,9 +197,12 @@ func TestGenerateSelfSignedCertKeyFiles(t *testing.T) {
 	if keyBlock.Type != "PRIVATE KEY" {
 		t.Errorf("Key PEM block type from file %s is %s, want PRIVATE KEY", keyFilePath, keyBlock.Type)
 	}
-	_, err = x509.ParsePKCS8PrivateKey(keyBlock.Bytes) // err is reused from cert parsing
+	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 	if err != nil {
 		t.Fatalf("Failed to parse private key from file %s: %v", keyFilePath, err)
+	}
+	if _, ok := key.(*ecdsa.PrivateKey); !ok {
+		t.Errorf("Parsed private key from file %s is not an *ecdsa.PrivateKey, got %T", keyFilePath, key)
 	}
 	for _, dnsName := range cert.DNSNames {
 		if dnsName == host {
