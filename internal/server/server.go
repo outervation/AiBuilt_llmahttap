@@ -315,17 +315,20 @@ func (s *Server) acceptLoop(l net.Listener) {
 
 		if tlsConfiguredAndEnabled {
 			br := bufio.NewReader(conn)
-			hdr, peekErr := br.Peek(3) // Peek 3 bytes for TLS handshake check
+			hdr, peekErr := br.Peek(3) // Peek 3 bytes for TLS handshake check: 1 (type) + 2 (version)
 
 			if peekErr != nil {
+				// If peeking fails (e.g., connection closed prematurely), log and close.
 				s.log.Error("Failed to peek connection for TLS detection", logger.LogFields{"remote_addr": conn.RemoteAddr().String(), "error": peekErr.Error()})
 				conn.Close()
-				continue
+				continue // Next iteration of acceptLoop
 			}
 
-			pc := &peekConn{Conn: conn, r: br} // Wrap original conn with peekConn
+			// Wrap original conn with peekConn to allow re-reading peeked bytes
+			pc := &peekConn{Conn: conn, r: br}
 
 			// TLS record header: first byte 22 (handshake), second byte 3 (TLS major version)
+			// Example: ClientHello is Handshake (22), Version TLS 1.2 (03 03)
 			if hdr[0] == 22 && hdr[1] == 0x03 {
 				s.log.Info("Potential TLS connection detected based on peeked bytes.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
 
@@ -333,20 +336,20 @@ func (s *Server) acceptLoop(l net.Listener) {
 				if errLoadCert != nil {
 					s.log.Error("Failed to load TLS certificate/key", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "cert": certFile, "key": keyFile, "error": errLoadCert.Error()})
 					pc.Close()
-					continue
+					continue // Next iteration of acceptLoop
 				}
 
 				tlsCfg := &tls.Config{
 					Certificates: []tls.Certificate{certificate},
-					NextProtos:   []string{"h2", "http/1.1"},
-					MinVersion:   tls.VersionTLS12,
+					NextProtos:   []string{"h2", "http/1.1"}, // Advertise h2 first for HTTP/2 over TLS
+					MinVersion:   tls.VersionTLS12,           // Recommended minimum TLS version
 				}
 
-				tlsConn := tls.Server(pc, tlsCfg)
+				tlsConn := tls.Server(pc, tlsCfg) // Use peekConn as the underlying net.Conn for tls.Server
 				if errHandshake := tlsConn.Handshake(); errHandshake != nil {
 					s.log.Error("TLS handshake failed", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "error": errHandshake.Error()})
-					tlsConn.Close()
-					continue
+					tlsConn.Close() // Close the *tls.Conn
+					continue        // Next iteration of acceptLoop
 				}
 				s.log.Info("TLS handshake successful.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String()})
 
@@ -355,25 +358,27 @@ func (s *Server) acceptLoop(l net.Listener) {
 
 				if state.NegotiatedProtocol != "h2" {
 					s.log.Warn("TLS ALPN did not negotiate \"h2\". Closing connection.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String(), "negotiated_protocol": state.NegotiatedProtocol})
-					// Respond with HTTP/1.1 505 Version Not Supported (inspired by example)
+					// Respond with HTTP/1.1 505 Version Not Supported
 					errMsg := "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nThis server requires ALPN \"h2\" for TLS connections.\r\n"
 					_, errWrite := io.WriteString(tlsConn, errMsg)
 					if errWrite != nil {
 						s.log.Error("Error writing ALPN failure message to TLS connection", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String(), "error": errWrite.Error()})
 					}
 					tlsConn.Close()
-					continue
+					continue // Next iteration of acceptLoop
 				}
 
 				s.log.Info("TLS ALPN negotiated \"h2\". Proceeding with HTTP/2 over TLS.", logger.LogFields{"remote_addr": tlsConn.RemoteAddr().String()})
 				effectiveConn = tlsConn // Use the *tls.Conn for handleTCPConnection
 			} else {
 				// Peeked bytes do not indicate TLS, but TLS was configured. Proceed with pc (peekConn) as clear text.
+				// This path might be for h2c (HTTP/2 Cleartext) or HTTP/1.1 if the server supports it on the same port.
+				// For this specific task, we assume if it's not TLS, it's handled as before.
 				s.log.Info("Peeked bytes do not indicate TLS, but TLS was configured. Proceeding with clear text connection using peekConn.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
-				effectiveConn = pc
+				effectiveConn = pc // Use peekConn so the initial bytes are not lost
 			}
 		}
-		// If TLS was not configured, effectiveConn remains the original conn.
+		// If TLS was not configured at all, effectiveConn remains the original conn.
 		// If TLS was configured but peek did not indicate TLS, effectiveConn is pc.
 		// If TLS was configured and TLS handshake succeeded with ALPN h2, effectiveConn is tlsConn.
 
