@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"example.com/llmahttap/v2/internal/config"
+	"example.com/llmahttap/v2/internal/handlers/staticfileserver"
 	"example.com/llmahttap/v2/internal/http2" // For http2.StreamWriter
 	"example.com/llmahttap/v2/internal/logger"
 	"example.com/llmahttap/v2/internal/router" // Added import
@@ -24,8 +25,9 @@ import (
 
 // StaticFileServer handles serving static files.
 type StaticFileServer struct {
-	config *config.StaticFileServerConfig
-	logger *logger.Logger
+	config       *config.StaticFileServerConfig
+	logger       *logger.Logger
+	mimeResolver *staticfileserver.MimeTypeResolver
 }
 
 // New creates a new StaticFileServer handler.
