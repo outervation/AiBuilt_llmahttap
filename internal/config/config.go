@@ -122,6 +122,13 @@ type ServerConfig struct {
 	GracefulShutdownTimeout *string `json:"graceful_shutdown_timeout,omitempty" toml:"graceful_shutdown_timeout,omitempty"` // e.g., "30s"
 }
 
+// TLSConfig holds TLS-specific configuration options.
+type TLSConfig struct {
+	Enabled  *bool   `json:"enabled,omitempty" toml:"enabled,omitempty"`
+	CertFile *string `json:"cert_file,omitempty" toml:"cert_file,omitempty"`
+	KeyFile  *string `json:"key_file,omitempty" toml:"key_file,omitempty"`
+}
+
 // RoutingConfig contains the list of routes.
 type RoutingConfig struct {
 	Routes []Route `json:"routes,omitempty" toml:"routes,omitempty"`
