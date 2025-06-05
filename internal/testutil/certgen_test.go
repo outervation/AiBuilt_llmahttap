@@ -68,6 +68,20 @@ func TestGenerateSelfSignedCertKeyPEM(t *testing.T) {
 				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) parsed private key is not an *ecdsa.PrivateKey, got %T", host, key)
 			}
 
+			// Verify that the public key in the certificate matches the public key of the private key
+			if certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey); ok {
+				if privKey, ok := key.(*ecdsa.PrivateKey); ok {
+					if !privKey.PublicKey.Equal(certPubKey) {
+						t.Errorf("GenerateSelfSignedCertKeyPEM(%s) public key in certificate does not match public key of private key", host)
+					}
+				} else {
+					// Already handled by key type check below, but defensive
+					t.Errorf("GenerateSelfSignedCertKeyPEM(%s) parsed private key is not an *ecdsa.PrivateKey, got %T", host, key)
+				}
+			} else {
+				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) public key in certificate is not an *ecdsa.PublicKey, got %T", host, cert.PublicKey)
+			}
+
 			// Verify hostname in certificate
 			foundHost := false
 			if parsedIP := net.ParseIP(host); parsedIP != nil {
