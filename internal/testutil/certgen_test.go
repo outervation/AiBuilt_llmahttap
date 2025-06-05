@@ -181,6 +181,22 @@ func TestGenerateSelfSignedCertKeyFiles(t *testing.T) {
 	}
 
 	foundHost := false
+
+	// Verify key content from file
+	keyBlock, restKey := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		t.Fatalf("Failed to decode key PEM from file %s", keyFilePath)
+	}
+	if len(restKey) > 0 {
+		t.Errorf("Key PEM from file %s has trailing data", keyFilePath)
+	}
+	if keyBlock.Type != "PRIVATE KEY" {
+		t.Errorf("Key PEM block type from file %s is %s, want PRIVATE KEY", keyFilePath, keyBlock.Type)
+	}
+	_, err = x509.ParsePKCS8PrivateKey(keyBlock.Bytes) // err is reused from cert parsing
+	if err != nil {
+		t.Fatalf("Failed to parse private key from file %s: %v", keyFilePath, err)
+	}
 	for _, dnsName := range cert.DNSNames {
 		if dnsName == host {
 			foundHost = true
