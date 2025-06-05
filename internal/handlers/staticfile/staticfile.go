@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"mime"
 
 	"net/http"
 	"net/url"
@@ -314,28 +313,8 @@ func (s *StaticFileServer) handleDirectory(stream http2.StreamWriter, req *http.
 }
 
 func (s *StaticFileServer) getMimeType(filePath string) string {
-	// Ensure mimeResolver is available; it should be initialized by New.
-	// If New failed to initialize it, this would panic. Good for catching errors.
-	// Consider adding a nil check here if defensive programming is preferred,
-	// though a properly constructed StaticFileServer should always have it.
-	if s.mimeResolver == nil {
-		// This case should ideally not happen if New constructs the object correctly.
-		// Log an error and fall back to a very basic MIME type resolution.
-		s.logger.Error("StaticFileServer.getMimeType called with nil mimeResolver. This indicates an instantiation error.",
-			logger.LogFields{"filePath": filePath})
-
-		// Fallback logic similar to original if resolver is missing
-		ext := filepath.Ext(filePath)
-		if s.config != nil && s.config.ResolvedMimeTypes != nil { // Check config as well
-			if mimeType, ok := s.config.ResolvedMimeTypes[ext]; ok {
-				return mimeType
-			}
-		}
-		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-			return mimeType
-		}
-		return "application/octet-stream"
-	}
+	// s.mimeResolver is guaranteed to be non-nil by the New constructor.
+	// If it were nil, New would have returned an error.
 	return s.mimeResolver.GetMimeType(filePath)
 }
 
