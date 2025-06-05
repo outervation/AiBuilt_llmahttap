@@ -68,6 +68,12 @@ func TestGenerateSelfSignedCertKeyPEM(t *testing.T) {
 				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) parsed private key is not an *ecdsa.PrivateKey, got %T", host, key)
 			}
 
+			// Check if the cert and key can be loaded as a pair using tls.X509KeyPair
+			_, err = tls.X509KeyPair(certPEM, keyPEM)
+			if err != nil {
+				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) tls.X509KeyPair(certPEM, keyPEM) failed: %v", host, err)
+			}
+
 			// Verify that the public key in the certificate matches the public key of the private key
 			if certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey); ok {
 				if privKey, ok := key.(*ecdsa.PrivateKey); ok {
