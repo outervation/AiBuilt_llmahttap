@@ -437,9 +437,18 @@ func applyDefaults(cfg *Config) {
 		val := defaultChildReadinessTimeout
 		cfg.Server.ChildReadinessTimeout = &val
 	}
+
 	if cfg.Server.GracefulShutdownTimeout == nil {
 		val := defaultGracefulShutdownTimeout
 		cfg.Server.GracefulShutdownTimeout = &val
+	}
+	// Moved TLS defaults outside
+	if cfg.Server.TLS == nil {
+		cfg.Server.TLS = &TLSConfig{}
+	}
+	if cfg.Server.TLS.Enabled == nil {
+		val := false
+		cfg.Server.TLS.Enabled = &val
 	}
 
 	if cfg.Logging == nil {
@@ -534,8 +543,41 @@ func validateConfig(cfg *Config) error {
 	if _, err := parseDuration(cfg.Server.ChildReadinessTimeout, "server.child_readiness_timeout", defaultChildReadinessTimeout); err != nil {
 		return err
 	}
+
 	if _, err := parseDuration(cfg.Server.GracefulShutdownTimeout, "server.graceful_shutdown_timeout", defaultGracefulShutdownTimeout); err != nil {
-		return err
+		return err // Error from GracefulShutdownTimeout
+	}
+
+	// Validate TLS configuration.
+	// applyDefaults ensures cfg.Server.TLS and cfg.Server.TLS.Enabled are non-nil.
+	if *cfg.Server.TLS.Enabled {
+		// TLS is enabled
+		if cfg.Server.TLS.CertFile == nil || *cfg.Server.TLS.CertFile == "" {
+			return fmt.Errorf("server.tls.cert_file is required when tls.enabled is true")
+		}
+		if !filepath.IsAbs(*cfg.Server.TLS.CertFile) {
+			return fmt.Errorf("server.tls.cert_file path '%s' must be absolute", *cfg.Server.TLS.CertFile)
+		}
+
+		if cfg.Server.TLS.KeyFile == nil || *cfg.Server.TLS.KeyFile == "" {
+			return fmt.Errorf("server.tls.key_file is required when tls.enabled is true")
+		}
+		if !filepath.IsAbs(*cfg.Server.TLS.KeyFile) {
+			return fmt.Errorf("server.tls.key_file path '%s' must be absolute", *cfg.Server.TLS.KeyFile)
+		}
+	} else {
+		// TLS is disabled
+		// Still validate paths if they are provided, ensuring they are absolute.
+		if cfg.Server.TLS.CertFile != nil && *cfg.Server.TLS.CertFile != "" {
+			if !filepath.IsAbs(*cfg.Server.TLS.CertFile) {
+				return fmt.Errorf("server.tls.cert_file path '%s' must be absolute (even if TLS is disabled)", *cfg.Server.TLS.CertFile)
+			}
+		}
+		if cfg.Server.TLS.KeyFile != nil && *cfg.Server.TLS.KeyFile != "" {
+			if !filepath.IsAbs(*cfg.Server.TLS.KeyFile) {
+				return fmt.Errorf("server.tls.key_file path '%s' must be absolute (even if TLS is disabled)", *cfg.Server.TLS.KeyFile)
+			}
+		}
 	}
 
 	if cfg.Routing == nil {
