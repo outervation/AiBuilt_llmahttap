@@ -345,6 +345,8 @@ func (s *Server) acceptLoop(l net.Listener) {
 					MinVersion:   tls.VersionTLS12,           // Recommended minimum TLS version
 				}
 
+				s.log.Info("Initiating TLS handshake.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
+
 				tlsConn := tls.Server(pc, tlsCfg) // Use peekConn as the underlying net.Conn for tls.Server
 				if errHandshake := tlsConn.Handshake(); errHandshake != nil {
 					s.log.Error("TLS handshake failed", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "error": errHandshake.Error()})
@@ -382,6 +384,19 @@ func (s *Server) acceptLoop(l net.Listener) {
 		// If TLS was configured but peek did not indicate TLS, effectiveConn is pc.
 		// If TLS was configured and TLS handshake succeeded with ALPN h2, effectiveConn is tlsConn.
 
+		// Determine and log the type of connection being passed
+		// Determine and log the type of connection being passed
+		connTypeDesc := ""
+		if effectiveConn == conn { // effectiveConn is the original conn
+			connTypeDesc = "original cleartext"
+		} else if _, ok := effectiveConn.(*peekConn); ok { // effectiveConn is peekConn
+			connTypeDesc = "peekConn (non-TLS after peek)"
+		} else if _, ok := effectiveConn.(*tls.Conn); ok { // effectiveConn is tls.Conn
+			connTypeDesc = "TLS"
+		} else {
+			connTypeDesc = "unknown" // Should not happen
+		}
+		s.log.Info("Passing connection to handleTCPConnection.", logger.LogFields{"remote_addr": effectiveConn.RemoteAddr().String(), "type": connTypeDesc})
 		go s.handleTCPConnection(effectiveConn)
 		// --- END TLS MODIFICATION ---
 	}
