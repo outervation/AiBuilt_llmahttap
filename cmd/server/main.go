@@ -53,7 +53,7 @@ func setupAndRunServer(cfg *config.Config, originalCfgPath string) error {
 			return nil, fmt.Errorf("StaticFileServer: failed to parse/validate specific handler config: %w", err)
 		}
 
-		handler, err := staticfile.New(staticServerSpecificConfig, factoryLogger)
+		handler, err := staticfile.New(staticServerSpecificConfig, factoryLogger, originalCfgPath)
 		if err != nil {
 			return nil, fmt.Errorf("StaticFileServer: failed to create handler instance: %w", err)
 		}
