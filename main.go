@@ -98,7 +98,7 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse static file server config: %w", err)
 		}
-		return staticfile.New(parsedSFSConfig, l)
+		return staticfile.New(parsedSFSConfig, l, "") // originalCfgPath is empty for programmatic config
 	})
 	if err != nil {
 		lg.Error("Error registering StaticFileServer handler", logger.LogFields{"error": err.Error()})
