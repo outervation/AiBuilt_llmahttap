@@ -1,6 +1,7 @@
 package testutil_test
 
 import (
+	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -59,9 +60,12 @@ func TestGenerateSelfSignedCertKeyPEM(t *testing.T) {
 			if keyBlock.Type != "PRIVATE KEY" { // As per x509.MarshalPKCS8PrivateKey
 				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) key PEM block type is %s, want PRIVATE KEY", host, keyBlock.Type)
 			}
-			_, err = x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+			key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 			if err != nil {
 				t.Fatalf("GenerateSelfSignedCertKeyPEM(%s) failed to parse private key: %v", host, err)
+			}
+			if _, ok := key.(*ecdsa.PrivateKey); !ok {
+				t.Errorf("GenerateSelfSignedCertKeyPEM(%s) parsed private key is not an *ecdsa.PrivateKey, got %T", host, key)
 			}
 
 			// Verify hostname in certificate
