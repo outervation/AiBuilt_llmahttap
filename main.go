@@ -114,7 +114,7 @@ func main() {
 
 	// Create Server
 	// originalCfgPath is empty as config is programmatic
-	srv, err := server.NewServer(cfg, lg, rt, "", handlerRegistry)
+	srv, err := server.NewServer(cfg, lg, rt, "", handlerRegistry, nil)
 	if err != nil {
 		lg.Error("Error creating server", logger.LogFields{"error": err.Error()})
 		os.Exit(1)
