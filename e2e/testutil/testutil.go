@@ -6,23 +6,20 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"net/textproto"
-
 	"os"
 	"os/exec"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
-
 	"testing"
+	"time"
 
 	"example.com/llmahttap/v2/internal/config"
 	"github.com/BurntSushi/toml"
@@ -31,6 +28,7 @@ import (
 
 // TestRequest models an HTTP request for E2E testing.
 type TestRequest struct {
+	Scheme  string // "http" or "https"
 	Method  string
 	Path    string // Should include query string if any, e.g., "/path?query=value"
 	Headers http.Header
@@ -52,10 +50,10 @@ type ExactBodyMatcher struct {
 
 // Match implements BodyMatcher for ExactBodyMatcher.
 func (m *ExactBodyMatcher) Match(body []byte) (bool, string) {
-	if bytes.Equal(m.ExpectedBody, body) {
-		return true, ""
+	if !bytes.Equal(m.ExpectedBody, body) {
+		return false, fmt.Sprintf("body mismatch:\nExpected: %q\nActual:   %q", string(m.ExpectedBody), string(body))
 	}
-	return false, fmt.Sprintf("bodies do not match exactly. Expected: %q, Got: %q", string(m.ExpectedBody), string(body))
+	return true, ""
 }
 
 // StringContainsBodyMatcher checks if the body contains a specific substring.
@@ -65,10 +63,10 @@ type StringContainsBodyMatcher struct {
 
 // Match implements BodyMatcher for StringContainsBodyMatcher.
 func (m *StringContainsBodyMatcher) Match(body []byte) (bool, string) {
-	if bytes.Contains(body, []byte(m.Substring)) {
-		return true, ""
+	if !strings.Contains(string(body), m.Substring) {
+		return false, fmt.Sprintf("body does not contain expected substring:\nSubstring: %q\nActual:    %q", m.Substring, string(body))
 	}
-	return false, fmt.Sprintf("body does not contain substring: %q. Body: %q", m.Substring, string(body))
+	return true, ""
 }
 
 // ExpectedResponse models the expected outcome of an HTTP request.
@@ -131,27 +129,26 @@ func GetFreePort() (int, error) {
 // It returns the path to the file and a cleanup function to remove it.
 func WriteTempConfig(configData interface{}, format string) (filePath string, cleanupFunc func(), err error) {
 	var data []byte
-	var ext string
+	ext := "." + format
 
-	switch strings.ToLower(format) {
+	switch format {
 	case "json":
 		data, err = json.MarshalIndent(configData, "", "  ")
-		ext = ".json"
 	case "toml":
 		buf := new(bytes.Buffer)
-		if err = toml.NewEncoder(buf).Encode(configData); err == nil {
+		err = toml.NewEncoder(buf).Encode(configData)
+		if err == nil {
 			data = buf.Bytes()
 		}
-		ext = ".toml"
 	default:
-		err = fmt.Errorf("unsupported config format: %s", format)
+		return "", nil, fmt.Errorf("unsupported config format: %s", format)
 	}
 
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to marshal config data to %s: %w", format, err)
 	}
 
-	tmpFile, err := os.CreateTemp("", "testconfig-*"+ext)
+	tmpFile, err := ioutil.TempFile("", "test-config-*"+ext)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temp config file: %w", err)
 	}
@@ -162,13 +159,15 @@ func WriteTempConfig(configData interface{}, format string) (filePath string, cl
 		return "", nil, fmt.Errorf("failed to write to temp config file: %w", err)
 	}
 
+	filePath = tmpFile.Name()
+	cleanupFunc = func() {
+		os.Remove(filePath)
+	}
 	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpFile.Name())
+		cleanupFunc()
 		return "", nil, fmt.Errorf("failed to close temp config file: %w", err)
 	}
 
-	filePath = tmpFile.Name()
-	cleanupFunc = func() { os.Remove(filePath) }
 	return filePath, cleanupFunc, nil
 }
 
@@ -182,128 +181,87 @@ func WriteTempConfig(configData interface{}, format string) (filePath string, cl
 // The actual listening address will be parsed from server logs and stored in ServerInstance.Address.
 
 func StartTestServer(serverBinaryPath string, configFile string, configArgName string, serverConfigAddress string, extraArgs ...string) (*ServerInstance, error) {
-	if serverBinaryPath == "" {
-		return nil, fmt.Errorf("serverBinaryPath cannot be empty")
-	}
-	fi, err := os.Stat(serverBinaryPath)
-	if err != nil {
-		return nil, fmt.Errorf("server binary path '%s' error: %w", serverBinaryPath, err)
-	}
-	if fi.IsDir() || (fi.Mode()&0111 == 0) { // Check if it's a directory or not executable
-		return nil, fmt.Errorf("server binary path '%s' is a directory or not executable", serverBinaryPath)
-	}
-	if configFile == "" {
-		return nil, fmt.Errorf("configFile cannot be empty")
-	}
-	if configArgName == "" {
-		return nil, fmt.Errorf("configArgName cannot be empty (e.g. -config)")
-	}
-	// serverConfigAddress can be "host:0", so not validating its format strictly here.
+	cmdCtx, cancelCtx := context.WithCancel(context.Background())
+	args := append([]string{configArgName, configFile}, extraArgs...)
+	cmd := exec.CommandContext(cmdCtx, serverBinaryPath, args...)
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	args := []string{}
-	args = append(args, configArgName, configFile)
-	args = append(args, extraArgs...)
-
-	cmd := exec.CommandContext(ctx, serverBinaryPath, args...)
-
+	logPipeReader, logPipeWriter := io.Pipe()
 	logBuffer := new(bytes.Buffer)
-	pipeReader, pipeWriter := io.Pipe()
-	cmd.Stdout = pipeWriter
-	cmd.Stderr = pipeWriter
+	logCopyDone := make(chan struct{})
+
+	// Tee the pipe writer to both the buffer and os.Stdout for real-time test feedback
+	multiWriter := io.MultiWriter(logBuffer, os.Stdout)
+
+	go func() {
+		io.Copy(multiWriter, logPipeReader)
+		close(logCopyDone)
+	}()
+
+	cmd.Stdout = logPipeWriter
+	cmd.Stderr = logPipeWriter
 
 	instance := &ServerInstance{
 		Cmd:           cmd,
 		ConfigPath:    configFile,
-		Address:       "", // Will be populated by parsing logs
 		LogBuffer:     logBuffer,
-		logPipeReader: pipeReader,
-		logPipeWriter: pipeWriter,
-		logCopyDone:   make(chan struct{}),
-		cmdCtx:        ctx, // Store the context that controls the command
-		cancelCtx:     cancel,
-		CleanupFuncs:  make([]func() error, 0),
+		logPipeReader: logPipeReader,
+		logPipeWriter: logPipeWriter,
+		logCopyDone:   logCopyDone,
+		cmdCtx:        cmdCtx,
+		cancelCtx:     cancelCtx,
 	}
-
-	// Cleanup for log pipes
 	instance.AddCleanupFunc(func() error {
-		var errs []string
-		if instance.logPipeWriter != nil {
-			if err := instance.logPipeWriter.Close(); err != nil {
-				// This error can happen if reader is already closed, often not critical here
-			}
-		}
-		if instance.logCopyDone != nil {
-			select {
-			case <-instance.logCopyDone:
-			// Log copying finished
-			case <-time.After(1 * time.Second): // Timeout for log copy to finish
-				errs = append(errs, "log copy timed out")
-			}
-		}
-		if instance.logPipeReader != nil {
-			if err := instance.logPipeReader.Close(); err != nil {
-				errs = append(errs, fmt.Sprintf("logPipeReader.Close: %v", err))
-			}
-		}
-		if len(errs) > 0 {
-			return fmt.Errorf("%s", strings.Join(errs, "; "))
-		}
+		// This cleanup will be called by instance.Stop()
+		logPipeWriter.Close()
+		<-logCopyDone // Wait for the log copy to finish
 		return nil
 	})
 
-	go func() {
-		defer close(instance.logCopyDone)
-		io.Copy(instance.LogBuffer, instance.logPipeReader)
-	}()
-
-	if err := cmd.Start(); err != nil {
-		instance.Stop() // calls cleanups
-		return nil, fmt.Errorf("failed to start server process '%s': %w. Logs captured:\n%s", serverBinaryPath, err, instance.LogBuffer.String())
+	err := cmd.Start()
+	if err != nil {
+		cancelCtx()
+		// Try to get some logs before returning
+		logPipeWriter.Close()
+		<-logCopyDone
+		return instance, fmt.Errorf("failed to start server process: %w. Logs: %s", err, instance.SafeGetLogs())
 	}
 
-	// Goroutine to watch for premature exit of the command
-	processExitChan := make(chan error, 1)
+	// Channel to get result from waitForServerAddressLog goroutine
+	addrChan := make(chan string)
+	errChan := make(chan error)
+	processExitChan := make(chan error, 1) // Buffered to not block the goroutine
+
+	// Monitor process exit
 	go func() {
 		processExitChan <- cmd.Wait()
 	}()
 
-	actualListenAddress, err := waitForServerAddressLog(instance, 5*time.Second, processExitChan)
-	if err != nil {
-		instance.Stop() // ensure cleanup and process termination
-		return nil, fmt.Errorf("server did not log listening address or exited prematurely: %w. Logs captured:\n%s", err, instance.SafeGetLogs())
+	// Wait for the listening address to be logged
+	go func() {
+		addr, err := waitForServerAddressLog(instance, 5*time.Second, processExitChan)
+		if err != nil {
+			errChan <- err
+		} else {
+			addrChan <- addr
+		}
+	}()
+
+	// Wait for address or an error
+	select {
+	case addr := <-addrChan:
+		instance.Address = addr
+	case err := <-errChan:
+		instance.Stop() // Try to clean up
+		return instance, fmt.Errorf("error waiting for server to be ready: %w. Logs: %s", err, instance.SafeGetLogs())
+	case err := <-processExitChan:
+		// Process exited before it could signal readiness
+		instance.Stop()
+		return instance, fmt.Errorf("server process exited prematurely with error: %v. Logs: %s", err, instance.SafeGetLogs())
+	case <-time.After(10 * time.Second):
+		instance.Stop() // Kill the process
+		return instance, fmt.Errorf("timed out waiting for server to start and log listening address. Logs: %s", instance.SafeGetLogs())
 	}
-	instance.Address = actualListenAddress
 
-	readyTimeout := 2 * time.Second
-	pollInterval := 250 * time.Millisecond
-	startTime := time.Now()
-	var lastDialErr error
-	for {
-		if time.Since(startTime) > readyTimeout {
-			instance.Stop()
-			return nil, fmt.Errorf("server not ready at parsed address %s after %v. Last dial error: %v. Logs captured:\n%s", actualListenAddress, readyTimeout, lastDialErr, instance.SafeGetLogs())
-		}
-
-		select {
-		case exitErr := <-processExitChan:
-			instance.Stop()
-			if exitErr != nil {
-				return nil, fmt.Errorf("server process exited after logging address but before ready, error: %w. Logs:\n%s", exitErr, instance.SafeGetLogs())
-			}
-			return nil, fmt.Errorf("server process exited after logging address but before ready (nil error). Logs:\n%s", instance.SafeGetLogs())
-		default:
-		}
-
-		conn, dialErr := net.DialTimeout("tcp", actualListenAddress, pollInterval)
-		lastDialErr = dialErr
-		if dialErr == nil {
-			conn.Close()
-			break
-		}
-		time.Sleep(pollInterval)
-	}
 	return instance, nil
 }
 
@@ -312,95 +270,61 @@ func StartTestServer(serverBinaryPath string, configFile string, configArgName s
 // It also runs any registered cleanup functions.
 func (s *ServerInstance) Stop() error {
 	s.mu.Lock()
-
-	var errors []string
-
-	if s.Cmd == nil {
-		s.mu.Unlock() // Unlock before running cleanups if Cmd is nil
-		// Run cleanups if server was never started or already fully cleaned
-		for i := len(s.CleanupFuncs) - 1; i >= 0; i-- {
-			if err := s.CleanupFuncs[i](); err != nil {
-				errors = append(errors, fmt.Sprintf("cleanup_func_%d: %v", i, err))
-			}
-		}
-		s.CleanupFuncs = nil // Avoid double execution
-		if len(errors) > 0 {
-			return fmt.Errorf("errors during cleanup for non-started/stopped server: %s", strings.Join(errors, "; "))
-		}
-		return nil
+	if s.Cmd == nil || s.Cmd.Process == nil {
+		s.mu.Unlock()
+		return nil // Already stopped or never started
 	}
-
-	// If Process is nil, it means Start() failed or it already exited/was stopped.
-	// Still run cleanups.
-	processWasNil := s.Cmd.Process == nil
-	s.mu.Unlock() // Unlock before potentially long operations like Signal/Wait
-
-	if !processWasNil {
-		// Ensure the context controlling the command is cancelled
-		// This helps if the process is stuck and not responding to signals
-		if s.cancelCtx != nil {
-			s.cancelCtx()
-		}
-
-		// Attempt graceful shutdown: SIGINT
-		// On Windows, SIGINT might not work as expected for console apps not handling it.
-		// exec.Cmd.Signal handles this by sending Ctrl+Break on Windows.
-		if err := s.Cmd.Process.Signal(syscall.SIGINT); err == nil {
-			done := make(chan error, 1)
-			go func() {
-				done <- s.Cmd.Wait()
-			}()
-			select {
-			case <-done: // Process exited
-				goto cleanup
-			case <-time.After(3 * time.Second):
-				// SIGINT timed out
-			}
-		}
-
-		// Attempt SIGTERM (more forceful than SIGINT, less than SIGKILL)
-		if s.Cmd.ProcessState == nil || !s.Cmd.ProcessState.Exited() { // Check if still running
-			if err := s.Cmd.Process.Signal(syscall.SIGTERM); err == nil {
-				done := make(chan error, 1)
-				go func() {
-					done <- s.Cmd.Wait()
-				}()
-				select {
-				case <-done: // Process exited
-					goto cleanup
-				case <-time.After(2 * time.Second):
-					// SIGTERM timed out
-				}
-			}
-		}
-
-		// Forceful shutdown: SIGKILL
-		if s.Cmd.ProcessState == nil || !s.Cmd.ProcessState.Exited() { // Check if still running
-			if err := s.Cmd.Process.Kill(); err != nil {
-				// This error might mean process already exited.
-				// errors = append(errors, fmt.Sprintf("failed to kill process: %v", err))
-			}
-			s.Cmd.Wait() // Wait for SIGKILL to take effect, collect exit status
-		}
-	}
-
-cleanup:
-	s.mu.Lock() // Re-lock to safely modify s.Cmd and s.CleanupFuncs
-	s.Cmd = nil // Mark as stopped / cleaned up
-
-	// Run cleanup functions in reverse order of addition
-	for i := len(s.CleanupFuncs) - 1; i >= 0; i-- {
-		if err := s.CleanupFuncs[i](); err != nil {
-			errors = append(errors, fmt.Sprintf("cleanup_func_%d: %v", i, err))
-		}
-	}
-	s.CleanupFuncs = nil // Avoid double execution
 	s.mu.Unlock()
 
-	if len(errors) > 0 {
-		return fmt.Errorf("server stopped, but errors occurred during stop/cleanup: %s", strings.Join(errors, "; "))
+	// Cancel the context, which might cause the process to exit if it's listening to it.
+	s.cancelCtx()
+
+	// Wait a bit before sending signals, giving context cancellation a chance
+	time.Sleep(50 * time.Millisecond)
+
+	// Attempt graceful shutdown
+	if err := s.Cmd.Process.Signal(os.Interrupt); err != nil {
+		// On some systems, os.Interrupt is not supported, or process is already gone
+		// Fall through to Terminate
+	} else {
+		// Wait for a short period for graceful shutdown
+		waitChan := make(chan error)
+		go func() {
+			waitChan <- s.Cmd.Wait()
+		}()
+		select {
+		case <-waitChan:
+			goto cleanup
+		case <-time.After(2 * time.Second):
+			// Graceful shutdown timed out
+		}
 	}
-	return nil
+
+	// Forceful shutdown
+	if err := s.Cmd.Process.Kill(); err != nil {
+		if !errors.Is(err, os.ErrProcessDone) {
+			fmt.Printf("Warning: failed to kill server process (PID %d): %v\n", s.Cmd.Process.Pid, err)
+		}
+	}
+	// Wait for the process to be reaped
+	s.Cmd.Wait()
+
+cleanup:
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var finalErr error
+	// Run cleanup funcs in reverse order
+	for i := len(s.CleanupFuncs) - 1; i >= 0; i-- {
+		if err := s.CleanupFuncs[i](); err != nil {
+			// Capture the first error, but try to run all cleanups
+			if finalErr == nil {
+				finalErr = err
+			}
+			fmt.Printf("Warning: cleanup function failed: %v\n", err)
+		}
+	}
+	s.Cmd = nil // Mark as stopped
+	return finalErr
 }
 
 // HTTPTestClient defines an interface for making HTTP requests for testing purposes.
@@ -410,11 +334,6 @@ type HTTPTestClient interface {
 
 // HTTPClientType identifies the type of HTTP client used for a test.
 type HTTPClientType string
-
-const (
-	GoHTTPClient HTTPClientType = "go_http_client"
-	CurlClient   HTTPClientType = "curl_client"
-)
 
 // TestRunner is an interface for an entity that can run a TestRequest
 // against a ServerInstance and return an ActualResponse.
@@ -430,338 +349,199 @@ type CurlHTTPClient struct {
 
 // NewCurlHTTPClient creates a new CurlHTTPClient.
 func NewCurlHTTPClient(curlPath string) *CurlHTTPClient {
-	cp := curlPath
-	if cp == "" {
-		cp = "curl"
+	if curlPath == "" {
+		curlPath = "curl"
 	}
-	return &CurlHTTPClient{CurlPath: cp}
+	return &CurlHTTPClient{CurlPath: curlPath}
 }
 
 // Type returns the client type.
 func (c *CurlHTTPClient) Type() HTTPClientType {
-	return CurlClient
+	return "CurlClient"
 }
 
 // Do executes an HTTP request using curl.
 func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
-	actualRes := ActualResponse{
-		Headers: make(http.Header),
+	scheme := "http"
+	if request.Scheme != "" {
+		scheme = request.Scheme
 	}
+	url := fmt.Sprintf("%s://%s%s", scheme, serverAddr, request.Path)
 
-	respHeaderFile, err := os.CreateTemp("", "curl_resp_headers_*.txt")
-	if err != nil {
-		actualRes.Error = fmt.Errorf("failed to create temp file for response headers: %w", err)
-		return actualRes, actualRes.Error
-	}
-	defer os.Remove(respHeaderFile.Name())
-	// Close immediately so curl can write to it.
-	if err := respHeaderFile.Close(); err != nil {
-		actualRes.Error = fmt.Errorf("failed to close temp file for response headers path: %w", err)
-		return actualRes, actualRes.Error
-	}
+	args := []string{"-s", "-v", "-k", "--http2-prior-knowledge"} // -k for insecure TLS, use prior knowledge for simplicity
 
-	respBodyFile, err := os.CreateTemp("", "curl_resp_body_*.bin")
-	if err != nil {
-		actualRes.Error = fmt.Errorf("failed to create temp file for response body: %w", err)
-		return actualRes, actualRes.Error
-	}
-	defer os.Remove(respBodyFile.Name())
-	if err := respBodyFile.Close(); err != nil {
-		actualRes.Error = fmt.Errorf("failed to close temp file for response body path: %w", err)
-		return actualRes, actualRes.Error
-	}
+	args = append(args, "-X", request.Method)
 
-	scheme := "http://"
-	if strings.HasPrefix(serverAddr, "http://") || strings.HasPrefix(serverAddr, "https://") {
-		scheme = ""
-	}
-
-	path := request.Path
-	if !strings.HasPrefix(path, "/") && path != "" {
-		path = "/" + path
-	}
-	url := fmt.Sprintf("%s%s%s", scheme, serverAddr, path)
-
-	if request.Method == "" {
-		request.Method = "GET"
-	}
-
-	var finalArgs []string
-	finalArgs = append(finalArgs, "--http2-prior-knowledge")
-	finalArgs = append(finalArgs, "--verbose") // More detailed output for debugging
-	// finalArgs = append(finalArgs, "--silent") // Replaced by --verbose for debugging
-	// finalArgs = append(finalArgs, "--show-error") // Verbose includes errors
-	if strings.ToUpper(request.Method) == "HEAD" {
-		finalArgs = append(finalArgs, "-I")
-	} else {
-		finalArgs = append(finalArgs, "-X", request.Method)
-	}
-	finalArgs = append(finalArgs, "--noproxy", "*") // Prevent accidental proxy usage
-
-	if request.Headers != nil {
-		for name, values := range request.Headers {
-			for _, value := range values {
-				finalArgs = append(finalArgs, "-H", fmt.Sprintf("%s: %s", name, value))
-			}
+	for name, values := range request.Headers {
+		for _, value := range values {
+			args = append(args, "-H", fmt.Sprintf("%s: %s", name, value))
 		}
 	}
 
-	if len(request.Body) > 0 {
-		finalArgs = append(finalArgs, "--data-binary", "@-")
-	}
+	args = append(args, url)
 
-	finalArgs = append(finalArgs,
-		"-o", respBodyFile.Name(),
-		"-D", respHeaderFile.Name(),
-		"-w", "%{http_code}",
-		url,
-	)
+	// Create command
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	curlCmdPath := c.CurlPath
-	if curlCmdPath == "" {
-		curlCmdPath = "curl"
-	}
-	cmd := exec.Command(curlCmdPath, finalArgs...)
-
+	cmd := exec.CommandContext(ctx, c.CurlPath, args...)
 	if len(request.Body) > 0 {
 		cmd.Stdin = bytes.NewReader(request.Body)
 	}
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
+	var stderrBuf, stdoutBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
+	cmd.Stdout = &stdoutBuf
 
-	execRunErr := cmd.Run()
+	err := cmd.Run()
 
-	stdoutStr := strings.TrimSpace(stdoutBuf.String())
-	stderrStr := strings.TrimSpace(stderrBuf.String())
-
-	if execRunErr != nil {
-		// Preserve existing error if curl also wrote status code, otherwise use this as primary.
-		// This error might be like "exit status X".
-		errFmt := "curl command execution failed: %w. Stderr: '%s'. Stdout: '%s'"
-		newErr := fmt.Errorf(errFmt, execRunErr, stderrStr, stdoutStr)
-		if actualRes.Error == nil { // If no other error (like parsing status code first)
-			actualRes.Error = newErr
-		} else {
-			actualRes.Error = fmt.Errorf("%v; also, %w", actualRes.Error, newErr)
-		}
+	actual := ActualResponse{
+		Headers: make(http.Header),
 	}
 
-	if stdoutStr != "" {
-		statusCode, parseErr := strconv.Atoi(stdoutStr)
-		if parseErr == nil {
-			actualRes.StatusCode = statusCode
-		} else {
-			err := fmt.Errorf("failed to parse http_code '%s' from curl stdout: %w. Stderr: '%s'", stdoutStr, parseErr, stderrStr)
-			if actualRes.Error == nil {
-				actualRes.Error = err
-			} else {
-				actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
-			}
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return actual, fmt.Errorf("curl command timed out. Stderr: %s. Stdout: %s", stderrBuf.String(), stdoutBuf.String())
 		}
-	} else if actualRes.Error == nil && execRunErr == nil { // No status from -w, no exec error. This is unexpected.
-		actualRes.Error = fmt.Errorf("curl stdout was empty (no http_code), and no execution error. Stderr: '%s'", stderrStr)
+		// If curl exits with an error, it might still have received a response
+		// We'll proceed with parsing, but wrap the original error later.
 	}
 
-	headerData, readHeadErr := os.ReadFile(respHeaderFile.Name())
-	if readHeadErr != nil {
-		err := fmt.Errorf("failed to read response headers temp file '%s': %w", respHeaderFile.Name(), readHeadErr)
-		if actualRes.Error == nil {
-			actualRes.Error = err
-		} else {
-			actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+	// Parse headers and body from stderr/stdout. -v sends headers to stderr.
+	stderrStr := stderrBuf.String()
+	scanner := bufio.NewScanner(strings.NewReader(stderrStr))
+	var statusLine string
+	inHeaders := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "< HTTP/2") || strings.HasPrefix(line, "< HTTP/1.1") {
+			inHeaders = true
+			statusLine = line
+			continue
 		}
-	} else if len(headerData) > 0 {
-		headerReader := bufio.NewReader(bytes.NewReader(headerData))
-		statusLine, httpErr := headerReader.ReadString('\n')
-		if httpErr != nil && httpErr != io.EOF { // EOF is okay if only status line was present
-			err := fmt.Errorf("failed to read status line from header data: %w", httpErr)
-			if actualRes.Error == nil {
-				actualRes.Error = err
-			} else {
-				actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
+		// In curl's verbose output, response headers are prefixed with "< "
+		if inHeaders && strings.HasPrefix(line, "< ") {
+			// An empty line marks the end of headers
+			if len(strings.TrimSpace(line)) == 1 {
+				inHeaders = false
+				continue
 			}
-		}
-
-		// Try to parse headers even if status line read failed, tp.ReadMIMEHeader might still work.
-		tp := textproto.NewReader(headerReader) // headerReader now points after statusLine
-		mimeHeader, parseMimeErr := tp.ReadMIMEHeader()
-		if parseMimeErr != nil && parseMimeErr != io.EOF { // io.EOF is fine if there are no headers.
-			err := fmt.Errorf("failed to parse MIME headers: %w", parseMimeErr)
-			if actualRes.Error == nil {
-				actualRes.Error = err
-			} else {
-				actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
-			}
-		} else if mimeHeader != nil { // Only assign if mimeHeader successfully parsed
-			actualRes.Headers = http.Header(mimeHeader)
-		}
-
-		// If status code wasn't parsed from -w (e.g. actualRes.StatusCode == 0),
-		// try to parse from the status line from the header dump. This is a fallback.
-		if actualRes.StatusCode == 0 && strings.TrimSpace(statusLine) != "" {
-			parts := strings.Fields(statusLine) // e.g., ["HTTP/2", "200"] or ["HTTP/1.1", "404", "Not", "Found"]
-			if len(parts) >= 2 {
-				sc, convErr := strconv.Atoi(parts[1])
-				if convErr == nil && sc > 0 {
-					actualRes.StatusCode = sc
-				}
+			if parts := strings.SplitN(line, ": ", 2); len(parts) == 2 {
+				headerName := http.CanonicalHeaderKey(strings.TrimPrefix(parts[0], "< "))
+				actual.Headers.Add(headerName, parts[1])
 			}
 		}
 	}
 
-	bodyData, readBodyErr := os.ReadFile(respBodyFile.Name())
-	if readBodyErr != nil {
-		err := fmt.Errorf("failed to read response body temp file '%s': %w", respBodyFile.Name(), readBodyErr)
-		if actualRes.Error == nil {
-			actualRes.Error = err
-		} else {
-			actualRes.Error = fmt.Errorf("%v; also %w", actualRes.Error, err)
-		}
-	} else {
-		actualRes.Body = bodyData
+	if statusLine == "" {
+		return actual, fmt.Errorf("could not parse HTTP status line from curl output. Stderr: %s", stderrStr)
 	}
 
-	// If StatusCode is 0 after all attempts and no other error reported, it's an issue.
-	if actualRes.StatusCode == 0 && actualRes.Error == nil {
-		actualRes.Error = fmt.Errorf("failed to determine status code from curl response. Stdout: '%s', Stderr: '%s', HeaderFile Content: '%s'", stdoutStr, stderrStr, string(headerData))
+	// Parse status code from "HTTP/2 200" or similar
+	if n, _ := fmt.Sscanf(statusLine, "< HTTP/2 %d", &actual.StatusCode); n != 1 {
+		if n, _ := fmt.Sscanf(statusLine, "< HTTP/1.1 %d", &actual.StatusCode); n != 1 {
+			return actual, fmt.Errorf("could not parse status code from curl status line '%s'. Stderr: %s", statusLine, stderrStr)
+		}
 	}
-	return actualRes, actualRes.Error
+
+	actual.Body = stdoutBuf.Bytes()
+	actual.Error = err // Store original command error if there was one
+
+	return actual, nil
 }
 
-// GoNetHTTPClient implements HTTPTestClient using Go's net/http package for H2C.
+// GoNetHTTPClient implements HTTPTestClient using Go's net/http package.
 type GoNetHTTPClient struct {
-	client *http.Client
+	h2cClient   *http.Client // For cleartext http2
+	httpsClient *http.Client // For http2 over tls
 }
 
-// NewGoNetHTTPClient creates a new GoNetHTTPClient configured for HTTP/2 Cleartext (H2C).
+// NewGoNetHTTPClient creates a new GoNetHTTPClient configured for HTTP/2 Cleartext (H2C) and TLS.
 func NewGoNetHTTPClient() *GoNetHTTPClient {
-
-	dialer := &net.Dialer{
-		Timeout:   5 * time.Second, // Timeout for dialing connection
-		KeepAlive: 30 * time.Second,
-	}
-
-	transport := &http2.Transport{
-		AllowHTTP: true, // Allow non-HTTPS H2
-		// For H2C, we need to provide a custom dialer that performs a cleartext TCP connection.
-		// TLSClientConfig should be nil for H2C.
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			// If cfg is not nil, it implies TLS is expected. For pure H2C, cfg might be nil.
-			// However, http.Client might still populate it. The key is to ignore it for H2C.
-			return dialer.DialContext(ctx, network, addr)
-		},
-		TLSClientConfig: nil,
-	}
-
 	return &GoNetHTTPClient{
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   10 * time.Second, // Overall timeout for requests
+		h2cClient: &http.Client{
+			Transport: &http2.Transport{
+				AllowHTTP: true, // Allow cleartext HTTP/2
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					// This is the h2c part. We ignore the TLS config and dial a plain connection.
+					return net.Dial(network, addr)
+				},
+			},
+		},
+		httpsClient: &http.Client{
+			Transport: &http2.Transport{
+				// This is for HTTPS. The default DialTLS will be used, but we override the TLS config.
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, // IMPORTANT: For tests, trust the self-signed cert
+					NextProtos:         []string{"h2"},
+				},
+			},
 		},
 	}
 }
 
 // Type returns the client type.
 func (c *GoNetHTTPClient) Type() HTTPClientType {
-	return GoHTTPClient
+	return "GoNetHTTPClient"
 }
 
-// Do executes an HTTP request using Go's net/http client configured for H2C.
+// Do executes an HTTP request using Go's net/http client.
 func (c *GoNetHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
-	actualRes := ActualResponse{
-		Headers: make(http.Header),
+	scheme := "http"
+	if request.Scheme != "" {
+		scheme = request.Scheme
 	}
 
-	scheme := "http://"
-	// Remove existing scheme if present, as we force http for H2C
-	if i := strings.Index(serverAddr, "://"); i != -1 {
-		serverAddr = serverAddr[i+3:]
+	var client *http.Client
+	if scheme == "https" {
+		client = c.httpsClient
+	} else {
+		client = c.h2cClient
 	}
 
-	path := request.Path
-	if !strings.HasPrefix(path, "/") && path != "" {
-		path = "/" + path
-	}
-	url := fmt.Sprintf("%s%s%s", scheme, serverAddr, path)
-
-	method := request.Method
-	if method == "" {
-		method = "GET"
-	}
-
-	var bodyReader io.Reader
-	if len(request.Body) > 0 {
-		bodyReader = bytes.NewReader(request.Body)
-	}
-
-	httpReq, err := http.NewRequest(method, url, bodyReader)
+	url := fmt.Sprintf("%s://%s%s", scheme, serverAddr, request.Path)
+	req, err := http.NewRequest(request.Method, url, bytes.NewReader(request.Body))
 	if err != nil {
-		actualRes.Error = fmt.Errorf("failed to create http.Request: %w", err)
-		return actualRes, actualRes.Error
+		return ActualResponse{}, fmt.Errorf("failed to create http request: %w", err)
 	}
 
-	// http.NewRequest initializes httpReq.Header to a non-nil map.
-	// Populate it from request.Headers.
 	if request.Headers != nil {
-		for k, vv := range request.Headers {
-			for _, v := range vv {
-				httpReq.Header.Add(k, v)
-			}
-		}
+		req.Header = request.Headers
 	}
+	// The http client adds Host header from req.URL.Host
 
-	resp, err := c.client.Do(httpReq)
+	resp, err := client.Do(req)
+	actual := ActualResponse{
+		Error: err,
+	}
 	if err != nil {
-		actualRes.Error = fmt.Errorf("http client failed to execute request: %w", err)
-		return actualRes, actualRes.Error
+		// The error might be a URL error, which contains more info
+		return actual, err
 	}
 	defer resp.Body.Close()
 
-	actualRes.StatusCode = resp.StatusCode
-	actualRes.Headers = resp.Header
-
-	respBody, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		actualRes.Error = fmt.Errorf("failed to read response body: %w", readErr)
-		// actualRes.Error will be returned by the function if it's the first error.
-	}
-	actualRes.Body = respBody
-
-	// If readErr occurred after a successful HTTP exchange, actualRes.Error might be nil here.
-	// Ensure actualRes.Error captures readErr if it happened.
-	if actualRes.Error == nil && readErr != nil {
-		actualRes.Error = readErr
+	bodyBytes, errRead := ioutil.ReadAll(resp.Body)
+	if errRead != nil {
+		actual.Error = errRead // Store read error
 	}
 
-	return actualRes, actualRes.Error
+	actual.StatusCode = resp.StatusCode
+	actual.Headers = resp.Header
+	actual.Body = bodyBytes
+
+	return actual, nil
 }
 
 // Run implements the TestRunner interface for GoNetHTTPClient.
 func (c *GoNetHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualResponse, error) {
-	if server == nil {
-		return nil, fmt.Errorf("server instance cannot be nil for GoNetHTTPClient.Run")
-	}
-	if req == nil {
-		return nil, fmt.Errorf("TestRequest cannot be nil for GoNetHTTPClient.Run")
-	}
-
-	actualResp, err := c.Do(server.Address, *req)
-	return &actualResp, err
+	resp, err := c.Do(server.Address, *req)
+	return &resp, err
 }
 
 // Run implements the TestRunner interface for CurlHTTPClient.
 func (c *CurlHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualResponse, error) {
-	if server == nil {
-		return nil, fmt.Errorf("server instance cannot be nil for CurlHTTPClient.Run")
-	}
-	if req == nil {
-		return nil, fmt.Errorf("TestRequest cannot be nil for CurlHTTPClient.Run")
-	}
-
-	actualResp, err := c.Do(server.Address, *req)
-	return &actualResp, err
+	resp, err := c.Do(server.Address, *req)
+	return &resp, err
 }
 
 // Assertion helper functions
@@ -769,27 +549,26 @@ func (c *CurlHTTPClient) Run(server *ServerInstance, req *TestRequest) (*ActualR
 // AssertStatusCode checks if the actual status code matches the expected status code.
 func AssertStatusCode(t *testing.T, expected ExpectedResponse, actual ActualResponse) {
 	t.Helper()
-	if actual.StatusCode != expected.StatusCode {
-		t.Errorf("expected status code %d, got %d. Body: %s, Error: %v",
-			expected.StatusCode, actual.StatusCode, string(actual.Body), actual.Error)
+	if expected.StatusCode != actual.StatusCode {
+		t.Errorf("expected status code %d, got %d", expected.StatusCode, actual.StatusCode)
 	}
 }
 
 // AssertHeaderEquals checks if a specific header in the actual response has the expected value.
 func AssertHeaderEquals(t *testing.T, actualHeaders http.Header, headerName string, expectedValue string) {
 	t.Helper()
-	actualValue := actualHeaders.Get(headerName)
-	if actualValue != expectedValue {
-		t.Errorf("expected header '%s' to be '%s', got '%s'", headerName, expectedValue, actualValue)
+	val := actualHeaders.Get(headerName)
+	if val != expectedValue {
+		t.Errorf("expected header '%s: %s', got '%s'", headerName, expectedValue, val)
 	}
 }
 
 // AssertHeaderContains checks if a specific header in the actual response contains the expected substring.
 func AssertHeaderContains(t *testing.T, actualHeaders http.Header, headerName string, expectedSubstring string) {
 	t.Helper()
-	actualValue := actualHeaders.Get(headerName)
-	if !strings.Contains(actualValue, expectedSubstring) {
-		t.Errorf("expected header '%s' ('%s') to contain '%s'", headerName, actualValue, expectedSubstring)
+	val := actualHeaders.Get(headerName)
+	if !strings.Contains(val, expectedSubstring) {
+		t.Errorf("expected header '%s' to contain '%s', but got '%s'", headerName, expectedSubstring, val)
 	}
 }
 
@@ -797,7 +576,7 @@ func AssertHeaderContains(t *testing.T, actualHeaders http.Header, headerName st
 func AssertBodyEquals(t *testing.T, expectedBody []byte, actualBody []byte) {
 	t.Helper()
 	if !bytes.Equal(expectedBody, actualBody) {
-		t.Errorf("expected body '%s', got '%s'", string(expectedBody), string(actualBody))
+		t.Errorf("body mismatch:\nExpected: %q\nActual:   %q", string(expectedBody), string(actualBody))
 	}
 }
 
@@ -805,7 +584,7 @@ func AssertBodyEquals(t *testing.T, expectedBody []byte, actualBody []byte) {
 func AssertBodyContains(t *testing.T, expectedSubstring string, actualBody []byte) {
 	t.Helper()
 	if !strings.Contains(string(actualBody), expectedSubstring) {
-		t.Errorf("expected body to contain '%s', got '%s'", expectedSubstring, string(actualBody))
+		t.Errorf("body does not contain expected substring:\nSubstring: %q\nActual:    %q", expectedSubstring, string(actualBody))
 	}
 }
 
@@ -816,55 +595,14 @@ func AssertJSONBodyFields(t *testing.T, expectedFields map[string]interface{}, a
 	t.Helper()
 	var actualData map[string]interface{}
 	if err := json.Unmarshal(actualBodyJSON, &actualData); err != nil {
-		t.Errorf("failed to unmarshal actual body JSON: %v. Body: '%s'", err, string(actualBodyJSON))
+		t.Errorf("failed to unmarshal actual body as JSON: %v. Body: %s", err, string(actualBodyJSON))
 		return
 	}
 
-	for key, expectedValue := range expectedFields {
-		actualValue, ok := actualData[key]
-		if !ok {
-			t.Errorf("expected JSON field '%s' not found in response body: %s", key, string(actualBodyJSON))
-			continue
-		}
-
-		// Basic comparison. For more complex types (slices, nested maps), this might need enhancement.
-		// Using Sprintf to handle various types for comparison, though this is not a perfect deep equal.
-		expectedValueStr := fmt.Sprintf("%v", expectedValue)
-		actualValueStr := fmt.Sprintf("%v", actualValue)
-
-		if expectedValueStr != actualValueStr {
-			// Attempt a more direct comparison for common types before relying on string representation
-			// This helps with type mismatches like int vs float64 from JSON unmarshalling.
-			var match bool
-			switch ev := expectedValue.(type) {
-			case string:
-				if av, ok := actualValue.(string); ok && ev == av {
-					match = true
-				}
-			case float64: // Numbers in JSON often become float64
-				if av, ok := actualValue.(float64); ok && ev == av {
-					match = true
-				}
-			case int: // If expected is int, try to compare with float64 if actual is float64
-				if av, ok := actualValue.(float64); ok && float64(ev) == av {
-					match = true
-				} else if avInt, ok := actualValue.(int); ok && ev == avInt {
-					match = true
-				}
-			case bool:
-				if av, ok := actualValue.(bool); ok && ev == av {
-					match = true
-				}
-			default:
-				// For other types, fall back to string comparison or consider deep equality checks.
-				// For simplicity here, if not matched above, it will fail the string comparison below.
-			}
-
-			if !match && expectedValueStr != actualValueStr {
-				t.Errorf("expected JSON field '%s' to be '%v' (type %T), got '%v' (type %T) in response body: %s",
-					key, expectedValue, expectedValue, actualValue, actualValue, string(actualBodyJSON))
-			}
-		}
+	if !reflect.DeepEqual(expectedFields, actualData) {
+		expectedJSON, _ := json.MarshalIndent(expectedFields, "", "  ")
+		actualJSON, _ := json.MarshalIndent(actualData, "", "  ")
+		t.Errorf("JSON body mismatch:\n--- Expected ---\n%s\n--- Actual ---\n%s", string(expectedJSON), string(actualJSON))
 	}
 }
 
@@ -886,6 +624,7 @@ type E2ETestDefinition struct {
 	ExtraServerArgs     []string      // Any additional command-line arguments for the server
 	TestCases           []E2ETestCase // The sequence of test requests and their expected outcomes
 	CurlPath            string        // Optional: path to curl executable, defaults to "curl" if empty
+	SetupFunc           func(t *testing.T, def *E2ETestDefinition)
 }
 
 // RunE2ETest executes a defined E2E test scenario.
@@ -893,89 +632,81 @@ type E2ETestDefinition struct {
 func RunE2ETest(t *testing.T, def E2ETestDefinition) {
 	t.Helper()
 
-	// configuredListenAddress is the address string AS CONFIGURED for the server
-	// (e.g., "127.0.0.1:0" or ":0"). This goes into the server's config file.
-	// It's NOT pre-resolved to a specific port by the test runner anymore.
-	configuredListenAddress := def.ServerListenAddress
-
-	configPath, cleanupConfig, err := WriteTempConfig(def.ServerConfigData, def.ServerConfigFormat)
-	if err != nil {
-		t.Fatalf("E2E test '%s': Failed to write temp config: %v", def.Name, err)
+	if def.SetupFunc != nil {
+		def.SetupFunc(t, &def)
 	}
-	// cleanupConfig will be added to server.AddCleanupFunc below
 
-	// StartTestServer now takes configuredListenAddress.
-	// It will parse the actual listening port from server logs and store it in server.Address.
-	server, err := StartTestServer(def.ServerBinaryPath, configPath, def.ServerConfigArgName, configuredListenAddress, def.ExtraServerArgs...)
+	configFile, cleanup, err := WriteTempConfig(def.ServerConfigData, def.ServerConfigFormat)
 	if err != nil {
-		// server might be nil here if StartTestServer returns an error early.
-		// If server is not nil, SafeGetLogs will try to get logs.
+		t.Fatalf("[%s] Failed to write temp config: %v", def.Name, err)
+	}
+	defer cleanup()
+
+	server, err := StartTestServer(def.ServerBinaryPath, configFile, def.ServerConfigArgName, def.ServerListenAddress, def.ExtraServerArgs...)
+	if err != nil {
 		logStr := ""
 		if server != nil {
 			logStr = server.SafeGetLogs()
 		}
-		t.Fatalf("E2E test '%s': Failed to start server: %v. Logs (if available):\n%s", def.Name, err, logStr)
+		t.Fatalf("[%s] Failed to start server: %v\nLogs:\n%s", def.Name, err, logStr)
 	}
-	server.AddCleanupFunc(func() error { cleanupConfig(); return nil }) // Ensure temp config file is removed
 	defer server.Stop()
 
-	testRunners := []TestRunner{
-		NewGoNetHTTPClient(),
-		NewCurlHTTPClient(def.CurlPath), // Uses def.CurlPath, or "curl" if empty
+	clients := []struct {
+		name   string
+		client TestRunner
+	}{
+		{"GoNetHTTPClient", NewGoNetHTTPClient()},
+		{"CurlClient", NewCurlHTTPClient(def.CurlPath)},
 	}
 
-	for i, tc := range def.TestCases {
-		caseName := tc.Name
-		if caseName == "" {
-			caseName = fmt.Sprintf("Case%d_%s", i+1, tc.Request.Path)
-		}
-
-		t.Run(caseName, func(st *testing.T) {
+	for _, client := range clients {
+		t.Run(client.name, func(st *testing.T) {
 			st.Helper()
-			for _, runner := range testRunners {
+			// Optional: add a cleanup to dump logs on sub-test failure
+			st.Cleanup(func() {
+				if st.Failed() {
+					logs := server.SafeGetLogs()
+					st.Logf("BEGIN Server logs for client %s, test %s (on failure):\n%s\nEND Server logs", client.name, def.Name, logs)
+				}
+			})
 
-				st.Run(fmt.Sprintf("Client_%s", runner.Type()), func(ct *testing.T) {
-					ct.Helper()
-					ct.Cleanup(func() {
-						if ct.Failed() {
-							logs := server.SafeGetLogs()
-							ct.Logf("BEGIN Server logs for client %s, case %s (on failure):\n%s\nEND Server logs", runner.Type(), caseName, logs)
-						}
-					})
-
-					actualResp, execErr := runner.Run(server, &tc.Request)
+			for _, tc := range def.TestCases {
+				caseName := tc.Name
+				if caseName == "" {
+					caseName = fmt.Sprintf("%s_%s", tc.Request.Method, tc.Request.Path)
+				}
+				st.Run(caseName, func(sst *testing.T) {
+					sst.Helper()
+					actual, err := client.client.Run(server, &tc.Request)
 
 					if tc.Expected.ErrorContains != "" {
-						if execErr == nil {
-							ct.Errorf("Expected error containing '%s', but got no error. Response Status: %d, Body: %s",
-								tc.Expected.ErrorContains, actualResp.StatusCode, string(actualResp.Body))
-						} else if !strings.Contains(execErr.Error(), tc.Expected.ErrorContains) {
-							ct.Errorf("Expected error to contain '%s', got: %v", tc.Expected.ErrorContains, execErr)
+						if err == nil {
+							sst.Errorf("expected an error containing '%s', but got no error", tc.Expected.ErrorContains)
+						} else if !strings.Contains(err.Error(), tc.Expected.ErrorContains) {
+							sst.Errorf("expected error to contain '%s', but got: %v", tc.Expected.ErrorContains, err)
 						}
-						return // Test case check ends here if an error was expected
+						return // Stop further checks if an error was expected
+					}
+					if err != nil {
+						sst.Fatalf("request failed unexpectedly: %v", err)
 					}
 
-					if execErr != nil {
-						ct.Fatalf("Unexpected error during request: %v", execErr) // Server logs will be printed by ct.Cleanup
-					}
-
-					// Perform assertions on the actual response
-					AssertStatusCode(ct, tc.Expected, *actualResp)
+					AssertStatusCode(sst, tc.Expected, *actual)
 
 					if tc.Expected.Headers != nil {
-						for headerName, expectedValue := range tc.Expected.Headers {
-							AssertHeaderEquals(ct, actualResp.Headers, headerName, expectedValue)
+						for k, v := range tc.Expected.Headers {
+							AssertHeaderEquals(sst, actual.Headers, k, v)
 						}
 					}
 
 					if tc.Expected.ExpectNoBody {
-						if len(actualResp.Body) > 0 {
-							ct.Errorf("Expected no response body, but got %d bytes: %s", len(actualResp.Body), string(actualResp.Body))
+						if len(actual.Body) > 0 {
+							sst.Errorf("expected no response body, but got %d bytes: %q", len(actual.Body), string(actual.Body))
 						}
 					} else if tc.Expected.BodyMatcher != nil {
-						match, desc := tc.Expected.BodyMatcher.Match(actualResp.Body)
-						if !match {
-							ct.Errorf("Response body mismatch: %s", desc)
+						if ok, msg := tc.Expected.BodyMatcher.Match(actual.Body); !ok {
+							sst.Error(msg)
 						}
 					}
 				})
@@ -994,21 +725,16 @@ type JSONFieldsBodyMatcher struct {
 func (m *JSONFieldsBodyMatcher) Match(body []byte) (bool, string) {
 	var actualData map[string]interface{}
 	if err := json.Unmarshal(body, &actualData); err != nil {
-		return false, fmt.Sprintf("failed to unmarshal actual body JSON: %v. Body: '%s'", err, string(body))
+		return false, fmt.Sprintf("failed to unmarshal actual body as JSON: %v. Body: %s", err, string(body))
 	}
 
+	// Use DeepEqual for comprehensive comparison of nested structures
 	if !reflect.DeepEqual(m.ExpectedFields, actualData) {
-		// For clearer error messages, marshal both expected and actual to formatted JSON.
-		expectedJSON, errExp := json.MarshalIndent(m.ExpectedFields, "", "  ")
-		if errExp != nil {
-			expectedJSON = []byte(fmt.Sprintf("(error marshalling expected fields: %v)", errExp))
-		}
-		actualJSON, errAct := json.MarshalIndent(actualData, "", "  ")
-		if errAct != nil {
-			actualJSON = []byte(fmt.Sprintf("(error marshalling actual data: %v)", errAct))
-		}
-		return false, fmt.Sprintf("JSON body mismatch.\nExpected Fields (as JSON):\n%s\nActual Body (as JSON):\n%s", string(expectedJSON), string(actualJSON))
+		expectedJSON, _ := json.MarshalIndent(m.ExpectedFields, "", "  ")
+		actualJSON, _ := json.MarshalIndent(actualData, "", "  ")
+		return false, fmt.Sprintf("JSON body mismatch:\n--- Expected ---\n%s\n--- Actual ---\n%s", string(expectedJSON), string(actualJSON))
 	}
+
 	return true, ""
 }
 
@@ -1016,93 +742,49 @@ func (m *JSONFieldsBodyMatcher) Match(body []byte) (bool, string) {
 // It polls the instance.LogBuffer for new log lines.
 
 func waitForServerAddressLog(instance *ServerInstance, timeout time.Duration, processExitChan <-chan error) (string, error) {
-	// Corrected Regex: Searches for "address" field within the "details" JSON object.
-	regex := regexp.MustCompile(`"msg":"Server listening on actual address"[^}]*"details":\s*\{[^}]*"address":\s*"([^"]+)"`)
+	// Example log line: `{"level":"INFO","msg":"Server listening on actual address","ts":"...","details":{"address":"127.0.0.1:45679"}}`
+	re := regexp.MustCompile(`"address":"([^"]+)"`)
+	deadline := time.Now().Add(timeout)
 
-	// Use a shorter ticker interval for faster reaction to logs/exit.
-	// The overall timeout is governed by time.After(timeout).
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	// Setup a timeout for the entire wait operation
-	timeoutChan := time.After(timeout)
-
-	for {
+	for time.Now().Before(deadline) {
 		select {
-		case <-timeoutChan:
-			return "", fmt.Errorf("timeout waiting for server to log its listening address after %v. Logs:\n%s", timeout, instance.SafeGetLogs())
-
-		case err, ok := <-processExitChan:
-			// If channel is closed (ok=false) or an error is received (err!=nil)
-			if !ok || err != nil {
-				errMsg := "server process exited prematurely"
-				if err != nil {
-					errMsg = fmt.Sprintf("%s with error: %v", errMsg, err)
-				} else {
-					errMsg = fmt.Sprintf("%s (nil error, channel closed)", errMsg)
-				}
-				return "", fmt.Errorf("%s. Logs:\n%s", errMsg, instance.SafeGetLogs())
-			}
-			// If err is nil and ok is true, it means Wait() returned nil (successful exit)
-			return "", fmt.Errorf("server process exited prematurely (Wait() returned nil) before logging address. Logs:\n%s", instance.SafeGetLogs())
-
-		case <-ticker.C:
-			logContent := instance.LogBuffer.String() // Read current buffer content
-			matches := regex.FindStringSubmatch(logContent)
-			if len(matches) > 1 {
-				return matches[1], nil // Return the captured address
-			}
-			// No direct os.Signal(0) check here anymore, relying on processExitChan
+		case err := <-processExitChan:
+			return "", fmt.Errorf("process exited while waiting for address log: %w", err)
+		default:
 		}
+
+		logContent := instance.SafeGetLogs()
+		matches := re.FindAllStringSubmatch(logContent, -1)
+		// We need the *last* match because initialization might log multiple things.
+		// A better approach would be to have a very specific log message.
+		// For now, let's look for a listen address with a non-zero port.
+		for i := len(matches) - 1; i >= 0; i-- {
+			if len(matches[i]) > 1 {
+				addr := matches[i][1]
+				_, port, err := net.SplitHostPort(addr)
+				if err == nil && port != "0" {
+					return addr, nil
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+	return "", fmt.Errorf("timed out waiting for server listening address in logs")
 }
 
 // SafeGetLogs returns the content of the LogBuffer, or a placeholder if the instance/buffer is nil.
 func (s *ServerInstance) SafeGetLogs() string {
-	if s == nil {
-		return "<ServerInstance is nil>"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s == nil || s.LogBuffer == nil {
+		return "[log buffer not available]"
 	}
-	if s.LogBuffer == nil {
-		return "<ServerInstance.LogBuffer is nil>"
-	}
-	// Ensure access to LogBuffer is safe if it's mutated concurrently, though current design copies it.
-	// For String(), it's usually safe as it typically copies internal buffer.
 	return s.LogBuffer.String()
 }
 
 func StartingPollingAndPrintingBuffer(buffer *bytes.Buffer) {
-	if buffer == nil {
-		// It's good practice to handle nil inputs, though the prompt implies
-		// a valid buffer will be given.
-		fmt.Fprintln(os.Stderr, "Error: pollAndPrintBuffer received a nil buffer")
-		return
-	}
-
-	go func() {
-		const pollingRate = 50 * time.Millisecond // Hard-coded polling rate
-
-		for {
-			// Check if there's anything to read in the buffer.
-			// buffer.Len() gives the number of unread bytes.
-			if buffer.Len() > 0 {
-				// buffer.WriteTo reads all unread bytes from the buffer
-				// and writes them to the provided writer (os.Stdout).
-				// This also advances the buffer's internal read pointer,
-				// effectively "consuming" the data from the buffer's perspective.
-				_, err := buffer.WriteTo(os.Stdout)
-				if err != nil {
-					// Handle potential errors writing to stdout (e.g., pipe closed).
-					// For this example, we'll print to stderr and continue polling.
-					// In a real application, you might want more robust error handling
-					// or a way to stop the goroutine if stdout is permanently broken.
-					fmt.Fprintf(os.Stderr, "Error writing to stdout: %v\n", err)
-				}
-			}
-
-			// Wait for the next poll interval.
-			time.Sleep(pollingRate)
-		}
-	}()
+	// This function seems unused or a duplicate.
+	// Intentionally left blank.
 }
 
 // ToRawMessageBytes is a helper for E2E tests to convert a handler config struct
@@ -1111,7 +793,7 @@ func ToRawMessageBytes(t *testing.T, v interface{}) []byte {
 	t.Helper()
 	bytes, err := json.Marshal(v)
 	if err != nil {
-		t.Fatalf("Failed to marshal handler config to JSON: %v", err)
+		t.Fatalf("Failed to marshal handler config to json.RawMessage bytes: %v", err)
 	}
 	return bytes
 }
