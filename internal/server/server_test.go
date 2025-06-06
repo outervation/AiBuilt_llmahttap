@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,13 @@ import (
 	"sync"
 	"syscall" // RE-ADDED
 	"testing"
+
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"time"
 
 	"example.com/llmahttap/v2/internal/config"
@@ -3857,4 +3866,157 @@ func TestServer_Start_And_DoneChannel(t *testing.T) {
 		}
 	})
 
+}
+
+func TestServer_acceptLoop_TLS_Path(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+	setupHandleTCPConnectionMocks_Test()
+	defer teardownHandleTCPConnectionMocks_Test()
+
+	baseCfg := newTestConfig("127.0.0.1:0")
+	originalCfgPath := "test_acceptloop_tls_config.json"
+	mockRouterInstance := newMockRouter()
+	hr := NewHandlerRegistry()
+
+	// 1. Generate cert and key for TLS config
+	// Since we can't import internal/testutil, we use a helper from a test file there
+	// This assumes the test harness can link it.
+	// If not, we'd need to copy the cert generation logic or use pre-generated certs.
+	// For now, let's assume `GenerateSelfSignedCertKeyPEM` is available via a helper.
+	// To make this test self-contained, we'll use a pre-generated one or skip.
+	// Let's use `crypto/tls` to generate a cert in memory for the test config.
+	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate private key: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test Co"},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &pk.PublicKey, pk)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+	tlsCert := tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  pk,
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"h2"},
+	}
+
+	// 2. Create server with TLS config
+	logBuf := &bytes.Buffer{}
+	lg := newMockLogger(logBuf)
+	s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, tlsCfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	s.stopAccepting = make(chan struct{})
+
+	// 3. Mock newHTTP2Connection to check conn type
+	var connPassedToH2 net.Conn
+	var connPassedToH2Mu sync.Mutex
+	connRecvChan := make(chan struct{})
+
+	originalNewH2ConnFunc := newHTTP2Connection
+	defer func() { newHTTP2Connection = originalNewH2ConnFunc }()
+
+	newHTTP2Connection = func(nc net.Conn, lgLogger *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+		connPassedToH2Mu.Lock()
+		connPassedToH2 = nc
+		connPassedToH2Mu.Unlock()
+		close(connRecvChan)
+		// To allow the connection handling goroutine to finish, return a nil connection.
+		// `handleTCPConnection` is implemented to handle a nil return from `newHTTP2Connection`.
+		return nil
+	}
+
+	// 4. Create client/server pipe for connection
+	clientPipe, serverPipe := net.Pipe()
+
+	// 5. In a goroutine, run a TLS client handshake
+	clientHandshakeDone := make(chan error, 1)
+	go func() {
+		defer clientPipe.Close()
+		tlsClient := tls.Client(clientPipe, &tls.Config{
+			InsecureSkipVerify: true, // we use a self-signed cert
+			NextProtos:         []string{"h2"},
+			ServerName:         "127.0.0.1",
+		})
+		err := tlsClient.Handshake()
+		clientHandshakeDone <- err
+		if err == nil {
+			tlsClient.Close()
+		}
+	}()
+
+	// 6. Setup mock listener and inject the server-side pipe
+	ml := newMockListener("127.0.0.1:8080")
+	// This setup ensures the first Accept() gets our pipe, and subsequent accepts block until the test is over.
+	ml.AcceptFunc = func() (net.Conn, error) {
+		select {
+		case <-ml.closed:
+			return nil, net.ErrClosed
+		default:
+			// first call
+			if len(ml.acceptChan) > 0 {
+				return <-ml.acceptChan, nil
+			}
+			// subsequent calls
+			<-s.stopAccepting
+			return nil, net.ErrClosed
+		}
+	}
+	ml.InjectConn(serverPipe)
+
+	// 7. Run acceptLoop
+	acceptLoopDone := make(chan struct{})
+	go func() {
+		s.acceptLoop(ml)
+		close(acceptLoopDone)
+	}()
+
+	// 8. Assertions
+	select {
+	case <-connRecvChan:
+		// Expected: newHTTP2Connection was called.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timeout waiting for acceptLoop to process connection and call newHTTP2Connection. Logs:\n%s", logBuf.String())
+	}
+
+	connPassedToH2Mu.Lock()
+	if connPassedToH2 == nil {
+		t.Fatal("newHTTP2Connection was called but with a nil net.Conn")
+	}
+	if _, ok := connPassedToH2.(*tls.Conn); !ok {
+		t.Errorf("Expected connection passed to newHTTP2Connection to be *tls.Conn, but got %T", connPassedToH2)
+	}
+	connPassedToH2Mu.Unlock()
+
+	// Check client handshake result
+	clientErr := <-clientHandshakeDone
+	if clientErr != nil {
+		t.Errorf("Client-side TLS handshake failed: %v", clientErr)
+	}
+
+	// 9. Cleanup
+	close(s.stopAccepting)
+	ml.Close() // This will help unblock the acceptLoop
+	select {
+	case <-acceptLoopDone:
+		// good
+	case <-time.After(1 * time.Second):
+		t.Error("acceptLoop did not terminate after stopAccepting was closed")
+	}
 }
