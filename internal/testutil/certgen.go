@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -20,70 +19,64 @@ import (
 // returning them as PEM-encoded byte slices.
 // The host parameter is used for the certificate's DNS names or IP addresses.
 func GenerateSelfSignedCertKeyPEM(hostname string) (certPEMBytes []byte, keyPEMBytes []byte, err error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// Generate a private key
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate private key: %w", err)
+		return nil, nil, err
 	}
 
-	notBefore := time.Now()
-	// Valid for 1 day for testing purposes, common for temporary certs
-	notAfter := notBefore.Add(24 * time.Hour)
-
+	// Create a certificate template
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate serial number: %w", err)
+		return nil, nil, err
 	}
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Test Org"}, // Simple organization for test certs
+			Organization: []string{"Test Co"},
 		},
-		NotBefore: notBefore,
-		NotAfter:  notAfter,
-
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
 
-	// Add the provided hostname and common local addresses to the certificate
+	// Always add localhost and 127.0.0.1 for test convenience
+	template.DNSNames = []string{"localhost"}
+	template.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+
 	if ip := net.ParseIP(hostname); ip != nil {
-		template.IPAddresses = append(template.IPAddresses, ip)
-	} else if hostname != "" {
-		template.DNSNames = append(template.DNSNames, hostname)
+		// It's an IP address, add it if it's not 127.0.0.1 (which is already there)
+		if !ip.Equal(net.ParseIP("127.0.0.1")) {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		}
+	} else {
+		// It's a DNS name, add it if it's not "localhost" (which is already there)
+		if hostname != "localhost" && hostname != "" {
+			template.DNSNames = append(template.DNSNames, hostname)
+		}
 	}
 
-	// Always include localhost and 127.0.0.1 for convenience in testing
-	template.DNSNames = append(template.DNSNames, "localhost")
-	template.IPAddresses = append(template.IPAddresses, net.IPv4(127, 0, 0, 1))
-	// If IPv6 is available on the system, ::1 might also be useful for some test setups
-	// template.IPAddresses = append(template.IPAddresses, net.ParseIP("::1"))
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	// Create the certificate
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create certificate: %w", err)
+		return nil, nil, err
 	}
 
-	certPEMBlock := &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}
-	certPEMBytes = pem.EncodeToMemory(certPEMBlock)
-	if certPEMBytes == nil {
-		return nil, nil, fmt.Errorf("failed to encode certificate to PEM")
-	}
+	// PEM-encode the certificate
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 
-	// Marshal the private key into PKCS8 format
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	// PEM-encode the private key
+	privBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal private key: %w", err)
+		return nil, nil, err
 	}
-	keyPEMBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}
-	keyPEMBytes = pem.EncodeToMemory(keyPEMBlock)
-	if keyPEMBytes == nil {
-		return nil, nil, fmt.Errorf("failed to encode private key to PEM")
-	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
 
-	return certPEMBytes, keyPEMBytes, nil
+	return certPEM, keyPEM, nil
 }
 
 // GenerateSelfSignedCertKeyFiles generates a self-signed X.509 certificate and private key,
@@ -92,22 +85,21 @@ func GenerateSelfSignedCertKeyPEM(hostname string) (certPEMBytes []byte, keyPEMB
 // The host parameter is used for the certificate's DNS names or IP addresses.
 func GenerateSelfSignedCertKeyFiles(t *testing.T, host string) (certFilePath string, keyFilePath string, err error) {
 	t.Helper()
-
-	certPEMBytes, keyPEMBytes, err := GenerateSelfSignedCertKeyPEM(host)
+	certPEM, keyPEM, err := GenerateSelfSignedCertKeyPEM(host)
 	if err != nil {
-		return "", "", fmt.Errorf("GenerateSelfSignedCertKeyPEM(%s) failed: %w", host, err)
+		return "", "", err
 	}
 
-	tempDir := t.TempDir()
+	dir := t.TempDir()
 
-	certFilePath = filepath.Join(tempDir, "cert.pem")
-	keyFilePath = filepath.Join(tempDir, "key.pem")
-
-	if err := os.WriteFile(certFilePath, certPEMBytes, 0600); err != nil {
-		return "", "", fmt.Errorf("failed to write certificate file %s: %w", certFilePath, err)
+	certFilePath = filepath.Join(dir, "cert.pem")
+	if err := os.WriteFile(certFilePath, certPEM, 0600); err != nil {
+		return "", "", err
 	}
-	if err := os.WriteFile(keyFilePath, keyPEMBytes, 0600); err != nil {
-		return "", "", fmt.Errorf("failed to write key file %s: %w", keyFilePath, err)
+
+	keyFilePath = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(keyFilePath, keyPEM, 0600); err != nil {
+		return "", "", err
 	}
 
 	return certFilePath, keyFilePath, nil
