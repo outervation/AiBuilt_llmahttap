@@ -4083,3 +4083,201 @@ func TestNewServer_TLSConfig(t *testing.T) {
 		assert.Same(t, tlsCfg, s.tlsConfig, "server.tlsConfig was not the same as the one passed to NewServer")
 	})
 }
+
+func TestServer_HandleTCPConnection_TLS_Peeking(t *testing.T) {
+	setupMocks()
+	defer teardownMocks()
+	setupHandleTCPConnectionMocks_Test()
+	defer teardownHandleTCPConnectionMocks_Test()
+
+	// --- Test Scenarios ---
+	t.Run("TLS Enabled, TLS Handshake Bytes", func(t *testing.T) {
+		// 1. Setup server with TLS
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		cfg := newTestConfigWithTLS(t, "127.0.0.1:0")
+		cert, err := tls.LoadX509KeyPair(*cfg.Server.TLS.CertFile, *cfg.Server.TLS.KeyFile)
+		require.NoError(t, err)
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2"},
+		}
+		s, err := NewServer(cfg, lg, newMockRouter(), "test.json", NewHandlerRegistry(), tlsCfg)
+		require.NoError(t, err)
+
+		// 2. Mock newHTTP2Connection to capture the connection type
+		var capturedConn net.Conn
+		var connCaptureMu sync.Mutex
+		connCaptured := make(chan struct{})
+		newHTTP2Connection = func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			connCaptureMu.Lock()
+			capturedConn = nc
+			connCaptureMu.Unlock()
+			close(connCaptured)
+			// Return nil to stop handleTCPConnection from proceeding further
+			return nil
+		}
+
+		// 3. Use net.Pipe to simulate a connection
+		clientConn, serverConn := net.Pipe()
+
+		// 4. Run TLS client handshake in a goroutine
+		clientDone := make(chan error, 1)
+		go func() {
+			clientTLS := tls.Client(clientConn, &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2"},
+				ServerName:         "127.0.0.1",
+			})
+			handshakeErr := clientTLS.Handshake()
+			if handshakeErr == nil {
+				// We must also check the negotiated protocol after a successful handshake
+				if state := clientTLS.ConnectionState(); state.NegotiatedProtocol != "h2" {
+					handshakeErr = fmt.Errorf("client failed to negotiate h2, got: %s", state.NegotiatedProtocol)
+				}
+				clientTLS.Close()
+			}
+			clientDone <- handshakeErr
+		}()
+
+		// 5. Run acceptLoop with a mock listener that provides the server-side pipe
+		ml := newMockListener("127.0.0.1:0")
+		ml.InjectConn(serverConn)
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+		defer func() {
+			close(s.stopAccepting)
+			ml.Close()
+			<-acceptLoopDone
+		}()
+
+		// 6. Wait for newHTTP2Connection to be called
+		select {
+		case <-connCaptured:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Timeout waiting for handleTCPConnection to call newHTTP2Connection. Logs:\n%s", logBuf.String())
+		}
+
+		// 7. Assert the captured connection is a *tls.Conn
+		connCaptureMu.Lock()
+		_, ok := capturedConn.(*tls.Conn)
+		connCaptureMu.Unlock()
+		assert.True(t, ok, "Expected net.Conn to be *tls.Conn, but was %T", capturedConn)
+
+		// 8. Check client handshake result
+		clientHandshakeErr := <-clientDone
+		require.NoError(t, clientHandshakeErr, "Client-side TLS handshake failed")
+	})
+
+	t.Run("TLS Enabled, Non-TLS Bytes (H2C Preface)", func(t *testing.T) {
+		// 1. Setup server with TLS
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		cfg := newTestConfigWithTLS(t, "127.0.0.1:0")
+		cert, err := tls.LoadX509KeyPair(*cfg.Server.TLS.CertFile, *cfg.Server.TLS.KeyFile)
+		require.NoError(t, err)
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+		s, err := NewServer(cfg, lg, newMockRouter(), "test.json", NewHandlerRegistry(), tlsCfg)
+		require.NoError(t, err)
+
+		// 2. Mock newHTTP2Connection
+		var capturedConn net.Conn
+		var connCaptureMu sync.Mutex
+		connCaptured := make(chan struct{})
+		newHTTP2Connection = func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			connCaptureMu.Lock()
+			capturedConn = nc
+			connCaptureMu.Unlock()
+			close(connCaptured)
+			return nil
+		}
+
+		// 3. Use mockConn with H2C preface
+		mc := newMockConn("", "")
+		mc.SetReadBuffer([]byte(http2.ClientPreface))
+		mc.autoEOF = true
+
+		// 4. Run acceptLoop
+		ml := newMockListener("127.0.0.1:0")
+		ml.InjectConn(mc)
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+		defer func() {
+			close(s.stopAccepting)
+			ml.Close()
+			<-acceptLoopDone
+		}()
+
+		// 5. Wait & Assert
+		select {
+		case <-connCaptured:
+			// Success
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timeout waiting for handleTCPConnection to call newHTTP2Connection. Logs:\n%s", logBuf.String())
+		}
+
+		connCaptureMu.Lock()
+		_, ok := capturedConn.(*peekConn)
+		connCaptureMu.Unlock()
+		assert.True(t, ok, "Expected net.Conn to be a *server.peekConn for non-TLS bytes on a TLS-enabled port, but was %T", capturedConn)
+	})
+
+	t.Run("TLS Disabled, Non-TLS Bytes (H2C Preface)", func(t *testing.T) {
+		// 1. Setup server without TLS
+		logBuf := &bytes.Buffer{}
+		lg := newMockLogger(logBuf)
+		cfg := newTestConfig("127.0.0.1:0")
+		s, err := NewServer(cfg, lg, newMockRouter(), "test.json", NewHandlerRegistry(), nil) // nil tls.Config
+		require.NoError(t, err)
+
+		// 2. Mock newHTTP2Connection
+		var capturedConn net.Conn
+		var connCaptureMu sync.Mutex
+		connCaptured := make(chan struct{})
+		newHTTP2Connection = func(nc net.Conn, lg *logger.Logger, isClientSide bool, srvSettingsOverride map[http2.SettingID]uint32, initialPeerSettingsForTest map[http2.SettingID]uint32, dispatcher http2.RequestDispatcherFunc) *http2.Connection {
+			connCaptureMu.Lock()
+			capturedConn = nc
+			connCaptureMu.Unlock()
+			close(connCaptured)
+			return nil
+		}
+
+		// 3. Use mockConn with H2C preface
+		mc := newMockConn("", "")
+		mc.SetReadBuffer([]byte(http2.ClientPreface))
+		mc.autoEOF = true
+
+		// 4. Run acceptLoop
+		ml := newMockListener("127.0.0.1:0")
+		ml.InjectConn(mc)
+		acceptLoopDone := make(chan struct{})
+		go func() {
+			s.acceptLoop(ml)
+			close(acceptLoopDone)
+		}()
+		defer func() {
+			close(s.stopAccepting)
+			ml.Close()
+			<-acceptLoopDone
+		}()
+
+		// 5. Wait & Assert
+		select {
+		case <-connCaptured:
+			// Success
+		case <-time.After(1 * time.Second):
+			t.Fatalf("Timeout waiting for handleTCPConnection to call newHTTP2Connection. Logs:\n%s", logBuf.String())
+		}
+
+		connCaptureMu.Lock()
+		assert.Same(t, mc, capturedConn, "Expected net.Conn to be the original *mockConn when TLS is disabled, but it was not")
+		connCaptureMu.Unlock()
+	})
+}
