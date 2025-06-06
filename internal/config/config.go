@@ -125,9 +125,10 @@ type ServerConfig struct {
 
 // TLSConfig holds TLS-specific configuration options.
 type TLSConfig struct {
-	Enabled  *bool   `json:"enabled,omitempty" toml:"enabled,omitempty"`
-	CertFile *string `json:"cert_file,omitempty" toml:"cert_file,omitempty"`
-	KeyFile  *string `json:"key_file,omitempty" toml:"key_file,omitempty"`
+	Enabled    *bool   `json:"enabled,omitempty" toml:"enabled,omitempty"`
+	CertFile   *string `json:"cert_file,omitempty" toml:"cert_file,omitempty"`
+	KeyFile    *string `json:"key_file,omitempty" toml:"key_file,omitempty"`
+	MinVersion *string `json:"min_version,omitempty" toml:"min_version,omitempty"`
 }
 
 // RoutingConfig contains the list of routes.
@@ -567,6 +568,15 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("server.tls.key_file path '%s' must be absolute", *cfg.Server.TLS.KeyFile)
 		}
 	} else {
+
+		if cfg.Server.TLS.MinVersion != nil && *cfg.Server.TLS.MinVersion != "" {
+			switch *cfg.Server.TLS.MinVersion {
+			case "1.2", "1.3":
+				// valid
+			default:
+				return fmt.Errorf("server.tls.min_version '%s' is invalid; must be '1.2' or '1.3'", *cfg.Server.TLS.MinVersion)
+			}
+		}
 		// TLS is disabled
 		// Still validate paths if they are provided, ensuring they are absolute.
 		if cfg.Server.TLS.CertFile != nil && *cfg.Server.TLS.CertFile != "" {
