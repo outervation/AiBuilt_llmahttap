@@ -798,7 +798,7 @@ func TestNewServer(t *testing.T) {
 			}
 
 			// Call NewServer with the potentially modified util functions
-			s, err := NewServer(tt.cfg, tt.lg, tt.rt, tt.path, tt.hr)
+			s, err := NewServer(tt.cfg, tt.lg, tt.rt, tt.path, tt.hr, nil)
 			tt.checkFunc(t, s, err)
 
 			if tt.cleanupEnv != nil {
@@ -822,7 +822,7 @@ func TestServer_DispatchRequest(t *testing.T) {
 		// NewServer itself might call util.ParseInheritedListenerFDs, ensure it's mocked if problematic.
 		// Default setupMocks/teardownMocks will use real implementations if not overridden.
 		// Here, we assume default (no inherited FDs) is fine for NewServer in these specific tests.
-		s, err := NewServer(cfg, lg, rtr, originalCfgPath, registry)
+		s, err := NewServer(cfg, lg, rtr, originalCfgPath, registry, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -992,7 +992,7 @@ func TestServer_Shutdown(t *testing.T) {
 		// For this test, we'll check for a log message indicating closure attempt.
 		// A more robust mock for logger's CloseLogFiles would be better.
 
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -1074,7 +1074,7 @@ func TestServer_Shutdown(t *testing.T) {
 
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(cfgWithGraceTimeout, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(cfgWithGraceTimeout, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -1201,7 +1201,7 @@ func TestServer_Shutdown(t *testing.T) {
 
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(cfgWithShortTimeout, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(cfgWithShortTimeout, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -1308,7 +1308,7 @@ func TestServer_Shutdown(t *testing.T) {
 			return ml, mockListenerFD, nil
 		}
 
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -1544,7 +1544,7 @@ func setupSIGHUPTestServer(t *testing.T, initialCfgContent string, logOut io.Wri
 		return 0, false, nil // Simulate no readiness pipe from parent
 	}
 
-	s, err := NewServer(loadedInitialCfg, ilg.Logger, mockRtr, cfgPath, hr) // Pass embedded logger
+	s, err := NewServer(loadedInitialCfg, ilg.Logger, mockRtr, cfgPath, hr, nil) // Pass embedded logger
 	if err != nil {
 		cleanupFunc()
 		t.Fatalf("NewServer failed: %v", err)
@@ -1965,7 +1965,7 @@ func TestServer_HandleSignals(t *testing.T) {
 		// 	return nil, nil
 		// }
 
-		s, err := NewServer(defaultCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(defaultCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed for signal test: %v", err)
 		}
@@ -2207,7 +2207,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("SuccessPath", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2325,7 +2325,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("HandshakeFailure_PrefaceReadError", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2379,7 +2379,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("HandshakeFailure_InvalidPreface", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2443,7 +2443,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("HandshakeFailure_InvalidPreface_SendsGoAwayAndCloses", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2574,7 +2574,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("HandshakeFailure_InvalidPreface_SendsGoAwayAndCloses", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2728,7 +2728,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	t.Run("newHTTP2Connection_ReturnsNil", func(t *testing.T) {
 		logBuf := &bytes.Buffer{}
 		lg := newMockLogger(logBuf)
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -2821,7 +2821,7 @@ func TestServer_InitializeListeners(t *testing.T) {
 		if lg == nil {
 			lg = newMockLogger(nil)
 		}
-		s, err := NewServer(cfg, lg, mockRtr, originalCfgPath, hr)
+		s, err := NewServer(cfg, lg, mockRtr, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -3271,7 +3271,7 @@ func TestServer_StartAccepting(t *testing.T) {
 
 	newTestSrvForStartAccepting := func(t *testing.T, lg *logger.Logger, isChild bool) *Server {
 		t.Helper()
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -3458,7 +3458,7 @@ func TestServer_acceptLoop(t *testing.T) {
 
 	newTestSrvForAcceptLoop := func(t *testing.T, lg *logger.Logger) *Server {
 		t.Helper()
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
@@ -3642,7 +3642,7 @@ func TestServer_Start_And_DoneChannel(t *testing.T) {
 
 	newTestSrvForStart := func(t *testing.T, lg *logger.Logger) *Server {
 		t.Helper()
-		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr)
+		s, err := NewServer(baseCfg, lg, mockRouterInstance, originalCfgPath, hr, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
