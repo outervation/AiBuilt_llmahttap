@@ -2940,22 +2940,12 @@ func (c *Connection) handleSettingsFrame(frame *SettingsFrame) error {
 	c.settingsMu.Lock()
 	oldPeerInitialWindowSize = c.peerInitialWindowSize // Capture current effective peer initial window size
 
-	// Map to track setting IDs seen in this specific SETTINGS frame
-	seenSettingsInThisFrame := make(map[SettingID]bool)
-
+	// Per RFC 7540, 6.5.3, settings are processed in order, with the last value for a given ID taking precedence.
+	// We no longer reject frames with duplicate settings.
 	for _, setting := range frame.Settings {
-		// Check for duplicate setting ID within this frame
-		if _, ok := seenSettingsInThisFrame[setting.ID]; ok {
-			c.settingsMu.Unlock() // Unlock before returning
-			errMsg := fmt.Sprintf("duplicate setting ID %s (0x%x) received in a single SETTINGS frame", setting.ID.String(), uint16(setting.ID))
-			c.log.Error(errMsg, logger.LogFields{"stream_id": 0}) // SETTINGS are for stream 0
-			return NewConnectionError(ErrCodeProtocolError, errMsg)
-		}
-		seenSettingsInThisFrame[setting.ID] = true
 		// Validate setting ID and value
 		switch setting.ID {
 		case SettingHeaderTableSize:
-
 			// Max value is effectively bounded by uint32.
 			c.peerSettings[SettingHeaderTableSize] = setting.Value
 			c.log.Debug("Peer SETTINGS_HEADER_TABLE_SIZE received", logger.LogFields{"value": setting.Value})
