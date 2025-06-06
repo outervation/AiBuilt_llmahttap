@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls" // Added for TLS configuration
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -85,7 +86,44 @@ func setupAndRunServer(cfg *config.Config, originalCfgPath string) error {
 	appLogger.Info("Router initialized", nil)
 
 	// 5. Initialize Server
-	http2Server, err := server.NewServer(cfg, appLogger, appRouter, originalCfgPath, handlerRegistry)
+	var tlsConfiguration *tls.Config
+	if cfg.Server != nil && cfg.Server.TLS != nil && cfg.Server.TLS.Enabled != nil && *cfg.Server.TLS.Enabled {
+		if cfg.Server.TLS.CertFile == nil || *cfg.Server.TLS.CertFile == "" ||
+			cfg.Server.TLS.KeyFile == nil || *cfg.Server.TLS.KeyFile == "" {
+			appLogger.Error("TLS is enabled but CertFile or KeyFile is missing in configuration.", nil)
+			return fmt.Errorf("TLS is enabled but CertFile or KeyFile is missing")
+		}
+
+		appLogger.Info("TLS is enabled. Loading certificate and key.", logger.LogFields{
+			"cert_file": *cfg.Server.TLS.CertFile,
+			"key_file":  *cfg.Server.TLS.KeyFile,
+		})
+
+		cert, err := tls.LoadX509KeyPair(*cfg.Server.TLS.CertFile, *cfg.Server.TLS.KeyFile)
+		if err != nil {
+			appLogger.Error("Failed to load TLS certificate/key", logger.LogFields{"error": err.Error()})
+			return fmt.Errorf("failed to load TLS certificate/key: %w", err)
+		}
+		tlsConfiguration = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1"}, // ALPN for HTTP/2
+			MinVersion:   tls.VersionTLS12,           // Set default minimum TLS version
+		}
+
+		// Override default MinVersion if specified in config
+		if cfg.Server.TLS.MinVersion != nil && *cfg.Server.TLS.MinVersion != "" {
+			switch *cfg.Server.TLS.MinVersion {
+			case "1.3":
+				tlsConfiguration.MinVersion = tls.VersionTLS13
+				// "1.2" is the default, so no case needed for it.
+				// Validation in config.go ensures only valid versions are present.
+			}
+			appLogger.Info("Applied minimum TLS version from configuration.", logger.LogFields{"min_version": *cfg.Server.TLS.MinVersion})
+		}
+		appLogger.Info("TLS is not enabled or not configured.", nil)
+	}
+
+	http2Server, err := server.NewServer(cfg, appLogger, appRouter, originalCfgPath, handlerRegistry, tlsConfiguration)
 	if err != nil {
 		appLogger.Error("Failed to initialize server", logger.LogFields{"error": err.Error()})
 		return fmt.Errorf("failed to initialize server: %w", err)
