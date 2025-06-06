@@ -2,12 +2,17 @@ package server
 
 import (
 	"bytes"
-
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -16,19 +21,15 @@ import (
 	"sync"
 	"syscall" // RE-ADDED
 	"testing"
-
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"math/big"
 	"time"
 
 	"example.com/llmahttap/v2/internal/config"
 	"example.com/llmahttap/v2/internal/http2"
 	"example.com/llmahttap/v2/internal/logger"
+	"example.com/llmahttap/v2/internal/testutil"
 	"example.com/llmahttap/v2/internal/util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- Mock Logger ---
@@ -4019,4 +4020,44 @@ func TestServer_acceptLoop_TLS_Path(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Error("acceptLoop did not terminate after stopAccepting was closed")
 	}
+}
+
+func TestNewServer_TLSConfig(t *testing.T) {
+	t.Run("with nil tls config", func(t *testing.T) {
+		cfg := newTestConfig("")
+		lg := logger.NewDiscardLogger()
+		router := &mockRouter{}
+		registry := NewHandlerRegistry()
+
+		s, err := NewServer(cfg, lg, router, "/path/to/config.json", registry, nil)
+		require.NoError(t, err)
+
+		assert.Nil(t, s.tlsConfig, "Expected server.tlsConfig to be nil, but it was not")
+	})
+
+	t.Run("with non-nil tls config", func(t *testing.T) {
+		// 1. Generate dummy cert/key
+		certPath, keyPath, err := testutil.GenerateSelfSignedCertKeyFiles(t, "localhost")
+		require.NoError(t, err, "Failed to generate self-signed cert/key files")
+
+		// 2. Load them to create a tls.Config
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		require.NoError(t, err, "Failed to load key pair")
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+
+		// 3. Create server
+		cfg := newTestConfig("")
+		lg := logger.NewDiscardLogger()
+		router := &mockRouter{}
+		registry := NewHandlerRegistry()
+
+		s, err := NewServer(cfg, lg, router, "/path/to/config.json", registry, tlsCfg)
+		require.NoError(t, err)
+
+		// 4. Assert
+		assert.NotNil(t, s.tlsConfig, "Expected server.tlsConfig to be non-nil, but it was nil")
+		assert.Same(t, tlsCfg, s.tlsConfig, "server.tlsConfig was not the same as the one passed to NewServer")
+	})
 }
