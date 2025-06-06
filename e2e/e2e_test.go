@@ -1407,8 +1407,8 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 
 // END_OF_FILE_MARKER_DO_NOT_USE
 
-var tlsSimpleGET = testutil.E2ETestDefinition{
-	Name:                "tlsSimpleGET",
+var tlsBasicTestDef = testutil.E2ETestDefinition{
+	Name:                "TestTLS_Basic",
 	ServerBinaryPath:    serverBinaryPath,
 	ServerConfigArgName: "-config",
 	ServerListenAddress: "127.0.0.1:0", // Dynamic port
@@ -1464,9 +1464,9 @@ var tlsSimpleGET = testutil.E2ETestDefinition{
 	},
 }
 
-func TestTLS(t *testing.T) {
+func TestTLS_Basic(t *testing.T) {
 	if serverBinaryMissing {
 		t.Skipf("Skipping E2E test: server binary not found or not executable at '%s'", serverBinaryPath)
 	}
-	testutil.RunE2ETest(t, tlsSimpleGET)
+	testutil.RunE2ETest(t, tlsBasicTestDef)
 }
