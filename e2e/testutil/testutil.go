@@ -28,7 +28,7 @@ import (
 
 // TestRequest models an HTTP request for E2E testing.
 type TestRequest struct {
-	Scheme  string // "http" or "https"
+	UseTLS  bool
 	Method  string
 	Path    string // Should include query string if any, e.g., "/path?query=value"
 	Headers http.Header
@@ -363,12 +363,20 @@ func (c *CurlHTTPClient) Type() HTTPClientType {
 // Do executes an HTTP request using curl.
 func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
 	scheme := "http"
-	if request.Scheme != "" {
-		scheme = request.Scheme
+	args := []string{"-s", "-v"} // Common args
+
+	if request.UseTLS {
+		scheme = "https"
+		// For HTTPS, we use ALPN. So we don't specify --http2-prior-knowledge.
+		// We use -k (--insecure) to allow self-signed certs.
+		// The server should negotiate h2 via ALPN.
+		args = append(args, "-k")
+	} else {
+		scheme = "http"
+		// For HTTP (H2C), we need --http2-prior-knowledge to speak HTTP/2 from the start.
+		args = append(args, "--http2-prior-knowledge")
 	}
 	url := fmt.Sprintf("%s://%s%s", scheme, serverAddr, request.Path)
-
-	args := []string{"-s", "-v", "-k", "--http2-prior-knowledge"} // -k for insecure TLS, use prior knowledge for simplicity
 
 	args = append(args, "-X", request.Method)
 
@@ -434,6 +442,9 @@ func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualRespo
 	}
 
 	if statusLine == "" {
+		if err != nil {
+			return actual, fmt.Errorf("curl command failed and could not parse HTTP status line. Error: %w. Stderr: %s", err, stderrStr)
+		}
 		return actual, fmt.Errorf("could not parse HTTP status line from curl output. Stderr: %s", stderrStr)
 	}
 
@@ -452,28 +463,19 @@ func (c *CurlHTTPClient) Do(serverAddr string, request TestRequest) (ActualRespo
 
 // GoNetHTTPClient implements HTTPTestClient using Go's net/http package.
 type GoNetHTTPClient struct {
-	h2cClient   *http.Client // For cleartext http2
-	httpsClient *http.Client // For http2 over tls
+	client *http.Client
 }
 
-// NewGoNetHTTPClient creates a new GoNetHTTPClient configured for HTTP/2 Cleartext (H2C) and TLS.
+// NewGoNetHTTPClient creates a new GoNetHTTPClient configured for both H2C and H2-over-TLS.
 func NewGoNetHTTPClient() *GoNetHTTPClient {
 	return &GoNetHTTPClient{
-		h2cClient: &http.Client{
+		client: &http.Client{
 			Transport: &http2.Transport{
-				AllowHTTP: true, // Allow cleartext HTTP/2
-				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-					// This is the h2c part. We ignore the TLS config and dial a plain connection.
-					return net.Dial(network, addr)
-				},
-			},
-		},
-		httpsClient: &http.Client{
-			Transport: &http2.Transport{
-				// This is for HTTPS. The default DialTLS will be used, but we override the TLS config.
+				AllowHTTP: true, // Allow cleartext HTTP/2 (H2C)
+				// The custom DialTLS is removed. The transport will now correctly
+				// use a regular net.Dial for http URLs and a tls.Dial for https URLs.
 				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true, // IMPORTANT: For tests, trust the self-signed cert
-					NextProtos:         []string{"h2"},
+					InsecureSkipVerify: true, // For tests, trust self-signed certs
 				},
 			},
 		},
@@ -488,15 +490,8 @@ func (c *GoNetHTTPClient) Type() HTTPClientType {
 // Do executes an HTTP request using Go's net/http client.
 func (c *GoNetHTTPClient) Do(serverAddr string, request TestRequest) (ActualResponse, error) {
 	scheme := "http"
-	if request.Scheme != "" {
-		scheme = request.Scheme
-	}
-
-	var client *http.Client
-	if scheme == "https" {
-		client = c.httpsClient
-	} else {
-		client = c.h2cClient
+	if request.UseTLS {
+		scheme = "https"
 	}
 
 	url := fmt.Sprintf("%s://%s%s", scheme, serverAddr, request.Path)
@@ -510,7 +505,7 @@ func (c *GoNetHTTPClient) Do(serverAddr string, request TestRequest) (ActualResp
 	}
 	// The http client adds Host header from req.URL.Host
 
-	resp, err := client.Do(req)
+	resp, err := c.client.Do(req)
 	actual := ActualResponse{
 		Error: err,
 	}
