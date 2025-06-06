@@ -553,7 +553,7 @@ func validateConfig(cfg *Config) error {
 	// Validate TLS configuration.
 	// applyDefaults ensures cfg.Server.TLS and cfg.Server.TLS.Enabled are non-nil.
 	if *cfg.Server.TLS.Enabled {
-		// TLS is enabled
+		// TLS is enabled: CertFile and KeyFile are required and must be absolute.
 		if cfg.Server.TLS.CertFile == nil || *cfg.Server.TLS.CertFile == "" {
 			return fmt.Errorf("server.tls.cert_file is required when tls.enabled is true")
 		}
@@ -568,17 +568,7 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("server.tls.key_file path '%s' must be absolute", *cfg.Server.TLS.KeyFile)
 		}
 	} else {
-
-		if cfg.Server.TLS.MinVersion != nil && *cfg.Server.TLS.MinVersion != "" {
-			switch *cfg.Server.TLS.MinVersion {
-			case "1.2", "1.3":
-				// valid
-			default:
-				return fmt.Errorf("server.tls.min_version '%s' is invalid; must be '1.2' or '1.3'", *cfg.Server.TLS.MinVersion)
-			}
-		}
-		// TLS is disabled
-		// Still validate paths if they are provided, ensuring they are absolute.
+		// TLS is disabled: If CertFile or KeyFile are provided, they must still be absolute paths.
 		if cfg.Server.TLS.CertFile != nil && *cfg.Server.TLS.CertFile != "" {
 			if !filepath.IsAbs(*cfg.Server.TLS.CertFile) {
 				return fmt.Errorf("server.tls.cert_file path '%s' must be absolute (even if TLS is disabled)", *cfg.Server.TLS.CertFile)
@@ -591,9 +581,14 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
-	if cfg.Routing == nil {
-		// Default is applied, making it &RoutingConfig{Routes: []Route{}}
-		// This state is considered valid (no routes).
+	// Validate MinVersion regardless of whether TLS is enabled.
+	if cfg.Server.TLS.MinVersion != nil && *cfg.Server.TLS.MinVersion != "" {
+		switch *cfg.Server.TLS.MinVersion {
+		case "1.2", "1.3":
+			// valid
+		default:
+			return fmt.Errorf("server.tls.min_version '%s' is invalid; must be '1.2' or '1.3'", *cfg.Server.TLS.MinVersion)
+		}
 	}
 
 	routeSignatures := make(map[string]struct{})
