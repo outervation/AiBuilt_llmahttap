@@ -1416,15 +1416,27 @@ var tlsBasicTestDef = testutil.E2ETestDefinition{
 	// ServerConfigData is set by the SetupFunc
 	TestCases: []testutil.E2ETestCase{
 		{
-			Name: "SecureGET_NoRoutes_Returns404",
+			Name: "SecureGET_SuccessfulRequest",
 			Request: testutil.TestRequest{
 				UseTLS: true,
 				Method: "GET",
-				Path:   "/",
+				Path:   "/static/secure.txt",
 			},
 			Expected: testutil.ExpectedResponse{
-				StatusCode: 404,
-				// Body check is optional, the main point is getting a valid response over TLS
+				StatusCode:  http.StatusOK,
+				BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("secure content")},
+			},
+		},
+		{
+			Name: "CleartextH2C_To_TLSPort_SuccessfulRequest",
+			Request: testutil.TestRequest{
+				UseTLS: false, // This is the key part for H2C test
+				Method: "GET",
+				Path:   "/static/secure.txt",
+			},
+			Expected: testutil.ExpectedResponse{
+				StatusCode:  http.StatusOK,
+				BodyMatcher: &testutil.ExactBodyMatcher{ExpectedBody: []byte("secure content")},
 			},
 		},
 	},
@@ -1434,6 +1446,15 @@ var tlsBasicTestDef = testutil.E2ETestDefinition{
 		if err != nil {
 			t.Fatalf("Failed to generate self-signed cert/key: %v", err)
 		}
+
+		// Setup a temp file for the handler
+		docRoot, cleanupDocRoot, err := setupTempFiles(t, map[string]string{
+			"secure.txt": "secure content",
+		})
+		if err != nil {
+			t.Fatalf("Failed to set up temp files for TLS test: %v", err)
+		}
+		t.Cleanup(cleanupDocRoot)
 
 		// Create a config with TLS enabled
 		trueBool := true
@@ -1451,14 +1472,19 @@ var tlsBasicTestDef = testutil.E2ETestDefinition{
 				AccessLog: &config.AccessLogConfig{
 					Enabled: &trueBool,
 					Target:  strPtr("stdout"),
-					Format:  "json",
-				},
-				ErrorLog: &config.ErrorLogConfig{
-					Target: strPtr("stderr"),
 				},
 			},
 			Routing: &config.RoutingConfig{
-				Routes: []config.Route{}, // No routes defined
+				Routes: []config.Route{
+					{
+						PathPattern: "/static/",
+						MatchType:   config.MatchTypePrefix,
+						HandlerType: "StaticFileServer",
+						HandlerConfig: testutil.ToRawMessageWrapper(t, config.StaticFileServerConfig{
+							DocumentRoot: docRoot,
+						}),
+					},
+				},
 			},
 		}
 	},
