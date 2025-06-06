@@ -120,6 +120,7 @@ func setupAndRunServer(cfg *config.Config, originalCfgPath string) error {
 			}
 			appLogger.Info("Applied minimum TLS version from configuration.", logger.LogFields{"min_version": *cfg.Server.TLS.MinVersion})
 		}
+	} else {
 		appLogger.Info("TLS is not enabled or not configured.", nil)
 	}
 
