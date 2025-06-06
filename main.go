@@ -1,9 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,59 +16,62 @@ import (
 	"example.com/llmahttap/v2/internal/server"
 )
 
+// tlsFileConfig is a minimal struct to unmarshal just the TLS cert/key file paths
+// from a dedicated TLS config file.
+type tlsFileConfig struct {
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+}
+
 func main() {
-	_ = fmt.Sprintf("") // Dummy use of fmt to satisfy import requirement and compiler
-	// Parse command-line arguments
-	rootDir := flag.String("root", ".", "Root directory to serve files from")
-	port := flag.String("port", "8080", "Port to listen on")
-	flag.Parse()
-
-	if *rootDir == "" {
-		log.Fatalf("Error: root directory cannot be empty")
+	if len(os.Args) < 3 || len(os.Args) > 4 {
+		log.Fatalf("Usage: %s <address> <document-root> [tls-config-path]", os.Args[0])
 	}
-	if *port == "" {
-		log.Fatalf("Error: port cannot be empty")
+	addr := os.Args[1]
+	docRoot := os.Args[2]
+	var tlsConfigPath string
+	if len(os.Args) == 4 {
+		tlsConfigPath = os.Args[3]
 	}
 
-	// Resolve absolute path for DocumentRoot
-	absRootDir, err := filepath.Abs(*rootDir)
+	if !filepath.IsAbs(docRoot) {
+		absPath, err := filepath.Abs(docRoot)
+		if err != nil {
+			log.Fatalf("Failed to convert document root to an absolute path: %v", err)
+		}
+		log.Printf("Warning: Document root path was not absolute. Using resolved path: %s", absPath)
+		docRoot = absPath
+	}
+
+	// Create a default logger for the server.
+	loggingCfg := &config.LoggingConfig{
+		LogLevel: config.LogLevelInfo,
+		AccessLog: &config.AccessLogConfig{
+			Enabled: boolPtr(true),
+			Target:  strPtr("stdout"),
+			Format:  "json",
+		},
+		ErrorLog: &config.ErrorLogConfig{
+			Target: strPtr("stderr"),
+		},
+	}
+	lg, err := logger.NewLogger(loggingCfg)
 	if err != nil {
-		log.Fatalf("Error resolving absolute path for root directory: %v", err)
+		log.Fatalf("Failed to create logger: %v", err)
 	}
 
-	// Programmatically construct config.Config
-	serverAddr := "0.0.0.0:" + *port
-	boolTrue := true
-	boolFalse := false
-	strStdout := "stdout"
-	strStderr := "stderr"
-	strJSON := "json"
-	strINFO := string(config.LogLevelInfo)
-
-	staticFsCfg := config.StaticFileServerConfig{
-		DocumentRoot:          absRootDir,
-		IndexFiles:            []string{"index.html"},
-		ServeDirectoryListing: &boolFalse,
-	}
-	handlerCfgBytes, err := json.Marshal(staticFsCfg)
+	// Programmatically create the configuration for a simple static file server.
+	handlerCfgJSON, err := json.Marshal(config.StaticFileServerConfig{
+		DocumentRoot:          docRoot,
+		ServeDirectoryListing: boolPtr(true),
+	})
 	if err != nil {
-		log.Fatalf("Error marshalling StaticFileServerConfig: %v", err)
+		log.Fatalf("Failed to marshal static file server config: %v", err)
 	}
 
 	cfg := &config.Config{
 		Server: &config.ServerConfig{
-			Address: &serverAddr,
-		},
-		Logging: &config.LoggingConfig{
-			LogLevel: config.LogLevel(strINFO),
-			AccessLog: &config.AccessLogConfig{
-				Enabled: &boolTrue,
-				Target:  &strStdout,
-				Format:  strJSON,
-			},
-			ErrorLog: &config.ErrorLogConfig{
-				Target: &strStderr,
-			},
+			Address: &addr,
 		},
 		Routing: &config.RoutingConfig{
 			Routes: []config.Route{
@@ -75,57 +79,112 @@ func main() {
 					PathPattern:   "/",
 					MatchType:     config.MatchTypePrefix,
 					HandlerType:   "StaticFileServer",
-					HandlerConfig: config.RawMessageWrapper(handlerCfgBytes),
+					HandlerConfig: handlerCfgJSON,
 				},
 			},
 		},
+		Logging: loggingCfg,
 	}
 
-	// Initialize logger
-	lg, err := logger.NewLogger(cfg.Logging)
-	if err != nil {
-		log.Fatalf("Error initializing logger: %v", err)
-	}
-
-	// Create HandlerRegistry
-	handlerRegistry := server.NewHandlerRegistry()
-
-	// Register StaticFileServer handler factory
-	err = handlerRegistry.Register("StaticFileServer", func(hc json.RawMessage, l *logger.Logger) (server.Handler, error) {
-		// The mainConfigFilePath is empty because MimeTypesPath is not being used here.
-		// If MimeTypesPath were used, we'd need to pass a valid path or handle it.
-		parsedSFSConfig, err := config.ParseAndValidateStaticFileServerConfig(hc, "")
+	// Load TLS configuration if a path is provided.
+	var tlsCfg *tls.Config
+	if tlsConfigPath != "" {
+		tlsCfg, err = createTLSConfig(tlsConfigPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse static file server config: %w", err)
+			log.Fatalf("Failed to create TLS config: %v", err)
 		}
-		return staticfile.New(parsedSFSConfig, l, "") // originalCfgPath is empty for programmatic config
-	})
-	if err != nil {
-		lg.Error("Error registering StaticFileServer handler", logger.LogFields{"error": err.Error()})
-		os.Exit(1)
 	}
 
-	// Create Router
-	rt, err := router.NewRouter(cfg.Routing.Routes, handlerRegistry, lg)
-	if err != nil {
-		lg.Error("Error creating router", logger.LogFields{"error": err.Error()})
-		os.Exit(1)
+	// Set up handlers, router, and the main server instance.
+	handlerRegistry := server.NewHandlerRegistry()
+	if err := handlerRegistry.Register("StaticFileServer",
+		// This anonymous function is a factory that adapts to the server.HandlerFactory interface.
+		// It is necessary because the compiler is reporting a signature for `staticfile.New`
+		// that is incompatible with direct registration. This adapter parses the config
+		// from raw JSON and then calls what the compiler believes is the actual constructor.
+		func(rawCfg json.RawMessage, lg *logger.Logger) (server.Handler, error) {
+			// This simple server does not use a main config file, so the path is empty.
+			// This means sub-configs (like for MIME types) must use absolute paths.
+			const mainConfigFilePath = ""
+
+			sfsCfg, err := config.ParseAndValidateStaticFileServerConfig(rawCfg, mainConfigFilePath)
+			if err != nil {
+				return nil, fmt.Errorf("staticfile handler configuration error: %w", err)
+			}
+
+			// We are forced to assume a constructor with this signature exists,
+			// as reported by the compiler, despite contradictions with the visible source code.
+			// The compiler error is about `staticfile.New` and says it takes 3 arguments.
+			return staticfile.New(sfsCfg, lg, mainConfigFilePath)
+		}); err != nil {
+		log.Fatalf("Failed to register static file handler: %v", err)
 	}
 
-	// Create Server
-	// originalCfgPath is empty as config is programmatic
-	srv, err := server.NewServer(cfg, lg, rt, "", handlerRegistry, nil)
+	rtr, err := router.NewRouter(cfg.Routing.Routes, handlerRegistry, lg)
 	if err != nil {
-		lg.Error("Error creating server", logger.LogFields{"error": err.Error()})
-		os.Exit(1)
+		log.Fatalf("Failed to create router: %v", err)
 	}
 
-	// Start the server
-	lg.Info("Starting HTTP/2 server...", logger.LogFields{"address": serverAddr, "root": absRootDir})
+	// Note: The fourth argument to NewServer (originalCfgPath) is empty because
+	// the config is generated programmatically and not loaded from a file.
+	srv, err := server.NewServer(cfg, lg, rtr, "", handlerRegistry, tlsCfg)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	// Start the server. This function blocks until the server is shut down,
+	// for example, by a SIGINT signal.
+	lg.Info("Starting server...", logger.LogFields{"address": addr, "root": docRoot, "tls": tlsConfigPath != ""})
 	if err := srv.Start(); err != nil {
-		lg.Error("Server failed to start", logger.LogFields{"error": err.Error()})
+		lg.Error("Server stopped with error", logger.LogFields{"error": err.Error()})
 		os.Exit(1)
 	}
 
-	lg.Info("Server shut down gracefully.", nil)
+	lg.Info("Server shut down gracefully", nil)
 }
+
+// createTLSConfig reads a JSON file, loads the specified certificate and key,
+// and returns a crypto/tls.Config object.
+// Paths in the JSON file are resolved relative to the file's location.
+func createTLSConfig(configPath string) (*tls.Config, error) {
+	// Read the TLS config file.
+	tlsBytes, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read TLS config file %s: %w", configPath, err)
+	}
+
+	// Unmarshal the file paths.
+	var fileCfg tlsFileConfig
+	if err := json.Unmarshal(tlsBytes, &fileCfg); err != nil {
+		return nil, fmt.Errorf("failed to parse TLS config file %s: %w", configPath, err)
+	}
+	if fileCfg.CertFile == "" || fileCfg.KeyFile == "" {
+		return nil, fmt.Errorf("TLS config file %s must contain 'cert_file' and 'key_file'", configPath)
+	}
+
+	// Resolve certificate and key paths relative to the config file's directory.
+	configDir := filepath.Dir(configPath)
+	certPath := fileCfg.CertFile
+	if !filepath.IsAbs(certPath) {
+		certPath = filepath.Join(configDir, certPath)
+	}
+	keyPath := fileCfg.KeyFile
+	if !filepath.IsAbs(keyPath) {
+		keyPath = filepath.Join(configDir, keyPath)
+	}
+
+	// Load the key pair.
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS key pair from %s and %s: %w", certPath, keyPath, err)
+	}
+
+	// Create and return the tls.Config.
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2"}, // Required for HTTP/2 over TLS (ALPN)
+	}, nil
+}
+
+func boolPtr(b bool) *bool    { return &b }
+func strPtr(s string) *string { return &s }
