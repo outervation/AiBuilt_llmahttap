@@ -1406,3 +1406,67 @@ func TestRouting_ConfigValidationFailures(t *testing.T) {
 }
 
 // END_OF_FILE_MARKER_DO_NOT_USE
+
+var tlsSimpleGET = testutil.E2ETestDefinition{
+	Name:                "tlsSimpleGET",
+	ServerBinaryPath:    serverBinaryPath,
+	ServerConfigArgName: "-config",
+	ServerListenAddress: "127.0.0.1:0", // Dynamic port
+	ServerConfigFormat:  "json",
+	// ServerConfigData is set by the SetupFunc
+	TestCases: []testutil.E2ETestCase{
+		{
+			Name: "SecureGET_NoRoutes_Returns404",
+			Request: testutil.TestRequest{
+				UseTLS: true,
+				Method: "GET",
+				Path:   "/",
+			},
+			Expected: testutil.ExpectedResponse{
+				StatusCode: 404,
+				// Body check is optional, the main point is getting a valid response over TLS
+			},
+		},
+	},
+	SetupFunc: func(t *testing.T, def *testutil.E2ETestDefinition) {
+		// Generate a self-signed cert and key for the test
+		certPath, keyPath, err := testutil.GenerateSelfSignedCertKeyFiles(t, "127.0.0.1")
+		if err != nil {
+			t.Fatalf("Failed to generate self-signed cert/key: %v", err)
+		}
+
+		// Create a config with TLS enabled
+		trueBool := true
+		def.ServerConfigData = &config.Config{
+			Server: &config.ServerConfig{
+				Address: &def.ServerListenAddress,
+				TLS: &config.TLSConfig{
+					Enabled:  &trueBool,
+					CertFile: &certPath,
+					KeyFile:  &keyPath,
+				},
+			},
+			Logging: &config.LoggingConfig{
+				LogLevel: config.LogLevelDebug,
+				AccessLog: &config.AccessLogConfig{
+					Enabled: &trueBool,
+					Target:  strPtr("stdout"),
+					Format:  "json",
+				},
+				ErrorLog: &config.ErrorLogConfig{
+					Target: strPtr("stderr"),
+				},
+			},
+			Routing: &config.RoutingConfig{
+				Routes: []config.Route{}, // No routes defined
+			},
+		}
+	},
+}
+
+func TestTLS(t *testing.T) {
+	if serverBinaryMissing {
+		t.Skipf("Skipping E2E test: server binary not found or not executable at '%s'", serverBinaryPath)
+	}
+	testutil.RunE2ETest(t, tlsSimpleGET)
+}
