@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -16,22 +17,16 @@ import (
 	"example.com/llmahttap/v2/internal/server"
 )
 
-// tlsFileConfig is a minimal struct to unmarshal just the TLS cert/key file paths
-// from a dedicated TLS config file.
-type tlsFileConfig struct {
-	CertFile string `json:"cert_file"`
-	KeyFile  string `json:"key_file"`
-}
-
 func main() {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
-		log.Fatalf("Usage: %s <address> <document-root> [tls-config-path]", os.Args[0])
-	}
-	addr := os.Args[1]
-	docRoot := os.Args[2]
-	var tlsConfigPath string
-	if len(os.Args) == 4 {
-		tlsConfigPath = os.Args[3]
+	var addr, docRoot, tlsConfigPath string
+
+	flag.StringVar(&addr, "addr", ":8080", "Address to listen on")
+	flag.StringVar(&docRoot, "docroot", ".", "Document root for static file server")
+	flag.StringVar(&tlsConfigPath, "tlsconfig", "", "Path to a JSON file containing TLS 'cert_file' and 'key_file' paths")
+	flag.Parse()
+
+	if docRoot == "" {
+		log.Fatalf("Error: -docroot must be provided.")
 	}
 
 	if !filepath.IsAbs(docRoot) {
@@ -153,22 +148,22 @@ func createTLSConfig(configPath string) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to read TLS config file %s: %w", configPath, err)
 	}
 
-	// Unmarshal the file paths.
-	var fileCfg tlsFileConfig
-	if err := json.Unmarshal(tlsBytes, &fileCfg); err != nil {
+	// Unmarshal the file paths into the shared config.TLSConfig struct.
+	var tlsSection config.TLSConfig
+	if err := json.Unmarshal(tlsBytes, &tlsSection); err != nil {
 		return nil, fmt.Errorf("failed to parse TLS config file %s: %w", configPath, err)
 	}
-	if fileCfg.CertFile == "" || fileCfg.KeyFile == "" {
-		return nil, fmt.Errorf("TLS config file %s must contain 'cert_file' and 'key_file'", configPath)
+	if tlsSection.CertFile == nil || *tlsSection.CertFile == "" || tlsSection.KeyFile == nil || *tlsSection.KeyFile == "" {
+		return nil, fmt.Errorf("TLS config file %s must contain 'cert_file' and 'key_file' fields", configPath)
 	}
 
 	// Resolve certificate and key paths relative to the config file's directory.
 	configDir := filepath.Dir(configPath)
-	certPath := fileCfg.CertFile
+	certPath := *tlsSection.CertFile
 	if !filepath.IsAbs(certPath) {
 		certPath = filepath.Join(configDir, certPath)
 	}
-	keyPath := fileCfg.KeyFile
+	keyPath := *tlsSection.KeyFile
 	if !filepath.IsAbs(keyPath) {
 		keyPath = filepath.Join(configDir, keyPath)
 	}
@@ -179,11 +174,27 @@ func createTLSConfig(configPath string) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to load TLS key pair from %s and %s: %w", certPath, keyPath, err)
 	}
 
-	// Create and return the tls.Config.
-	return &tls.Config{
+	// Create the tls.Config.
+	finalTlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"h2"}, // Required for HTTP/2 over TLS (ALPN)
-	}, nil
+	}
+
+	// Apply MinVersion if specified.
+	if tlsSection.MinVersion != nil {
+		switch *tlsSection.MinVersion {
+		case "1.3":
+			finalTlsCfg.MinVersion = tls.VersionTLS13
+		case "1.2":
+			finalTlsCfg.MinVersion = tls.VersionTLS12
+		case "":
+			// Do nothing, use crypto/tls default
+		default:
+			return nil, fmt.Errorf("invalid 'min_version' in TLS config: %q", *tlsSection.MinVersion)
+		}
+	}
+
+	return finalTlsCfg, nil
 }
 
 func boolPtr(b bool) *bool    { return &b }
