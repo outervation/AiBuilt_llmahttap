@@ -127,6 +127,28 @@ func newTestConfig(addr string) *config.Config {
 }
 func strPtr(s string) *string { return &s }
 
+// newTestConfigWithTLS creates a minimal, valid configuration for testing with TLS enabled.
+// It generates a self-signed certificate and key, storing them in temp files.
+func newTestConfigWithTLS(t *testing.T, addr string) *config.Config {
+	t.Helper()
+	cfg := newTestConfig(addr) // Start with a standard test config
+
+	// Generate cert and key
+	certPath, keyPath, err := testutil.GenerateSelfSignedCertKeyFiles(t, "127.0.0.1")
+	require.NoError(t, err, "Failed to generate self-signed cert/key for test config")
+
+	// Enable TLS in the config
+	enabled := true
+	if cfg.Server.TLS == nil {
+		cfg.Server.TLS = &config.TLSConfig{}
+	}
+	cfg.Server.TLS.Enabled = &enabled
+	cfg.Server.TLS.CertFile = &certPath
+	cfg.Server.TLS.KeyFile = &keyPath
+
+	return cfg
+}
+
 // --- Mock net.Listener ---
 type mockListener struct {
 	AcceptFunc func() (net.Conn, error)
