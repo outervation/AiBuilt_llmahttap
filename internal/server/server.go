@@ -51,6 +51,7 @@ type Server struct {
 	log             *logger.Logger
 	router          RouterInterface  // Type defined in internal/server/handler.go
 	handlerRegistry *HandlerRegistry // Type defined in internal/server/handler.go
+	tlsConfig       *tls.Config      // Added for TLS support
 
 	mu          sync.RWMutex
 	listeners   []net.Listener
@@ -71,7 +72,7 @@ type Server struct {
 }
 
 // NewServer creates a new Server instance.
-func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, originalCfgPath string, registry *HandlerRegistry) (*Server, error) {
+func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, originalCfgPath string, registry *HandlerRegistry, tlsCfg *tls.Config) (*Server, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -85,12 +86,14 @@ func NewServer(cfg *config.Config, lg *logger.Logger, router RouterInterface, or
 	if registry == nil {
 		return nil, fmt.Errorf("handler registry cannot be nil")
 	}
+	// tlsCfg can be nil if TLS is not configured.
 
 	s := &Server{
 		cfg:             cfg,
 		log:             lg,
 		router:          router,
 		handlerRegistry: registry,
+		tlsConfig:       tlsCfg, // Store the TLS config
 		// activeConns:     make(map[*http2.Connection]struct{}), // TEMPORARY
 
 		activeConns:    make(map[*http2.Connection]struct{}),
@@ -297,23 +300,9 @@ func (s *Server) acceptLoop(l net.Listener) {
 		// --- BEGIN TLS MODIFICATION ---
 		var effectiveConn net.Conn = conn // Default to original conn
 
-		tlsConfiguredAndEnabled := false
-		var certFile, keyFile string
+		if s.tlsConfig != nil {
+			s.log.Debug("TLS is configured. Peeking for TLS handshake.", logger.LogFields{"remote_addr": conn.RemoteAddr().String()})
 
-		if s.cfg.Server != nil && s.cfg.Server.TLS != nil &&
-			s.cfg.Server.TLS.Enabled != nil && *s.cfg.Server.TLS.Enabled &&
-			s.cfg.Server.TLS.CertFile != nil && *s.cfg.Server.TLS.CertFile != "" &&
-			s.cfg.Server.TLS.KeyFile != nil && *s.cfg.Server.TLS.KeyFile != "" {
-
-			tlsConfiguredAndEnabled = true
-			certFile = *s.cfg.Server.TLS.CertFile
-			keyFile = *s.cfg.Server.TLS.KeyFile
-			s.log.Debug("TLS is configured and enabled. Peeking for TLS handshake.", logger.LogFields{"remote_addr": conn.RemoteAddr().String(), "cert": certFile, "key": keyFile})
-		} else {
-			s.log.Debug("TLS not configured or not enabled. Proceeding with clear text.", logger.LogFields{"remote_addr": conn.RemoteAddr().String()})
-		}
-
-		if tlsConfiguredAndEnabled {
 			br := bufio.NewReader(conn)
 			hdr, peekErr := br.Peek(3) // Peek 3 bytes for TLS handshake check: 1 (type) + 2 (version)
 
@@ -328,26 +317,12 @@ func (s *Server) acceptLoop(l net.Listener) {
 			pc := &peekConn{Conn: conn, r: br}
 
 			// TLS record header: first byte 22 (handshake), second byte 3 (TLS major version)
-			// Example: ClientHello is Handshake (22), Version TLS 1.2 (03 03)
 			if hdr[0] == 22 && hdr[1] == 0x03 {
 				s.log.Info("Potential TLS connection detected based on peeked bytes.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
 
-				certificate, errLoadCert := tls.LoadX509KeyPair(certFile, keyFile)
-				if errLoadCert != nil {
-					s.log.Error("Failed to load TLS certificate/key", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "cert": certFile, "key": keyFile, "error": errLoadCert.Error()})
-					pc.Close()
-					continue // Next iteration of acceptLoop
-				}
-
-				tlsCfg := &tls.Config{
-					Certificates: []tls.Certificate{certificate},
-					NextProtos:   []string{"h2", "http/1.1"}, // Advertise h2 first for HTTP/2 over TLS
-					MinVersion:   tls.VersionTLS12,           // Recommended minimum TLS version
-				}
-
 				s.log.Info("Initiating TLS handshake.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
 
-				tlsConn := tls.Server(pc, tlsCfg) // Use peekConn as the underlying net.Conn for tls.Server
+				tlsConn := tls.Server(pc, s.tlsConfig) // Use the pre-loaded s.tlsConfig
 				if errHandshake := tlsConn.Handshake(); errHandshake != nil {
 					s.log.Error("TLS handshake failed", logger.LogFields{"remote_addr": pc.RemoteAddr().String(), "error": errHandshake.Error()})
 					tlsConn.Close() // Close the *tls.Conn
@@ -374,27 +349,22 @@ func (s *Server) acceptLoop(l net.Listener) {
 				effectiveConn = tlsConn // Use the *tls.Conn for handleTCPConnection
 			} else {
 				// Peeked bytes do not indicate TLS, but TLS was configured. Proceed with pc (peekConn) as clear text.
-				// This path might be for h2c (HTTP/2 Cleartext) or HTTP/1.1 if the server supports it on the same port.
-				// For this specific task, we assume if it's not TLS, it's handled as before.
 				s.log.Info("Peeked bytes do not indicate TLS, but TLS was configured. Proceeding with clear text connection using peekConn.", logger.LogFields{"remote_addr": pc.RemoteAddr().String()})
 				effectiveConn = pc // Use peekConn so the initial bytes are not lost
 			}
-		}
-		// If TLS was not configured at all, effectiveConn remains the original conn.
-		// If TLS was configured but peek did not indicate TLS, effectiveConn is pc.
-		// If TLS was configured and TLS handshake succeeded with ALPN h2, effectiveConn is tlsConn.
-
-		// Determine and log the type of connection being passed
-		// Determine and log the type of connection being passed
-		connTypeDesc := ""
-		if effectiveConn == conn { // effectiveConn is the original conn
-			connTypeDesc = "original cleartext"
-		} else if _, ok := effectiveConn.(*peekConn); ok { // effectiveConn is peekConn
-			connTypeDesc = "peekConn (non-TLS after peek)"
-		} else if _, ok := effectiveConn.(*tls.Conn); ok { // effectiveConn is tls.Conn
-			connTypeDesc = "TLS"
 		} else {
-			connTypeDesc = "unknown" // Should not happen
+			s.log.Debug("TLS not configured. Proceeding with clear text.", logger.LogFields{"remote_addr": conn.RemoteAddr().String()})
+		}
+
+		connTypeDesc := ""
+		if _, ok := effectiveConn.(*tls.Conn); ok {
+			connTypeDesc = "TLS"
+		} else if _, ok := effectiveConn.(*peekConn); ok {
+			connTypeDesc = "peekConn (non-TLS after peek)"
+		} else if effectiveConn == conn {
+			connTypeDesc = "original cleartext"
+		} else {
+			connTypeDesc = "unknown"
 		}
 		s.log.Info("Passing connection to handleTCPConnection.", logger.LogFields{"remote_addr": effectiveConn.RemoteAddr().String(), "type": connTypeDesc})
 		go s.handleTCPConnection(effectiveConn)
