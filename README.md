@@ -2,7 +2,7 @@
 
 `go run  ./main.go -addr=":8888" -docroot=/home/someUser/dirToServe`
 
-or with TLS:
+or with TLS (not well-tested):
 
 `go run  ./main.go -addr=":8888" -docroot=/home/someUser/dirToServe -tlsconfig=/home/someUser/llmahttap/example_tls_config/tls_config.json`
 
