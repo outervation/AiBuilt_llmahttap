@@ -10,6 +10,6 @@ run
 
 `./build_all_go_binaries.sh`
 
-to build the full server binary, ./server, which takes a more detailed config supporting route configurations.
+to build the full server binary, `./server`, which takes a more detailed config supporting route configurations.
 
-./internal/server/server.go contains the core server code.
+The core server code, which could be used as a reference for how to use the library from other code, is in `internal/server/server.go`
